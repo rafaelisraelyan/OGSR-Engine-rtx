@@ -23,7 +23,7 @@ RD /s /q 3rd_party\Src\mimalloc\mimalloc
 git clone --branch v3.5.1 --depth 1 https://github.com/microsoft/mimalloc.git 3rd_party\Src\mimalloc\mimalloc
 
 RD /s /q 3rd_party\Src\NVIDIA_DLSS\DLSS
-git clone --branch v310.7.0 --depth 1 https://github.com/NVIDIA/DLSS.git 3rd_party\Src\NVIDIA_DLSS\DLSS
+git clone --branch v310.9.1 --depth 1 https://github.com/NVIDIA/DLSS.git 3rd_party\Src\NVIDIA_DLSS\DLSS
 
 RD /s /q 3rd_party\Src\cpputils\cpputils
 git clone --branch main --depth 1 https://github.com/tzcnt/cpputils.git 3rd_party\Src\cpputils\cpputils
