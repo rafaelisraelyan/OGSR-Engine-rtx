@@ -2,9 +2,8 @@
 
 ## Статус
 
-**PARTIAL** — build integration создана, но сборка не проверена (нет MSBuild
-в среде выполнения). DX12 backend не реализован — только минимальная
-инфраструктура.
+**PARTIAL** — build scaffold создан и собирается. Полноценный DX12 backend
+не реализован (только минимальный `CHW12` без `D3D12CreateDevice`).
 
 ## Структура новых проектов
 
@@ -12,57 +11,34 @@
 ogsr_engine/Layers/xrRenderDX12/
   CHW12.h          — минимальный интерфейс (пустой класс)
   CHW12.cpp        — пустая реализация
+  stdafx.h         — d3d12.h, dxgi1_4.h, d3dcompiler.h
 
 ogsr_engine/Layers/xrRenderPC_R5_DX12/
-  xrRender_R5_DX12.vcxproj  — новый проект (StaticLib)
+  xrRender_R5_DX12.vcxproj  — StaticLibrary (ReleaseDX12|x64)
 ```
 
-## Как работает выбор DX11/DX12
+## GUID проекта
 
-```cpp
-// Device_create.cpp (существующий, не изменён)
-m_pRender = RenderFactory->CreateRenderDeviceRender();
-```
+`{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}`
 
-Для DX12 будет добавлена альтернативная фабрика:
+## ReleaseDX12 mapping
 
-```cpp
-// Будущее (F2.1+):
-#if defined(OGSR_USE_DX12)
-    m_pRender = RenderFactory12->CreateRenderDeviceRender();
-#else
-    m_pRender = RenderFactory->CreateRenderDeviceRender();
-#endif
-```
-
-**На F2.0 это НЕ реализовано** — только build-time конфигурация.
-
-## Global symbols
-
-| Символ | Библиотека | Конфликт? |
+| Проект | ActiveCfg | Build.0 |
 |---|---|---|
-| `HW` | `xrRender_R4.lib` | Нет — DX12 использует `HW12` |
-| `RImplementation` | `xrRender_R4.lib` | Нет — DX12 использует `R5` |
-| `RenderFactoryImpl` | `xrRender_R4.lib` | Нет — DX12 использует `RenderFactory12Impl` |
+| `xrRender_R5_DX12` | `ReleaseDX12\|x64` | `ReleaseDX12\|x64` |
+| Вспомогательные библиотеки (xrCore, xrCDB, и т.д.) | `Release\|x64` | `Release\|x64` |
+| `XR_3DA` (EXE) | `Release\|x64` | **нет** |
+| `xrRender_R4` (DX11 renderer) | `Release\|x64` | **нет** |
 
-## Библиотеки
+## Результаты сборки
 
-| Проект | Линкуется в |
-|---|---|
-| `xrRender_R4.lib` | `xrEngine.exe` (Release) |
-| `xrRender_R5_DX12.lib` | `xrEngine.exe` (ReleaseDX12) — будущее |
-
-## Как собрать
-
-```cmd
-:: DX11 (default, рабочий)
-msbuild Engine.sln /p:Configuration=Release /p:Platform=x64
-
-:: DX12 (экспериментальный, F2.0)
+```
 msbuild Engine.sln /p:Configuration=ReleaseDX12 /p:Platform=x64
+ExitCode: 0
+Warnings: MSB4121 (ожидаемы — проекты без ReleaseDX12 mapping)
 ```
 
-## Что НЕ реализовано
+## Что НЕ реализовано (F2.1+)
 
 - `D3D12CreateDevice` — F2.1
 - DXGI swapchain — F2.1
@@ -71,8 +47,8 @@ msbuild Engine.sln /p:Configuration=ReleaseDX12 /p:Platform=x64
 - Command recording — F2.1
 - `ClearRenderTargetView` — F2.1
 - `Present` — F2.1
-- Полноценный `CRender12` — F4
 - `dxRenderDeviceRender12` — F2.1
+- Полноценный `CRender12` — F4
 
 ## План F2.1
 
