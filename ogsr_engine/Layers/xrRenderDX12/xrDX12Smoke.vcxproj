@@ -67,6 +67,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="xrDX12Smoke.cpp" />
+    <ClCompile Include="dx12log.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\xrRenderPC_R5_DX12\xrRender_R5_DX12.vcxproj">

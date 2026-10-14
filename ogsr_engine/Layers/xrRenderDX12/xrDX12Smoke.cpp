@@ -1,14 +1,25 @@
 #include "stdafx.h"
 #include "CHW12.h"
+#include "dx12log.h"
 #include <Windows.h>
 
 static const wchar_t* kWindowClass = L"XRDX12Smoke";
 static const wchar_t* kWindowTitle = L"OGSR DX12 Smoke Test";
+static constexpr int kClientWidth = 1280;
+static constexpr int kClientHeight = 720;
 
-// F2.1-B: окно остаётся единственной точкой входа, но цикл теперь обрабатывает
-// WM_SIZE (реальный вызов Resize) и немедленно выходит при отказе RenderFrame,
-// вместо бесконечного горячего цикла на сломанном устройстве.
+// F2.1-B.1: окно изменяемого размера с реальным client area. Resize вызывается
+// только при изменении client area, не рекурсивно и не при минимизации.
 static CHW12* g_hw = nullptr;
+static bool g_running = true;
+static bool g_minimized = false;
+
+// Разрешает или запрещает рендеринг. Во время минимизации Present вернул бы
+// DXGI_STATUS_OCCLUDED на каждом кадре, поэтому цикл просто простаивает.
+static void SetRenderEnabled(bool enabled)
+{
+    g_minimized = !enabled;
+}
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -17,12 +28,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SIZE:
         if (g_hw)
         {
-            const uint32_t w = LOWORD(lParam);
-            const uint32_t h = HIWORD(lParam);
-            if (!g_hw->Resize(w, h))
+            const bool wasMinimized = (wParam == SIZE_MINIMIZED);
+            SetRenderEnabled(!wasMinimized);
+
+            // При минимизации client area равен нулю: Resize не вызываем.
+            if (!wasMinimized)
             {
-                DestroyWindow(hwnd);
-                return 0;
+                const uint32_t w = LOWORD(lParam);
+                const uint32_t h = HIWORD(lParam);
+                if (w != 0 && h != 0 && !g_hw->Resize(w, h))
+                {
+                    dx12log::Write("[smoke] Resize(%u,%u) failed, stopping", w, h);
+                    g_running = false;
+                    DestroyWindow(hwnd);
+                }
             }
         }
         return 0;
@@ -39,6 +58,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
+    dx12log::Open();
+    dx12log::Write("[smoke] xrDX12Smoke starting");
+
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -48,30 +70,59 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     wc.lpszClassName = kWindowClass;
 
     if (!RegisterClassExW(&wc))
+    {
+        dx12log::Write("[smoke] RegisterClassExW failed, GetLastError=%lu", GetLastError());
+        dx12log::Close();
         return 1;
+    }
+
+    // AdjustWindowRectEx: 1280x720 — это CLIENT area, а не размер окна.
+    // Без этой поправки backbuffer получал бы размер окна вместе со рамкой.
+    RECT desired = {0, 0, kClientWidth, kClientHeight};
+    const DWORD style = WS_OVERLAPPEDWINDOW;
+    if (!AdjustWindowRectEx(&desired, style, FALSE, 0))
+    {
+        dx12log::Write("[smoke] AdjustWindowRectEx failed, GetLastError=%lu", GetLastError());
+        UnregisterClassW(kWindowClass, hInstance);
+        dx12log::Close();
+        return 1;
+    }
+
+    const int winWidth = desired.right - desired.left;
+    const int winHeight = desired.bottom - desired.top;
 
     HWND hwnd = CreateWindowExW(
-        0, kWindowClass, kWindowTitle,
-        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME,
+        0, kWindowClass, kWindowTitle, style,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1280, 720,
+        winWidth, winHeight,
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hwnd)
     {
+        dx12log::Write("[smoke] CreateWindowExW failed, GetLastError=%lu", GetLastError());
         UnregisterClassW(kWindowClass, hInstance);
+        dx12log::Close();
         return 1;
     }
 
-    CHW12 hw;
-    g_hw = &hw;
+    // Фактический client area: источник истины для размера backbuffer.
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    const uint32_t clientWidth = static_cast<uint32_t>(client.right - client.left);
+    const uint32_t clientHeight = static_cast<uint32_t>(client.bottom - client.top);
+    dx12log::Write("[smoke] client area: %ux%u (window %dx%d)",
+                   clientWidth, clientHeight, winWidth, winHeight);
 
-    if (!hw.Initialize(hwnd, 1280, 720))
+    CHW12 hw12;
+    g_hw = &hw12;
+
+    if (!hw12.Initialize(hwnd, clientWidth, clientHeight))
     {
-        wprintf(L"[smoke] CHW12::Initialize failed\n");
+        dx12log::Write("[smoke] CHW12::Initialize failed, see [DX12] lines above for the stage");
         DestroyWindow(hwnd);
         g_hw = nullptr;
         UnregisterClassW(kWindowClass, hInstance);
+        dx12log::Close();
         return 1;
     }
 
@@ -79,8 +130,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UpdateWindow(hwnd);
 
     MSG msg = {};
-    bool running = true;
-    while (running)
+    while (g_running)
     {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
@@ -88,26 +138,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT)
             {
-                running = false;
+                g_running = false;
                 break;
             }
         }
 
-        if (!running)
+        if (!g_running)
             break;
 
-        if (!hw.RenderFrame())
+        // Минимизировано: не рендерим вовсе, а не слать Present в occlusion.
+        if (g_minimized)
+            continue;
+
+        if (!hw12.RenderFrame())
         {
-            wprintf(L"[smoke] RenderFrame failed, device removed=%d, stopping\n",
-                    hw.IsDeviceRemoved() ? 1 : 0);
-            running = false;
+            dx12log::Write("[smoke] RenderFrame failed, device removed=%d, stopping",
+                           hw12.IsDeviceRemoved() ? 1 : 0);
+            g_running = false;
             break;
         }
     }
 
-    hw.Shutdown();
+    hw12.Shutdown();
     g_hw = nullptr;
     UnregisterClassW(kWindowClass, hInstance);
 
+    dx12log::Write("[smoke] exit");
+    dx12log::Close();
     return 0;
 }

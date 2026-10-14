@@ -274,7 +274,6 @@ Global
 		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.ReleaseDX12|x64.ActiveCfg = ReleaseDX12|x64
 		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.ReleaseDX12|x64.Build.0 = ReleaseDX12|x64
 		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.Release|x64.ActiveCfg = ReleaseDX12|x64
-		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.Release|x64.Build.0 = ReleaseDX12|x64
 	EndGlobalSection
 
 	GlobalSection(SolutionProperties) = preSolution
