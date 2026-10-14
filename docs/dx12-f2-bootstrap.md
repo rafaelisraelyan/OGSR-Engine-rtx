@@ -2,8 +2,8 @@
 
 ## Статус
 
-**PARTIAL** — build scaffold создан и собирается. Полноценный DX12 backend
-не реализован (только минимальный `CHW12` без `D3D12CreateDevice`).
+**PASS** (build scaffold) — DX12 static library компилируется без предупреждений.
+Полноценный DX12 backend не реализован (только минимальный `CHW12`).
 
 ## Структура новых проектов
 
@@ -30,13 +30,44 @@ ogsr_engine/Layers/xrRenderPC_R5_DX12/
 | `XR_3DA` (EXE) | `Release\|x64` | **нет** |
 | `xrRender_R4` (DX11 renderer) | `Release\|x64` | **нет** |
 
-## Результаты сборки
+## Результаты сборки (2026-10-14)
+
+### Прямая компиляция DX12-проекта
 
 ```
-msbuild Engine.sln /p:Configuration=ReleaseDX12 /p:Platform=x64
-ExitCode: 0
-Warnings: MSB4121 (ожидаемы — проекты без ReleaseDX12 mapping)
+msbuild xrRender_R5_DX12.vcxproj /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64
 ```
+
+| Параметр | Значение |
+|---|---|
+| ExitCode | 0 |
+| Предупреждений | 0 |
+| Ошибок | 0 |
+| `CHW12.cpp` передан компилятору | да |
+| Созданная `.lib` | `ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib` |
+
+### Solution ReleaseDX12
+
+```
+msbuild Engine.sln /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64
+```
+
+| Параметр | Значение |
+|---|---|
+| ExitCode | 0 |
+| MSB4121 warnings | да (ожидаемо — проекты без `Build.0`) |
+
+### DX11 Release regression
+
+```
+msbuild Engine.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64
+```
+
+| Параметр | Значение |
+|---|---|
+| Компиляция и линковка | успешно (`xrEngine.exe` создан) |
+| Post-build A1 (`dbghelp.dll`) | упал — известная проблема (§13.1), не связана с F2.0 |
+| ATL workaround | `CL=/I"...\atlmfc\include"` + `LINK=/LIBPATH:"...\atlmfc\lib\x64"` |
 
 ## Что НЕ реализовано (F2.1+)
 
