@@ -17,6 +17,7 @@
 | [06-rtx-feasibility.md](06-rtx-feasibility.md) | **Главный документ: что можно и что нельзя сделать с RTX в DX11** |
 | [07-known-issues.md](07-known-issues.md) | Найденные проблемы (A–H) + «что проверено и не проблема» |
 | [08-roadmap.md](08-roadmap.md) | Этапы A–E с критериями приёмки и откатом |
+| [09-dx12-port-references.md](09-dx12-port-references.md) | Официальные ресурсы DX12/DXR и привязка к этапам дорожной карты |
 
 ## TL;DR по RTX
 
@@ -63,7 +64,7 @@ struct f_deffer
 
 - **Апстрим:** `https://github.com/OGSR/OGSR-Engine`
 - **Форк:** `https://github.com/rafaelisraelyan/OGSR-Engine-rtx` (public)
-- **Рабочая ветка для CoP:** `cop-rtx` (от `main_cop_cs`)
+- **Рабочая ветка для CoP:** `prypiat` (от `main_cop_cs`, default branch форка)
 - **Базовый коммит:** `9d0021ce6` («Merge branch 'main' into main_cop_cs»)
 - **Флаг стандарта:** ветка `main` (SoC) — старая база с другой документацией
 - **Стандарт C++:** `stdcpp20` безусловно (`OgsrBuildProps.props:28`)
