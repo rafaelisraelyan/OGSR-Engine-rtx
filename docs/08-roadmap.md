@@ -87,16 +87,20 @@ with **DX11**, DX12, and Vulkan.»* — цитата проверена лока
 `git submodule status` → `-35e13ba3…` — submodule не инициализирован.
 Это баг скрипта, а не дизайна.
 
-### B1. Починить скрипт
+**Статус B1:** ✅ **выполнено 2026-10-14** — скрипт поправлен, сабмодуль
+`NVIDIAImageScaling v1.0.3` активирован в существующем дереве (333 файла).
+
+### B1. Починить скрипт — ✅ СДЕЛАНО
 
 ```diff
 -  git clone --branch v310.9.1 --depth 1 https://github.com/NVIDIA/DLSS.git 3rd_party/Src/NVIDIA_DLSS/DLSS
 +  git clone --branch v310.9.1 --depth 1 --recurse-submodules https://github.com/NVIDIA/DLSS.git 3rd_party/Src/NVIDIA_DLSS/DLSS
 ```
 
-Альтернатива (если не хочется тянуть лишнее) — отдельный клон
-`NVIDIAGameWorks/NVIDIAImageScaling`. Точный тег уточняется по commmit id
-сабмодуля (`35e13ba316c98eeecf16f37eae70ce88019911f6`).
+Активация сабмодуля в существующем дереве (без перекачки 2 ГБ):
+```cmd
+git -C 3rd_party\Src\NVIDIA_DLSS\DLSS submodule update --init --recursive
+```
 
 ### B2. `.cs`-шейдеры
 
