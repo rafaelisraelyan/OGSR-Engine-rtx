@@ -282,12 +282,14 @@ graph TD
 | Resources | `CResourceManager` | `CResourceManager12` | Нет |
 | State | `dx10StateManager` | PSO cache | Нет |
 | Window/Loop | `CRenderDevice` | `CRenderDevice` | **Да** |
-| Frame Logic | `CRender` | `CRender` | **Да** |
-| Post-processing | `RenderPhaseAA` | `RenderPhaseAA` | **Да** |
+| Frame Logic | `CRender` | `CRender12` | **Нет** |
+| Post-processing | `RenderPhaseAA` | `RenderPhaseAA12` | Нет |
 | Shaders | `r4.cpp` (D3DCompile) | `r4_12.cpp` (DXC) | Нет |
 
-**Decision:** Общий слой — только `CRenderDevice` (оконный цикл) и `CRender`
-(логика кадра). Всё остальное — раздельно.
+**Decision:** Общий слой — только `CRenderDevice` (оконный цикл). `CRender`
+не может быть общим: содержит `contexts_pool[10]` (`R_dsgraph_structure`
+с `CBackend`), `nVB/xVB` (`ID3DVertexBuffer*`), `nIB/xIB` (`ID3DIndexBuffer*`),
+прямые вызовы `HW` (глобальный `CHW`). Для DX12 нужен отдельный `CRender12`.
 
 ---
 
@@ -474,10 +476,15 @@ list per frame (3 в flight). 9 deferred contexts D3D11 используются
 | Понятие | Описание |
 |---|---|
 | `ID3D12Resource` | GPU-ресурс (текстура, buffer) |
-| View | `ID3D12ShaderResourceView` и т.д. |
-| Descriptor | Структура, описывающая view для GPU |
-| Descriptor Heap | Массив дескрипторов |
+| View | Логическое представление ресурса (SRV, UAV, RTV, DSV) |
+| Descriptor | CPU-side структура, описывающая view для GPU. Не COM-объект. |
+| Descriptor Heap | Массив дескрипторов в GPU-видимой памяти |
 | GPU Virtual Address | Адрес ресурса в GPU-памяти |
+
+**Важно:** В D3D12 нет `ID3D12ShaderResourceView` как COM-объекта. Есть
+`D3D12_SHADER_RESOURCE_VIEW_DESC` — структура, которая хранится в
+descriptor heap и интерпретируется GPU. Descriptor — это не COM-объект,
+это блок памяти фиксированного размера.
 
 ### 11.2 Интерфейсы
 
@@ -563,13 +570,20 @@ class PSOCache12
 public:
     struct PSOKey
     {
-        // Hash из:
+        // Hash из всех полей D3D12_GRAPHICS_PIPELINE_STATE_DESC:
         // - shader bytecode (VS/PS/GS/HS/DS)
+        // - root signature
         // - input layout (D3D12_INPUT_ELEMENT_DESC)
-        // - blend state
-        // - depth-stencil state
-        // - rasterizer state
+        // - blend state (D3D12_BLEND_DESC)
+        // - rasterizer state (D3D12_RASTERIZER_DESC)
+        // - depth-stencil state (D3D12_DEPTH_STENCIL_DESC)
+        // - primitive topology type (D3D12_PRIMITIVE_TOPOLOGY_TYPE)
+        // - render target count
+        // - RTV formats[]
+        // - DSV format
+        // - sample description (count, quality)
         // - sample mask
+        // - cached PSO blob (optional)
     };
 
     ID3D12PipelineState* GetOrCreate(const PSOKey& key, const PSODesc& desc);
@@ -579,6 +593,9 @@ private:
     std::unordered_map<u64, ID3D12PipelineState*> cache;
 };
 ```
+
+**Decision:** PSO key должен включать все поля, влияющие на совместимость
+pipeline. Неполный ключ приводит к ошибкам рендера или validation errors.
 
 ### 12.3 Root Signature
 
@@ -683,9 +700,14 @@ msbuild Engine.sln /p:Configuration=ReleaseDX12 /p:Platform=x64
 ### 14.3 Rollback
 
 Для отката к DX11:
-1. Вернуть `Release` конфигурацию.
-2. Убрать `xrRender_R5_DX12` из `Engine.sln`.
-3. Всё остальное — без изменений.
+1. Выбрать `Release|x64` конфигурацию.
+2. Собрать исходный DX11 target.
+3. Убедиться, что старый renderer загружается.
+4. Не использовать экспериментальные DX12-бинарники.
+
+**Не нужно удалять `xrRender_R5_DX12` из `Engine.sln`** — проект просто не
+участвует в сборке `Release`. Rollback воспроизводим без ручного
+удаления проектов или исходников.
 
 ---
 
