@@ -388,6 +388,22 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F5 — temporal и совместимость** | DX12-обёртки для выбранных DLSS/FSR, jitter, history reset, upscale input/output, прицел 3DSS, ImGui, Tracy/PIX/RenderDoc, HDR/ReShade там, где поддерживается. | DLSS/FSR fallback без device loss, нет ошибок resize/async lifetime и серьёзного ghosting. |
 | **F6 — стабилизация** | Параллельные command lists только по результатам замеров, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
+**Статус подэтапов F на 2026-10-15** (ветка `prypiat`, HEAD `64b1b81c5`):
+
+| Подэтап | Статус | Комментарий |
+|---|---|---|
+| F0 — аудит | ✅ PASS | `docs/dx12-port-audit.md` |
+| F1 — проектирование | ✅ PASS | `docs/dx12-architecture-adr.md` |
+| F2 — bootstrap | 🔶 PARTIAL | F2.0 scaffold и F2.1-B (исправления) собираются с 0 ошибок и 0 предупреждений. GPU runtime **не подтверждён**: exe не запускался. Подробности и критерии приёмки — `docs/dx12-f2-first-frame.md` |
+| F3 — ресурсы и геометрия | ⬜ NOT STARTED | Только после подтверждённого F2 |
+| F4 — игровой кадр | ⬜ NOT STARTED | — |
+| F5 — temporal | ⬜ NOT STARTED | — |
+| F6 — стабилизация | ⬜ NOT STARTED | — |
+
+Следующий разрешённый шаг: F2.1-C — запуск `xrDX12Smoke.exe` и проверка
+критериев приёмки на реальном GPU. До него статус F2 остаётся `PARTIAL`,
+и F3 не начинается.
+
 ### Принципы F
 
 - Не заменять существующий `CHW` на D3D12 в одном большом коммите и не

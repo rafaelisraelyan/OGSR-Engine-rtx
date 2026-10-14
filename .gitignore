@@ -6,6 +6,12 @@
 /ogsr_engine/_TEMP
 /bin*
 
+# Артефакты сборки DX12 smoke (ReleaseDX12)
+/x64
+ogsr_engine/Layers/xrRenderDX12/x64/
+ogsr_engine/Layers/xrRenderDX12/xrDX12Smoke/
+ogsr_engine/Layers/xrRenderPC_R5_DX12/ogsr_engine/
+
 # Precompiled Headers
 *.ipch
 

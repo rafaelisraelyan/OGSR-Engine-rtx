@@ -5,6 +5,8 @@ VisualStudioVersion = 18.6.11806.211
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "xrRender_R5_DX12", "ogsr_engine\Layers\xrRenderPC_R5_DX12\xrRender_R5_DX12.vcxproj", "{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "xrDX12Smoke", "ogsr_engine\Layers\xrRenderDX12\xrDX12Smoke.vcxproj", "{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libvorbis_static", "3rd_party\Src\Xiph\libvorbis\win32\VS2010\libvorbis\libvorbis_static.vcxproj", "{0F3163C6-FAE6-4FBD-BF88-037EB0420DAF}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "3rd_party", "3rd_party", "{240AEFB4-B8D3-465D-BFE0-D3700EC0485C}"
@@ -269,12 +271,12 @@ Global
 		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.ReleaseDX12|x64.ActiveCfg = ReleaseDX12|x64
 		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.ReleaseDX12|x64.Build.0 = ReleaseDX12|x64
 		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.Release|x64.ActiveCfg = Release|x64
+		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.ReleaseDX12|x64.ActiveCfg = ReleaseDX12|x64
+		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.ReleaseDX12|x64.Build.0 = ReleaseDX12|x64
+		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.Release|x64.ActiveCfg = ReleaseDX12|x64
+		{E8A4C1D2-3B5F-4E7A-8C9D-1F2A3B4C5D6E}.Release|x64.Build.0 = ReleaseDX12|x64
 	EndGlobalSection
 
-		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.ReleaseDX12|x64.ActiveCfg = ReleaseDX12|x64
-		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.ReleaseDX12|x64.Build.0 = ReleaseDX12|x64
-		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.Release|x64.ActiveCfg = Release|x64
-		{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}.Release|x64.Build.0 = Release|x64
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
