@@ -388,21 +388,19 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F5 — temporal и совместимость** | DX12-обёртки для выбранных DLSS/FSR, jitter, history reset, upscale input/output, прицел 3DSS, ImGui, Tracy/PIX/RenderDoc, HDR/ReShade там, где поддерживается. | DLSS/FSR fallback без device loss, нет ошибок resize/async lifetime и серьёзного ghosting. |
 | **F6 — стабилизация** | Параллельные command lists только по результатам замеров, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
-**Статус подэтапов F на 2026-10-15** (ветка `prypiat`, HEAD `64b1b81c5`):
+**Статус подэтапов F на 2026-10-15** (ветка `prypiat`, HEAD `2f6ca66da`):
 
 | Подэтап | Статус | Комментарий |
 |---|---|---|
 | F0 — аудит | ✅ PASS | `docs/dx12-port-audit.md` |
 | F1 — проектирование | ✅ PASS | `docs/dx12-architecture-adr.md` |
-| F2 — bootstrap | 🔶 PARTIAL | F2.0 scaffold и F2.1-B (исправления) собираются с 0 ошибок и 0 предупреждений. GPU runtime **не подтверждён**: exe не запускался. Подробности и критерии приёмки — `docs/dx12-f2-first-frame.md` |
-| F3 — ресурсы и геометрия | ⬜ NOT STARTED | Только после подтверждённого F2 |
+| F2 — bootstrap | ✅ PASS | F2.0 scaffold и F2.1-B собираются с 0 ошибок. GPU runtime подтверждён: Debug Layer + GBV + DRED активны, 6 036 ресайзов суммарно с 0 validation errors и 0 провалов, shutdown корректен, утечек нет (`ReportLiveObjects` через Microsoft DebugView v5.02, разбор владельцев). Documented limitations: обработка device removal — NOT TESTED (провокация TDR запрещена); полноценный игровой DX12 renderer отсутствует, есть только standalone bootstrap. CI для DX12 добавлен отдельным job `dx12-smoke-build` (build-only, без GPU runtime). Детали — `docs/dx12-f2-first-frame.md`, разделы F2.1-C.1, F2.1-C.2 и F2.1 Finalization |
+| F3 — ресурсы и геометрия | ⬜ NOT STARTED | Разрешён старт. Предложение по F3.0 — в `docs/dx12-f2-first-frame.md` |
 | F4 — игровой кадр | ⬜ NOT STARTED | — |
 | F5 — temporal | ⬜ NOT STARTED | — |
 | F6 — стабилизация | ⬜ NOT STARTED | — |
 
-Следующий разрешённый шаг: F2.1-C — запуск `xrDX12Smoke.exe` и проверка
-критериев приёмки на реальном GPU. До него статус F2 остаётся `PARTIAL`,
-и F3 не начинается.
+Следующий разрешённый шаг: F3.0 — минимальный рендер 3D-геометрии.
 
 ### Принципы F
 

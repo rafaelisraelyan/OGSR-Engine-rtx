@@ -74,3 +74,62 @@ jobs:
         asset_path: .\OGSR_Engine_COP_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
         asset_name: OGSR_Engine_COP_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
         asset_content_type: application/x-7z-compressed
+
+  # Independent DX12 bootstrap build. Separate job so Release/ReleaseTracyProfiler
+  # logic above stays untouched. Build-only: no GPU on the runner, so Smoke EXE is
+  # never executed here.
+  dx12-smoke-build:
+    runs-on: windows-2022
+    steps:
+    - uses: actions/checkout@v7.0.1
+      with:
+        fetch-depth: 0
+
+    # ReleaseDX12 builds xrCore/xrGame, which need 3rd_party sources that are not
+    # tracked in git (mimalloc, concurrentqueue, libsquashfs, lz4, zstd,
+    # DirectXTex/Math/Mesh). Without this step the build fails on missing headers.
+    # NOTE: Update_Components.cmd ends with "pause", so it is fed NUL on stdin to
+    # avoid hanging the job. This mirrors what the build job above relies on.
+    - name: Update Components
+      shell: cmd
+      run: |
+        Update_Components.cmd < nul
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v3
+
+    # Rebuild only. XR_3DA has no ReleaseDX12|Build.0 entry, so the game exe is not
+    # produced here; the DX12 library and Smoke EXE are the deliverables.
+    - name: MSBuild ReleaseDX12
+      shell: cmd
+      run: |
+        set APPVEYOR_BUILD_VERSION=3.${{ github.run_number }}
+        set APPVEYOR_REPO_NAME=${{ github.repository }}
+        set CONFIGURATION_GA=ReleaseDX12
+
+        msbuild Engine.sln /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64 /m /v:m
+
+    # Verify the DX12 layer really compiled rather than trusting the exit code alone:
+    # msbuild can succeed while a project is skipped as up-to-date or unresolved.
+    - name: Verify DX12 library and Smoke EXE were built
+      shell: cmd
+      run: |
+        if not exist "ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib" (
+          echo ERROR: xrRender_R5_DX12.lib was not produced
+          exit /b 1
+        )
+        if not exist "x64\ReleaseDX12\xrDX12Smoke.exe" (
+          echo ERROR: xrDX12Smoke.exe was not produced
+          exit /b 1
+        )
+        echo OK: DX12 library and Smoke EXE built
+        dir /b "ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib" "x64\ReleaseDX12\xrDX12Smoke.exe"
+
+    - name: Upload DX12 diagnostics
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: dx12-smoke-release-dx12
+        path: |
+          x64\ReleaseDX12\xrDX12Smoke.exe
+          ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib
+        if-no-files-found: error

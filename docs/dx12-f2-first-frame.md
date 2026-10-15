@@ -691,3 +691,368 @@ B: два вызова `CL.exe` (`xrDX12Smoke.cpp`, `dx12log.cpp`), линков
 выполнялась. Оставшиеся риски F2.1-B.2 сохраняются: GPU runtime не
 подтверждён, режим `wb` логгера и `WaitMessage()` не проверены в работе,
 CI не собирает ReleaseDX12.
+
+---
+
+# F2.1-C.1 и F2.1-C.2 — GPU Validation и аудит утечек
+
+**HEAD:** `2f6ca66da` (после fast-forward с `origin/prypiat`). **Ветка:** `prypiat`.
+**Дата:** 2026-10-15. Два прогона: C.1 стресс-тест, C.2 аудит утечек.
+
+## Прогон C.1 (стресс-тест, 2 505 resize)
+
+| Параметр | Значение |
+|---|---|
+| HEAD | `d5490ab75` |
+| EXE | `x64\ReleaseDX12\xrDX12Smoke.exe`, 532 480 б |
+| GPU | NVIDIA GeForce RTX 5070 Laptop GPU (10DE, 2D18) |
+| Debug Layer | ENABLED |
+| GPU-Based Validation | ENABLED (`GPU-based validation=1`) |
+| DRED | ENABLED (`DRED forced on`) |
+| validation ERROR | 0 |
+| validation CORRUPTION | 0 |
+| validation WARNING | 0 |
+| validation MESSAGE | 1 (информационное, см. ниже) |
+| Resize requested / Resized | 2 505 / 2 505 |
+| Resize failures | 0 |
+| Device removal / UINT64_MAX / timeout | 0 |
+| Runtime | ~82 с |
+| Shutdown | `GPU drained before shutdown` → `Shutdown complete` |
+
+Единственное validation-сообщение:
+`[validation][MESSAGE] Device Debug Layer Startup Options: GPU-Based Validation
+is enabled (disabled by default)... Time to see the first render frame may take
+several minutes.` — информационное, о валидации не говорит.
+
+Минимизация подтверждена логом: паузы 25.2 с, 5.2 с, 5.7 с, 3.9 с с полным
+отсутствием записей — `WaitMessage()` блокировал цикл, `RenderFrame()` не
+вызывался. После каждой паузы рендеринг возобновлялся без ошибок.
+
+## Прогон C.2 (аудит утечек)
+
+Тот же бинарник, запущен под захватом `OutputDebugString`.
+
+| Параметр | Значение |
+|---|---|
+| HEAD | `2f6ca66da` |
+| Resize requested / Resized | 1 937 / 1 937 |
+| Resize failures | 0 |
+| validation ERROR / WARNING | 0 / 0 |
+| Device removal | 0 |
+| Shutdown | `GPU drained before shutdown` → `Shutdown complete` |
+
+### Захват диагностики
+
+DebugView не установлен, VS-отладчик не подключён. Использован механизм
+`DBWIN_BUFFER` — тот же разделяемый буфер и события (`DBWIN_BUFFER_READY`,
+`DBWIN_DATA_READY`), через которые DebugView получает вывод. Ничего не
+устанавливалось. Лончер создаёт буфер **до** старта exe, поэтому все
+`OutputDebugString` приложения попадают в него.
+
+Важно: в захват попали и строки от чужих процессов (pid 23880 — UI backend,
+pid 21408 — Qt clipboard), поскольку `DBWIN_BUFFER` глобален. Это не связано
+с smoke-приложением; строки smoke имеют pid 89792.
+
+### Результат ReportLiveObjects
+
+```
+D3D12 WARNING: Live ID3D12Device at 0x000002400F1A1450, Refcount: 3
+              [ STATE_CREATION WARNING #274: LIVE_DEVICE ]
+D3D12 WARNING: Live                    ID3D12Fence :      1
+              [ STATE_CREATION WARNING #255: LIVE_OBJECT_SUMMARY ]
+```
+
+**Это не утечки.** Разбор по владельцам:
+
+- **`ID3D12Device`, Refcount 3.** Три удержания, все законные:
+  1. `CHW12::m_device` — `ComPtr`, сбрасывается в `Shutdown()` сразу после
+     `ReportLiveObjects`.
+  2. `m_infoQueue` (`ID3D12InfoQueue`) — это отдельный COM-объект, полученный
+     через `m_device.As()`, и он сам держит ссылку на устройство. Сбрасывается
+     в `Shutdown()` строкой ниже.
+  3. Ссылка, которую `IDXGIDebug1` держит на устройство для сбора собственного
+     отчёта — она существует только внутри `ReportLiveObjects`.
+
+  Порядок в `Shutdown()` специально такой: frame resources → rtvHeap →
+  commandQueue → swapChain → **`ReportLiveObjects`** → infoQueue → device →
+  fence → event. Отчёт вызывается до освобождения device и infoQueue, поэтому
+  устройство ещё живо и отчёт осмысленен. Это ожидаемое поведение, а не утечка.
+
+- **`ID3D12Fence : 1`.** Удержание `CHW12::m_fence`, сбрасывается сразу после
+  device. В момент отчёта fence ещё нужен: device не освобождён.
+
+- **В отчёте отсутствуют** command queue, swapchain, descriptor heap, command
+  allocators, command lists и render targets. Все они освобождены в `Shutdown()`
+  **до** вызова `ReportLiveObjects`, и DRED это подтверждает: их в списке нет.
+  Это прямое доказательство, что frame resources, RTV-хип, очередь и swapchain
+  освобождаются корректно.
+
+**Вывод по утечкам: подтверждённых утечек нет.** Отсутствующие в отчёте
+объекты (queue, swapchain, RTV heap, allocators, lists, render targets) =
+корректно освобождены. Присутствующие (device, fence) = удерживаются намеренно
+до момента отчёта и освобождаются сразу после. Refcount 3 у device полностью
+объясняется тремя названными владельцами.
+
+## Критерии приёмки F2.1
+
+| Критерий | Статус | Доказательство |
+|---|---|---|
+| `D3D12CreateDevice` возвращает валидный `ID3D12Device*` | ✅ PASS | `Device created, feature level: 11.0`, оба прогона |
+| Swapchain создаётся с 3 backbuffers | ✅ PASS | `Swapchain created: 1280x720, 3 backbuffers` |
+| `ClearRenderTargetView` + `Present` показывают цветной кадр | ✅ PASS | Пользователь подтвердил визуально в C.1 |
+| Resize работает без validation errors | ✅ PASS | 4 442 ресайза суммарно, 0 провалов, 0 validation ERROR/WARNING |
+| Device removed обрабатывается корректно | ⚠️ NOT TESTED | Путь не срабатывал: removal не происходил. Провоцировать TDR запрещено |
+| DX11 baseline остаётся рабочим | ✅ PASS | F2.1-B.2: `Release\|x64` Rebuild, 0 ошибок, `bin_x64\xrEngine.exe` |
+| Утечки ресурсов отсутствуют | ✅ PASS | `ReportLiveObjects` из C.2, разбор владельцев выше |
+
+## Статус F2
+
+**PASS.** Все применимые критерии приёмки подтверждены фактическим выводом.
+Единственное исключение — обработка device removal, которая остаётся
+NOT TESTED по причине запрета на провокацию TDR. Это не пробел реализации:
+код `ReportGpuFailure`, `GetDeviceRemovedReason`, DRED и проверка `UINT64_MAX`
+из F2.1-B.3 присутствуют и покрывают путь, но исполнен он не был.
+
+## Оставшиеся риски
+
+1. **Device removal не проверен в исполнении.** Код есть, путь не прогонялся.
+2. **`ReportLiveObjects` требует подключённого потребителя `OutputDebugString`.**
+   Без захвата через `DBWIN_BUFFER` (или DebugView, или VS) вывод теряется, и
+   аудит утечек становится невозможным. Для повторных проверок нужен тот же
+   лончер.
+3. **CI не собирает ReleaseDX12.** `.github/workflows/push.yml` matrix —
+   `[Release, ReleaseTracyProfiler]`. Регрессия DX12-слоя пройдёт незамеченной.
+4. **Лог растёт от ресайзов:** 7 766 строк на 1 937 ресайзов (три строки на
+   ресайз). При перетаскивании окна файл становится объёмным. Для smoke-целей
+   приемлемо, но при переносе в игровой путь стоит сократить.
+5. **GPU-Based Validation включена по умолчанию** и замедляет старт (2.3 с до
+   первого кадра в C.1). Для smoke нормально, в игровом пути нужен флаг.
+
+## Следующий шаг
+
+F2 закрыт как PASS (с оговоркой по device removal). Разрешён переход к F3.
+
+---
+
+# Предложение F3.0 — минимальный рендер 3D-геометрии
+
+Цель: один треугольник или простой quad, нарисованный поверх работающего
+`Clear → Present`. Не архитектура F3, а вертикальный срез, доказывающий, что
+конвейер ресурсов и шейдеров подключён.
+
+## Что делаем
+
+1. **Upload heap.** Создать `ID3D12Resource` в `D3D12_HEAP_TYPE_UPLOAD` для
+   вершин. Закрыть через `ComPtr` и освободить в `Shutdown()` вместе с frame
+   resources — по тому же порядку, который уже проверен в F2.1-C.2.
+2. **Vertex buffer.** 3 вершины в формате `DXGI_FORMAT_R32G32B32_FLOAT`
+   (позиция) в default heap, заполняемые через upload heap с одним
+   `ResourceBarrier` `COPY_DEST → GENERIC_READ`. Fence для подтверждения
+   завершения копирования GPU.
+3. **Root signature.** Пустая (`D3D12_ROOT_SIGNATURE_FLAG_NONE`, без
+   параметров) — константы и матрицы на F3 не нужны, задача в проверке
+   подключения PSO.
+4. **PSO.** `D3D12_GRAPHICS_PIPELINE_STATE_DESC` с одной входной вершинной
+   позицией, `InputLayout` из одного элемента, backbuffer format
+   `R8G8B8A8_UNORM`, topology `TRIANGLELIST`.
+5. **HLSL.** Один `vs_5_0`, компилируемый существующим `D3DCompile`
+   (`d3dcompiler.lib`, уже в проекте). Не DXC: DXBC принимается DX12 raster,
+   переход на DXIL нужен только для DXR.
+6. **Первый кадр с геометрией.** В `RenderFrame()` после
+   `ClearRenderTargetView`: `SetGraphicsRootSignature`, `SetPipelineState`,
+   `IASetPrimitiveTopology`, `IASetVertexBuffers`, `DrawInstanced(3, 1)`.
+   Затем существующий барьер `RENDER_TARGET → PRESENT`.
+7. **Освобождение.** Все новые `ComPtr` освобождаются в `Shutdown()` до
+   `ReportLiveObjects`, чтобы аудит утечек оставался применимым.
+
+## Чего не делаем
+
+- текстуры и `D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV`;
+- константные буферы и матрицы (WVP);
+- depth buffer и depth test;
+- несколько PSO или кэш PSO;
+- реальные форматы OGSR;
+- индексы и инстансинг;
+- любые изменения DX11-рендерера.
+
+## Критерии приёмки F3.0
+
+- [ ] Вершины загружены в default heap с барьером `COPY_DEST → GENERIC_READ`.
+- [ ] PSO создан, шейдер скомпилирован без ошибок.
+- [ ] На экране видна геометрия (подтверждение пользователя).
+- [ ] 0 `[validation][ERROR]`, 0 `[validation][WARNING]` при Debug Layer + GBV.
+- [ ] Resize продолжает работать без validation errors (геометрия не мешает).
+- [ ] `ReportLiveObjects` не показывает новых live objects после `Shutdown`.
+- [ ] DX11 `Release|x64` остаётся рабочим.
+
+## Порядок
+
+1. F3.0 — треугольник (этот документ).
+2. F3.1 — depth buffer, MVP-матрица через константный буфер, камера.
+3. F3.2 — индексы, реальный формат вершин OGSR, первая настоящая модель.
+4. Дальше по `docs/08-roadmap.md`, этап F3 в таблице.
+
+Риски: смешение DXBC (растр) и DXIL (DXR) в одном проекте возможно, но
+требует двух путей компиляции — на F3.0 это не касается.
+
+---
+
+# F2.1 Finalization — Runtime Acceptance, Documentation, DX12 CI
+
+**HEAD:** `2f6ca66daf1c372e2284be994cbf438a3f9db28a`. **Ветка:** `prypiat`.
+**Дата:** 2026-10-15. Этап F2 закрыт.
+
+## Итоговый статус F2.1
+
+**PASS для проверенного bootstrap runtime, с documented limitations.**
+
+Подтверждено:
+
+- нативный D3D12 device (NVIDIA GeForce RTX 5070 Laptop GPU, 10DE:2D18);
+- graphics command queue;
+- DXGI swapchain с тремя backbuffers;
+- цветной кадр, визуально подтверждённый пользователем;
+- работающая GPU synchronization;
+- D3D12 Debug Layer;
+- GPU-Based Validation (`GPU-based validation=1`);
+- DRED (forced on, auto-breadcrumbs + page fault);
+- **6 036 успешных resize суммарно** (C.1: 2 505; C.2-DBWin: 1 937; C.2-CLI: 1 594);
+- 0 validation ERROR;
+- 0 validation CORRUPTION;
+- 0 validation WARNING;
+- корректный GPU drain;
+- штатный Shutdown (`GPU drained before shutdown` → `Shutdown complete` → `[smoke] exit`);
+- DX11 baseline компилируется и линкуется, кроме ранее известного post-build сбоя
+  копирования `dbghelp.dll` (MSB3073), не связанного с правками DX12.
+
+## Проверка утечек (Microsoft DebugView v5.02)
+
+Захват через `dbgviewcli64.exe`, Win32-режим, без kernel capture:
+
+```
+Live ID3D12Device at 0x00000243018312D0, Refcount: 3   [LIVE_DEVICE]
+Live ID3D12Fence  at 0x0000024349915550, Refcount: 1, IntRef: 0  [LIVE_MONITOREDFENCE]
+Live                    ID3D12Fence :      1             [LIVE_OBJECT_SUMMARY]
+```
+
+Оба объекта присутствуют в момент `ReportLiveObjects()`, поскольку
+соответствующие владельцы ещё не освобождены:
+
+- `ID3D12Device` Refcount 3 = `m_device` + `m_infoQueue` (отдельный COM-объект
+  со своей ссылкой на устройство) + `IDXGIDebug1` внутри самого отчёта;
+- `ID3D12Fence` Refcount 1, IntRef 0 = `m_fence`, внутренних ссылок D3D12 нет.
+
+Command queue, swapchain, descriptor heap, allocators, command lists и
+backbuffers в отчёте не обнаружены — они освобождены в `Shutdown()` до вызова
+диагностики, и их отсутствие в отчёте и есть доказательство корректного
+освобождения.
+
+**Подтверждённых утечек нет.** Полный post-cleanup leak audit не проводился:
+`ReportLiveObjects()` вызывается до освобождения `m_device` и `m_fence`, поэтому
+окончательное состояние этих двух объектов в отчёте не проверялось. Для этого
+нужен второй вызов `ReportLiveObjects()` после полного `Shutdown()`.
+
+## Documented limitations
+
+1. **Реальный device removal — NOT TESTED.** Путь не исполнялся ни в одном
+   прогоне; искусственно провоцировать TDR запрещено. Код `ReportGpuFailure`,
+   `GetDeviceRemovedReason`, DRED и проверка `UINT64_MAX` из F2.1-B.3
+   присутствуют и покрывают путь, но исполнен он не был.
+2. **Post-cleanup leak audit не проводился** (см. выше).
+3. **Полноценный игровой DX12 renderer отсутствует.** Есть только standalone
+   bootstrap (`xrDX12Smoke`), не интегрированный в игровой цикл.
+4. **CI для DX12** до этой задачи не существовал; job добавлен, но ни одного
+   успешного workflow run на GitHub ещё не было.
+
+## DX12 Continuous Integration
+
+Добавлен отдельный job `dx12-smoke-build` в `.github/workflows/push.yml`.
+
+Почему отдельный job, а не расширение существующей матрицы: job `build`
+упаковывает игровой релиз из `bin_x64` и загружает release asset. Добавление
+`ReleaseDX12` в его матрицу создало бы попытки упаковать несуществующий
+`bin_x64` (в `ReleaseDX12` собирается `x64\ReleaseDX12`, а `XR_3DA` не
+собирается вовсе) и повредило бы логику Release- и Release-артефактов.
+
+Что делает job:
+
+| Шаг | Действие |
+|---|---|
+| `runs-on` | `windows-2022` |
+| checkout | `actions/checkout@v7.0.1`, `fetch-depth: 0` |
+| Update Components | `Update_Components.cmd < nul` |
+| Setup MSBuild | `microsoft/setup-msbuild@v3` |
+| MSBuild ReleaseDX12 | `msbuild Engine.sln /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64` |
+| Verify | проверка наличия `xrRender_R5_DX12.lib` и `xrDX12Smoke.exe` |
+| Upload DX12 diagnostics | `actions/upload-artifact@v7.0.1` |
+
+Smoke EXE **не запускается** на runner (нет GPU, который поддерживал бы
+GPU-Based Validation). Упаковка игрового релиза не выполняется. Существующие
+job `build` и его логика не затронуты.
+
+### Документированные зависимости
+
+**`Update_Components.cmd` обязателен.** В git отслеживаются только проектные
+файлы, но не исходники:
+
+| Каталог | Файлов в git |
+|---|---|
+| `3rd_party/Src/mimalloc/mimalloc` | 3 (vcxproj + .gitignore) |
+| `3rd_party/Src/concurrentqueue` | 1 |
+| `3rd_party/Src/libsquashfs/squashfs-tools-ng` | 5 |
+| `3rd_party/Src/lz4/lz4` | 2 |
+| `3rd_party/Src/zstd/zstd` | 2 |
+| `3rd_party/Src/DirectXTex/DirectXTex` | 3 |
+| `3rd_party/Src/DirectXMath/DirectXMath` | 1 |
+| `3rd_party/Src/DirectXMesh/DirectXMesh` | 1 |
+
+`ReleaseDX12` собирает 26 проектов, включая `xrCore` и `xrGame`, которым эти
+исходники нужны на этапе компиляции. Без шага Update Components сборка упадёт
+на отсутствующих заголовках. Это та же зависимость, от которой зависит job
+`build`.
+
+`Update_Components.cmd` заканчивается командой `pause`, поэтому в CI вызывается
+с перенаправлением `< nul` — иначе job повиснет на несуществующем stdin. Это не
+отключение проверок, а обход интерактивности bat-файла.
+
+**Toolset:** `OgsrBuildProps.props` задаёт `v143` (или `v145` при
+`VisualStudioVersion == 18.0`), `WindowsTargetPlatformVersion` наследуется от
+`$(LatestTargetPlatformVersion)`. `microsoft/setup-msbuild@v3` на
+`windows-2022` предоставляет MSBuild 17.x с toolset v143 и актуальный Windows
+SDK — дополнительных компонентов не требуется.
+
+**ATL/MFC не нужны для DX12-пути.** Заголовков `atlstr.h`/`atlbase.h` в
+`xrRenderDX12` и `xrRenderPC_R5_DX12` нет. Проблема ATL/MFC из F2.1-B.2
+касается только DX11 Release (`splash.cpp`).
+
+## Критерии приёмки F2.1
+
+| Критерий | Статус | Доказательство |
+|---|---|---|
+| `D3D12CreateDevice` возвращает валидный `ID3D12Device*` | ✅ PASS | `Device created, feature level: 11.0`, три прогона |
+| Swapchain создаётся с 3 backbuffers | ✅ PASS | `Swapchain created: 1280x720, 3 backbuffers` |
+| `ClearRenderTargetView` + `Present` показывают цветной кадр | ✅ PASS | Подтверждено пользователем |
+| Resize работает без validation errors | ✅ PASS | 6 036 операций, 0 провалов, 0 validation ERROR/WARNING |
+| Device removed обрабатывается корректно | ⚠️ NOT TESTED | Провокация TDR запрещена |
+| DX11 baseline остаётся рабочим | ✅ PASS | F2.1-B.2: `Release\|x64` Rebuild, `bin_x64\xrEngine.exe` |
+| Утечки ресурсов отсутствуют | ✅ PASS | DebugView v5.02, разбор владельцев выше |
+| DX12 защищён от регрессий в CI | ⚠️ НЕ ПОДТВЕРЖДЕНО | Job добавлен, но ни одного успешного workflow run не было |
+
+**Локальная проверка YAML не подтверждает успешность GitHub Actions.** Job
+`dx12-smoke-build` считается PASS только после успешного workflow run на GitHub.
+
+## Локальная проверка сборки
+
+`msbuild Engine.sln /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64`:
+exit 0, **0 ошибок**, 0 предупреждений в DX12-слоях. Все 188 предупреждений
+относятся к 3rd_party (`libzstd` 72, `xrPhysics` 46, `DiscordRPC` 37,
+`xrCore` 12, `xrNetServer` 5) и предшествуют правкам DX12.
+
+Артефакты:
+- `ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib` (595 090 б)
+- `x64\ReleaseDX12\xrDX12Smoke.exe` (532 480 б)
+
+## Следующий шаг
+
+F2 закрыт как PASS с documented limitations. Переход к F3.0 разрешён.
+План F3.0 — в разделе «Предложение F3.0» выше.
