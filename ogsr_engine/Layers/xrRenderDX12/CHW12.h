@@ -110,4 +110,7 @@ private:
     // GPU получал команды: до первой отправки WaitForGpu бессмысленен,
     // а SetEventOnCompletion на fence без signal завис бы навсегда.
     bool m_gpuWorkSubmitted = false;
+
+    // Идемпотентность Shutdown. Отдельный флаг, а не m_stage: см. Shutdown().
+    bool m_shutdownComplete = false;
 };

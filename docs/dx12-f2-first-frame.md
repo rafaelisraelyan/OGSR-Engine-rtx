@@ -468,3 +468,226 @@ F2.1-C — **разрешение на запуск `xrDX12Smoke.exe` и про�
 5. Пересобрать DX11 baseline (`Release|x64`) и убедиться, что поведение не
    изменилось.
 6. Зафиксировать статусы в `docs/08-roadmap.md` и запросить разрешение на коммит.
+
+---
+
+# F2.1-B.2 — Final Hotfix
+
+**Базовый коммит:** `a0b946cbd`. **Дата:** 2026-10-15. **Ветка:** `prypiat`.
+Точечный hotfix по четырём проблемам независимого ревью F2.1-B.1.
+Архитектура `CHW12` не менялась.
+
+## 1. UTF-8 Logger
+
+**Проблема:** файл открывался как `_wfopen_s(&g_log, path, L"w, ccs=UTF-8")`.
+Режим `ccs=UTF-8` включает Unicode-oriented преобразование CRT, которое
+несовместимо со смешением узких (`fprintf`/`vfprintf` в `Write()`) и
+WideCharToMultiByte (`WriteWide()`) операций на одном stream.
+
+**Исправлено:** режим `wb` — обычная бинарная запись. Обе функции пишут
+одинаковые UTF-8/ASCII байты, смешения wide/narrow операций на одном CRT
+stream нет. `Write()` для UTF-8/ASCII, `WriteWide()` с явным преобразованием
+UTF-16 → UTF-8 — оба сохранены. Timestamp и `\n` формируются одинаково в
+обеих функциях, `fflush` после каждого сообщения сохранён. Ошибки
+`_wfopen_s`, конвертации (`WideCharToMultiByte` возвращает ≤ 0 → выход) и
+записи проверяются. Если лог не открывается, `g_log == nullptr` и все
+функции выходят сразу — рендеринг от логгера не зависит.
+
+## 2. Swapchain Resize & Resource References
+
+**Проблема:** `Resize()` делал `WaitForGpu()` → освобождение `renderTarget`
+→ `ResizeBuffers()`, но не учитывал косвенные ссылки на старые backbuffers.
+
+**Фактическое правило DXGI:** `ResizeBuffers` требует, чтобы на старые
+backbuffers не осталось ни одной ссылки — прямой или косвенной. Записанный,
+но ещё не исполненный command list держит `pResource` каждого барьера, то
+есть косвенную ссылку на буфер. Это не предположение: барьер в
+`RenderFrame()` явно устанавливает
+`barrier.Transition.pResource = frame.renderTarget.Get()`.
+
+**Исправлено:**
+
+- `WaitForGpu()` — GPU завершил использование старых backbuffers.
+- Командные листы закрываются до `ResizeBuffers` (`Close()` с проверкой
+  HRESULT для каждого из 3 слотов). Это допустимо и проще, чем
+  пересоздание: аллокаторы и листы остаются валидными, `Reset()` в
+  `RenderFrame()` работает с любым состоянием листа. Resource Manager
+  не создавался.
+- `renderTarget` освобождается после закрытия листов.
+- `m_rtvHeap.Reset()` теперь выполняется **до** `ResizeBuffers`, а не
+  после: старый RTV-хип тоже держит ссылки на освобождённые буферы через
+  дескрипторы.
+- Новый RTV-хип создаётся на новые буферы после успешного `ResizeBuffers`.
+- HRESULT проверяется у `Close()`, `ResizeBuffers`, `CreateRenderTargetViews`.
+
+**Failure handling:** при ошибке `ResizeBuffers` или пересоздания RTV
+рендеринг прекращается, действительный HRESULT фиксируется в логе,
+освобождённые backbuffers никем не используются, `ReportGpuFailure`
+вызывается только для настоящего removal (см. F2.1-B.1 §3), приложение
+завершается штатно через `DestroyWindow` → `WM_QUIT`.
+
+## 3. Minimized Window CPU Usage
+
+**Проблема:** `if (g_minimized) continue;` внутри цикла с `PeekMessage` —
+busy loop, 100% CPU на одном ядре при свёрнутом окне.
+
+**Исправлено:** `WaitMessage()` при минимизации. Блокируется до появления
+сообщения в очереди (в том числе `WM_SIZE` при восстановлении), поэтому
+CPU простаивает. `WM_QUIT` тоже является сообщением и разблокирует
+ожидание. `Sleep()` не используется. Восстановление окна снимает
+`g_minimized`, `WM_SIZE` вызывает `Resize` с актуальным client area,
+рендеринг возобновляется.
+
+## 4. Shutdown State Reset
+
+**Исправлено:** после успешной очистки сбрасываются `m_initialized`,
+`m_stage`, `m_gpuWorkSubmitted`, `m_fenceValue`, все `frame.fenceValue`,
+`m_frameIndex`, `m_width`, `m_height`, `m_occluded`, `m_deviceRemoved`,
+`m_debugLayerEnabled`, `m_rtvDescriptorSize`. Все `ComPtr` освобождены,
+`m_fenceEvent` закрыт. Повторный `Initialize()` после `Shutdown()` теперь
+не унаследовал бы мусорные `fenceValue`.
+
+**Дополнительная проверка — частичная инициализация внутри CreateDevice:**
+обнаружена реальная проблема. `m_stage` выставляется только после успеха
+шага, поэтому провал внутри `CreateDevice()` (например, `D3D12CreateDevice`
+прошёл, а `CreateCommandQueue` упал) при предварительно проваленном
+`EnableDebugLayer()` оставляет `m_stage == Stage::None` при уже созданном
+устройстве. Старый ранний выход `if (m_stage == Stage::None &&
+!m_initialized) return;` в этом случае терял устройство, очередь и всё
+остальное созданное.
+
+**Исправлено:** идемпотентность `Shutdown()` держится на отдельном флаге
+`m_shutdownComplete`, а не на `m_stage`. Теперь очистка выполняется при
+любом частично созданном состоянии, а `ComPtr::Reset()` сам проверяет
+указатель, поэтому несуществующие объекты просто отсутствуют.
+
+**Failed GPU synchronization:** провал `WaitForGpu()` в `Shutdown()` не
+заявляется как успешное завершение GPU — в лог уходит
+`WARNING: GPU drain failed, releasing resources without confirmation`.
+Ресурсы с неопределённым состоянием не переиспользуются: объект после
+`Shutdown()` приведён к исходному состоянию, приложение завершается.
+Device recovery не разрабатывался.
+
+## 5. Результаты сборок
+
+MSBuild 14.44.35207, PlatformToolset v143, Windows SDK 10.0.26100.0.
+
+| Сборка | Exit | Ошибки C/LNK | Предупр. | Артефакт |
+|---|---|---|---|---|
+| A. `xrRender_R5_DX12` ReleaseDX12\|x64 Rebuild | 0 | 0 | 0 | `xrRender_R5_DX12.lib` |
+| B. `xrDX12Smoke` ReleaseDX12\|x64 Rebuild | 0 | 0 | 0 | `x64\ReleaseDX12\xrDX12Smoke.exe` |
+| C. `Engine.sln` ReleaseDX12\|x64 Rebuild | 0 | 0 | — | `x64\ReleaseDX12\xrDX12Smoke.exe`, MSB4121: 0 |
+| D. `Engine.sln` Release\|x64 Rebuild (DX11) | — | 0 | — | `bin_x64\xrEngine.exe`, MSB4121: 0 |
+
+B: линковка подтверждена в логе — `link.exe` с `d3d12.lib dxgi.lib`,
+входы `xrDX12Smoke.obj`, `dx12log.obj`, `xrRender_R5_DX12.lib(CHW12.obj)`.
+
+D: smoke в Release отсутствует (0 совпадений), `xrEngine.exe` линкуется,
+изменений исходников DX11 нет (`git diff` по `xrRenderPC_R4`, `xrRender`,
+`xr_3da`, `xrRenderDX10` пуст). Единственная ошибка — `MSB3073` на
+post-build `copy dbghelp.dll`, известная проблема §13.1
+`docs/07-known-issues.md`, классифицируется отдельно: возникает после
+успешной линковки `xrEngine.exe`. `git diff --check` проходит.
+
+## 6. Статус
+
+**PARTIAL.** Все четыре проблемы исправлены, все сборки проходят.
+Runtime validation не выполнялась: компиляция ничего не говорит о работе
+на GPU.
+
+## 7. Оставшиеся риски
+
+1. GPU runtime не подтверждён: `xrDX12Smoke.exe` не запускался.
+2. Логгер в режиме `wb` не проверен на реальном выводе.
+3. Закрытие командных листов перед `ResizeBuffers` не проверено на
+   реальном драйвере.
+4. `WaitMessage()` не проверен в работе при реальной минимизации.
+5. Сценарий «провал внутри `CreateDevice` при проваленном
+   `EnableDebugLayer`» исправлен, но не воспроизводился.
+6. CI не собирает ReleaseDX12 (matrix `[Release, ReleaseTracyProfiler]`).
+
+## 8. Условия первого runtime test
+
+F2.1-C — запуск `xrDX12Smoke.exe`. Только по отдельному разрешению.
+Порядок: прочитать `xrDX12Smoke.log`, проверить стадии `Initialize`,
+цветной кадр, отсутствие `[validation][ERROR]`, resize (растягивание,
+максимизация, минимизация с последующей проверкой CPU, восстановление),
+`Shutdown` с `ReportLiveObjects`.
+
+---
+
+# F2.1-B.2.1 — Hotfix: повторный Close() в Resize
+
+**Базовый коммит:** `a0b946cbd` (F2.1-B.2 не коммитился). **Дата:** 2026-10-15.
+**Ветка:** `prypiat`. Правка по замечанию ревью на F2.1-B.2.
+
+## Проблема
+
+В `Resize()` из F2.1-B.2 безусловно вызывался
+`ID3D12GraphicsCommandList::Close()` для всех трёх слотов. По Microsoft Learn
+`Close()` возвращает `E_FAIL`, если список уже закрыт.
+
+В нашей архитектуре списки закрываются дважды: `CreateFrameResources()`
+закрывает лист сразу после создания (чтобы `Reset()` в `RenderFrame()` был
+первым обращением), а `RenderFrame()` закрывает лист в конце каждого кадра.
+Значит к моменту `Resize()` **все** списки гарантированно закрыты, и вызов
+`Close()` всегда возвращал `E_FAIL`. Код это не ломал (HRESULT только
+логировался), но засорял лог ложной ошибкой на каждом ресайзе и делал
+неверное предположение о состоянии листов.
+
+## Исправление
+
+`Resize()` перестроен по вашему порядку:
+
+1. `WaitForGpu()` с проверкой результата (было и осталось).
+2. Сброс `frame.fenceValue` для всех слотов — **только после**
+   подтверждённого GPU drain. До drain сброс был бы неверным: GPU мог ещё
+   использовать слот.
+3. Освобождение командных листов через `commandList.Reset()`. `Close()` не
+   вызывается вообще. Освобождение COM-ссылки на лист убирает косвенную
+   ссылку на backbuffers, которую лист держит через `pResource` барьеров, —
+   этого достаточно для требования DXGI об отсутствии ссылок.
+4. Освобождение аллокаторов вместе с листами (`commandAllocator.Reset()`),
+   затем пересоздание обоих через `CreateFrameResources()` в конце.
+5. Освобождение старых backbuffers и RTV-хипа до `ResizeBuffers()`.
+6. `ResizeBuffers()`.
+7. Пересоздание RTV, затем аллокаторов и листов.
+8. Безопасный отказ на каждой стадии: `WaitForGpu`, `ResizeBuffers`,
+   `CreateRenderTargetViews`, `CreateFrameResources` — каждый с записью
+   действительного HRESULT и остановом рендеринга.
+
+Аллокаторы пересоздаются, а не переиспользуются: после `Reset()` аллокатора
+лист, ассоциированный с ним, требует `Reset(allocator, pso)`, и проще
+создать пару заново, чем отслеживать согласованность. `CreateFrameResources()`
+закрывает лист сразу после создания, поэтому `RenderFrame()` получает
+закрытый лист и `Reset()` остаётся первым обращением — ровно как при
+`Initialize`.
+
+## m_shutdownComplete и повторный Initialize
+
+Проверено: флаг сбрасывался только внутри `Shutdown()`, то есть после
+успешного cleanup. Если `Initialize()` вызывается повторно (в том числе
+после частично неуспешной первой попытки, где `Shutdown()` уже приводил
+объект к исходному состоянию), `m_shutdownComplete` оставался `true`, и
+`Shutdown()` после повторной попытки стал бы no-op — cleanup потерялся бы.
+
+**Исправлено:** `m_shutdownComplete = false` в начале `Initialize()`, до
+любого создания ресурсов.
+
+## Результаты сборок
+
+| Сборка | Exit | Ошибки C/LNK | Предупр. | Артефакт |
+|---|---|---|---|---|
+| A. `xrRender_R5_DX12` ReleaseDX12\|x64 Rebuild | 0 | 0 | 0 | `xrRender_R5_DX12.lib` |
+| B. `xrDX12Smoke` ReleaseDX12\|x64 Rebuild | 0 | 0 | 0 | `x64\ReleaseDX12\xrDX12Smoke.exe` (531 456 б) |
+
+B: два вызова `CL.exe` (`xrDX12Smoke.cpp`, `dx12log.cpp`), линковка с
+`d3d12.lib dxgi.lib`, входы `xrDX12Smoke.obj`, `dx12log.obj`,
+`xrRender_R5_DX12.lib(CHW12.obj)`.
+
+## Статус и риски
+
+**PARTIAL.** Правка внесена, обе сборки проходят. Runtime validation не
+выполнялась. Оставшиеся риски F2.1-B.2 сохраняются: GPU runtime не
+подтверждён, режим `wb` логгера и `WaitMessage()` не проверены в работе,
+CI не собирает ReleaseDX12.

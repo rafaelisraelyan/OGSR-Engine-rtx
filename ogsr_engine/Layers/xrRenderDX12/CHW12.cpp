@@ -75,6 +75,11 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
+    // Новая попытка инициализации (в том числе после неуспешной, когда
+    // Shutdown уже приводил объект к исходному состоянию): идемпотентность
+    // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
+    m_shutdownComplete = false;
+
     m_width = width;
     m_height = height;
 
@@ -630,8 +635,28 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
         return false;
     }
 
+    // GPU завершён: все слоты безопасны для пересоздания. Сбрасываем
+    // per-frame fence tracking только теперь, после подтверждённого drain.
     for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+        m_frameResources[i].fenceValue = 0;
+
+    // Освобождаем командные листы. Close() здесь НЕ вызывается: листы уже
+    // закрыты (CreateFrameResources закрывает при создании, RenderFrame
+    // закрывает в конце каждого кадра), а повторный Close() по Microsoft Learn
+    // возвращает E_FAIL. Освобождение COM-ссылки на лист убирает косвенную
+    // ссылку на backbuffers, которую лист держит через pResource барьеров.
+    // Аллокаторы освобождаем вместе с листами и пересоздаём ниже: это проще
+    // и надёжнее, чем пытаться угадать состояние Reset/Close для каждого.
+    for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+    {
+        m_frameResources[i].commandList.Reset();
+        m_frameResources[i].commandAllocator.Reset();
         m_frameResources[i].renderTarget.Reset();
+    }
+
+    // Старый RTV-хип тоже держит ссылки на освобождённые буферы через
+    // дескрипторы: сбрасываем до ResizeBuffers, а не после.
+    m_rtvHeap.Reset();
 
     HRESULT hr = m_swapChain->ResizeBuffers(
         FRAME_COUNT, width, height, BACKBUFFER_FORMAT, 0);
@@ -651,14 +676,24 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
     m_height = height;
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
-    // Старый RTV-хип указывает на освобождённые буферы: пересоздаём целиком.
-    m_rtvHeap.Reset();
+    // Новый RTV-хип на новые буферы: старые дескрипторы уже уничтожены.
     if (!CreateRenderTargetViews())
     {
         // Провал после успешного ResizeBuffers: буферы новые, но без RTV
         // рендерить нельзя. Останавливаемся, не трогая освобождённое.
         dx12log::Write("[DX12] CreateRenderTargetViews failed after resize: rendering stopped");
         ReportGpuFailure(L"CreateRenderTargetViews", E_FAIL);
+        return false;
+    }
+
+    // Аллокаторы и листы пересоздаются под новые RTV: пустые ComPtr после
+    // Reset() выше. CreateFrameResources закрывает лист сразу после создания,
+    // поэтому RenderFrame получит закрытый лист и Reset() будет первым
+    // обращением к нему, как и при Initialize.
+    if (!CreateFrameResources())
+    {
+        dx12log::Write("[DX12] CreateFrameResources failed after resize: rendering stopped");
+        ReportGpuFailure(L"CreateFrameResources", E_FAIL);
         return false;
     }
 
@@ -674,8 +709,15 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
 void CHW12::Shutdown()
 {
     // Повторный вызов (деструктор после явного Shutdown) — no-op.
-    if (m_stage == Stage::None && !m_initialized)
+    // Идемпотентность держится на отдельном флаге, а НЕ на m_stage: стадия
+    // отражает только успешные шаги Initialize, а провал внутри CreateDevice
+    // (например, D3D12CreateDevice прошёл, а CreateCommandQueue упал) при
+    // предварительно проваленном EnableDebugLayer оставляет m_stage == None
+    // при уже созданном устройстве. Ранний выход по стадии терял бы его.
+    if (m_shutdownComplete)
         return;
+
+    m_shutdownComplete = true;
 
     const bool canWaitForGpu = m_commandQueue && m_fence && m_fenceEvent && m_gpuWorkSubmitted;
 
@@ -726,5 +768,25 @@ void CHW12::Shutdown()
 
     m_initialized = false;
     m_stage = Stage::None;
+
+    // Полный сброс состояния: объект после Shutdown() должен быть
+    // неотличим от свежесозданного, включая частичную инициализацию.
+    // Без этого повторный Initialize() унаследовал бы мусорные fenceValue
+    // (WaitForFenceValue ждал бы значения, которого fence уже не помнит),
+    // старый frameIndex и размеры.
+    for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+        m_frameResources[i].fenceValue = 0;
+
+    m_frameIndex = 0;
+    m_fenceValue = 0;
+    m_gpuWorkSubmitted = false;
+    m_width = 0;
+    m_height = 0;
+    m_occluded = false;
+    m_deviceRemoved = false;
+    m_debugLayerEnabled = false;
+    m_rtvDescriptorSize = 0;
+    m_shutdownComplete = true;
+
     dx12log::Write("[DX12] Shutdown complete");
 }

@@ -132,6 +132,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     MSG msg = {};
     while (g_running)
     {
+        // Минимизировано: GPU-рендеринг остановлен, но PeekMessage в пустой
+        // очереди вернулся бы сразу — получался busy loop со 100% CPU на одном
+        // ядре. WaitMessage блокируется до появления сообщения (в том числе
+        // WM_SIZE при восстановлении окна), поэтому CPU простаивает, а
+        // приложение остаётся отзывчивым. WM_QUIT тоже является сообщением
+        // и разблокирует ожидание.
+        if (g_minimized)
+        {
+            WaitMessage();
+            continue;
+        }
+
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
@@ -145,10 +157,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
         if (!g_running)
             break;
-
-        // Минимизировано: не рендерим вовсе, а не слать Present в occlusion.
-        if (g_minimized)
-            continue;
 
         if (!hw12.RenderFrame())
         {

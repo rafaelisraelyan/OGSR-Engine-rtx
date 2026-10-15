@@ -35,7 +35,12 @@ namespace dx12log
         wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - modulePath), L"xrDX12Smoke.log");
         wcscpy_s(g_logPath, MAX_PATH, modulePath);
 
-        const errno_t err = _wfopen_s(&g_log, modulePath, L"w, ccs=UTF-8");
+        // Обычный бинарный режим. Прежний режим "w, ccs=UTF-8" включал
+        // Unicode-oriented преобразование CRT, несовместимое с нашим
+        // смешением fprintf (Write) и ручным UTF-16 -> UTF-8 (WriteWide).
+        // В "wb" обе функции пишут одинаковые UTF-8/ASCII байты, и
+        // wide/narrow операции на одном CRT stream не смешиваются.
+        const errno_t err = _wfopen_s(&g_log, modulePath, L"wb");
         if (err != 0 || !g_log)
         {
             g_logPath[0] = L'\0';
