@@ -52,7 +52,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -68,6 +68,11 @@
   <ItemGroup>
     <ClCompile Include="xrDX12Smoke.cpp" />
     <ClCompile Include="dx12log.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="dx12log.h" />
+    <ClInclude Include="dx12triangle.h" />
+    <ClInclude Include="dx12quarantine.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\xrRenderPC_R5_DX12\xrRender_R5_DX12.vcxproj">

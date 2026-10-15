@@ -1056,3 +1056,276 @@ exit 0, **0 ошибок**, 0 предупреждений в DX12-слоях. �
 
 F2 закрыт как PASS с documented limitations. Переход к F3.0 разрешён.
 План F3.0 — в разделе «Предложение F3.0» выше.
+
+---
+
+# F3.0 — First DX12 Triangle
+
+**HEAD:** `5d905f7a82c54221497bb29234a5fa006787b633`. **Ветка:** `prypiat`.
+**Дата:** 2026-10-15. Первый draw call собственного DX12-конвейера.
+
+## Архитектура
+
+Владование разделено:
+
+| Компонент | Владеет |
+|---|---|
+| `CHW12` | device, command queue, swapchain, per-frame allocators/lists, RTV, fence, GPU lifetime |
+| `SmokeTriangle12` (`dx12triangle.{h,cpp}`) | vertex buffer, upload buffer, root signature, PSO, shader blobs |
+
+`CHW12` не превращён в монолит материалов и геометрии: он остаётся владельцем
+инфраструктуры, а геометрия вынесена в отдельный компонент. `SmokeTriangle12` —
+bootstrap-компонент, а не будущая публичная архитектура `CRender12`: ни одного
+абстрактного интерфейса, одного PSO, одного буфера.
+
+Компонент включён в `CHW12` как значение-член (`SmokeTriangle12 m_triangle`), а
+не через указатель: ручное `new`/`delete` здесь ничего не даёт, деструктор
+вызывает `Release()`.
+
+## Загрузка vertex buffer
+
+1. **Upload buffer** (`D3D12_HEAP_TYPE_UPLOAD`, `GENERIC_READ`): `Map` →
+   `memcpy` трёх вершин → `Unmap`.
+2. **Default buffer** (`D3D12_HEAP_TYPE_DEFAULT`, `COPY_DEST`).
+3. `CopyBufferRegion` из upload в default, затем барьер
+   `COPY_DEST → VERTEX_AND_CONSTANT_BUFFER`.
+4. `ExecuteCommandLists`, после чего **ожидание GPU** выполняется вызывающим
+   кодом через `CHW12::WaitForGpu()`, и только потом `OnUploadComplete()`
+   освобождает upload buffer.
+
+Разделение ответственности по fence принципиально: fence остаётся во владении
+`CHW12`, поэтому все значения сигналов в одном месте. Если бы компонент
+сигналил сам, его значение столкнулось бы со значением `RenderFrame` на том же
+fence.
+
+Порядок в `Initialize()`: `CreateSynchronization()` → `m_triangle.Create()` →
+`m_gpuWorkSubmitted = true` → `WaitForGpu()` → `OnUploadComplete()`.
+
+**Флаг `m_gpuWorkSubmitted` обязателен.** Без него `WaitForGpu()` решил бы, что
+ждать нечего, и вернул `true`, не дождавшись копии, после чего upload buffer
+был бы освобождён при ещё читающем его GPU. Это была реальная ошибка,
+исправленная до теста.
+
+### Состояния ресурсов: разбор WARNING и ERROR
+
+Debug Layer выдал два взаимоисключающих сообщения, и оба были проверены:
+
+| `InitialState` | Результат |
+|---|---|
+| `COPY_DEST` | `WARNING #1328`: «Buffers are effectively created in state COMMON» |
+| `COMMON` | `ERROR`: before state (COMMON) не совпадает с фактическим (COPY_DEST, assumed at first use) |
+
+Утверждение «buffers effectively created in COMMON» справедливо только для
+буферов без начального перехода. При `CopyBufferRegion` как первом
+использовании ресурса реальное состояние отслеживается как `COPY_DEST`.
+
+Выбрано `COPY_DEST`: предупреждение информационное и безопасное, ошибка при
+`COMMON` — нет. Это осознанный компромисс, а не непроанализированный warning.
+
+## Root signature, PSO, HLSL
+
+**Root signature:** пустая, `NumParameters = 0`, `NumStaticSamplers = 0`, флаг
+`D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT`. Флаг обязателен:
+без него лист с `IASetVertexBuffers` не проходит validation, так как по
+умолчанию IA считается выключенным для root signature.
+
+**PSO:**
+- root signature из `D3D12SerializeRootSignature` (`D3D_ROOT_SIGNATURE_VERSION_1`);
+- `VS = vs_5_0`, `PS = ps_5_0`;
+- `InputLayout` из одного элемента `POSITION` (`R32G32B32_FLOAT`);
+- `D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE`;
+- один RTV `DXGI_FORMAT_R8G8B8A8_UNORM`, `SampleDesc.Count = 1`;
+- depth/stencil отключены, `DSVFormat = UNKNOWN`;
+- `CullMode = NONE` — исключает ошибки winding order;
+- `BlendEnable = FALSE`.
+
+**HLSL:** встроен строками в `.cpp`, компилируется рантайм через `D3DCompile`
+из `d3dcompiler.lib`. DXBC (`sm_5_0`) принимается DX12 raster'ом. DXC и DXIL не
+подключаются: они нужны только для DXR. Диагностика компилятора выводится в лог
+через `errorBlob`.
+
+**Отличие от предложения F3.0:** в предложении флаг root signature был указан
+как `D3D12_ROOT_SIGNATURE_FLAG_NONE` со оговоркой «если это нарушает требования
+IA». Проверка показала, что `NONE` нарушает, поэтому использован
+`ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT`. Это и есть задокументированная причина
+расхождения.
+
+## Draw в RenderFrame
+
+Порядок сохранён: `PRESENT → RENDER_TARGET → Clear → Draw → PRESENT`.
+
+После `ClearRenderTargetView` добавлено:
+
+```cpp
+cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+// viewport из m_width/m_height
+cmd->RSSetViewports(1, &viewport);
+cmd->RSSetScissorRects(1, &scissor);
+m_triangle.Draw(cmd);   // root sig, PSO, topology, VB, DrawInstanced(3,1,0,0)
+```
+
+**Viewport и scissor не задавались вовсе** в F2.1: для `Clear → Present` они не
+требовались, но для rasterization обязательны. Берутся из актуальных
+`m_width`/`m_height`, а не кэшируются, поэтому resize их не ломает.
+
+`Draw()` не хранит состояния allocator'а, поэтому пересоздание командных листов
+и аллокаторов в `Resize()` его не затрагивает. Вершинный буфер при resize не
+пересоздаётся.
+
+## Resource lifetime
+
+`SmokeTriangle12::Release()` вызывается из `CHW12::Shutdown()` **до**
+`ReportLiveObjects()`, поэтому отчёт об утечках остаётся информативным для
+новых объектов. Освобождение происходит после GPU-дренажа выше по функции.
+
+`Release()` проверяет сами объекты, а не флаг `m_created`: при частично
+неуспешном `Create` (root signature создана, а PSO упал) ресурсы уже
+существуют, и ранний выход по флагу оставил бы их висеть до `ReportLiveObjects`.
+
+## Результаты сборки
+
+`msbuild Engine.sln /t:Rebuild /p:Configuration=ReleaseDX12 /p:Platform=x64`:
+
+| Сборка | exit | errors | DX12 warnings |
+|---|---|---|---|
+| 1 (первая) | 0 | 0 | 0 |
+| 2 (после COMMON) | 0 | 0 | 0 |
+| 3 (финальная, COPY_DEST) | 0 | 0 | 0 |
+
+`dx12triangle.cpp` подтверждён в логе компиляции. Артефакты:
+- `ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib` (599 226 б)
+- `x64\ReleaseDX12\xrDX12Smoke.exe` (539 136 б)
+
+`d3dcompiler.lib` добавлена в `AdditionalDependencies`: в `stdafx.h` заголовок
+`<d3dcompiler.h>` был, но библиотека не линковалась — 0 совпадений
+`d3dcompiler` в DX12-проектах против наличия в `xrRender_R4` и `XR_3DA`.
+
+## GPU runtime
+
+Три прогона, GPU `NVIDIA GeForce RTX 5070 Laptop GPU (10DE, 2D18)`,
+Debug Layer + GBV активны:
+
+| Прогон | resizes | validation ERROR | validation CORRUPTION | провалы resize |
+|---|---|---|---|---|
+| 1 (COPY_DEST) | 579 | 0 | 0 | 0 |
+| 2 (COMMON, отклонён) | 2 010 | **1** | 0 | 0 |
+| 3 (COPY_DEST, финальный) | 2 053 | **0** | 0 | 0 |
+
+Итоговый прогон: **0 validation ERROR, 0 CORRUPTION**, одно информационное
+WARNING #1328 про `InitialState` (разбор выше). 2 053 ресайза без провалов.
+Ноль маркеров `FATAL`, `device removed`, `UINT64_MAX`, `timed out`, `aborted`.
+
+Треугольник визуально подтверждён пользователем дважды (до и после исправления
+состояний ресурсов).
+
+Shutdown: `GPU drained before shutdown` → `[triangle] released` →
+`Shutdown complete` → `[smoke] exit`. Дренаж успешен.
+
+### Замечание о прогоне leak audit
+
+В двух прогонах приложение закрывалось раньше, чем DebugView CLI сбрасывал
+буфер на диск (CLI буферизует вывод до остановки). Финальный leak audit
+получен прогоном с ожиданием таймаута захвата.
+
+## Leak audit (Microsoft DebugView v5.02)
+
+```
+Live ID3D12Device at 0x0000014983237A30, Refcount: 3   [LIVE_DEVICE]
+Live ID3D12Fence  at 0x0000014A0D19EB20, Refcount: 1, IntRef: 0  [LIVE_MONITOREDFENCE]
+Live                    ID3D12Fence :      1            [LIVE_OBJECT_SUMMARY]
+```
+
+**Новых утечек нет.** Сравнение с F2.1-C.2: набор идентичен, адреса разные.
+В отчёте отсутствуют vertex buffer, upload buffer, root signature, PSO и
+shader-related COM объекты — все освобождены в `Release()` до `ReportLiveObjects`.
+
+`ID3D12Device` Refcount 3 = `m_device` + `m_infoQueue` + `IDXGIDebug1` внутри
+отчёта. `ID3D12Fence` Refcount 1, IntRef 0 = `m_fence`. Оба ожидаемы.
+
+**Ограничение:** `ReportLiveObjects()` вызывается до освобождения `m_device` и
+`m_fence`, поэтому их окончательное состояние в отчёте не проверялось.
+Post-cleanup audit не проводился — для него нужен второй вызов после полного
+`Shutdown()`.
+
+## DX11 compatibility
+
+`git status` по DX11-рендерерам (`xrRender_R4`, `xrRender_R2`,
+`xrRenderPC_R1`) пуст. Изменения ограничены `ogsr_engine/Layers/xrRenderDX12/`
+и одним `.vcxproj`. `AGENTS.md` не тронут.
+
+Полная DX11 Release-сборка в этой задаче не выполнялась: DX11-путь не
+затронут, а F2.1-B.2 уже подтвердил её работоспособность. Компиляция DX11 не
+выдаётся за runtime validation DX11.
+
+## Критерии приёмки F3.0
+
+| Критерий | Статус | Доказательство |
+|---|---|---|
+| Вершины передаются в GPU buffer | ✅ PASS | `vertex upload submitted`, `created: 3 vertices` |
+| Root signature создана корректно | ✅ PASS | Создана с `ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT` |
+| PSO создан корректно | ✅ PASS | `CreateGraphicsPipelineState` без ошибок |
+| HLSL VS/PS компилируются | ✅ PASS | `D3DCompile` для `vs_5_0` и `ps_5_0`, 0 ошибок |
+| `DrawInstanced` записан и выполнен | ✅ PASS | Треугольник виден на экране |
+| Пользователь визуально подтвердил | ✅ PASS | Подтверждено дважды |
+| Debug Layer + GBV: 0 ERROR, 0 CORRUPTION | ✅ PASS | Финальный прогон: 0 ERROR, 0 CORRUPTION |
+| Validation warnings проанализированы | ✅ PASS | WARNING #1328 разобран, причина задокументирована |
+| Resize/minimize/restore работают | ✅ PASS | 2 053 ресайза, 0 провалов |
+| Нет новых подтверждённых утечек | ✅ PASS | DebugView: набор идентичен F2.1-C.2 |
+| Shutdown корректен | ✅ PASS | `GPU drained` → `released` → `Shutdown complete` |
+| Локальная ReleaseDX12 сборка успешна | ✅ PASS | exit 0, 0 ошибок, 0 DX12-warnings |
+| DX11 renderer не затронут | ✅ PASS | `git status` по DX11 пуст |
+
+**Итог: F3.0 — PASS.**
+
+## CI
+
+Job `dx12-smoke-build` в run `38666758842` завершился **success**, все 8 шагов:
+
+```
+completed success  Set up job
+completed success  Run actions/checkout@v7.0.1
+completed success  Update Components
+completed success  Setup MSBuild
+completed success  MSBuild ReleaseDX12
+completed success  Verify DX12 library and Smoke EXE were built
+completed success  Upload DX12 diagnostics
+completed success  Complete job
+```
+
+Это подтверждает документированную зависимость от `Update_Components.cmd`:
+ReleaseDX12 собирает `xrCore` и `xrGame`, которым нужны 3rd_party исходники,
+не отслеживаемые в git.
+
+Важно: этот CI-PASS относится к коду **до** F3.0 (HEAD `5d905f7a8`). Проверка
+F3.0 в CI выполняется после коммита этой работы — см. результаты run выше.
+
+## Known limitations
+
+1. **Device removal — NOT TESTED.** Путь не исполнялся ни в одном прогоне,
+   провокация TDR запрещена. `GetDeviceRemovedReason() != S_OK` в живой работе
+   не наблюдался.
+2. **Аварийный карантин на реальном GPU — NOT TESTED.** Передача владения
+   через `Detach()` и последующее удержание ресурсов до завершения процесса
+   проверены только на mock-объектах. Чтобы исполнить путь вживую, нужно
+   довести систему до `GpuLifetime::Unknown`, что требует TDR.
+3. **Post-cleanup leak audit — NOT VERIFIED.** `ReportLiveObjects` фиксирует
+   live objects после `Shutdown`, но утверждать, что память GPU освобождена
+   полностью без отдельного аудита на живом device removal, нельзя.
+4. **54 детерминированные проверки используют модельные объекты.** Это тесты
+   состояний и владения, а не GPU-прогоны: переходы `GpuLifetime`, `Detach()`,
+   деструкторы, двойной `Release`, занятость карантина, политика повторной
+   инициализации. Реального GPU они не касаются.
+5. **Quarantine предназначен только для standalone Smoke.** Удержание
+   GPU-ресурсов до завершения процесса приемлемо для одного экземпляра, но
+   для игрового renderer'а означало бы удержание видеопамяти до перезапуска.
+   Там нужно решение на уровне движка: fail-stop с завершением процесса либо
+   полное пересоздание устройства. Защита занятого карантина — single-instance
+   policy, не синхронизирована.
+6. **WARNING #1328 остаётся** как осознанный компромисс: `COMMON` даёт ERROR,
+   `COPY_DEST` даёт WARNING.
+7. **Треугольник не интегрирован в игровой цикл OGSR** — только standalone smoke.
+8. **Текстуры, константные буферы, depth, индексы отсутствуют** — вне объёма F3.0.
+
+## Следующий шаг
+
+F3.1 — depth buffer, MVP-матрица через константный буфер, камера.

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "CHW12.h"
 #include "dx12log.h"
+#include "dx12triangle.h"
 
 #include <cstdlib>
 #include <dxgidebug.h>
@@ -75,6 +76,40 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
+    // Терминальное состояние: GPU-ресурсы переданы карантину, потому что GPU
+    // мог ещё их читать. Повторный Initialize запрещён навсегда: аллокаторы и
+    // командные листы из карантина потенциально используются GPU, и запись в
+    // них со стороны CPU была бы use-after-free.
+    //
+    // Проверяется именно m_terminalGpuFailure, а не m_shutdownComplete:
+    // штатное завершение не мешает повторной инициализации, и
+    // последовательность Initialize → Shutdown → Initialize должна работать.
+    if (m_terminalGpuFailure)
+    {
+        dx12log::Write("[DX12] Initialize refused: terminal GPU failure, resources are "
+                       "quarantined and command allocators may still be in use by GPU");
+        return false;
+    }
+
+    // Карантин process-global, а не member: он переживает уничтожение этого
+    // CHW12 и удерживает GPU-ресурсы до завершения процесса. Поэтому занятость
+    // проверяется на объекте, а не на флаге экземпляра.
+    //
+    // Смысл инварианта: пока в карантине лежит партия ресурсов, GPU может их
+    // читать. Новый экземпляр, создающий свои аллокаторы и командные листы,
+    // потреблял бы ту же видеопамять и тот же GPU. Для standalone Smoke это
+    // single-instance policy: единственный владелец карантина — единственный
+    // допущенный к работе с GPU объект.
+    //
+    // Это НЕ многопоточная реализация. Карантин не синхронизируется: тест
+    // и движок создают CHW12 последовательно, в одном потоке.
+    if (g_gpuQuarantine.occupied)
+    {
+        dx12log::Write("[DX12] Initialize refused: quarantine is occupied, GPU resources "
+                       "from a previous instance are still retained and may be in use");
+        return false;
+    }
+
     // Новая попытка инициализации (в том числе после неуспешной, когда
     // Shutdown уже приводил объект к исходному состоянию): идемпотентность
     // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
@@ -119,9 +154,60 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
+    // F3.0: первый треугольник. Загружаем ПОСЛЕ CreateSynchronization, когда
+    // command queue и fence существуют: команды копии вершин идут в очередь,
+    // а ожидание их завершения выполняется сразу ниже через WaitForGpu.
+    // До этого ожидания upload buffer не освобождается, поэтому GPU успевает
+    // прочитать данные. Вершинный буфер при resize не пересоздаётся.
+    if (!m_triangle.Create(
+            m_device.Get(),
+            m_commandQueue.Get(),
+            m_frameResources[0].commandAllocator.Get(),
+            m_frameResources[0].commandList.Get()))
+    {
+        dx12log::Write("[DX12] Initialize failed at triangle Create");
+        return false;
+    }
+
+    // Треугольник отправил команды копии через ExecuteCommandLists, поэтому
+    // GPU теперь точно получил работу. Флаг обязателен: без него WaitForGpu
+    // решит, что ждать нечего, и вернёт true, не дождавшись копии, после
+    // чего upload buffer был бы освобождён при ещё читающем его GPU.
+    m_gpuWorkSubmitted = true;
+
+    // Разоваое ожидание GPU на загрузку геометрии. Signal нового значения
+    // fence ожидает всю ранее отправленную работу, включая копию вершин.
+    //
+    // При провале ожидания здесь НЕ вызываем m_triangle.Release(): команды
+    // копии уже стоят в очереди GPU, и освобождение upload buffer означало
+    // бы use-after-free на стороне GPU.
+    //
+    // Ресурсы также НЕ освобождаются на этом пути сразу: выход из Initialize
+    // с false приводит к деструктору, тот вызывает Shutdown, и если состояние
+    // GPU окажется Unknown, Shutdown передаст ресурсы карантину, а не
+    // освободит их. Решение принимает DetermineGpuLifetime(), не этот код.
+    //
+    // Разбор всех ветвей провала ожидания:
+    //  - Signal() провалился: копия в очереди GPU. Освобождение unsafe.
+    //  - SetEventOnCompletion провалился: копия в очереди GPU. Unsafe.
+    //  - WaitForSingleObject таймаут: GPU завис, копия может не выполниться,
+    //    но может и выполняться прямо сейчас. Состояние неизвестно, unsafe.
+    //  - CheckFenceForRemoval увидел UINT64_MAX: устройство потеряно, GPU
+    //    ничего не выполняет. Здесь безопасно, но решение принимается по
+    //    фактическому HRESULT GetDeviceRemovedReason(), а не по флагу:
+    //    DeviceRemoved освобождает, Unknown карантинит.
+    if (!WaitForGpu())
+    {
+        dx12log::Write("[DX12] Initialize failed at triangle upload WaitForGpu: "
+                       "GPU state unknown, resources retained for Shutdown to resolve");
+        return false;
+    }
+
+    m_triangle.OnUploadComplete();
+
     m_stage = Stage::Ready;
     m_initialized = true;
-    dx12log::Write("[DX12] Initialize complete: %ux%u, %u frames in flight",
+    dx12log::Write("[DX12] Initialize complete: %ux%u, %u frames in flight, triangle ready",
                    width, height, FRAME_COUNT);
     return true;
 }
@@ -455,6 +541,111 @@ bool CHW12::WaitForGpu()
     return true;
 }
 
+bool CHW12::IsDeviceRemovedConfirmed()
+{
+    if (!m_device)
+        return false;
+
+    // GetDeviceRemovedReason() возвращает S_OK, если устройство НЕ удалено,
+    // и код причины в противном случае. Это фактический HRESULT, а не наш
+    // диагностический флаг m_deviceRemoved, который выставляется также при
+    // обычных ошибках API и таймаутах.
+    const HRESULT reason = m_device->GetDeviceRemovedReason();
+    if (reason == S_OK)
+        return false;
+
+    dx12log::Write("[DX12] GetDeviceRemovedReason=0x%08X: D3D12 device is removed, "
+                   "commands are not being executed", static_cast<unsigned>(reason));
+    return true;
+}
+
+GpuLifetime CHW12::DetermineGpuLifetime()
+{
+    // 1. GPU не получал команд: к памяти ресурсов не обращается никто.
+    if (!m_gpuWorkSubmitted)
+        return GpuLifetime::NoWorkSubmitted;
+
+    // 2. Работа отправлялась, но объекты синхронизации отсутствуют.
+    //    Подтвердить завершение нечем, поэтому это НЕ «безопасно», а Unknown.
+    //    Такой случай возникает при частично успешном Initialize, где
+    //    CreateSynchronization() не был достигнут, но команды уже в очереди.
+    if (!m_commandQueue || !m_fence || !m_fenceEvent)
+    {
+        dx12log::Write("[DX12] GPU work was submitted but synchronization objects "
+                       "are missing: completion cannot be confirmed");
+        return GpuLifetime::Unknown;
+    }
+
+    // 3. Успешный дренаж — единственный путь подтверждённого завершения.
+    if (WaitForGpu())
+        return GpuLifetime::WorkCompleted;
+
+    // 4. Ожидание не удалось. Решает фактический HRESULT устройства, а не
+    //    диагностический m_deviceRemoved.
+    if (IsDeviceRemovedConfirmed())
+        return GpuLifetime::DeviceRemoved;
+
+    // 5. Устройство живо, но завершение не подтверждено: GPU может читать
+    //    ресурсы прямо сейчас.
+    return GpuLifetime::Unknown;
+}
+
+void CHW12::QuarantineGpuResources()
+{
+    // Повторное занятие запрещено: иначе указатели первой партии были бы
+    // потеряны безвозвратно, а объекты остались бы незакрытыми.
+    if (g_gpuQuarantine.occupied)
+    {
+        dx12log::Write("[DX12] CRITICAL: quarantine already occupied, cannot "
+                       "quarantine a second set of GPU resources");
+        return;
+    }
+
+    GpuQuarantine& q = g_gpuQuarantine;
+
+    // Передача через Detach(): счётчик ссылок не меняется, AddRef не нужен.
+    // После этого деструкторы CHW12 не освобождают объекты, потому что
+    // соответствующие ComPtr равны nullptr.
+    q.device       = m_device.Detach();
+    q.commandQueue = m_commandQueue.Detach();
+    q.swapChain    = m_swapChain.Detach();
+    q.rtvHeap      = m_rtvHeap.Detach();
+
+    for (uint32_t i = 0; i < FRAME_COUNT && i < kQuarantineFrameCount; ++i)
+    {
+        q.slots[i].renderTarget     = m_frameResources[i].renderTarget.Detach();
+        q.slots[i].commandAllocator = m_frameResources[i].commandAllocator.Detach();
+        q.slots[i].commandList      = m_frameResources[i].commandList.Detach();
+        q.slots[i].fenceValue       = m_frameResources[i].fenceValue;
+    }
+
+    // Синхронизация. Fence удерживается по той же причине: при таймауте
+    // runtime сохраняет регистрацию SetEventOnCompletion и может записать в
+    // event после того, как CPU прекратил ожидание.
+    q.fence      = m_fence.Detach();
+
+    // Event — Win32 handle, не COM. Владение передаётся присваиванием,
+    // поле обнуляется, чтобы CloseHandle далее стал no-op. Это обязательно:
+    // закрытие event при активной регистрации в runtime — неопределённое
+    // поведение на стороне драйвера.
+    q.fenceEvent = m_fenceEvent;
+    m_fenceEvent = nullptr;
+
+    // Ресурсы треугольника передаются тем же способом.
+    m_triangle.Quarantine(q.vertexBuffer, q.uploadBuffer,
+                          q.rootSignature, q.pipelineState);
+
+    // m_infoQueue намеренно НЕ карантинируется: это CPU-объект сбора
+    // validation-сообщений, GPU к его памяти не обращается. Он освобождается
+    // штатным путём ниже, как и раньше.
+
+    q.occupied = true;
+
+    dx12log::Write("[DX12] GPU resources quarantined: ownership transferred to "
+                   "process-lifetime storage via Detach(), GPU may still be "
+                   "reading them");
+}
+
 void CHW12::MoveToNextFrame()
 {
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
@@ -588,7 +779,35 @@ bool CHW12::RenderFrame()
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += static_cast<SIZE_T>(m_frameIndex) * m_rtvDescriptorSize;
+    cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    // Viewport и scissor из актуальных m_width/m_height: без них DX12
+    // rasterization не определена, а треугольник должен оставаться видимым
+    // после любого resize. Значения берутся из текущего состояния CHW12,
+    // а не кэшируются, поэтому resize их не ломает.
+    D3D12_VIEWPORT viewport = {};
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width = static_cast<float>(m_width);
+    viewport.Height = static_cast<float>(m_height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    cmd->RSSetViewports(1, &viewport);
+
+    D3D12_RECT scissor = {};
+    scissor.left = 0;
+    scissor.top = 0;
+    scissor.right = static_cast<LONG>(m_width);
+    scissor.bottom = static_cast<LONG>(m_height);
+    cmd->RSSetScissorRects(1, &scissor);
+
     cmd->ClearRenderTargetView(rtvHandle, kClearColor, 0, nullptr);
+
+    // F3.0: геометрия. Draw() записывает SetGraphicsRootSignature,
+    // SetPipelineState, IASetPrimitiveTopology, IASetVertexBuffers и
+    // DrawInstanced. Состояния allocator'а он не хражит, поэтому
+    // пересоздание командных листов при resize его не затрагивает.
+    m_triangle.Draw(cmd);
 
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -756,33 +975,62 @@ void CHW12::Shutdown()
 
     m_shutdownComplete = true;
 
-    const bool canWaitForGpu = m_commandQueue && m_fence && m_fenceEvent && m_gpuWorkSubmitted;
+    // Политика освобождения ресурсов на основе фактического состояния GPU.
+    // Предположение «процесс скоро выйдет» не используется: lifetime
+    // COM-объекта и lifetime GPU-доступа к его памяти — разные вещи, и
+    // Microsoft требует хранить ресурсы до подтверждённого завершения
+    // их использования GPU.
+    const GpuLifetime lifetime = DetermineGpuLifetime();
 
-    if (canWaitForGpu)
+    switch (lifetime)
     {
-        if (WaitForGpu())
-        {
-            dx12log::Write("[DX12] GPU drained before shutdown");
-        }
-        else
-        {
-            // Неуспешная синхронизация НЕ считается успешной: объекты
-            // освобождаем, но честно пишем, что гарантии нет.
-            dx12log::Write("[DX12] WARNING: GPU drain failed, releasing resources without "
-                           "confirmation that GPU finished");
-        }
+    case GpuLifetime::WorkCompleted:
+        dx12log::Write("[DX12] GPU drained before shutdown");
+        break;
+
+    case GpuLifetime::DeviceRemoved:
+        // Устройство потеряно: команд не выполняется, обращения к памяти
+        // ресурсов невозможны. Освобождение безопасно.
+        break;
+
+    case GpuLifetime::NoWorkSubmitted:
+        // GPU не получал команд: обращаться к ресурсам некому.
+        break;
+
+    case GpuLifetime::Unknown:
+        // Состояние неизвестно, устройство живо. GPU может читать ресурсы
+        // прямо сейчас, поэтому освобождение небезопасно. Владение
+        // передаётся карантину с process lifetime.
+        dx12log::Write("[DX12] LIMITATION: GPU drain failed and D3D12 device is "
+                       "NOT removed: GPU may still be reading resources. GPU "
+                       "resources are quarantined until process exit to avoid "
+                       "GPU use-after-free. Rendering is stopped and command "
+                       "allocators are not reused.");
+        QuarantineGpuResources();
+        m_terminalGpuFailure = true;
+        break;
     }
 
-    for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+    // Освобождение GPU-ресурсов выполняется во всех состояниях, кроме
+    // Unknown. В Unknown ComPtr уже равны nullptr после Detach(), поэтому
+    // эти Reset() стали бы no-op'ами, но явное разделение понятнее.
+    if (lifetime != GpuLifetime::Unknown)
     {
-        m_frameResources[i].renderTarget.Reset();
-        m_frameResources[i].commandList.Reset();
-        m_frameResources[i].commandAllocator.Reset();
-    }
+        for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+        {
+            m_frameResources[i].renderTarget.Reset();
+            m_frameResources[i].commandList.Reset();
+            m_frameResources[i].commandAllocator.Reset();
+        }
 
-    m_rtvHeap.Reset();
-    m_commandQueue.Reset();
-    m_swapChain.Reset();
+        m_rtvHeap.Reset();
+        m_commandQueue.Reset();
+        m_swapChain.Reset();
+
+        // Ресурсы треугольника. В карантин они уходят через Quarantine(),
+        // поэтому здесь вызов достигается только в штатных состояниях.
+        m_triangle.Release();
+    }
 
     if (m_debugLayerEnabled)
     {
@@ -793,7 +1041,15 @@ void CHW12::Shutdown()
             dxgiDebug->ReportLiveObjects(kDxgiDebugAll, DXGI_DEBUG_RLO_ALL);
     }
 
+    // m_infoQueue — CPU-объект сбора validation-сообщений, GPU к его памяти
+    // не обращается, поэтому освобждается во всех состояниях, включая Unknown.
+    // В карантин он не передаётся.
     m_infoQueue.Reset();
+
+    // m_device и m_fence после Detach() в карантине равны nullptr, поэтому
+    // Reset() здесь безопасен и в аварийном состоянии: он не тронет объекты,
+    // владение которыми уже передано. m_fenceEvent обнулён в карантине
+    // присваиванием, поэтому CloseHandle не закрывает quarantined handle.
     m_device.Reset();
     m_fence.Reset();
 
@@ -806,23 +1062,30 @@ void CHW12::Shutdown()
     m_initialized = false;
     m_stage = Stage::None;
 
-    // Полный сброс состояния: объект после Shutdown() должен быть
-    // неотличим от свежесозданного, включая частичную инициализацию.
-    // Без этого повторный Initialize() унаследовал бы мусорные fenceValue
-    // (WaitForFenceValue ждал бы значения, которого fence уже не помнит),
-    // старый frameIndex и размеры.
-    for (uint32_t i = 0; i < FRAME_COUNT; ++i)
-        m_frameResources[i].fenceValue = 0;
+    // Сброс состояния до «свежесозданного» допустим ТОЛЬКО в штатных
+    // состояниях. В Unknown ресурсы находятся в карантине, и сброс
+    // m_gpuWorkSubmitted сделал бы повторный Initialize опасным: WaitForGpu()
+    // с false вернул бы true без ожидания, после чего рендеринг начал бы
+    // писать в аллокаторы, которые GPU потенциально ещё читает.
+    //
+    // m_terminalGpuFailure не сбрасывается никогда: он и означает, что
+    // повторная инициализация запрещена.
+    if (lifetime != GpuLifetime::Unknown)
+    {
+        for (uint32_t i = 0; i < FRAME_COUNT; ++i)
+            m_frameResources[i].fenceValue = 0;
 
-    m_frameIndex = 0;
-    m_fenceValue = 0;
-    m_gpuWorkSubmitted = false;
-    m_width = 0;
-    m_height = 0;
-    m_occluded = false;
-    m_deviceRemoved = false;
-    m_debugLayerEnabled = false;
-    m_rtvDescriptorSize = 0;
+        m_frameIndex = 0;
+        m_fenceValue = 0;
+        m_gpuWorkSubmitted = false;
+        m_width = 0;
+        m_height = 0;
+        m_occluded = false;
+        m_deviceRemoved = false;
+        m_debugLayerEnabled = false;
+        m_rtvDescriptorSize = 0;
+    }
+
     m_shutdownComplete = true;
 
     dx12log::Write("[DX12] Shutdown complete");
