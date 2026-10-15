@@ -132,18 +132,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     MSG msg = {};
     while (g_running)
     {
-        // Минимизировано: GPU-рендеринг остановлен, но PeekMessage в пустой
-        // очереди вернулся бы сразу — получался busy loop со 100% CPU на одном
-        // ядре. WaitMessage блокируется до появления сообщения (в том числе
-        // WM_SIZE при восстановлении окна), поэтому CPU простаивает, а
-        // приложение остаётся отзывчивым. WM_QUIT тоже является сообщением
-        // и разблокирует ожидание.
-        if (g_minimized)
-        {
-            WaitMessage();
-            continue;
-        }
-
+        // 1. Обрабатываем все накопленные сообщения. WM_SIZE с SIZE_MINIMIZED
+        // устанавливает g_minimized здесь же, в WndProc.
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
@@ -155,9 +145,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             }
         }
 
+        // 2. WM_QUIT обработан: выходим, не рендеря лишний кадр.
         if (!g_running)
             break;
 
+        // 3. Минимизировано: ждём сообщения. Ожидание идёт ПОСЛЕ полного
+        // pump, иначе WM_SIZE/SIZE_MINIMIZED, уже лежащий в очереди, не был
+        // бы обработан до блокировки. PeekMessage в пустой очереди вернулся
+        // бы сразу, дав busy loop со 100% CPU; WaitMessage блокируется до
+        // нового сообщения (в том числе WM_SIZE при восстановлении окна),
+        // поэтому RenderFrame() не вызывается и дополнительный кадр после
+        // SIZE_MINIMIZED невозможен. Sleep не используется.
+        if (g_minimized)
+        {
+            WaitMessage();
+            continue;
+        }
+
+        // 4. Окно видимо: рендерим.
         if (!hw12.RenderFrame())
         {
             dx12log::Write("[smoke] RenderFrame failed, device removed=%d, stopping",

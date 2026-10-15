@@ -348,6 +348,30 @@ bool CHW12::CreateSynchronization()
 
 // timedOut отделяет зависший GPU от сбоя API: это разные диагнозы, и
 // treating timeout как device removal было бы неверным утверждением.
+// Значение UINT64_MAX от GetCompletedValue означает device removal, а не
+// «GPU всё завершил». Microsoft: при removed device fence возвращает
+// UINT64_MAX, поэтому сравнение >= value ложно принимало бы потерю
+// устройства за успешное завершение. Проверяем оба пути: до
+// SetEventOnCompletion и после пробуждения события.
+static constexpr uint64_t kFenceRemovedMarker = 0xFFFFFFFFFFFFFFFFull;
+
+bool CHW12::CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage)
+{
+    if (completed != kFenceRemovedMarker)
+        return true;
+
+    dx12log::WriteWide(L"[DX12] %s: GetCompletedValue returned UINT64_MAX, device removed "
+                       L"(waiting for %llu)", stage, static_cast<unsigned long long>(value));
+
+    if (m_device)
+    {
+        const HRESULT reason = m_device->GetDeviceRemovedReason();
+        dx12log::Write("[DX12] GetDeviceRemovedReason: 0x%08X", static_cast<unsigned>(reason));
+    }
+
+    return false;
+}
+
 bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut)
 {
     timedOut = false;
@@ -358,7 +382,13 @@ bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut)
         return false;
     }
 
-    if (m_fence->GetCompletedValue() >= value)
+    // Путь 1: до SetEventOnCompletion. UINT64_MAX здесь означал бы, что
+    // устройство уже потеряно, и ожидание было бы ложным успехом.
+    const uint64_t completedBefore = m_fence->GetCompletedValue();
+    if (!CheckFenceForRemoval(completedBefore, value, L"WaitForFenceValue(before wait)"))
+        return false;
+
+    if (completedBefore >= value)
         return true;
 
     HRESULT hr = m_fence->SetEventOnCompletion(value, m_fenceEvent);
@@ -386,6 +416,13 @@ bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut)
                        wait, GetLastError());
         return false;
     }
+
+    // Путь 2: после пробуждения. Событие может быть сигнализировано именно
+    // потому, что устройство удалено, и тогда GetCompletedValue равен
+    // UINT64_MAX. Проверка обязательна: без неё возвращался бы true.
+    const uint64_t completedAfter = m_fence->GetCompletedValue();
+    if (!CheckFenceForRemoval(completedAfter, value, L"WaitForFenceValue(after wait)"))
+        return false;
 
     return true;
 }

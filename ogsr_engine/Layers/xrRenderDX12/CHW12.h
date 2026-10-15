@@ -65,6 +65,10 @@ private:
     bool CreateSynchronization();
     bool EnableDebugLayer();
 
+    // UINT64_MAX от GetCompletedValue означает device removal. Возвращает
+    // false, если ожидание нельзя считать успешным, и логирует причину.
+    bool CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage);
+
     // Ждёт конкретного значения fence. false только при аппаратной ошибке
     // (нет fence/event или провал SetEventOnCompletion); timeout возвращает
     // отдельно, чтобы вызывающий код мог отличить зависание GPU от сбоя API.
