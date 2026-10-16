@@ -485,6 +485,14 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **G4 — динамика и материалы** | Skinned/dynamic objects, обновление/rebuild BLAS/TLAS, alpha-tested foliage, invalidation, emissive и material lookup. | Нет существенных артефактов при анимации NPC/растительности и движении камеры. |
 | **G5 — дополнительные эффекты (опц.)** | Только после G3/G4: **RT-отражения как отдельный проверяемый рубеж**, затем по отдельному решению diffuse GI и denoise; DLSS Ray Reconstruction — отдельная интеграция при проверенной поддержке SDK/API. | Для RT-отражений отдельно зафиксированы качество, GPU ms, CPU ms и frametime. После работающих RT-теней и отражений — переход к H1 (аудит многопоточности всего движка). Каждый дополнительный эффект имеет собственный performance budget. |
 
+### Исследовательская пометка по архитектуре освещения (2026-10-16)
+
+**Статус: обсуждается, не утверждено к реализации.** В качестве ориентиров для возможной архитектуры непрямого освещения OGSR RTX изучаем опубликованные решения 4A Games в Metro Exodus Enhanced Edition: гибридная raster + ray tracing схема, RTGI, DDGI/временное накопление освещения, упрощённое представление материалов для GI, гибридные SSR/RT-отражения и оптимизацию GPU. Это идеи для оценки после появления полноценного игрового кадра и измерений, **не новый этап, не обязательство внедрить DDGI и не изменение порядка F4 → G3/G4 → опциональный G5**. Сохранить совместимость Legacy Materials и каноничную визуальную атмосферу X-Ray.
+
+**Первоисточники 4A Games для быстрого возврата:**
+- [In-Depth Technical Dive into Metro Exodus PC Enhanced Edition](https://www.4a-games.com.mt/4a-dna/in-depth-technical-dive-into-metro-exodus-pc-enhanced-edition) — архитектура RTGI, DDGI, материалы, отражения.
+- [Everything Technical about Metro Exodus Upgrade for PlayStation 5 and Xbox Series X|S](https://www.4a-games.com.mt/4a-dna/everything-technical-about-metro-exodus-upgrade-for-playstation-5-and-xbox-series-x-s) — оптимизация рендеринга и производительности.
+
 ### Совместимость материалов Legacy / Enhanced (проектное правило)
 
 **Asset Compatibility First:** существующие OGSR/X-Ray текстуры, модели и материалы должны отображаться на DX12 и поддерживать начальные DXR-тени **без обязательной конвертации ассетов**. `Legacy Materials` сохраняют стиль старого контента через документированные fallback-параметры; `Enhanced Materials` — опциональные карты/метаданные для более точного PBR, мокрых поверхностей, отражений и расширенных эффектов. Это правило проектирования, а не подтверждённая реализация.
