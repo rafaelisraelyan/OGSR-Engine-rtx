@@ -36,6 +36,7 @@
 | D · DX11 SSGI / Hi-Z | ⬜ Исследование | D0 → D1 → D2, решение по результатам |
 | E · Техдолг | 🔎 Диагностика | Отдельные согласованные изменения |
 | F · Нативный DX12 | 🛠 В работе (статусы F ниже — исторический снимок) | После F3: F3.5 CPU-side многопоточная архитектура перед F4 |
+| F3.2 · GR Job System (DX12 only) | 🛠 Локальная интеграция Stage 1 по отчёту, не закоммичена | C.1: ownership/lifecycle; затем DX12 Smoke runtime/CPU scene |
 | F3.5 · Multithreaded Renderer Foundation | ⬜ Запланирован, не реализован | Snapshot, frame scheduler, per-worker allocators, CPU scaling tests |
 | G · DXR | 🆕 План, зависит от F | G0: проверка возможностей GPU/драйвера |
 | H · Многопоточность | ⬜ План | H0: базовые профили, H1 после RT-теней и отражений |
@@ -417,6 +418,48 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 **Ближайшая работа по историческому снимку:** F3.0 — минимальный рендер 3D-геометрии. Если с тех пор выполнены F3.x GPU-гейты, свериться с актуальными коммитами/логами перед планированием F3.5. Новая запись не переоценивает уже выполненное.
 
+
+### F3.2 — GR Job System: сначала только DX12 (решение 2026-10-18)
+
+**Архитектурный статус:** GR Job System — самостоятельная библиотека уровня Engine Core
+(`ogsr_engine/Layers/JobSystem/`), а не часть `xrRender_R5_DX12`. Backend — закреплённый
+форк enkiTS (SHA `404a3bf8f855039dfff2052184d6308655286c07`); публичный
+`gr/jobs/` API не зависит от enkiTS, DX11, DX12 и Win32. Принцип — один общий
+планировщик CPU-задач и Work Stealing; размещение потоков оставлено Windows
+(**OS Default**, без hard/soft CPU affinity в runtime). Количество workers
+конфигурируется, а последовательный путь сохраняется для отката и измерений.
+
+**Решение об области работ:** на текущем этапе **только собственный DX12 renderer /
+standalone `xrDX12Smoke.exe`** становится потребителем GR Job System.
+Физика, AI, анимация, streaming и фоновые задачи аудио **не интегрируются сейчас**:
+позднее, после измерений DX12 и отдельного аудита зависимостей, в направлении H.
+Специализированные realtime-потоки (особенно audio callback) не обязаны
+использовать общий пул; запрещено блокировать realtime audio callback ожиданием job.
+
+| Подэтап | Статус на 2026-10-18 по локальным отчётам, без независимого GPU runtime PASS | Следующий гейт |
+|---|---|---|
+| **F3.2A / A.1 — enkiTS bench + OS scheduler** | Отчёт: 10 раундов, 480 конфигураций; принято **OS Default**, хотя hard affinity дала локальный выигрыш в синтетике | Хранить raw timings; не выдавать синтетический speedup за FPS |
+| **F3.2B / B.1 — GR Job System Foundation + Safety Review** | По отчёту агента: автономная библиотека и исправления noexcept destructor, move-assignment, lifetime; требуются проверки интегрируемой версии | Убедиться в корректном ownership, исключениях, shutdown и регрессионных тестах |
+| **F3.2C Stage 1 — VS integration** | По отчёту Codex: `xrDX12Smoke → gr_job_system → enkiTS`, ReleaseDX12/x64 без ошибок/предупреждений; окно не запускалось; изменения локальные, не закоммичены | Воспроизводимая сборка из репозитория; не подключать `xrRender_R5_DX12` и другие игровые targets раньше отдельного этапа |
+| **F3.2C.1 — ownership/lifecycle hardening** | Требует отдельной проверки: потенциальное освобождение опубликованной задачи при исключении из `tasks.push_back`, а также hook/drain/shutdown | Устранить подтверждённые дефекты, fault-injection и регрессионные тесты |
+| **F3.2C.2 — DX12 Smoke CPU scene pipeline** | Запланировано, не подтверждено runtime | Serial/Parallel на равных данных, transforms + frustum culling для opt-in 256/1024/4096/16384 CPU-объектов; старые два куба, depth/resize/GPU path сохранить |
+| **F3.3 — DX12 CPU render preparation** | Запланировано | Изучить реальные операции рендерера; immutable scene snapshot, visibility, draw packets; serial fallback, CPU correctness |
+| **F3.4 — DX12 parallel command recording** | Запланировано; согласовать с существующим разделом F3.5.3, не дублировать работу | Per-worker command lists/allocators, GPU fence lifetime, barriers, validation, profiling |
+| **F3.5 — DX11 vs DX12 comparison / решение** | Запланировано; согласовать с существующим F3.5.4 (не переименовывать старый этап) | Одинаковые сцены и настройки, CPU/GPU timings, p50/p95/p99, frametime, 1% low; отделить различия backend от различий качества |
+
+**Последовательность:** закрыть корректность и lifecycle → подключить GR к
+standalone DX12 Smoke → подготовка CPU сцены → реальные CPU-задачи DX12 →
+параллельная запись D3D12 command lists только после отдельных GPU lifetime
+инвариантов → сравнение с сохранённым DX11 baseline. DX11, gameplay, physics,
+AI и audio сейчас не менять. Сборка **не равна** запуску или GPU validation PASS.
+
+**Важно о нумерации:** существующий ниже F3.5 — общий архитектурный рубеж
+Multithreaded Renderer Foundation до F4. Ссылки F3.3/F3.4/F3.5 в таблице выше
+описывают предложенные рабочие итерации GR/DX12 внутри этого рубежа; они **не
+отменяют и не перенумеровывают** F3.5.0–F3.5.4 и требуют синхронизации перед
+обновлением основных milestones.
+
+---
 
 ### F3.5 — Multithreaded Renderer Foundation: архитектура ДО массового переноса F4
 
