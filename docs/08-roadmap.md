@@ -442,10 +442,34 @@ standalone `xrDX12Smoke.exe`** становится потребителем GR 
 | **F3.2B / B.1 — GR Job System Foundation + Safety Review** | По отчёту агента: автономная библиотека и исправления noexcept destructor, move-assignment, lifetime; требуются проверки интегрируемой версии | Убедиться в корректном ownership, исключениях, shutdown и регрессионных тестах |
 | **F3.2C Stage 1 — VS integration** | По отчёту Codex: `xrDX12Smoke → gr_job_system → enkiTS`, ReleaseDX12/x64 без ошибок/предупреждений; окно не запускалось; изменения локальные, не закоммичены | Воспроизводимая сборка из репозитория; не подключать `xrRender_R5_DX12` и другие игровые targets раньше отдельного этапа |
 | **F3.2C.1 — ownership/lifecycle hardening** | Требует отдельной проверки: потенциальное освобождение опубликованной задачи при исключении из `tasks.push_back`, а также hook/drain/shutdown | Устранить подтверждённые дефекты, fault-injection и регрессионные тесты |
-| **F3.2C.2 — DX12 Smoke CPU scene pipeline** | Запланировано, не подтверждено runtime | Serial/Parallel на равных данных, transforms + frustum culling для opt-in 256/1024/4096/16384 CPU-объектов; старые два куба, depth/resize/GPU path сохранить |
+| **F3.2C.2 — DX12 Smoke CPU scene pipeline** | **PASS по локальному отчёту 2026-10-18, ещё без коммита исходников**: 32/32 runtime, 857 CPU checks, depth readback, resize и GPU validation; ручной визуальный осмотр и race detector не выполнены | Сохранить исходники и raw logs отдельным коммитом; выполнить ручную проверку окна перед полной визуальной приёмкой |
 | **F3.3 — DX12 CPU render preparation** | Запланировано | Изучить реальные операции рендерера; immutable scene snapshot, visibility, draw packets; serial fallback, CPU correctness |
 | **F3.4 — DX12 parallel command recording** | Запланировано; согласовать с существующим разделом F3.5.3, не дублировать работу | Per-worker command lists/allocators, GPU fence lifetime, barriers, validation, profiling |
 | **F3.5 — DX11 vs DX12 comparison / решение** | Запланировано; согласовать с существующим F3.5.4 (не переименовывать старый этап) | Одинаковые сцены и настройки, CPU/GPU timings, p50/p95/p99, frametime, 1% low; отделить различия backend от различий качества |
+
+**F3.2C.2 — измерения в standalone Smoke (4 background workers + main, grain=64):**
+
+| CPU-объектов | Serial, мс | Parallel, мс | Serial / Parallel |
+|---:|---:|---:|---:|
+| 256 | 0.024141 | 0.037532 | 0.64× (parallel медленнее) |
+| 1024 | 0.114042 | 0.059029 | 1.93× |
+| 4096 | 0.383540 | 0.136484 | 2.81× |
+| 16384 | 1.301304 | 0.421946 | 3.08× |
+
+Источник — локальный `docs/dx12-f3-2c2-runtime.md` (30 прогревочных и
+200 измеряемых кадров; Serial/Parallel verification, 32 automated runs).
+Числа измеряют **только CPU scene preparation** на RTX 5070 Laptop GPU,
+не FPS и не реальный игровой scene renderer. Serial остаётся default.
+F3.2C.2: runtime и автоматическая корректность по отчёту PASS; ручной осмотр
+окна, интерактивный minimize/restore и специализированный race detector
+остаются открытыми. Не заявлять завершения этих проверок.
+
+**Следующий этап F3.3:** сначала аудит фактических CPU scene/render preparation
+и их владельцев в `xrRender_R5_DX12`, анализ frame lifetime и точек
+синхронизации; затем отдельный минимальный serial/parallel path с проверкой
+эквивалентности. Не переносить синтетические объекты в игру как «готовый
+рендерер», не менять DX11 и другие подсистемы; GPU command list recording
+оставить на более поздний гейт F3.5.3.
 
 **Последовательность:** закрыть корректность и lifecycle → подключить GR к
 standalone DX12 Smoke → подготовка CPU сцены → реальные CPU-задачи DX12 →
