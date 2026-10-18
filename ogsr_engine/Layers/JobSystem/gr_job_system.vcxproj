@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- F3.2C: GR Job System — автономная статическая библиотека движка.
+     Универсальный модуль, не являющийся частью DX12. Ссылается только
+     xrDX12Smoke.vcxproj; основной рендерер X-Ray (xrRender_R5_DX12) его не
+     использует и новых зависимостей не получает.
+     enkiTS закреплён на 404a3bf8f855039dfff2052184d6308655286c07, лицензия
+     zlib сохранена в thirdparty/enkiTS/License.txt. -->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <!-- Конфигурация нужна, чтобы библиотеку можно было подключить через
+         ProjectReference к xrDX12Smoke.vcxproj, который собирается как
+         ReleaseDX12|x64. Настройки идентичны Release. -->
+    <ProjectConfiguration Include="ReleaseDX12|x64">
+      <Configuration>ReleaseDX12</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7C4E9A1F-2D6B-4E8A-9F3C-5B1D7A2E8C64}</ProjectGuid>
+    <RootNamespace>gr_job_system</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDX12|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <GRJobTestSuffix Condition="'$(GRJobTesting)'=='true'">testing\</GRJobTestSuffix>
+    <OutDir>$(MSBuildThisFileDirectory)x64\$(Configuration)\$(GRJobTestSuffix)</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)x64\$(Configuration)\$(GRJobTestSuffix)obj\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- Исключения задач перехватываются и возвращаются через Wait(). -->
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(GRJobTesting)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>GR_JOBS_TESTING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;$(MSBuildThisFileDirectory)thirdparty\enkiTS\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Lib>
+      <TargetMachine>MachineX64</TargetMachine>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64' Or '$(Configuration)|$(Platform)'=='ReleaseDX12|x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;$(MSBuildThisFileDirectory)thirdparty\enkiTS\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Lib>
+      <TargetMachine>MachineX64</TargetMachine>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\JobSystem.cpp" />
+    <ClCompile Include="src\JobGroup.cpp" />
+    <ClCompile Include="src\EnkiBackend.cpp" />
+    <ClCompile Include="src\CpuTopology.cpp" />
+    <ClCompile Include="thirdparty\enkiTS\src\TaskScheduler.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\gr\jobs\JobConfig.h" />
+    <ClInclude Include="include\gr\jobs\JobGroup.h" />
+    <ClInclude Include="include\gr\jobs\JobStats.h" />
+    <ClInclude Include="include\gr\jobs\JobSystem.h" />
+    <ClInclude Include="include\gr\jobs\JobTypes.h" />
+    <ClInclude Include="src\JobSystemState.h" />
+    <ClInclude Include="src\JobDiagnostics.h" />
+    <ClInclude Include="src\EnkiBackend.h" />
+    <ClInclude Include="src\CpuTopology.h" />
+    <ClInclude Include="src\InternalJobTask.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

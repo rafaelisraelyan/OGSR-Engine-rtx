@@ -85,6 +85,23 @@ struct GpuQuarantine
     ID3D12RootSignature* rootSignature = nullptr;
     ID3D12PipelineState* pipelineState = nullptr;
 
+    // F3.1: depth buffer и DSV heap. Depth buffer — чистый GPU-ресурс,
+    // CPU в него не пишет никогда, но при неизвестном GPU completion
+    // он может ещё читаться, поэтому передаётся карантину.
+    ID3D12Resource* depthBuffer = nullptr;
+    ID3D12DescriptorHeap* dsvHeap = nullptr;
+
+    // F3.1: per-frame constant buffers. Владение передаётся через Detach().
+    // CPU-указатели mapped обнуляются в момент передачи (§3.3 ТЗ): после
+    // Detach объект принадлежит карантину, и оставшийся валидным mapped
+    // позволял бы писать в upload heap, который потенциально ещё читает GPU.
+    ID3D12Resource* constantBuffers[kQuarantineFrameCount] = {};
+
+    // F3.1: readback buffer (только тестовый режим). mappedReadback
+    // обнуляется там же — readback-буфер тоже Map'ится, и запись в него
+    // после передачи владения была бы ошибкой того же класса.
+    ID3D12Resource* readbackBuffer = nullptr;
+
     // Синхронизация. Fence удерживается по той же причине, что и остальные
     // ресурсы: при таймауте ожидания runtime сохраняет регистрацию
     // SetEventOnCompletion и может записать в event позже, поэтому и fence,

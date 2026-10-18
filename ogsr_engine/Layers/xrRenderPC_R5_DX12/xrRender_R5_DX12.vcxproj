@@ -63,7 +63,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;$(SolutionDir)\3rd_party\Src\DirectXMath\DirectXMath\Inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -81,13 +81,15 @@
   <ItemGroup>
     <ClCompile Include="..\xrRenderDX12\CHW12.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12quarantine.cpp" />
-    <ClCompile Include="..\xrRenderDX12\dx12triangle.cpp" />
+    <ClCompile Include="..\xrRenderDX12\dx12camera.cpp" />
+    <ClCompile Include="..\xrRenderDX12\dx12mesh.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\xrRenderDX12\CHW12.h" />
     <ClInclude Include="..\xrRenderDX12\stdafx.h" />
     <ClInclude Include="..\xrRenderDX12\dx12quarantine.h" />
-    <ClInclude Include="..\xrRenderDX12\dx12triangle.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12camera.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12mesh.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

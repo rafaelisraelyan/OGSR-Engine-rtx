@@ -48,7 +48,8 @@
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(MSBuildProjectDirectory)\..\JobSystem\include;$(SolutionDir)\3rd_party\Src\DirectXMath\DirectXMath\Inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -68,15 +69,26 @@
   <ItemGroup>
     <ClCompile Include="xrDX12Smoke.cpp" />
     <ClCompile Include="dx12log.cpp" />
+    <ClCompile Include="dx12cpuscene.cpp" />
+    <ClCompile Include="dx12cpuscene_tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dx12log.h" />
-    <ClInclude Include="dx12triangle.h" />
+    <ClInclude Include="dx12camera.h" />
+    <ClInclude Include="dx12mesh.h" />
     <ClInclude Include="dx12quarantine.h" />
+    <ClInclude Include="dx12cpuscene.h" />
+    <ClInclude Include="dx12cpuruntime.inl" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\xrRenderPC_R5_DX12\xrRender_R5_DX12.vcxproj">
       <Project>{D7F3A2B1-8C4E-4F6A-9D2B-5E1C3A7F8B6D}</Project>
+    </ProjectReference>
+    <!-- F3.2C: GR Job System подключён только к standalone smoke target.
+         Основной рендерер X-Ray (xrRender_R5_DX12) его не использует. -->
+    <ProjectReference Include="..\JobSystem\gr_job_system.vcxproj">
+      <Project>{7C4E9A1F-2D6B-4E8A-9F3C-5B1D7A2E8C64}</Project>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

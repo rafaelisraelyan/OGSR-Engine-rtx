@@ -5,7 +5,8 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
-#include "dx12triangle.h"
+#include "dx12camera.h"
+#include "dx12mesh.h"
 #include "dx12quarantine.h"
 
 using Microsoft::WRL::ComPtr;
@@ -58,6 +59,33 @@ public:
     bool IsDeviceRemoved() const { return m_deviceRemoved; }
     bool IsOccluded() const { return m_occluded; }
 
+    // F3.1: управление режимами тестирования.
+    void SetTestMode(bool enabled) { m_testMode = enabled; }
+    void SetFixedPose(bool enabled) { m_fixedPose = enabled; }
+    void UpdateCamera(float timeSeconds) { m_camera.SetOrbit(timeSeconds); }
+    bool SetCameraLookAt(DirectX::XMVECTOR eye, DirectX::XMVECTOR target, DirectX::XMVECTOR up)
+    {
+        return m_camera.SetLookAt(eye, target, up);
+    }
+    bool SetCameraAspect(float aspect) { return m_camera.SetAspect(aspect); }
+    void GetCameraFixedPose(DirectX::XMVECTOR& eye, DirectX::XMVECTOR& target, DirectX::XMVECTOR& up) const
+    {
+        m_camera.GetFixedPose(eye, target, up);
+    }
+
+    // F3.1: результат автоматического depth-теста.
+    struct DepthTestResult
+    {
+        bool passed = false;
+        char message[512] = {};
+    };
+
+    // F3.1: автоматический depth-test с инкапсуляцией readback.
+    // Синхронизирует GPU через fence, читает readback с учётом
+    // Offset/RowPitch, проверяет три контрольных пикселя.
+    // Возвращает структуру с результатом и диагностикой.
+    DepthTestResult VerifyDepthTest();
+
 private:
     static constexpr uint32_t FRAME_COUNT = 3;
     static constexpr DXGI_FORMAT BACKBUFFER_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -74,6 +102,7 @@ private:
         RenderTargetViews,
         FrameResources,
         Fence,
+        DepthBuffer,
         Ready
     };
 
@@ -82,6 +111,8 @@ private:
         ComPtr<ID3D12CommandAllocator> commandAllocator;
         ComPtr<ID3D12GraphicsCommandList> commandList;
         ComPtr<ID3D12Resource> renderTarget;
+        ComPtr<ID3D12Resource> constantBuffer;
+        void* mapped = nullptr;
         uint64_t fenceValue = 0;
     };
 
@@ -91,6 +122,8 @@ private:
     bool CreateFrameResources();
     bool CreateSynchronization();
     bool EnableDebugLayer();
+    bool CreateDepthBuffer();
+    bool CreateReadback();
 
     // F3.0: определение фактического состояния GPU для решения о lifetime
     // ресурсов. Решение опирается на факты: были ли отправлены команды,
@@ -108,11 +141,16 @@ private:
     // FrameResource является приватным вложенным типом этого класса.
     void QuarantineGpuResources();
 
-    // F3.0: первый DX12-треугольник. Отдельный компонент, а не часть CHW12,
-    // чтобы владение геометрией и pipeline не смешивалось с владением
-    // device/queue/swapchain/fence. Значение-член, а не указатель: ручное
-    // new/delete здесь ничего не даёт, деструктор вызовет Release().
-    SmokeTriangle12 m_triangle;
+    // F3.1: геометрия — два куба с мировыми координатами в вершинах.
+    // Отдельный компонент, а не часть CHW12, чтобы владение геометрией
+    // и pipeline не смешивалось с владением device/queue/swapchain/fence.
+    // Значение-член, а не указатель: ручное new/delete здесь ничего
+    // не даёт, деструктор вызовет Release().
+    SmokeMesh12 m_mesh;
+
+    // F3.1: камера. Значение-член, как m_mesh: без COM-объектов, только
+    // математика. Тестируема на CPU без GPU и переносима в IX-Ray-адаптер.
+    SmokeCamera12 m_camera;
 
     // UINT64_MAX от GetCompletedValue означает device removal. Возвращает
     // false, если ожидание нельзя считать успешным, и логирует причину.
@@ -146,6 +184,23 @@ private:
     ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
     uint32_t m_rtvDescriptorSize = 0;
 
+    // F3.1: depth buffer и DSV heap. Один общий depth buffer на все три
+    // слота кадра: CPU в него не пишет никогда, а внутри одной очереди
+    // команды выполняются строго в порядке отправки (§7 ТЗ). Барьеров на
+    // depth нет: ресурс остаётся в DEPTH_WRITE весь кадр.
+    ComPtr<ID3D12Resource> m_depthBuffer;
+    ComPtr<ID3D12DescriptorHeap> m_dsvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_dsv = {};
+    uint32_t m_dsvDescriptorSize = 0;
+
+    // F3.1: readback buffer для автоматического depth-теста (только тестовый
+    // режим). Создаётся и уничтожается при resize вместе с backbuffer,
+    // потому что RowPitch и число строк зависят от размера backbuffer.
+    ComPtr<ID3D12Resource> m_readbackBuffer;
+    void* mappedReadback = nullptr;
+    UINT64 m_readbackTotalBytes = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_copyableFootprint = {};
+
     // Synchronization
     ComPtr<ID3D12Fence> m_fence;
     HANDLE m_fenceEvent = nullptr;
@@ -174,4 +229,10 @@ private:
     // m_shutdownComplete, не сбрасывается никогда и блокирует повторный
     // Initialize: аллокаторы и командные листы могут ещё читаться GPU.
     bool m_terminalGpuFailure = false;
+
+    // F3.1: режимы тестирования. m_testMode включает readback buffer и
+    // автоматический depth-тест. m_fixedPose отключает орбитальную камеру
+    // для детерминированных прогонов.
+    bool m_testMode = false;
+    bool m_fixedPose = false;
 };

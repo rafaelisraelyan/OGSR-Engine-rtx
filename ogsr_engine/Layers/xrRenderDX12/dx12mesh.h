@@ -5,12 +5,13 @@
 
 using Microsoft::WRL::ComPtr;
 
-// F3.0: минимальный вспомогательный компонент для первого DX12-треугольника.
-// Вынесен из CHW12, чтобы CHW12 оставался владельцем только device/queue/
-// swapchain/fence, а владение геометрией и pipeline не смешивалось с ними.
+// F3.1: компонент геометрии — два куба с мировыми координатами, записанными
+// непосредственно в вершины (вариант A, §2.3 ТЗ). Depth-tested, с одной
+// общей ViewProjection на кадр.
 //
-// Это bootstrap-компонент, а не будущая публичная архитектура CRender12:
-// никаких абстракций материалов, нескольких PSO или менеджера ресурсов.
+// Переименован из SmokeTriangle12: содержание изменилось принципиально
+// (depth, MVP, куб), и имя «Triangle» на кубе сделало бы код лгущим.
+// Структура Create/OnUploadComplete/Draw/Quarantine/Release сохранена.
 //
 // Соглашения по lifetime:
 //  - Create() вызывается из CHW12::Initialize после CreateSynchronization,
@@ -19,19 +20,26 @@ using Microsoft::WRL::ComPtr;
 //    состояния allocator'а, поэтому пересоздание листов при resize
 //    его не затрагивает;
 //  - Release() вызывается из CHW12::Shutdown до ReportLiveObjects.
-class SmokeTriangle12
+//
+// Draw НЕ пишет в constant buffer: матрица одна на кадр и от объекта не
+// зависит (§2.3), поэтому между двумя draw call CB не перезаписывается.
+// GBV это не ловит: адрес выровнен и валиден, но второй куб получил бы
+// матрицу первого, а первый — потенциально мусор.
+class SmokeMesh12
 {
 public:
-    SmokeTriangle12() = default;
-    ~SmokeTriangle12();
+    static constexpr uint32_t kVertexCount = 72; // 2 куба × 36 вершин
 
-    SmokeTriangle12(const SmokeTriangle12&) = delete;
-    SmokeTriangle12& operator=(const SmokeTriangle12&) = delete;
+    SmokeMesh12() = default;
+    ~SmokeMesh12();
 
-    // device и queue берутся только на время Create: компонент не хранит их.
-    // Ожидание GPU после загрузки вершин выполняет вызывающий код через
-    // WaitForGpu: fence остаётся во владении CHW12, иначе значения сигналов
-    // треугольника и RenderFrame столкнулись бы на одном fence.
+    SmokeMesh12(const SmokeMesh12&) = delete;
+    SmokeMesh12& operator=(const SmokeMesh12&) = delete;
+
+    // device и queue берутся только на время Create: компонент не хранит
+    // их. Ожидание GPU после загрузки вершин выполняет вызывающий код
+    // через WaitForGpu: fence остаётся во владении CHW12, иначе значения
+    // сигналов меша и RenderFrame столкнулись бы на одном fence.
     bool Create(
         ID3D12Device* device,
         ID3D12CommandQueue* copyQueue,
@@ -44,11 +52,23 @@ public:
 
     // Записывает draw-команды в переданный command list. Вызывается из
     // CHW12::RenderFrame между ClearRenderTargetView и барьером в PRESENT.
-    void Draw(ID3D12GraphicsCommandList* cmd);
+    //
+    // cbVA — адрес constant buffer текущего слота (передаётся, а не
+    // пишется: Draw не трогает CB). Одна ViewProjection на кадр, оба
+    // draw call используют один адрес.
+    //
+    // Валидация диапазона обязательна: firstVertex + vertexCount <= 72,
+    // иначе запись в лог и выход без рисования. Выход за пределы буфера
+    // был бы GPU page fault.
+    void Draw(
+        ID3D12GraphicsCommandList* cmd,
+        D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+        UINT firstVertex,
+        UINT vertexCount);
 
     // Передаёт владение ресурсами карантину. Владение передаётся через
     // Detach(), поэтому счётчики ссылок не меняются и AddRef не нужен.
-    // После вызова деструктор SmokeTriangle12 эти объекты не освобождает:
+    // После вызова деструктор SmokeMesh12 эти объекты не освобождает:
     // соответствующие ComPtr равны nullptr, и Release() становится no-op.
     //
     // Вызывается только из CHW12 при неподтверждённом завершении GPU-работы.

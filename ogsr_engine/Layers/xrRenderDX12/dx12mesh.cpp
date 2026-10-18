@@ -1,42 +1,178 @@
 #include "stdafx.h"
-#include "dx12triangle.h"
+#include "dx12mesh.h"
 #include "dx12log.h"
 
 #include <d3dcompiler.h>
 #include <cstring>
 
-// Вершины в NDC: треугольник в центре окна, z = 0 попадает внутрь
-// [-1, 1] depth range. Для F3.0 достаточно одного атрибута POSITION.
-// Winding order намеренно не важен: PSO создаётся с CullMode = NONE.
+// Вершина: POSITION (R32G32B32_FLOAT) + COLOR (R32G32B32A32_FLOAT).
+// COLOR делает depth-тест наблюдаемым: перекрытие передних и задних
+// граней визуально не доказуемо, а цвет позволяет отличить ближний куб от
+// дальнего в readback (§4.4 ТЗ, D5).
 struct Vertex
 {
-    float x, y, z;
+    float x, y, z;       // POSITION
+    float r, g, b, a;    // COLOR
 };
 
-static const Vertex kTriangle[3] = {
-    { 0.0f,  0.6f, 0.0f},  // верхняя вершина
-    {-0.55f, -0.45f, 0.0f},  // нижняя левая
-    { 0.55f, -0.45f, 0.0f},  // нижняя правая
-};
+// Добавляет два треугольника грани куба: (v0,v1,v2) и (v0,v2,v3).
+// Winding order намеренно не важен: PSO создаётся с CullMode = NONE.
+static void AddFace(
+    Vertex* dst,
+    const Vertex& v0, const Vertex& v1, const Vertex& v2, const Vertex& v3)
+{
+    dst[0] = v0; dst[1] = v1; dst[2] = v2;
+    dst[3] = v0; dst[4] = v2; dst[5] = v3;
+}
+
+// Один vertex buffer на 72 вершины (два куба по 36), без индексного буфера —
+// индексы переносятся в F3.2. Раскладка:
+//   [0, 36)  — ближний куб, около origin
+//   [36, 72) — дальний куб, сдвинут по Z так, чтобы перекрываться на экране
+//
+// Мировые координаты записаны непосредственно в вершины (вариант A, §2.3 ТЗ).
+// Матрица одна на кадр и от объекта не зависит, поэтому между двумя draw
+// call CB не перезаписывается.
+static void BuildCubeVertices(Vertex (&vertices)[72])
+{
+    // --- Ближний куб: центр (0,0,0), размер 2 (от -1 до 1 по каждой оси) ---
+
+    // Передняя грань (z=1): красный
+    const Vertex nearFront[] = {
+        {-1.0f, -1.0f,  1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        { 1.0f, -1.0f,  1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        { 1.0f,  1.0f,  1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        {-1.0f,  1.0f,  1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    };
+    // Задняя грань (z=-1): зелёный
+    const Vertex nearBack[] = {
+        { 1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {-1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {-1.0f,  1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        { 1.0f,  1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+    };
+    // Левая грань (x=-1): синий
+    const Vertex nearLeft[] = {
+        {-1.0f, -1.0f,  1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        {-1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        {-1.0f,  1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        {-1.0f,  1.0f,  1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+    };
+    // Правая грань (x=1): жёлтый
+    const Vertex nearRight[] = {
+        { 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 1.0f, -1.0f,  1.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 1.0f,  1.0f,  1.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 1.0f,  1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+    };
+    // Верхняя грань (y=1): пурпурный
+    const Vertex nearTop[] = {
+        {-1.0f, 1.0f,  1.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        { 1.0f, 1.0f,  1.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        { 1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        {-1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+    };
+    // Нижняя грань (y=-1): голубой
+    const Vertex nearBottom[] = {
+        {-1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        { 1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        { 1.0f, -1.0f,  1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        {-1.0f, -1.0f,  1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+    };
+
+    AddFace(&vertices[0],  nearFront[0], nearFront[1], nearFront[2], nearFront[3]);
+    AddFace(&vertices[6],  nearBack[0], nearBack[1], nearBack[2], nearBack[3]);
+    AddFace(&vertices[12], nearLeft[0], nearLeft[1], nearLeft[2], nearLeft[3]);
+    AddFace(&vertices[18], nearRight[0], nearRight[1], nearRight[2], nearRight[3]);
+    AddFace(&vertices[24], nearTop[0], nearTop[1], nearTop[2], nearTop[3]);
+    AddFace(&vertices[30], nearBottom[0], nearBottom[1], nearBottom[2], nearBottom[3]);
+
+    // --- Дальний куб: центр (0,0,2), размер 4 (от -2 到 2 по x/y, 从 0 到 4 по z) ---
+
+    // Передняя грань (z=0): синий
+    const Vertex farFront[] = {
+        {-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        { 2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        { 2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+        {-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+    };
+    // Задняя грань (z=4): пурпурный
+    const Vertex farBack[] = {
+        { 2.0f, -2.0f, 4.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        {-2.0f, -2.0f, 4.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        {-2.0f,  2.0f, 4.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+        { 2.0f,  2.0f, 4.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+    };
+    // Левая грань (x=-2): зелёный
+    const Vertex farLeft[] = {
+        {-2.0f, -2.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {-2.0f, -2.0f, 4.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {-2.0f,  2.0f, 4.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {-2.0f,  2.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+    };
+    // Правая грань (x=2): жёлтый
+    const Vertex farRight[] = {
+        { 2.0f, -2.0f, 4.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 2.0f, -2.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 2.0f,  2.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+        { 2.0f,  2.0f, 4.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+    };
+    // Верхняя грань (y=2): голубой
+    const Vertex farTop[] = {
+        {-2.0f, 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        { 2.0f, 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        { 2.0f, 2.0f, 4.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        {-2.0f, 2.0f, 4.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+    };
+    // Нижняя грань (y=-2): красный
+    const Vertex farBottom[] = {
+        {-2.0f, -2.0f, 4.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        { 2.0f, -2.0f, 4.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        { 2.0f, -2.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+        {-2.0f, -2.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    };
+
+    AddFace(&vertices[36], farFront[0], farFront[1], farFront[2], farFront[3]);
+    AddFace(&vertices[42], farBack[0], farBack[1], farBack[2], farBack[3]);
+    AddFace(&vertices[48], farLeft[0], farLeft[1], farLeft[2], farLeft[3]);
+    AddFace(&vertices[54], farRight[0], farRight[1], farRight[2], farRight[3]);
+    AddFace(&vertices[60], farTop[0], farTop[1], farTop[2], farTop[3]);
+    AddFace(&vertices[66], farBottom[0], farBottom[1], farBottom[2], farBottom[3]);
+}
 
 // Шейдеры держим строками в коде: отдельный .hlsl потребовал бы либо
-// компиляции на этапе сборки, либо пути к файлу в рантайме. Для одного
-// треугольника строковый вариант проще и не добавляет зависимостей.
+// компиляции на этапе сборки, либо пути к файлу в рантайме. Для двух
+// кубов строковый вариант проще и не добавляет зависимостей.
 static const char* kVertexShaderSrc = R"(
 struct VSInput
 {
     float3 position : POSITION;
+    float4 color    : COLOR;
 };
 
 struct VSOutput
 {
     float4 position : SV_Position;
+    float4 color    : COLOR;
+};
+
+// ViewProjection приходит из constant buffer (register b0).
+// mul(float4, float4x4) — вектор СЛЕВА, что согласовано с row-vector
+// конвенцией DirectXMath и транспонированием на CPU (§6.3 ТЗ).
+// Комбинация «transpose на CPU + mul(matrix, vector)» ЗАПРЕЩЕНА:
+// она применит матрицу дважды транспонированно, то есть исходную
+// viewProj в другом порядке. Рендер даст искажённую геометрию,
+// validation промолчит.
+cbuffer ViewProjectionCB : register(b0)
+{
+    float4x4 ViewProjection;
 };
 
 VSOutput main(VSInput input)
 {
     VSOutput output;
-    output.position = float4(input.position, 1.0f);
+    output.position = mul(float4(input.position, 1.0f), ViewProjection);
+    output.color = input.color;
     return output;
 }
 )";
@@ -45,11 +181,12 @@ static const char* kPixelShaderSrc = R"(
 struct PSInput
 {
     float4 position : SV_Position;
+    float4 color    : COLOR;
 };
 
 float4 main(PSInput input) : SV_Target
 {
-    return float4(1.0f, 0.55f, 0.12f, 1.0f);
+    return input.color;
 }
 )";
 
@@ -69,7 +206,7 @@ bool CompileShader(
     HRESULT hr = D3DCompile(
         source,
         strlen(source),
-        "dx12triangle_inline",
+        "dx12mesh_inline",
         nullptr,
         nullptr,
         entryPoint,
@@ -83,13 +220,13 @@ bool CompileShader(
     {
         if (errorBlob)
         {
-            dx12log::Write("[DX12][triangle] shader compile failed (%s / %s), hr=0x%08X: %s",
+            dx12log::Write("[DX12][mesh] shader compile failed (%s / %s), hr=0x%08X: %s",
                            entryPoint, target, static_cast<unsigned>(hr),
                            static_cast<const char*>(errorBlob->GetBufferPointer()));
         }
         else
         {
-            dx12log::Write("[DX12][triangle] shader compile failed (%s / %s), hr=0x%08X, no diagnostic",
+            dx12log::Write("[DX12][mesh] shader compile failed (%s / %s), hr=0x%08X, no diagnostic",
                            entryPoint, target, static_cast<unsigned>(hr));
         }
         return false;
@@ -99,12 +236,12 @@ bool CompileShader(
 }
 }  // namespace
 
-SmokeTriangle12::~SmokeTriangle12()
+SmokeMesh12::~SmokeMesh12()
 {
     Release();
 }
 
-bool SmokeTriangle12::Create(
+bool SmokeMesh12::Create(
     ID3D12Device* device,
     ID3D12CommandQueue* copyQueue,
     ID3D12CommandAllocator* copyAllocator,
@@ -112,13 +249,13 @@ bool SmokeTriangle12::Create(
 {
     if (m_created)
     {
-        dx12log::Write("[DX12][triangle] Create called twice, refusing");
+        dx12log::Write("[DX12][mesh] Create called twice, refusing");
         return false;
     }
 
     if (!device || !copyQueue || !copyAllocator || !copyCommandList)
     {
-        dx12log::Write("[DX12][triangle] Create refused: null dependency");
+        dx12log::Write("[DX12][mesh] Create refused: null dependency");
         return false;
     }
 
@@ -134,15 +271,16 @@ bool SmokeTriangle12::Create(
     // Загрузка вершин через upload heap. Ожидание GPU выполняет вызывающий
     // код (CHW12::Initialize) через WaitForGpu: компонент не владеет fence,
     // чтобы все значения сигналов остались в одном месте. Иначе значения
-    // треугольника и RenderFrame столкнулись бы на одном fence.
+    // меша и RenderFrame столкнулись бы на одном fence.
     D3D12_HEAP_PROPERTIES uploadHeapProps = {};
     uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
     uploadHeapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
     uploadHeapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
 
+    // Размер — все 72 вершины. Вершинный буфер при resize не пересоздаётся.
     D3D12_RESOURCE_DESC uploadDesc = {};
     uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDesc.Width = sizeof(kTriangle);
+    uploadDesc.Width = sizeof(Vertex) * kVertexCount;
     uploadDesc.Height = 1;
     uploadDesc.DepthOrArraySize = 1;
     uploadDesc.MipLevels = 1;
@@ -159,7 +297,7 @@ bool SmokeTriangle12::Create(
         IID_PPV_ARGS(&m_uploadBuffer));
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] CreateCommittedResource(upload) failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] CreateCommittedResource(upload) failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         return false;
     }
@@ -169,12 +307,17 @@ bool SmokeTriangle12::Create(
     hr = m_uploadBuffer->Map(0, &readRange, &mapped);
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] upload buffer Map failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] upload buffer Map failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         m_uploadBuffer.Reset();
         return false;
     }
-    memcpy(mapped, kTriangle, sizeof(kTriangle));
+
+    // Копируем вершины в upload buffer. BuildCubeVertices заполняет массив
+    // по ссылке, поэтому memcpy выполняется один раз.
+    Vertex vertices[kVertexCount];
+    BuildCubeVertices(vertices);
+    memcpy(mapped, vertices, sizeof(vertices));
     m_uploadBuffer->Unmap(0, nullptr);
 
     // Командный лист для копии берём у вызывающего: CHW12::CreateFrameResources
@@ -183,14 +326,14 @@ bool SmokeTriangle12::Create(
     hr = copyCommandList->Reset(copyAllocator, nullptr);
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] copy command list Reset failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] copy command list Reset failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         m_uploadBuffer.Reset();
         return false;
     }
 
     copyCommandList->CopyBufferRegion(
-        m_vertexBuffer.Get(), 0, m_uploadBuffer.Get(), 0, sizeof(kTriangle));
+        m_vertexBuffer.Get(), 0, m_uploadBuffer.Get(), 0, sizeof(Vertex) * kVertexCount);
 
     // StateBefore = COPY_DEST, хотя буфер создан в COMMON: при первом
     // использовании в CopyBufferRegion выше Debug Layer неявно продвинул
@@ -208,7 +351,7 @@ bool SmokeTriangle12::Create(
     hr = copyCommandList->Close();
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] copy command list Close failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] copy command list Close failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         m_uploadBuffer.Reset();
         return false;
@@ -240,13 +383,13 @@ bool SmokeTriangle12::Create(
     // вызовет только после успешного WaitForGpu(): до этого GPU ещё читает
     // из upload buffer.
     m_copySubmitted = true;
-    dx12log::Write("[DX12][triangle] vertex upload submitted, awaiting GPU drain");
+    dx12log::Write("[DX12][mesh] vertex upload submitted, awaiting GPU drain");
     return true;
 }
 
 // Вызывается из CHW12::Initialize после Create и успешного WaitForGpu.
 // GPU завершил копирование, поэтому upload buffer можно освободить.
-void SmokeTriangle12::OnUploadComplete()
+void SmokeMesh12::OnUploadComplete()
 {
     if (!m_copySubmitted)
         return;
@@ -255,10 +398,11 @@ void SmokeTriangle12::OnUploadComplete()
     m_copySubmitted = false;
     m_created = true;
 
-    dx12log::Write("[DX12][triangle] created: 3 vertices, root signature and PSO ready");
+    dx12log::Write("[DX12][mesh] created: %u vertices (2 cubes), root signature and PSO ready",
+                   kVertexCount);
 }
 
-bool SmokeTriangle12::CreateVertexBuffer(ID3D12Device* device)
+bool SmokeMesh12::CreateVertexBuffer(ID3D12Device* device)
 {
     D3D12_HEAP_PROPERTIES defaultHeapProps = {};
     defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -267,7 +411,7 @@ bool SmokeTriangle12::CreateVertexBuffer(ID3D12Device* device)
 
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = sizeof(kTriangle);
+    desc.Width = sizeof(Vertex) * kVertexCount;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -306,27 +450,37 @@ bool SmokeTriangle12::CreateVertexBuffer(ID3D12Device* device)
         IID_PPV_ARGS(&m_vertexBuffer));
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] CreateCommittedResource(vertex) failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] CreateCommittedResource(vertex) failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         return false;
     }
 
     m_vertexBufferView.BufferLocation = m_vertexBuffer->GetGPUVirtualAddress();
-    m_vertexBufferView.SizeInBytes = sizeof(kTriangle);
+    m_vertexBufferView.SizeInBytes = sizeof(Vertex) * kVertexCount;
     m_vertexBufferView.StrideInBytes = sizeof(Vertex);
 
     return true;
 }
 
-bool SmokeTriangle12::CreateRootSignature(ID3D12Device* device)
+bool SmokeMesh12::CreateRootSignature(ID3D12Device* device)
 {
-    // Пустая root signature: параметров, CBV/SRV/UAV и сэмплеров нет.
+    // Один root parameter: CBV, register 0, ShaderVisibility_ALL.
+    // Дескриптор не нужен: адрес передаётся через
+    // SetGraphicsRootConstantBufferView. Убирает CBV_SRV_UAV heap,
+    // шейдер-visible heap и его пересоздание при resize.
+    //
     // Флаг ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT обязателен, иначе лист
     // с IASetVertexBuffers не пройдёт validation: по умолчанию IA
     // считается выключенным для root signature.
+    D3D12_ROOT_PARAMETER rootParam = {};
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParam.Descriptor.ShaderRegister = 0;
+    rootParam.Descriptor.RegisterSpace = 0;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 0;
-    desc.pParameters = nullptr;
+    desc.NumParameters = 1;
+    desc.pParameters = &rootParam;
     desc.NumStaticSamplers = 0;
     desc.pStaticSamplers = nullptr;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -340,13 +494,13 @@ bool SmokeTriangle12::CreateRootSignature(ID3D12Device* device)
     {
         if (error)
         {
-            dx12log::Write("[DX12][triangle] SerializeRootSignature failed, hr=0x%08X: %s",
+            dx12log::Write("[DX12][mesh] SerializeRootSignature failed, hr=0x%08X: %s",
                            static_cast<unsigned>(hr),
                            static_cast<const char*>(error->GetBufferPointer()));
         }
         else
         {
-            dx12log::Write("[DX12][triangle] SerializeRootSignature failed, hr=0x%08X, no diagnostic",
+            dx12log::Write("[DX12][mesh] SerializeRootSignature failed, hr=0x%08X, no diagnostic",
                            static_cast<unsigned>(hr));
         }
         return false;
@@ -359,7 +513,7 @@ bool SmokeTriangle12::CreateRootSignature(ID3D12Device* device)
         IID_PPV_ARGS(&m_rootSignature));
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] CreateRootSignature failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] CreateRootSignature failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         return false;
     }
@@ -367,7 +521,7 @@ bool SmokeTriangle12::CreateRootSignature(ID3D12Device* device)
     return true;
 }
 
-bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
+bool SmokeMesh12::CreatePipelineState(ID3D12Device* device)
 {
     ComPtr<ID3D10Blob> vertexShader;
     ComPtr<ID3D10Blob> pixelShader;
@@ -381,6 +535,8 @@ bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
@@ -390,7 +546,7 @@ bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
     desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
     desc.PS.BytecodeLength = pixelShader->GetBufferSize();
     desc.InputLayout.pInputElementDescs = inputLayout;
-    desc.InputLayout.NumElements = 1;
+    desc.InputLayout.NumElements = 2;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 
     // Формат совпадает с BACKBUFFER_FORMAT в CHW12.
@@ -399,14 +555,19 @@ bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
     desc.SampleDesc.Count = 1;
     desc.SampleMask = UINT_MAX;
 
-    desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
-    desc.DepthStencilState.DepthEnable = FALSE;
+    // DSVFormat обязан совпадать с форматом depth buffer (D32_FLOAT).
+    // Расхождение даёт validation error, то есть детектируемо.
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     desc.DepthStencilState.StencilEnable = FALSE;
 
     desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
-    // CullMode NONE исключает ошибки winding order на первом треугольнике.
+    // CullMode NONE сохраняется: F3.1 валидирует глубину, а не winding order.
+    // Winding проверяется на реальном формате вершин OGSR в F3.2.
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.FrontCounterClockwise = FALSE;
@@ -415,7 +576,7 @@ bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
     HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_pipelineState));
     if (FAILED(hr))
     {
-        dx12log::Write("[DX12][triangle] CreateGraphicsPipelineState failed, hr=0x%08X",
+        dx12log::Write("[DX12][mesh] CreateGraphicsPipelineState failed, hr=0x%08X",
                        static_cast<unsigned>(hr));
         return false;
     }
@@ -423,27 +584,41 @@ bool SmokeTriangle12::CreatePipelineState(ID3D12Device* device)
     return true;
 }
 
-void SmokeTriangle12::Draw(ID3D12GraphicsCommandList* cmd)
+void SmokeMesh12::Draw(
+    ID3D12GraphicsCommandList* cmd,
+    D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+    UINT firstVertex,
+    UINT vertexCount)
 {
     if (!m_created || !cmd)
         return;
+
+    // Валидация диапазона обязательна: выход за пределы буфера был бы GPU
+    // page fault. GBV это не ловит: адрес выровнен и валиден, но чтение
+    // за пределами буфера неопределённо.
+    if (firstVertex + vertexCount > kVertexCount)
+    {
+        dx12log::Write("[DX12][mesh] Draw refused: firstVertex=%u + vertexCount=%u > %u",
+                       firstVertex, vertexCount, kVertexCount);
+        return;
+    }
 
     cmd->SetGraphicsRootSignature(m_rootSignature.Get());
     cmd->SetPipelineState(m_pipelineState.Get());
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd->IASetVertexBuffers(0, 1, &m_vertexBufferView);
-
-    cmd->DrawInstanced(3, 1, 0, 0);
+    cmd->SetGraphicsRootConstantBufferView(0, cbVA);
+    cmd->DrawInstanced(vertexCount, 1, firstVertex, 0);
 }
 
-void SmokeTriangle12::Quarantine(
+void SmokeMesh12::Quarantine(
     ID3D12Resource*& outVertexBuffer,
     ID3D12Resource*& outUploadBuffer,
     ID3D12RootSignature*& outRootSignature,
     ID3D12PipelineState*& outPipelineState)
 {
     // Detach() снимает владение без вызова Release: счётчик ссылок каждого
-    // объекта не меняется. Деструктор SmokeTriangle12 после этого ничего не
+    // объекта не меняется. Деструктор SmokeMesh12 после этого ничего не
     // освобождает, потому что ComPtr равны nullptr.
     outVertexBuffer  = m_vertexBuffer.Detach();
     outUploadBuffer  = m_uploadBuffer.Detach();
@@ -457,7 +632,7 @@ void SmokeTriangle12::Quarantine(
     m_copySubmitted = false;
 }
 
-void SmokeTriangle12::Release()
+void SmokeMesh12::Release()
 {
     // Проверяем сами объекты, а не m_created: при частично неуспешном Create
     // (например, root signature создана, а PSO упал) ресурсы уже существуют,
@@ -476,5 +651,5 @@ void SmokeTriangle12::Release()
 
     m_created = false;
     m_copySubmitted = false;
-    dx12log::Write("[DX12][triangle] released");
+    dx12log::Write("[DX12][mesh] released");
 }
