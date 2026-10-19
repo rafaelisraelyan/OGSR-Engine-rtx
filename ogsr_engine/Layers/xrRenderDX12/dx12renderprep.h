@@ -47,7 +47,7 @@ struct DrawPacket12 {
     Object12 object;
     DirectX::XMFLOAT3 worldMinimum{}, worldMaximum{};
     Sphere12 worldSphere{};
-    bool visible{}; // Диагностика: никогда не исключает Draw.
+    bool visible{}; // В Prepare — диагностика; CPU PrepareVisible выполняет compaction.
 };
 struct PreparedFrame12 {
     DirectX::XMFLOAT4X4 shaderCamera{};
@@ -62,6 +62,15 @@ struct Timings12 {
 PreparedFrame12 Prepare(const RenderSceneSnapshot12&, uint64_t liveGeneration,
     Mode, gr::jobs::JobSystem*, Timings12&);
 bool Equivalent(const PreparedFrame12&, const PreparedFrame12&);
+struct VisibilityPhases12 {
+    double preparation{}, visibility{}, blockCounts{}, prefix{}, scatter{}, total{};
+};
+struct VisibilityTimings12 { VisibilityPhases12 serial{}, parallel{}; };
+// Только representative CPU-сцена. GPU-потребитель продолжает вызывать Prepare.
+// Все стадии завершены до возврата; при исключении кадр не публикуется.
+PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12&, uint64_t liveGeneration,
+    Mode, gr::jobs::JobSystem*, VisibilityTimings12&);
 bool RunTests();
 bool RunRepresentativeTests();
+bool RunVisibilityTests();
 }

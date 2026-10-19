@@ -7,6 +7,10 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#ifdef GR_JOBS_TESTING
+#include "../JobSystem/tests/JobTestHooks.h"
+#include "tests/visibility_test_hooks.h"
+#endif
 
 namespace renderprep12 {
 namespace {
@@ -179,6 +183,200 @@ bool RunRepresentativeTests() {
         }
     } catch(const std::exception& e) { ++failures; dx12log::Write("[snapshot-test] exception: %s",e.what()); }
     dx12log::Write("[snapshot-test] %s checks=%llu failures=%llu",failures?"FAIL":"PASS",(unsigned long long)checks,(unsigned long long)failures);
+    return failures==0;
+}
+}
+
+namespace renderprep12 {
+namespace {
+// Независимый геометрический oracle для двух известных frustum.
+// Ortho: пересечение с [-1,1]² x [0,1]. Perspective: сечения [-z,z]²,
+// z в [1,2]; достаточно самого широкого доступного сечения. Плоскости
+// из camera matrix не извлекаются; production support/interval helpers не вызываются.
+bool FrustumOracle(const DrawPacket12& p, bool perspective) {
+    const auto& o=p.object;
+    if ((o.flags&Invisible) || o.opacity==0 || !o.visibility.mask) return false;
+    if (o.flags&Hud) return true;
+    const double zlo=(std::max)(double(p.worldMinimum.z),perspective?1.0:0.0);
+    const double zhi=(std::min)(double(p.worldMaximum.z),perspective?2.0:1.0);
+    if (zlo>zhi) return false;
+    const double extent=perspective?zhi:1.0;
+    return double(p.worldMinimum.x)<=extent && double(p.worldMaximum.x)>=-extent &&
+        double(p.worldMinimum.y)<=extent && double(p.worldMaximum.y)>=-extent;
+}
+DirectX::XMFLOAT4X4 OracleCamera(bool perspective) {
+    DirectX::XMFLOAT4X4 m;
+    DirectX::XMStoreFloat4x4(&m,DirectX::XMMatrixIdentity());
+    if (perspective) { m._33=2; m._34=1; m._43=-2; m._44=0; }
+    return m;
+}
+}
+bool RunVisibilityTests() {
+    uint64_t checks=0,failures=0;
+    const auto check=[&](bool value) { ++checks; if (!value) ++failures; };
+    const auto rejects=[&](auto&& action) { bool threw=false; try { action(); } catch(const std::exception&) { threw=true; } check(threw); };
+    try {
+        for (uint32_t workers:{1u,2u,4u,8u}) {
+            gr::jobs::JobSystem jobs; gr::jobs::JobConfig config;
+            config.backgroundWorkers=workers; config.automaticWorkers=false; check(jobs.Initialize(config));
+            VisibilityTimings12 timing;
+            for (bool perspective:{false,true}) {
+                const auto camera=OracleCamera(perspective);
+                // Границы блоков, пустой/полностью видимый/полностью скрытый список.
+                for (uint32_t count:{0u,1u,127u,128u,129u,255u,256u,257u}) {
+                    for (unsigned pattern=0;pattern<3;++pattern) {
+                        auto objects=Scene(count);
+                        for (uint32_t i=0;i<count;++i) {
+                            auto& o=objects[i];
+                            DirectX::XMStoreFloat4x4(&o.world,DirectX::XMMatrixIdentity());
+                            o.minimum={-0.1f,-0.1f,1}; o.maximum={0.1f,0.1f,1};
+                            o.flags=pattern==1 || (pattern==2 && i%3==0)?Invisible:0; o.opacity=1;
+                            // Порядок ID намеренно обратный: compaction не должна сортировать.
+                            o.id=count-i;
+                        }
+                        const RenderSceneSnapshot12 snapshot(camera,objects,42);
+                        Timings12 oldTime; auto expected=Prepare(snapshot,42,Mode::Serial,nullptr,oldTime);
+                        std::erase_if(expected.packets,[&](auto& p) { p.visible=FrustumOracle(p,perspective); return !p.visible; });
+                        for (Mode mode:{Mode::Serial,Mode::Parallel,Mode::Verify})
+                            check(Equivalent(expected,PrepareVisible(snapshot,42,mode,&jobs,timing)));
+                    }
+                }
+                std::vector<Object12> cases;
+                const auto add=[&](DirectX::XMFLOAT3 lo,DirectX::XMFLOAT3 hi,uint32_t flags=0) {
+                    auto o=Scene(1).front(); o.id=cases.size()+1; o.minimum=lo; o.maximum=hi;
+                    o.flags=flags; o.opacity=1;
+                    DirectX::XMStoreFloat4x4(&o.world,DirectX::XMMatrixIdentity()); cases.push_back(o);
+                };
+                const float nearZ=perspective?1.f:0.f,farZ=perspective?2.f:1.f;
+                for (float z:{std::nextafter(nearZ,-INFINITY),nearZ,std::nextafter(nearZ,INFINITY),
+                              std::nextafter(farZ,-INFINITY),farZ,std::nextafter(farZ,INFINITY)}) add({0,0,z},{0,0,z});
+                for (float edge:{-1.f,1.f}) for (float x:{std::nextafter(edge,-INFINITY),edge,std::nextafter(edge,INFINITY)}) {
+                    add({x,0,1},{x,0,1}); add({0,x,1},{0,x,1});
+                }
+                add({-10,-10,-10},{10,10,10}); // Frustum целиком внутри AABB; ни один угол не внутри frustum.
+                add({-0.1f,-0.1f,-1},{0.1f,0.1f,1.5f}); // Охват камеры и near plane.
+                add({-0.1f,-0.1f,-2},{0.1f,0.1f,-1});
+                add({-2,-0.1f,0.5f},{2,0.1f,1.5f});
+                add({100,100,100},{101,101,101},Hud);
+                add({100,100,100},{101,101,101},Hud|Invisible);
+                add({0,0,1},{0,0,1},Transparent); cases.back().opacity=0;
+                add({0,0,1},{0,0,1},Hud); cases.back().visibility.mask=0;
+                // Детерминированные AABB на бинарной сетке, oracle с точной геометрией.
+                uint32_t seed=7931;
+                const auto sample=[&]() { seed=1664525u*seed+1013904223u; return float((seed>>16)%65)/8-4; };
+                for (unsigned i=0;i<1000;++i) {
+                    const float x=sample(),y=sample(),z=sample();
+                    add({x,y,z},{x+0.5f,y+0.25f,z+0.5f});
+                }
+                const RenderSceneSnapshot12 snapshot(camera,cases,42);
+                Timings12 oldTime; const auto unfiltered=Prepare(snapshot,42,Mode::Serial,nullptr,oldTime);
+                const auto expected=PrepareVisible(snapshot,42,Mode::Serial,nullptr,timing);
+                for (Mode mode:{Mode::Serial,Mode::Parallel,Mode::Verify}) {
+                    const auto actual=PrepareVisible(snapshot,42,mode,&jobs,timing);
+                    check(Equivalent(expected,actual));
+                    auto metadata=unfiltered;
+                    std::erase_if(metadata.packets,[&](auto& p) {
+                        p.visible=true;
+                        return !std::any_of(actual.packets.begin(),actual.packets.end(),[&](const auto& q) { return q.object.id==p.object.id; });
+                    });
+                    check(Equivalent(metadata,actual)); // Все поля и порядок исходного snapshot.
+                    for (size_t i=0;i<unfiltered.packets.size();++i) {
+                        const auto& p=unfiltered.packets[i];
+                        const bool oracle=FrustumOracle(p,perspective);
+                        const bool present=std::any_of(actual.packets.begin(),actual.packets.end(),[&](const auto& q) { return q.object.id==p.object.id; });
+                        // Для произвольных AABB допускается консервативное лишнее включение
+                        // у рёбер frustum, но ни одного false negative относительно точного oracle.
+                        check(!oracle || present);
+                        if (i<26) check(oracle==present);
+                    }
+                }
+                auto published=expected;
+#ifdef GR_JOBS_TESTING
+                // Отдельная ASan-сборка: реальные ветки отказа регистрации и Submit.
+                for (Mode mode:{Mode::Parallel,Mode::Verify}) {
+                    for (auto phase:{testing::Phase::Counts,testing::Phase::Scatter}) {
+                        const auto before=jobs.GetStats();
+                        const auto failuresBefore=testing::failures.load();
+                        check(testing::active==0 && testing::entered==testing::exited);
+                        testing::failPhase=phase;
+                        rejects([&] { published=PrepareVisible(snapshot,42,mode,&jobs,timing); });
+                        check(testing::failPhase==testing::Phase::None && testing::failures==failuresBefore+1);
+                        check(testing::active==0 && testing::entered==testing::exited);
+                        const auto after=jobs.GetStats();
+                        check(after.tasksSubmitted==after.tasksCompleted &&
+                            after.tasksSubmitted-before.tasksSubmitted==(phase==testing::Phase::Counts?3u:4u));
+                        check(after.jobFailures==before.jobFailures+1 && after.unobservedFailures==before.unobservedFailures);
+                        check(Equivalent(published,expected));
+                        // После исключения та же система и snapshot вновь пригодны к работе.
+                        published=PrepareVisible(snapshot,42,mode,&jobs,timing);
+                        check(Equivalent(published,expected));
+                        check(testing::active==0 && testing::entered==testing::exited);
+                    }
+                    gr::jobs::testing::failRegistration=true;
+                    rejects([&] { published=PrepareVisible(snapshot,42,mode,&jobs,timing); });
+                    check(!gr::jobs::testing::failRegistration && Equivalent(published,expected));
+                    gr::jobs::testing::failSubmit=true;
+                    rejects([&] { published=PrepareVisible(snapshot,42,mode,&jobs,timing); });
+                    check(!gr::jobs::testing::failSubmit && Equivalent(published,expected));
+                }
+#endif
+                for (unsigned fault=0;fault<5;++fault) {
+                    auto bad=cases;
+                    auto& o=bad.back();
+                    if (fault==0) ++o.visual.generation;
+                    if (fault==1) o.minimum.x=o.maximum.x+1;
+                    if (fault==2) o.flags=0x80000000;
+                    if (fault==3) o.world._11=std::numeric_limits<float>::quiet_NaN();
+                    if (fault==4) o.opacity=-1;
+                    const RenderSceneSnapshot12 invalid(camera,bad,42);
+                    for (Mode mode:{Mode::Serial,Mode::Parallel,Mode::Verify}) {
+                        rejects([&] { published=PrepareVisible(invalid,42,mode,&jobs,timing); });
+                        check(Equivalent(published,expected));
+                    }
+                }
+                rejects([&] { published=PrepareVisible(snapshot,43,Mode::Parallel,&jobs,timing); });
+                rejects([&] { published=PrepareVisible(snapshot,42,Mode::Parallel,nullptr,timing); });
+                rejects([&] { published=PrepareVisible(snapshot,42,static_cast<Mode>(99),&jobs,timing); });
+                check(Equivalent(published,expected));
+                jobs.Shutdown();
+                rejects([&] { published=PrepareVisible(snapshot,42,Mode::Verify,&jobs,timing); });
+                check(Equivalent(published,expected));
+                check(jobs.Initialize(config));
+                check(Equivalent(expected,PrepareVisible(snapshot,42,Mode::Verify,&jobs,timing)));
+            }
+            for (uint32_t count:{256u,1024u,4096u,16384u}) {
+                const auto objects=Scene(count);
+                SmokeCamera12 camera; camera.SetAspect(16.f/9); camera.SetOrbit(1);
+                const RenderSceneSnapshot12 snapshot(camera.CaptureViewProjection(),objects,42);
+                VisibilityPhases12 sums[2]{};
+                size_t visible=0;
+                for (unsigned sample=0;sample<120;++sample) {
+                    VisibilityTimings12 s,p; PreparedFrame12 a,b;
+                    if (sample%2) { b=PrepareVisible(snapshot,42,Mode::Parallel,&jobs,p); a=PrepareVisible(snapshot,42,Mode::Serial,nullptr,s); }
+                    else { a=PrepareVisible(snapshot,42,Mode::Serial,nullptr,s); b=PrepareVisible(snapshot,42,Mode::Parallel,&jobs,p); }
+                    check(Equivalent(a,b)); visible=a.packets.size();
+                    uint64_t previous=0;
+                    for (const auto& packet:a.packets) { check(packet.visible && packet.object.id>previous); previous=packet.object.id; }
+                    if (sample>=20) {
+                        const VisibilityPhases12 phases[]={s.serial,p.parallel};
+                        for (unsigned i=0;i<2;++i) {
+                            sums[i].preparation+=phases[i].preparation; sums[i].visibility+=phases[i].visibility;
+                            sums[i].blockCounts+=phases[i].blockCounts; sums[i].prefix+=phases[i].prefix;
+                            sums[i].scatter+=phases[i].scatter; sums[i].total+=phases[i].total;
+                        }
+                    }
+                }
+                check(Equivalent(PrepareVisible(snapshot,42,Mode::Serial,nullptr,timing),PrepareVisible(snapshot,42,Mode::Verify,&jobs,timing)));
+                for (unsigned i=0;i<2;++i) {
+                    const auto& t=sums[i];
+                    dx12log::Write("[visibility-bench] objects=%u visible=%llu workers=%u mode=%s samples=100 preparation=%.6f visibility=%.6f counts=%.6f prefix=%.6f scatter=%.6f total=%.6f ms",
+                        count,(unsigned long long)visible,workers,i?"parallel":"serial",t.preparation/100,t.visibility/100,t.blockCounts/100,t.prefix/100,t.scatter/100,t.total/100);
+                }
+            }
+            jobs.Shutdown();
+        }
+    } catch(const std::exception& e) { ++failures; dx12log::Write("[visibility-test] exception: %s",e.what()); }
+    dx12log::Write("[visibility-test] %s checks=%llu failures=%llu",failures?"FAIL":"PASS",(unsigned long long)checks,(unsigned long long)failures);
     return failures==0;
 }
 }

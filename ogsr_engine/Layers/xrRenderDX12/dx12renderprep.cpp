@@ -9,6 +9,9 @@
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
+#ifdef GR_JOBS_TESTING
+#include "tests/visibility_test_hooks.h"
+#endif
 namespace renderprep12 {
 using namespace DirectX;
 using Clock = std::chrono::steady_clock;
@@ -62,7 +65,7 @@ static void AffineInterval(const float* lo, const float* hi, const XMFLOAT4X4& m
 static bool ValidResource(Resource12 r) {
     return std::find(SyntheticResources12.begin(),SyntheticResources12.end(),r)!=SyntheticResources12.end();
 }
-static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera) {
+static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera, bool diagnosticClip=true) {
     if (!o.vertexCount || o.firstVertex > 72 || o.vertexCount > 72-o.firstVertex ||
         !Finite(o.world) || o.world._14 != 0 || o.world._24 != 0 || o.world._34 != 0 || o.world._44 != 1)
         throw std::invalid_argument("invalid render object");
@@ -78,7 +81,7 @@ static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera) {
     DrawPacket12 p{}; p.object=o;
     bool outside[6] = {true,true,true,true,true,true};
     // Консервативный clip test восьми углов; совпадение путей не заменяет oracle.
-    for (int c=0;c<8;++c) {
+    for (int c=0;diagnosticClip && c<8;++c) {
         const auto v = XMVectorSet((c&1)?hi[0]:lo[0],(c&2)?hi[1]:lo[1],(c&4)?hi[2]:lo[2],1);
         const auto world = XMVector4Transform(v,XMLoadFloat4x4(&o.world));
         XMFLOAT4 w, clip; XMStoreFloat4(&w,world);
@@ -191,6 +194,132 @@ PreparedFrame12 Prepare(const RenderSceneSnapshot12& snapshot, uint64_t liveGene
     if (mode==Mode::Parallel) return run(true);
     const auto serial=run(false); const auto parallel=run(true);
     if (!Equivalent(serial,parallel)) throw std::runtime_error("render preparation mismatch");
+    return parallel;
+}
+}
+
+namespace renderprep12 {
+namespace {
+// Row-vector camera: -w <= x,y <= w, 0 <= z <= w (D3D12).
+// Верхняя оценка support AABB: удаляем только строго вне одной плоскости.
+// Не нормализуем плоскости, не делим на w; касание и охват камеры сохраняются.
+bool VisibleWorld(const DrawPacket12& packet, const DirectX::XMFLOAT4X4& camera) {
+    const auto& o=packet.object;
+    if ((o.flags&Invisible) || o.opacity==0 || !o.visibility.mask) return false;
+    if (o.flags&Hud) return true;
+    const float lo[]={packet.worldMinimum.x,packet.worldMinimum.y,packet.worldMinimum.z};
+    const float hi[]={packet.worldMaximum.x,packet.worldMaximum.y,packet.worldMaximum.z};
+    for (unsigned plane=0;plane<6;++plane) {
+        double lower[4], upperPlane[4];
+        for (unsigned i=0;i<4;++i) {
+            if (plane==4) lower[i]=upperPlane[i]=camera.m[i][2];
+            else {
+                const unsigned axis=plane<4?plane/2:2;
+                const double sign=(plane%2)?-1.0:1.0;
+                // Интервал сохраняет малое слагаемое при разных порядках.
+                lower[i]=AddOutward(camera.m[i][3],sign*double(camera.m[i][axis]),false);
+                upperPlane[i]=AddOutward(camera.m[i][3],sign*double(camera.m[i][axis]),true);
+            }
+        }
+        double upper=upperPlane[3];
+        for (unsigned i=0;i<3;++i) {
+            const double product=std::nextafter(std::max({double(lo[i])*lower[i],double(lo[i])*upperPlane[i],
+                double(hi[i])*lower[i],double(hi[i])*upperPlane[i]}),INFINITY);
+            upper=AddOutward(upper,product,true);
+        }
+        if (upper<0) return false;
+    }
+    return true;
+}
+}
+PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t liveGeneration,
+    Mode mode, gr::jobs::JobSystem* jobs, VisibilityTimings12& timings) {
+    timings={};
+    if (!liveGeneration || snapshot.Generation()!=liveGeneration || !Finite(snapshot.Camera()))
+        throw std::invalid_argument("invalid visibility snapshot");
+    if (mode!=Mode::Serial && mode!=Mode::Parallel && mode!=Mode::Verify)
+        throw std::invalid_argument("invalid visibility mode");
+    if (mode!=Mode::Serial && (!jobs || !jobs->IsInitialized()))
+        throw std::runtime_error("visibility requires running JobSystem");
+    const size_t count=snapshot.Objects().size();
+    if (count>UINT32_MAX) throw std::length_error("visibility count overflow");
+    constexpr size_t blockSize=128;
+    const size_t blocks=count/blockSize+(count%blockSize!=0);
+    const auto run=[&](bool parallel, VisibilityPhases12& time) {
+        const auto start=Clock::now();
+        std::vector<DrawPacket12> scratch(count);
+        std::vector<size_t> counts(blocks), offsets(blocks+1);
+        // Группа каждой стадии уничтожается до массивов и захваченных callback.
+        const auto ranges=[&](size_t n, auto&& callback) {
+            if (!n) return;
+            if (parallel) {
+                auto group=jobs->CreateGroup();
+                if (!group.IsValid()) throw std::runtime_error("invalid visibility group");
+                group.ParallelFor(static_cast<uint32_t>(n),1,[&](uint32_t begin,uint32_t end,uint32_t) {
+#ifdef GR_JOBS_TESTING
+                    testing::CallbackScope callbackScope;
+#endif
+                    for (size_t i=begin;i<end;++i) callback(i);
+                });
+                group.Wait();
+            } else for (size_t i=0;i<n;++i) callback(i);
+        };
+        auto phase=Clock::now();
+        ranges(blocks,[&](size_t b) {
+            const size_t end=std::min(count,(b+1)*blockSize);
+            for (size_t i=b*blockSize;i<end;++i) scratch[i]=Kernel(snapshot.Objects()[i],snapshot.Camera(),false);
+        });
+        time.preparation=Ms(phase);
+        phase=Clock::now();
+        ranges(blocks,[&](size_t b) {
+            const size_t end=std::min(count,(b+1)*blockSize);
+            for (size_t i=b*blockSize;i<end;++i) scratch[i].visible=VisibleWorld(scratch[i],snapshot.Camera());
+        });
+        time.visibility=Ms(phase);
+        phase=Clock::now();
+        ranges(blocks,[&](size_t b) {
+            size_t n=0;
+            const size_t end=std::min(count,(b+1)*blockSize);
+            for (size_t i=b*blockSize;i<end;++i) n+=scratch[i].visible?1:0;
+            counts[b]=n;
+#ifdef GR_JOBS_TESTING
+            testing::FailAfterWrite(testing::Phase::Counts,parallel,b);
+#endif
+        });
+        time.blockCounts=Ms(phase);
+        phase=Clock::now();
+        for (size_t b=0;b<blocks;++b) {
+            if (counts[b]>count-offsets[b]) throw std::overflow_error("visibility prefix overflow");
+            offsets[b+1]=offsets[b]+counts[b];
+        }
+        time.prefix=Ms(phase);
+        PreparedFrame12 result{};
+        if (offsets.back()>result.packets.max_size()) throw std::length_error("visibility output overflow");
+        result.packets.resize(offsets.back());
+        phase=Clock::now();
+        ranges(blocks,[&](size_t b) {
+            size_t destination=offsets[b];
+            const size_t end=std::min(count,(b+1)*blockSize);
+            for (size_t i=b*blockSize;i<end;++i) if (scratch[i].visible) {
+                if (destination>=offsets[b+1]) throw std::logic_error("visibility scatter overflow");
+                result.packets[destination++]=scratch[i];
+#ifdef GR_JOBS_TESTING
+                // Исключение после реальной записи в ещё не опубликованный кадр.
+                testing::FailAfterWrite(testing::Phase::Scatter,parallel,b);
+#endif
+            }
+            if (destination!=offsets[b+1]) throw std::logic_error("visibility count mismatch");
+        });
+        time.scatter=Ms(phase);
+        result.shaderCamera=snapshot.ShaderCamera(); result.generation=snapshot.Generation();
+        time.total=Ms(start);
+        return result;
+    };
+    if (mode==Mode::Serial) return run(false,timings.serial);
+    if (mode==Mode::Parallel) return run(true,timings.parallel);
+    const auto serial=run(false,timings.serial);
+    auto parallel=run(true,timings.parallel);
+    if (!Equivalent(serial,parallel)) throw std::runtime_error("visibility mismatch");
     return parallel;
 }
 }
