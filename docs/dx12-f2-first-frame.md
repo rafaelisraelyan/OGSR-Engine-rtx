@@ -1329,3 +1329,79 @@ F3.0 в CI выполняется после коммита этой работ�
 ## Следующий шаг
 
 F3.1 — depth buffer, MVP-матрица через константный буфер, камера.
+
+---
+
+# F2.1-B retrofit (2026-10-20) — `$(SolutionDir)` fallback
+
+## Контекст
+
+Задание F2.1-B ссылалось на baseline `64b1b81c5`, но фактический HEAD на
+момент работы — `b52326224` (F3.5.0, +8 коммитов к `origin/prypiat`).
+Все девять целевых дефектов F2.1-B к этому моменту уже закрыты разделами
+F2.1-B.1 и F2.1-B.2. Единственным сохранившимся дефектом оставался пункт 9:
+неорганизованные build output/intermediate directories при прямом вызове
+`msbuild` на `.vcxproj`.
+
+## Причина
+
+`Engine_lib_properties.props` вычисляет `OutDir`/`IntDir` от `$(SolutionDir)`.
+При сборке через `Engine.sln` MSBuild задаёт `SolutionDir` = корень репозитория.
+При прямом вызове на `.vcxproj` `Microsoft.Cpp.Default.props` подставляет
+`SolutionDir` = каталог проекта, поэтому:
+
+- `xrRender_R5_DX12.lib` попадал в
+  `...\xrRenderPC_R5_DX12\ogsr_engine\_LIB\Engine\ReleaseDX12\x64\`;
+- `xrDX12Smoke.exe` — в `...\xrRenderDX12\x64\ReleaseDX12\`.
+
+`SolutionDir` в этом режиме не пуст и не равен `*Undefined*`, поэтому условие
+`'$(SolutionDir)' == ''` не срабатывает. Признак прямого запуска снимается
+до импорта `Microsoft.Cpp.Default.props`.
+
+## Изменение
+
+Оба DX12-проекта получили одинаковую пробу:
+
+```xml
+<PropertyGroup Label="DirectBuildProbe">
+  <_DirectBuildSolutionDir Condition="'$(SolutionDir)' == ''">1</_DirectBuildSolutionDir>
+</PropertyGroup>
+```
+
+и fallback после импорта свойств:
+
+```xml
+<PropertyGroup Label="DirectBuildSolutionDir" Condition="'$(_DirectBuildSolutionDir)' == '1'">
+  <SolutionDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\..'))\</SolutionDir>
+</PropertyGroup>
+```
+
+`xrDX12Smoke.vcxproj` дополнительно явно задаёт `OutDir`
+(`$(SolutionDir)$(Platform)\$(Configuration)\`) и `IntDir`
+(`$(ProjectName)\$(Platform)\$(Configuration)\`) — ровно те значения, которые
+MSBuild выводит при сборке через solution.
+
+При сборке через `Engine.sln` условие ложно: `OutDir`/`IntDir` и поведение
+DX11 baseline не меняются.
+
+## Проверка
+
+| Проверка | ExitCode | Ошибок | Результат |
+|---|---|---|---|
+| A. Прямой `.vcxproj` rebuild библиотеки | 0 | 0 | `ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib` |
+| B. Прямой `.vcxproj` rebuild smoke | 0 | 0 | `x64\ReleaseDX12\xrDX12Smoke.exe` |
+| C. `Engine.sln` ReleaseDX12 | 1 (vendored deps) | 76 | Оба DX12-проекта собраны, MSB4121 = 0; падение только на отсутствующих в worktree исходниках `3rd_party` (mimalloc/zstd/LuaJIT и др., исключены вложенными `.gitignore`) |
+| D. `Engine.sln` Release (DX11) | 1 (known) | 1 | `bin_x64\xrEngine.exe` собран и слинкован (31 463 424 б); единственная ошибка — известный post-build `dbghelp.dll` (MSB3073) |
+
+Статусы этой правки: **IMPLEMENTED**, **COMPILED**, **LINKED**. Runtime
+именно этой правки не запускался: **NOT RUN**. Ранее выполненные
+runtime-прогоны F2.1 (разделы выше) сохраняются и не переписываются.
+
+## Ограничения
+
+- Изменение проверено только сборкой. GPU runtime не выполнялся.
+- Полный solution rebuild в изолированном worktree невозможен без
+  `Update_Components.cmd`: часть vendored-исходников не отслеживается git.
+  Это ограничение среды проверки, а не следствие правки.
+- Вложенный каталог `...\xrRenderPC_R5_DX12\ogsr_engine\` в worktree —
+  остаток первого прогона со сломанным условием; новые сборки его не создают.

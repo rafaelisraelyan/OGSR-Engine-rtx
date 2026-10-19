@@ -19,7 +19,21 @@
     <RootNamespace>xrRender_R5_DX12</RootNamespace>
     <Keyword>Win32Proj</Keyword>
   </PropertyGroup>
+  <!-- Признак прямого вызова msbuild на .vcxproj фиксируется ДО импорта
+       Microsoft.Cpp.Default.props: тот выставляет SolutionDir равным
+       каталогу проекта, поэтому отличить режим по самому SolutionDir
+       уже нельзя. .sln задаёт SolutionDir заранее, и проба остаётся пустой. -->
+  <PropertyGroup Label="DirectBuildProbe">
+    <_DirectBuildSolutionDir Condition="'$(SolutionDir)' == ''">1</_DirectBuildSolutionDir>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <!-- Прямой вызов msbuild на .vcxproj создавал из-за подставленного
+       SolutionDir вложенный мусор вида ...\xrRenderPC_R5_DX12\ogsr_engine\_LIB\...
+       Fallback возвращает корень репозитория. При сборке через Engine.sln
+       условие ложно, итоговые OutDir/IntDir не меняются. -->
+  <PropertyGroup Label="DirectBuildSolutionDir" Condition="'$(_DirectBuildSolutionDir)' == '1'">
+    <SolutionDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\..'))\</SolutionDir>
+  </PropertyGroup>
   <Import Project="..\..\Engine_lib_properties.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDX12|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>

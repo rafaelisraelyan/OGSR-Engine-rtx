@@ -19,6 +19,13 @@
     <RootNamespace>xrDX12Smoke</RootNamespace>
     <Keyword>Win32Proj</Keyword>
   </PropertyGroup>
+  <!-- Признак прямого вызова msbuild на .vcxproj фиксируется ДО импорта
+       Microsoft.Cpp.Default.props: тот выставляет SolutionDir равным
+       каталогу проекта. .sln задаёт SolutionDir заранее, поэтому проба
+       остаётся пустой и итоговые OutDir/IntDir не меняются. -->
+  <PropertyGroup Label="DirectBuildProbe">
+    <_DirectBuildSolutionDir Condition="'$(SolutionDir)' == ''">1</_DirectBuildSolutionDir>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDX12|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
@@ -37,6 +44,14 @@
     <UseDebugLibraries>true</UseDebugLibraries>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="DirectBuildSolutionDir" Condition="'$(_DirectBuildSolutionDir)' == '1'">
+    <SolutionDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\..'))\</SolutionDir>
+    <!-- Значения повторяют default из Microsoft.Cpp.props, но считаются
+         от корня репозитория. При сборке через Engine.sln эта группа
+         не применяется, поэтому пути остаются прежними. -->
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
