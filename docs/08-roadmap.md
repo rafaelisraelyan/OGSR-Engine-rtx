@@ -36,7 +36,9 @@
 | D · DX11 SSGI / Hi-Z | ⬜ Исследование | D0 → D1 → D2, решение по результатам |
 | E · Техдолг | 🔎 Диагностика | Отдельные согласованные изменения |
 | F · Нативный DX12 | 🛠 В работе (статусы F ниже — исторический снимок) | После F3: F3.5 CPU-side многопоточная архитектура перед F4 |
-| F3.5 · Multithreaded Renderer Foundation | ⬜ Запланирован, не реализован | Snapshot, frame scheduler, per-worker allocators, CPU scaling tests |
+| F3.2 · GR Job System (DX12 only) | 🛠 Локальная интеграция Stage 1 по отчёту, не закоммичена | C.1: ownership/lifecycle; затем DX12 Smoke runtime/CPU scene |
+| F3.5 · Multithreaded Renderer Foundation | ✅ ADR принят (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата | F3.5.1 — representative snapshot prototype |
+| F3.5.1 · Representative snapshot prototype | ⏭ NEXT / NOT STARTED | Расширить snapshot представительными полями X-Ray; синтетические `(id, generation)`; не трогать R4 |
 | G · DXR | 🆕 План, зависит от F | G0: проверка возможностей GPU/драйвера |
 | H · Многопоточность | ⬜ План | H0: базовые профили, H1 после RT-теней и отражений |
 | I · World Streaming | ⬜ Концепция | I0: аудит X-Ray ресурсов/уровней и ownership |
@@ -418,13 +420,79 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 **Ближайшая работа по историческому снимку:** F3.0 — минимальный рендер 3D-геометрии. Если с тех пор выполнены F3.x GPU-гейты, свериться с актуальными коммитами/логами перед планированием F3.5. Новая запись не переоценивает уже выполненное.
 
 
+### F3.2 — GR Job System: сначала только DX12 (решение 2026-10-18)
+
+**Архитектурный статус:** GR Job System — самостоятельная библиотека уровня Engine Core
+(`ogsr_engine/Layers/JobSystem/`), а не часть `xrRender_R5_DX12`. Backend — закреплённый
+форк enkiTS (SHA `404a3bf8f855039dfff2052184d6308655286c07`); публичный
+`gr/jobs/` API не зависит от enkiTS, DX11, DX12 и Win32. Принцип — один общий
+планировщик CPU-задач и Work Stealing; размещение потоков оставлено Windows
+(**OS Default**, без hard/soft CPU affinity в runtime). Количество workers
+конфигурируется, а последовательный путь сохраняется для отката и измерений.
+
+**Решение об области работ:** на текущем этапе **только собственный DX12 renderer /
+standalone `xrDX12Smoke.exe`** становится потребителем GR Job System.
+Физика, AI, анимация, streaming и фоновые задачи аудио **не интегрируются сейчас**:
+позднее, после измерений DX12 и отдельного аудита зависимостей, в направлении H.
+Специализированные realtime-потоки (особенно audio callback) не обязаны
+использовать общий пул; запрещено блокировать realtime audio callback ожиданием job.
+
+| Подэтап | Статус на 2026-10-18 по локальным отчётам, без независимого GPU runtime PASS | Следующий гейт |
+|---|---|---|
+| **F3.2A / A.1 — enkiTS bench + OS scheduler** | Отчёт: 10 раундов, 480 конфигураций; принято **OS Default**, хотя hard affinity дала локальный выигрыш в синтетике | Хранить raw timings; не выдавать синтетический speedup за FPS |
+| **F3.2B / B.1 — GR Job System Foundation + Safety Review** | По отчёту агента: автономная библиотека и исправления noexcept destructor, move-assignment, lifetime; требуются проверки интегрируемой версии | Убедиться в корректном ownership, исключениях, shutdown и регрессионных тестах |
+| **F3.2C Stage 1 — VS integration** | По отчёту Codex: `xrDX12Smoke → gr_job_system → enkiTS`, ReleaseDX12/x64 без ошибок/предупреждений; окно не запускалось; изменения локальные, не закоммичены | Воспроизводимая сборка из репозитория; не подключать `xrRender_R5_DX12` и другие игровые targets раньше отдельного этапа |
+| **F3.2C.1 — ownership/lifecycle hardening** | Требует отдельной проверки: потенциальное освобождение опубликованной задачи при исключении из `tasks.push_back`, а также hook/drain/shutdown | Устранить подтверждённые дефекты, fault-injection и регрессионные тесты |
+| **F3.2C.2 — DX12 Smoke CPU scene pipeline** | **PASS**, коммит `09ca02357`: 32/32 runtime, 857 CPU checks, depth readback, resize и GPU validation; ручной визуальный осмотр и race detector не выполнены | Выполнить ручную проверку окна перед полной визуальной приёмкой |
+| **F3.3 — DX12 CPU render preparation** | **PASS**, коммиты `09ca02357` + `5b0e4bbcb` (F3.3.0 и F3.3.0a): immutable snapshot, prepared packets, Serial/Parallel/Verify, WM_TIMER fault handling; merge с `origin/prypiat` — `99c9d1a10` | F3.5.0 ADR принят → F3.5.1 |
+| **F3.4 — DX12 parallel command recording** | Запланировано; согласовать с существующим разделом F3.5.3, не дублировать работу | Per-worker command lists/allocators, GPU fence lifetime, barriers, validation, profiling |
+| **F3.5 — DX11 vs DX12 comparison / решение** | Запланировано; согласовать с существующим F3.5.4 (не переименовывать старый этап) | Одинаковые сцены и настройки, CPU/GPU timings, p50/p95/p99, frametime, 1% low; отделить различия backend от различий качества |
+
+**F3.2C.2 — измерения в standalone Smoke (4 background workers + main, grain=64):**
+
+| CPU-объектов | Serial, мс | Parallel, мс | Serial / Parallel |
+|---:|---:|---:|---:|
+| 256 | 0.024141 | 0.037532 | 0.64× (parallel медленнее) |
+| 1024 | 0.114042 | 0.059029 | 1.93× |
+| 4096 | 0.383540 | 0.136484 | 2.81× |
+| 16384 | 1.301304 | 0.421946 | 3.08× |
+
+Источник — локальный `docs/dx12-f3-2c2-runtime.md` (30 прогревочных и
+200 измеряемых кадров; Serial/Parallel verification, 32 automated runs).
+Числа измеряют **только CPU scene preparation** на RTX 5070 Laptop GPU,
+не FPS и не реальный игровой scene renderer. Serial остаётся default.
+F3.2C.2: runtime и автоматическая корректность по отчёту PASS; ручной осмотр
+окна, интерактивный minimize/restore и специализированный race detector
+остаются открытыми. Не заявлять завершения этих проверок.
+
+**Следующий этап F3.3:** сначала аудит фактических CPU scene/render preparation
+и их владельцев в `xrRender_R5_DX12`, анализ frame lifetime и точек
+синхронизации; затем отдельный минимальный serial/parallel path с проверкой
+эквивалентности. Не переносить синтетические объекты в игру как «готовый
+рендерер», не менять DX11 и другие подсистемы; GPU command list recording
+оставить на более поздний гейт F3.5.3.
+
+**Последовательность:** закрыть корректность и lifecycle → подключить GR к
+standalone DX12 Smoke → подготовка CPU сцены → реальные CPU-задачи DX12 →
+параллельная запись D3D12 command lists только после отдельных GPU lifetime
+инвариантов → сравнение с сохранённым DX11 baseline. DX11, gameplay, physics,
+AI и audio сейчас не менять. Сборка **не равна** запуску или GPU validation PASS.
+
+**Важно о нумерации:** существующий ниже F3.5 — общий архитектурный рубеж
+Multithreaded Renderer Foundation до F4. Ссылки F3.3/F3.4/F3.5 в таблице выше
+описывают предложенные рабочие итерации GR/DX12 внутри этого рубежа; они **не
+отменяют и не перенумеровывают** F3.5.0–F3.5.4 и требуют синхронизации перед
+обновлением основных milestones.
+
+---
+
 ### F3.5 — Multithreaded Renderer Foundation: архитектура ДО массового переноса F4
 
 **Мотивация:** D3D12 позволяет записывать независимые command lists с нескольких CPU threads, но это не делает устаревший frame loop X-Ray автоматически многопоточным. После F3 достаточно рабочего 3D-пути, чтобы проверить модель владения состоянием; откладывание этих границ до H создаёт риск переписывать F4. **F3.5 — архитектурный минимальный прототип, не обещание прироста FPS и не переписывание simulation scheduler.**
 
 | Подэтап | Работа | Обязательный гейт |
 |---|---|---|
-| **F3.5.0 — architecture ADR + trace** | Карта main/render threads, кадра, точек синхронизации, потоков GPU и владельцев данных; выбрать границы immutable frame snapshot, draw packets, PSO/material handles, queue submission и fallback. Без предположения, что готовый X-Ray renderer thread-safe. | ADR с диаграммой frame N/N+1, потоковой моделью, fencing/lifetime invariants и списком опасных mutable pointers. |
+| **F3.5.0 — architecture ADR + trace** | Карта main/render threads, кадра, точек синхронизации, потоков GPU и владельцев данных; выбрать границы immutable frame snapshot, draw packets, PSO/material handles, queue submission и fallback. Без предположения, что готовый X-Ray renderer thread-safe. | ✅ ADR принят: `docs/dx12-f3-5-architecture-adr.md` (frame N/N+1, потоковая модель, fencing/lifetime invariants, список опасных mutable pointers, синхронизация с TTAPI, render-owned `(id, generation)`). Реализация не начата. |
 | **F3.5.1 — immutable snapshot** | На согласованной границе кадра после update собрать компактный read-only RenderSceneSnapshot (transform/bounds/material/resource references); без записи игровых сущностей из render workers. Owner и lifetime сохраняются до последнего потребителя, ограничить frames-in-flight и backpressure. | Snapshot непротиворечив; проверены изменения/удаления объектов и быстрое движение камеры без dangling references/data races. |
 | **F3.5.2 — work decomposition** | Минимальная независимая подготовка visibility/culling, sort/draw packets из snapshot; фиксированный порядок там, где нужна прозрачность или зависимости; исключить global mutex per draw. Мелкие сцены допускают последовательный путь. | Детерминированная либо визуально эквивалентная сборка тестовой сцены в serial и worker режимах, без нарушения порядка проходов. |
 | **F3.5.3 — D3D12 multi-list prototype** | Per-thread/per-frame command allocators & lists, per-frame descriptor/upload allocation и synchronization; reuse/reset лишь после завершения fence; command list ownership на одном worker во время записи, упорядоченный submission на direct queue. Ввести явные правила ресурсов/barriers (межлистовые зависимости согласуются при merge/submission). | Тестовые сцены без GPU validation, race, lifetime и barrier errors на 1/2/4/8 workers; resize/shutdown и быстрая смена сцены безопасны. |
@@ -442,7 +510,9 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 **Порядок:** F3 минимальная 3D геометрия/depth/materials → F3.5.0–F3.5.4 → перенос игрового кадра F4 с уже определёнными безопасными границами. При необходимости F4 может стартовать с serial recording поверх подготовленного интерфейса и включать рабочий parallel path постепенно. G0/G1 лабораторные исследования не обязаны ждать полного performance tuning F3.5; полноценная интеграция DXR в игру — после F4.
 
-**Статус на 2026-10-16:** ⬜ **PLANNED / NOT STARTED**. Этот пункт не подтверждает реализацию snapshot или multi-list renderer.
+**Статус на 2026-10-19:** ✅ **F3.5.0 — ADR ПРИНЯТ** (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата. ⏭ **F3.5.1 — NEXT / NOT STARTED**: это **representative snapshot prototype** (раздел 9 ADR), а не интеграция реальных игровых объектов — реальный обход сцены остаётся за F4. Пункт не подтверждает реализацию snapshot или multi-list renderer.
+
+**Ограничения, сохраняемые без изменений:** ручной визуальный осмотр окна, интерактивный minimize/restore и специализированный race detector (TSan) **не выполнены**; отсутствие гонок не доказано. Синтетические замеры F3.2C.2 — не FPS и не игровой рендер.
 
 ### Принципы F
 
