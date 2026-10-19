@@ -1,7 +1,8 @@
-param([int]$Frames = 200)
+param([int]$Frames = 200, [string]$Executable = '')
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../../..'))
-$exe = Join-Path $root 'x64/ReleaseDX12/xrDX12Smoke.exe'
+if (!$Executable) { $Executable = Join-Path $root 'x64/ReleaseDX12/xrDX12Smoke.exe' }
+$exe = (Resolve-Path $Executable).Path
 $sourceLog = Join-Path (Split-Path $exe) 'xrDX12Smoke.log'
 $output = Join-Path $root 'x64/f32c2'
 New-Item -ItemType Directory -Force $output | Out-Null

@@ -23,7 +23,7 @@ function Run([string]$Name, [string]$Arguments, [string]$Expected, [bool]$Gpu = 
     }
     if ($Name.StartsWith('depth-')) {
         $hash = [regex]::Match($log,'\[depth-frame\] hash=([0-9a-f]+)').Groups[1].Value
-        $pass = $pass -and $hash.Length -eq 16
+        $pass = $pass -and $hash -eq '9dd37d87b8eb202d'
         if (!$script:imageHash) { $script:imageHash = $hash }
         $pass = $pass -and $hash -eq $script:imageHash
     }

@@ -3,6 +3,7 @@
 #include "dx12log.h"
 #include "gr/jobs/JobSystem.h"
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -21,7 +22,7 @@ bool RunTests() {
         const RenderSceneSnapshot12 snapshot(identity,objects,7);
         objects[0].id=99; // Snapshot не ссылается на изменяемый источник.
         check(snapshot.Objects()[0].id==1);
-        objects=snapshot.Objects();
+        std::copy(snapshot.Objects().begin(),snapshot.Objects().end(),objects.begin());
         const auto expected=Prepare(snapshot,7,Mode::Serial,nullptr,timing);
         check(expected.packets[0].visible && expected.packets[1].visible);
         check(expected.packets[0].object.firstVertex==0 && expected.packets[1].object.firstVertex==36);

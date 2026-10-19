@@ -330,6 +330,12 @@ bool SmokeMesh12::Create(
             o.minimum.z=(std::min)(o.minimum.z,v.z); o.maximum.z=(std::max)(o.maximum.z,v.z);
         }
     }
+    for (auto& o:m_objects) {
+        o.sphere.center={(o.minimum.x+o.maximum.x)*0.5f,(o.minimum.y+o.maximum.y)*0.5f,(o.minimum.z+o.maximum.z)*0.5f};
+        const auto ext=DirectX::XMVectorSubtract(DirectX::XMLoadFloat3(&o.maximum),DirectX::XMLoadFloat3(&o.sphere.center));
+        o.sphere.radius=DirectX::XMVectorGetX(DirectX::XMVector3Length(ext));
+    }
+
     memcpy(mapped, vertices, sizeof(vertices));
     m_uploadBuffer->Unmap(0, nullptr);
 

@@ -72,6 +72,7 @@
     <ClCompile Include="dx12cpuscene.cpp" />
     <ClCompile Include="dx12cpuscene_tests.cpp" />
     <ClCompile Include="dx12renderprep_tests.cpp" />
+    <ClCompile Include="dx12snapshot_tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dx12log.h" />
