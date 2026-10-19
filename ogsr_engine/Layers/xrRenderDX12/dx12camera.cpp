@@ -147,12 +147,19 @@ void SmokeCamera12::GetFixedPose(
     up = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 1.0f);
 }
 
+DirectX::XMFLOAT4X4 SmokeCamera12::CaptureViewProjection() const
+{
+    DirectX::XMFLOAT4X4 out;
+    const auto view = DirectX::XMMatrixLookAtLH(m_eye, m_target, m_up);
+    const auto proj = DirectX::XMMatrixPerspectiveFovLH(m_fov, m_aspect, m_nearZ, m_farZ);
+    DirectX::XMStoreFloat4x4(&out, DirectX::XMMatrixMultiply(view, proj));
+    return out;
+}
+
 bool SmokeCamera12::BuildViewProjection(DirectX::XMFLOAT4X4& out)
 {
-    const DirectX::XMMATRIX view = DirectX::XMMatrixLookAtLH(m_eye, m_target, m_up);
-    const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(
-        m_fov, m_aspect, m_nearZ, m_farZ);
-    const DirectX::XMMATRIX viewProj = DirectX::XMMatrixMultiply(view, proj);
+    const auto captured = CaptureViewProjection();
+    const auto viewProj = DirectX::XMLoadFloat4x4(&captured);
 
     // Транспонирование обязательно: DirectXMath хранит row-major, а
     // компилятор HLSL по умолчанию упаковывает матрицы в constant buffer

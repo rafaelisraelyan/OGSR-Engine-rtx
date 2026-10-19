@@ -4,6 +4,7 @@
 
 #include <d3dcompiler.h>
 #include <cstring>
+#include <algorithm>
 
 // Вершина: POSITION (R32G32B32_FLOAT) + COLOR (R32G32B32A32_FLOAT).
 // COLOR делает depth-тест наблюдаемым: перекрытие передних и задних
@@ -317,6 +318,18 @@ bool SmokeMesh12::Create(
     // по ссылке, поэтому memcpy выполняется один раз.
     Vertex vertices[kVertexCount];
     BuildCubeVertices(vertices);
+    // Bounds из того же массива, который копируется на GPU.
+    for (uint32_t i=0;i<2;++i) {
+        auto& o=m_objects[i]; o.id=i+1; o.firstVertex=i*36; o.vertexCount=36;
+        DirectX::XMStoreFloat4x4(&o.world,DirectX::XMMatrixIdentity());
+        o.minimum=o.maximum={vertices[i*36].x,vertices[i*36].y,vertices[i*36].z};
+        for (uint32_t j=i*36;j<(i+1)*36;++j) {
+            const auto& v=vertices[j];
+            o.minimum.x=(std::min)(o.minimum.x,v.x); o.maximum.x=(std::max)(o.maximum.x,v.x);
+            o.minimum.y=(std::min)(o.minimum.y,v.y); o.maximum.y=(std::max)(o.maximum.y,v.y);
+            o.minimum.z=(std::min)(o.minimum.z,v.z); o.maximum.z=(std::max)(o.maximum.z,v.z);
+        }
+    }
     memcpy(mapped, vertices, sizeof(vertices));
     m_uploadBuffer->Unmap(0, nullptr);
 

@@ -65,6 +65,10 @@ static bool g_resizeInProgress = false;  // защита от реентераб
 // внутри модального цикла, что позволяет продолжать отрисовку.
 static bool g_timerActive = false;
 static uint64_t g_timerFrameCount = 0;
+// F3.3.0a: RenderFrame вернул false в таймерном пути. Латчится до конца
+// сессии: повторная отрисовка из WM_TIMER запрещена, а выход выполняется
+// штатно через WM_CLOSE основным циклом. Renderer из callback не разрушаем.
+static bool g_timerFrameFailed = false;
 
 // F3.1-FIX C: непрерывность времени камеры.
 // Камера использовала абсолютное время от старта процесса. После паузы
@@ -313,7 +317,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             !g_resizeInProgress && msg == WM_TIMER && wParam == 1)
         {
             // Не рисуем, если окно не видно или идёт Shutdown.
-            if (!g_running)
+            // F3.3.0a: g_timerFrameFailed запрещает повторную отрисовку после
+            // уже зафиксированного сбоя в этом же пути.
+            if (!g_running || g_timerFrameFailed)
                 return 0;
 
             // F3.1-FIX C: обновляем время камеры с ограничением deltaTime.
@@ -332,7 +338,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_hw->UpdateCamera(g_cameraTime);
             }
 
-            g_hw->RenderFrame();
+            // F3.3.0a: RenderFrame возвращает false не только при device
+            // removal, но и по причинам, добавленным в F3.3.0 (сбой подготовки
+            // кадра, защита от реентерабельности). Молчаливый игнор оставлял
+            // таймер крутящимся без единого кадра и без диагностики.
+            //
+            // Renderer из callback не разрушаем: останавливаем таймер,
+            // запрещаем дальнейшую отрисовку из WM_TIMER и просим основной
+            // цикл выйти штатно через WM_CLOSE (DestroyWindow -> PostQuitMessage
+            // -> Shutdown на потоке-владельце).
+            if (!g_hw->RenderFrameFromTimer())
+            {
+                dx12log::Write("[diag] WM_TIMER: RenderFrame failed, device removed=%d, "
+                               "preparation failed=%d; stopping timer rendering",
+                               g_hw->IsDeviceRemoved() ? 1 : 0,
+                               g_hw->PreparationFailed() ? 1 : 0);
+                g_timerFrameFailed = true;
+                g_running = false;
+                if (g_timerActive)
+                {
+                    KillTimer(hwnd, 1);
+                    g_timerActive = false;
+                }
+                PostMessage(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
             ++g_timerFrameCount;
         }
         return 0;
@@ -377,6 +407,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // -fixedpose — детерминированный ракурс для тестов.
     // -depthtest — автоматический depth-тест через readback.
     // -freeaspect — отключает фиксацию 16:9 (свободный resize).
+    renderprep12::Mode prepMode=renderprep12::Mode::Serial;
+    bool prepSelfTest=false;
+    bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
+    uint32_t prepFrames=0;
     bool fixedPose = false;
     bool depthTest = false;
     bool badArgument = false;
@@ -387,7 +421,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         {
             for (int i = 1; i < argc; ++i)
             {
-                if (_wcsicmp(argv[i], L"-fixedpose") == 0)
+                if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
+                // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути.
+                else if (_wcsicmp(argv[i], L"-timerfault") == 0) timerFault=true;
+                else if (_wcsicmp(argv[i], L"-prepframes") == 0) {
+                    if (i+1<argc && _wtoi(argv[i+1])>0) prepFrames=static_cast<uint32_t>(_wtoi(argv[++i]));
+                    else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i], L"-renderprep") == 0) {
+                    if (i+1>=argc) badArgument=true;
+                    else { ++i;
+                        if (!_wcsicmp(argv[i],L"serial")) prepMode=renderprep12::Mode::Serial;
+                        else if (!_wcsicmp(argv[i],L"parallel")) prepMode=renderprep12::Mode::Parallel;
+                        else if (!_wcsicmp(argv[i],L"verify")) prepMode=renderprep12::Mode::Verify;
+                        else badArgument=true;
+                    }
+                }
+                else if (_wcsicmp(argv[i], L"-fixedpose") == 0)
                     fixedPose = true;
                 else if (_wcsicmp(argv[i], L"-depthtest") == 0)
                     depthTest = true;
@@ -533,6 +583,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
+    if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
     if (g_cpuSelfTest)
     {
         const bool passed = dx12cpuscene::RunSelfTests();
@@ -641,7 +692,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     // F3.2C: один JobSystem на приложение. Initialize вызывается один раз,
     // Shutdown — один раз при выходе; в цикле кадра ничего не пересоздаётся.
-    if (g_stressObjects > 0 && (g_jobsParallel || g_cpuVerify))
+    if (prepMode!=renderprep12::Mode::Serial || (g_stressObjects > 0 && (g_jobsParallel || g_cpuVerify)))
     {
         gr::jobs::JobConfig jobConfig;
         jobConfig.backgroundWorkers = g_jobWorkers;   // 0 = автоматическая политика
@@ -675,6 +726,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             }
         }
     }
+
+    hw12.ConfigurePreparation(prepMode,g_jobSystemReady?g_jobSystem:nullptr);
+    // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути. Флаг виден только
+    // RenderFrameFromTimer(); главный цикл вызывает RenderFrame() и потому
+    // инъекцию не израсходует и не заметит.
+    if (timerFault) hw12.ArmTimerRenderFailure();
 
     // F3.2C: таблица CPU-сцены строится один раз из фиксированного seed, поэтому
     // Serial и Parallel получают идентичные входные данные.
@@ -888,10 +945,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 exitCode = 1;
                 break;
             }
+            if (prepFrames && --prepFrames==0) g_running=false;
             // Проверяем штатный WM_SIZE -> отложенный Resize без изменения GPU-кода.
-            if (g_resizeTest && (g_cpuStep == 10 || g_cpuStep == 20))
+            // F3.3.0a: третий resize намеренно НЕ 16:9. Прежние два размера
+            // (960x540, 1280x720) сохраняют соотношение сторон, поэтому путь
+            // смены аспекта камеры после resize (CHW12::SetAspect) в наборе
+            // не проверялся вообще — ни одним прогоном.
+            if (g_resizeTest && (g_cpuStep == 10 || g_cpuStep == 20 || g_cpuStep == 30))
             {
-                RECT size = {0, 0, g_cpuStep == 10 ? 960 : 1280, g_cpuStep == 10 ? 540 : 720};
+                RECT size = {0, 0,
+                    g_cpuStep == 10 ? 960 : (g_cpuStep == 20 ? 1280 : 1024),
+                    g_cpuStep == 10 ? 540 : (g_cpuStep == 20 ? 720 : 768)};
                 AdjustWindowRectEx(&size, style, FALSE, 0);
                 if (!SetWindowPos(hwnd, nullptr, 0, 0, size.right - size.left, size.bottom - size.top,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
@@ -903,6 +967,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
     }
 
+    if (hw12.PreparationFailed()) exitCode=1;
+    // F3.3.0a: сбой отрисовки в таймерном пути не должен давать код возврата 0.
+    if (g_timerFrameFailed) exitCode=1;
     hw12.Shutdown();
     g_hw = nullptr;
 
@@ -930,8 +997,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // пережить этот вызов.
     ReportCpuScene();
     StopJobs();
-    dx12log::Write("[runtime] rendered=%llu resizeSuccess=%u starts=%u",
-        (unsigned long long)g_diagFrameCount, g_runtimeResizes, g_jobStarts);
+    dx12log::Write("[runtime] rendered=%llu resizeSuccess=%u starts=%u timerFrames=%llu",
+        (unsigned long long)g_diagFrameCount, g_runtimeResizes, g_jobStarts,
+        (unsigned long long)g_timerFrameCount);
 
     UnregisterClassW(kWindowClass, hInstance);
 

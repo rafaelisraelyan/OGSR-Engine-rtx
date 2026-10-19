@@ -51,7 +51,7 @@
       <Optimization>MaxSpeed</Optimization>
       <EnableFiberSafeOptimizations>false</EnableFiberSafeOptimizations>
       <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;XRENGINE_STATIC;XRCORE_STATIC;OGSR_USE_DX12;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <ExceptionHandling></ExceptionHandling>
+      <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <FloatingPointModel>Fast</FloatingPointModel>
@@ -63,7 +63,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;$(SolutionDir)\3rd_party\Src\DirectXMath\DirectXMath\Inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;$(MSBuildProjectDirectory)\..\JobSystem\include;$(SolutionDir)\3rd_party\Src\DirectXMath\DirectXMath\Inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -79,6 +79,7 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\xrRenderDX12\dx12renderprep.cpp"><FloatingPointModel>Precise</FloatingPointModel></ClCompile>
     <ClCompile Include="..\xrRenderDX12\CHW12.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12quarantine.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12camera.cpp" />
@@ -91,6 +92,7 @@
     <ClInclude Include="..\xrRenderDX12\dx12camera.h" />
     <ClInclude Include="..\xrRenderDX12\dx12mesh.h" />
   </ItemGroup>
+  <ItemGroup><ProjectReference Include="..\JobSystem\gr_job_system.vcxproj"><Project>{7C4E9A1F-2D6B-4E8A-9F3C-5B1D7A2E8C64}</Project></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

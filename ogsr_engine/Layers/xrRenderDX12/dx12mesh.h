@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include "dx12renderprep.h"
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
@@ -81,9 +82,12 @@ public:
 
     void Release();
 
+    const std::array<renderprep12::Object12, 2>& Objects() const { return m_objects; }
+
     bool IsCreated() const { return m_created; }
 
 private:
+    std::array<renderprep12::Object12, 2> m_objects{};
     bool CreateVertexBuffer(ID3D12Device* device);
     bool CreateRootSignature(ID3D12Device* device);
     bool CreatePipelineState(ID3D12Device* device);

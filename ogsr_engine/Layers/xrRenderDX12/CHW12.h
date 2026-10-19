@@ -49,6 +49,22 @@ public:
 
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
     bool RenderFrame();
+
+    // F3.3.0a TEST ONLY — WM_TIMER fault injection.
+    //
+    // ArmTimerRenderFailure() включает одноразовый отказ, который виден ТОЛЬКО
+    // WM_TIMER-пути: RenderFrameFromTimer() в этом случае возвращает false,
+    // не обращаясь к device, fence, ресурсам или JobSystem, после чего
+    // вызывающий выполняет обычную обработку сбоя. RenderFrame() главного
+    // цикла этот флаг не читает, поэтому production-путь не меняется, пока
+    // не вызван arm API. Нужен, чтобы проверить обработку сбоя в WM_TIMER
+    // без реального device removal/TDR.
+    void ArmTimerRenderFailure() { m_timerFaultArmed = true; }
+    bool RenderFrameFromTimer();
+
+    // Заимствование: JobSystem должен пережить CHW12.
+    void ConfigurePreparation(renderprep12::Mode mode, gr::jobs::JobSystem* jobs) { m_prepMode=mode; m_jobs=jobs; }
+    bool PreparationFailed() const { return m_prepFailed; }
     bool Resize(uint32_t width, uint32_t height);
 
     // Идемпотентный shutdown. Безопасен после частично неуспешного Initialize
@@ -87,6 +103,18 @@ public:
     DepthTestResult VerifyDepthTest();
 
 private:
+    renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
+    gr::jobs::JobSystem* m_jobs=nullptr;
+    bool m_preparing=false, m_prepFailed=false;
+    bool m_timerFaultArmed=false; // F3.3.0a TEST ONLY, см. ArmTimerRenderFailure()
+    uint64_t m_sceneGeneration=1, m_prepFrames=0, m_prepSamples=0;
+    double m_snapshotMs=0, m_serialMs=0, m_parallelMs=0, m_submitMs=0, m_waitMs=0;
+    // F3.3.0a: merge (финальная сборка PreparedFrame) и ожидание GPU fence
+    // измеряются отдельно от CPU JobGroup::Wait — это разные синхронизации,
+    // и гейт F3.3.0 требует видеть их раздельно. gpuFence усредняется по
+    // числу ожиданий, а не по числу кадров: первый кадр слота не ждёт fence.
+    double m_mergeMs=0, m_gpuFenceMs=0;
+    uint64_t m_gpuFenceWaits=0;
     static constexpr uint32_t FRAME_COUNT = 3;
     static constexpr DXGI_FORMAT BACKBUFFER_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
     static constexpr DWORD GPU_WAIT_TIMEOUT_MS = 5000;

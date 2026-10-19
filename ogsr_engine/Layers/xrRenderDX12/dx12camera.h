@@ -68,6 +68,7 @@ public:
     // проверил их при установке, но проверка на месте защищает от
     // прямого вызова с невалидным состоянием).
     bool BuildViewProjection(DirectX::XMFLOAT4X4& out);
+    DirectX::XMFLOAT4X4 CaptureViewProjection() const;
 
     float GetFovRadians() const { return m_fov; }
     float GetNear() const { return m_nearZ; }

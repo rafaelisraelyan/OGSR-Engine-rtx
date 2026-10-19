@@ -3,6 +3,8 @@
 #include "dx12log.h"
 #include "dx12camera.h"
 #include "dx12mesh.h"
+#include <chrono>
+#include <exception>
 
 #include <cstdio>
 #include <cstdlib>
@@ -801,6 +803,18 @@ CHW12::DepthTestResult CHW12::VerifyDepthTest()
     const UINT rowPitch = m_copyableFootprint.Footprint.RowPitch;
     const uint8_t* data = static_cast<const uint8_t*>(mapped);
 
+    // Полный RGBA-кадр без padding; readback уже защищён прежним fence.
+    uint64_t imageHash = 14695981039346656037ull;
+    for (uint32_t y=0;y<m_height;++y) {
+        const uint64_t row=offset+static_cast<uint64_t>(y)*rowPitch;
+        const uint64_t bytes=static_cast<uint64_t>(m_width)*4;
+        if (row>m_readbackTotalBytes || bytes>m_readbackTotalBytes-row) {
+            snprintf(result.message,sizeof(result.message),"invalid image footprint"); return result;
+        }
+        for (uint64_t x=0;x<bytes;++x) { imageHash^=data[row+x]; imageHash*=1099511628211ull; }
+    }
+    dx12log::Write("[depth-frame] hash=%016llx",(unsigned long long)imageHash);
+
     bool allPassed = true;
     // BLOCKER B: каждый пиксель логируется отдельно, без конкатенации
     // через тот же буфер. Отдельные сообщения для каждого контрольного пункта.
@@ -1170,6 +1184,21 @@ void CHW12::ReportGpuFailure(const wchar_t* stage, HRESULT hr)
     DrainInfoQueue();
 }
 
+// F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути. Реализован отдельной
+// точкой входа, а не проверкой флага внутри RenderFrame(), чтобы главный цикл
+// (busy loop, вызывает RenderFrame() постоянно) физически не мог израсходовать
+// инъекцию раньше таймера. Ни device, ни fence, ни ресурсы, ни JobSystem при
+// инъекции не затрагиваются — возвращается только false.
+bool CHW12::RenderFrameFromTimer()
+{
+    if (m_timerFaultArmed)
+    {
+        m_timerFaultArmed = false;
+        return false;
+    }
+    return RenderFrame();
+}
+
 bool CHW12::RenderFrame()
 {
     if (!m_initialized)
@@ -1178,6 +1207,27 @@ bool CHW12::RenderFrame()
     if (m_deviceRemoved)
         return false;
 
+    if (m_prepFailed || m_preparing) return false;
+    m_preparing=true;
+    struct PreparingGuard { bool& active; ~PreparingGuard() { active=false; } } guard{m_preparing};
+    renderprep12::PreparedFrame12 prepared;
+    try {
+        const auto start=std::chrono::steady_clock::now();
+        const renderprep12::RenderSceneSnapshot12 snapshot(m_camera.CaptureViewProjection(),m_mesh.Objects(),m_sceneGeneration);
+        const double snapshotMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        renderprep12::Timings12 timing;
+        prepared=renderprep12::Prepare(snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing);
+        ++m_prepFrames;
+        if (m_prepFrames>30) {
+            ++m_prepSamples; m_snapshotMs+=snapshotMs; m_serialMs+=timing.serial;
+            m_parallelMs+=timing.parallel; m_submitMs+=timing.submit; m_waitMs+=timing.wait;
+            m_mergeMs+=timing.merge;
+        }
+    } catch (const std::exception& e) {
+        m_prepFailed=true; dx12log::Write("[renderprep] FAIL: %s",e.what()); return false;
+    } catch (...) {
+        m_prepFailed=true; dx12log::Write("[renderprep] FAIL: unknown exception"); return false;
+    }
     FrameResource& frame = m_frameResources[m_frameIndex];
 
     // Ждём завершения именно этого слота: его аллокатор и лист не должны
@@ -1185,7 +1235,13 @@ bool CHW12::RenderFrame()
     if (frame.fenceValue != 0)
     {
         bool timedOut = false;
-        if (!WaitForFenceValue(frame.fenceValue, timedOut))
+        // F3.3.0a: ожидание GPU fence — отдельная синхронизация от CPU
+        // JobGroup::Wait, поэтому измеряется отдельно и не смешивается с ним.
+        const auto fenceStart=std::chrono::steady_clock::now();
+        const bool fenceCompleted=WaitForFenceValue(frame.fenceValue, timedOut);
+        m_gpuFenceMs+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fenceStart).count();
+        ++m_gpuFenceWaits;
+        if (!fenceCompleted)
         {
             // Таймаут и сбой API оба означают, что аллокатор нельзя сбрасывать:
             // GPU может всё ещё писать в его память.
@@ -1256,8 +1312,7 @@ bool CHW12::RenderFrame()
 
     // F3.1: расчёт ViewProjection камерой. Одна матрица на кадр, world-матрицы
     // нет (мировые координаты запечены в вершины).
-    DirectX::XMFLOAT4X4 viewProj = {};
-    m_camera.BuildViewProjection(viewProj);
+    const auto& viewProj = prepared.shaderCamera;
 
     // F3.1: единственная запись CB за кадр. memcpy, а не поэлементная
     // запись: содержимое — одна float4x4, и memcpy быстрее и проще.
@@ -1277,8 +1332,9 @@ bool CHW12::RenderFrame()
     // перезаписывает ближний — тест падает. При работающем depth-тесте
     // ближний куб первым пишет цвет A и глубину, дальний проваливает
     // LESS и не пишет ничего.
-    m_mesh.Draw(cmd, frame.constantBuffer->GetGPUVirtualAddress(), 0, 36);
-    m_mesh.Draw(cmd, frame.constantBuffer->GetGPUVirtualAddress(), 36, 36);
+    for (const auto& packet : prepared.packets)
+        m_mesh.Draw(cmd, frame.constantBuffer->GetGPUVirtualAddress(),
+            packet.object.firstVertex, packet.object.vertexCount); // visible не фильтрует Draw.
 
     // F3.1: readback для автоматического depth-тест (только тестовый режим).
     // Копирование выполняется после обоих Draw и ДО барьера в PRESENT.
@@ -1570,6 +1626,15 @@ void CHW12::Shutdown()
         return;
 
     m_shutdownComplete = true;
+    dx12log::Write("[renderprep] %s mode=%u frames=%llu samples=%llu packets=2 snapshot=%.6f serial=%.6f parallel=%.6f submit=%.6f wait=%.6f merge=%.6f gpuFence=%.6f ms",
+        m_prepFailed ? "FAIL" : "PASS",static_cast<unsigned>(m_prepMode),
+        (unsigned long long)m_prepFrames,(unsigned long long)m_prepSamples,
+        m_prepSamples?m_snapshotMs/m_prepSamples:0,m_prepSamples?m_serialMs/m_prepSamples:0,
+        m_prepSamples?m_parallelMs/m_prepSamples:0,m_prepSamples?m_submitMs/m_prepSamples:0,
+        m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
+        m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
+    ++m_sceneGeneration;
+    m_jobs=nullptr;
 
     // Политика освобождения ресурсов на основе фактического состояния GPU.
     // Предположение «процесс скоро выйдет» не используется: lifetime
