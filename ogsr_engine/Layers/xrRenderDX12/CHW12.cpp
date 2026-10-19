@@ -5,6 +5,10 @@
 #include "dx12mesh.h"
 #include <chrono>
 #include <exception>
+#include <atomic>
+#include <thread>
+#include <stdexcept>
+#include "gr/jobs/JobGroup.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -118,8 +122,13 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     // Shutdown уже приводил объект к исходному состоянию): идемпотентность
     // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
     m_shutdownComplete = false;
+    // F3.5.3B: m_prepFailed обязан сбрасываться вместе с m_recordFailed.
+    // Иначе один сбой подготовки кадра навсегда блокирует RenderFrame(),
+    // и последовательность Shutdown → Initialize не восстанавливает рендер.
+    m_prepFailed = false;
     m_recordFailed=false; m_recordFrames=m_recordSamples=0;
-    m_recordMs=m_queueSubmitMs=0;
+    m_recordMs=m_queueSubmitMs=m_recordScheduleMs=m_recordWaitMs=0;
+    m_timestampFrequency=m_gpuSamples=0; m_gpuMs=0;
 
 
     m_width = width;
@@ -421,6 +430,8 @@ bool CHW12::CreateRenderTargetViews()
 // потенциальный читатель CB этого слота мёртв.
 bool CHW12::CreateFrameResources()
 {
+    if (FAILED(m_commandQueue->GetTimestampFrequency(&m_timestampFrequency))) m_timestampFrequency=0;
+
     for (uint32_t i = 0; i < FRAME_COUNT; ++i)
     {
         HRESULT hr = m_device->CreateCommandAllocator(
@@ -456,6 +467,21 @@ bool CHW12::CreateFrameResources()
             if (FAILED(hr)) return false;
             hr=resource.list->Close();
             if (FAILED(hr)) return false;
+        }
+
+        if (m_timestampFrequency) {
+            auto& frame=m_frameResources[i];
+            D3D12_QUERY_HEAP_DESC query={}; query.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP; query.Count=2;
+            hr=m_device->CreateQueryHeap(&query,IID_PPV_ARGS(&frame.timestamps));
+            if (FAILED(hr)) return false;
+            D3D12_HEAP_PROPERTIES heap={}; heap.Type=D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC buffer={}; buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+            buffer.Width=16; buffer.Height=1; buffer.DepthOrArraySize=1; buffer.MipLevels=1;
+            buffer.SampleDesc.Count=1; buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr=m_device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,IID_PPV_ARGS(&frame.timestampReadback));
+            if (FAILED(hr)) return false;
+            frame.timestampPending=false;
         }
 
         // Per-frame constant buffer: 256 байт (требование выравнивания),
@@ -505,7 +531,7 @@ bool CHW12::CreateFrameResources()
         m_frameResources[i].mapped = mapped;
     }
 
-    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",m_multiList?"multi":"legacy",FRAME_COUNT,m_multiList?4:1);
+    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",m_parallelRecording?"parallel":(m_multiList?"multi":"legacy"),FRAME_COUNT,m_multiList?4:1);
     dx12log::Write("[DX12] Command allocators, lists and per-frame CBs created");
     return true;
 }
@@ -1070,6 +1096,8 @@ void CHW12::QuarantineGpuResources()
             q.slots[i].extraAllocators[j]=m_frameResources[i].extra[j].allocator.Detach();
             q.slots[i].extraLists[j]=m_frameResources[i].extra[j].list.Detach();
         }
+        q.slots[i].timestamps=m_frameResources[i].timestamps.Detach();
+        q.slots[i].timestampReadback=m_frameResources[i].timestampReadback.Detach();
         q.slots[i].fenceValue       = m_frameResources[i].fenceValue;
 
         // Per-frame constant buffer. Владение передаётся через Detach(),
@@ -1216,6 +1244,22 @@ bool CHW12::RenderFrameFromTimer()
     return RenderFrame();
 }
 
+void CHW12::CollectGpuTiming(FrameResource& frame)
+{
+    // Только owner, после подтверждённого fence/drain; новых ожиданий нет.
+    if (!frame.timestampPending || !m_timestampFrequency) return;
+    frame.timestampPending=false;
+    uint64_t* ticks=nullptr;
+    const D3D12_RANGE read={0,16};
+    if (FAILED(frame.timestampReadback->Map(0,&read,reinterpret_cast<void**>(&ticks)))) {
+        dx12log::Write("[recording-gpu] timestamp Map failed"); return;
+    }
+    if (frame.timestampSample && ticks[1]>=ticks[0]) {
+        m_gpuMs+=double(ticks[1]-ticks[0])*1000.0/double(m_timestampFrequency); ++m_gpuSamples;
+    }
+    const D3D12_RANGE written={0,0}; frame.timestampReadback->Unmap(0,&written);
+}
+
 bool CHW12::InjectRecordingFailure(unsigned stage, unsigned list) {
     if (m_recordFaultStage!=stage || m_recordFaultList!=list) return false;
     m_recordFaultStage=m_recordFaultList=~0u; m_recordFailed=true;
@@ -1236,6 +1280,13 @@ bool CHW12::RenderFrame()
     struct PreparingGuard { bool& active; ~PreparingGuard() { active=false; } } guard{m_preparing};
     renderprep12::PreparedFrame12 prepared;
     try {
+        // F3.5.3B TEST ONLY: одноразовый отказ внутри prepare-пути. Нужен,
+        // чтобы получить реальный m_prepFailed через штатный catch, а не
+        // выставлять флаг в обход обработки ошибок.
+        if (m_prepFaultArmed) {
+            m_prepFaultArmed = false;
+            throw std::runtime_error("preparation fault injection");
+        }
         const auto start=std::chrono::steady_clock::now();
         const renderprep12::RenderSceneSnapshot12 snapshot(m_camera.CaptureViewProjection(),m_mesh.Objects(),m_sceneGeneration);
         const double snapshotMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
@@ -1274,12 +1325,15 @@ bool CHW12::RenderFrame()
         }
     }
 
+    CollectGpuTiming(frame);
+    double scheduleMs=0, recordWaitMs=0;
     const auto recordStart=std::chrono::steady_clock::now();
     ID3D12GraphicsCommandList* commands[4]={frame.commandList.Get(),frame.extra[0].list.Get(),frame.extra[1].list.Get(),frame.extra[2].list.Get()};
     ID3D12CommandAllocator* allocators[4]={frame.commandAllocator.Get(),frame.extra[0].allocator.Get(),frame.extra[1].allocator.Get(),frame.extra[2].allocator.Get()};
     const unsigned listCount=m_multiList?4u:1u;
     HRESULT hr=S_OK;
     for (unsigned i=0;i<listCount;++i) {
+        if (m_parallelRecording && (i==1 || i==2)) continue;
         if (InjectRecordingFailure(0,i)) return false;
         hr=allocators[i]->Reset();
         if (FAILED(hr)) { m_recordFailed=true; ReportGpuFailure(L"allocator Reset",hr); return false; }
@@ -1294,6 +1348,7 @@ bool CHW12::RenderFrame()
         return true;
     };
     ID3D12GraphicsCommandList* cmd=commands[0];
+    if (frame.timestamps) cmd->EndQuery(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
 
     D3D12_RESOURCE_BARRIER toRenderTarget = {};
     toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1363,6 +1418,103 @@ bool CHW12::RenderFrame()
     if (m_multiList) {
         if (prepared.packets.size()!=2) { m_recordFailed=true; return false; }
         if (!closeList(0)) return false;
+        if (m_parallelRecording) {
+            // Все заимствования живут до Wait; owner не меняет mesh/CB/descriptors.
+            if (!m_jobs || !m_jobs->IsInitialized()) { m_recordFailed=true; return false; }
+            struct Result { HRESULT hr=E_PENDING; bool closed=false; } results[2];
+            std::atomic<unsigned> entered{0}, exited{0};
+            std::atomic<bool> overlap{false};
+            const unsigned faultStage=m_recordFaultStage, faultList=m_recordFaultList;
+            const bool faultDraw=faultList==1 || faultList==2;
+            const bool rendezvous=faultDraw && faultStage!=~0u && faultStage!=4;
+            // F3.5.3B: rendezvous требует минимум двух одновременных
+            // исполнителей (background worker + поток, вызывающий Wait).
+            // При totalParticipants < 2 система последовательна: второй
+            // callback не стартует, пока первый ждёт, и проверка перекрытия
+            // вырождается в таймаут. Такой прогон НЕ считается успешным:
+            // недостаточная параллельность фиксируется как отказ теста, а не
+            // маскируется под подтверждённое перекрытие.
+            if (rendezvous)
+            {
+                const uint32_t participants = m_jobs->GetStats().totalParticipants;
+                if (participants < 2)
+                {
+                    m_recordFailed = true;
+                    dx12log::Write("[parallel-fault] insufficient parallelism: "
+                                   "totalParticipants=%u, rendezvous requires >=2; test FAILED",
+                                   participants);
+                    return false;
+                }
+            }
+            if (faultDraw) m_recordFaultStage=m_recordFaultList=~0u;
+            std::exception_ptr failure;
+            const auto schedulingStart=std::chrono::steady_clock::now();
+            try {
+                auto group=m_jobs->CreateGroup();
+                try {
+                    for (unsigned i=0;i<2;++i) {
+                        if (faultDraw && faultStage==4 && i==1)
+                            throw std::runtime_error("recording submit injection");
+                        auto* draw=commands[i+1]; auto* allocator=allocators[i+1];
+                        const SmokeMesh12* mesh=&m_mesh;
+                        const auto object=prepared.packets[i].object;
+                        const auto cb=frame.constantBuffer->GetGPUVirtualAddress();
+                        const auto dsv=m_dsv;
+                        group.Submit([i,draw,allocator,mesh,object,cb,dsv,rtvHandle,viewport,scissor,
+                                      faultStage,faultList,rendezvous,&results,&entered,&exited,&overlap] {
+                            struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
+                            ++entered;
+                            // Только fault harness: подтверждённое перекрытие двух callbacks.
+                            if (rendezvous) {
+                                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+                                while (entered.load()<2) {
+                                    if (std::chrono::steady_clock::now()>deadline) {
+                                        results[i].hr=E_ABORT; return;
+                                    }
+                                    std::this_thread::yield();
+                                }
+                                overlap=true;
+                            }
+                            const auto fault=[&](unsigned stage) { return faultList==i+1 && faultStage==stage; };
+                            if (fault(5)) throw std::runtime_error("recording callback injection");
+                            auto& result=results[i];
+                            result.hr=fault(0)?E_FAIL:allocator->Reset();
+                            if (FAILED(result.hr)) return;
+                            result.hr=fault(1)?E_FAIL:draw->Reset(allocator,nullptr);
+                            if (FAILED(result.hr)) return;
+                            draw->OMSetRenderTargets(1,&rtvHandle,FALSE,&dsv);
+                            draw->RSSetViewports(1,&viewport); draw->RSSetScissorRects(1,&scissor);
+                            if (!mesh->Draw(draw,cb,object.firstVertex,object.vertexCount) || fault(2)) {
+                                result.hr=E_FAIL; return;
+                            }
+                            result.hr=fault(3)?E_FAIL:draw->Close();
+                            result.closed=SUCCEEDED(result.hr);
+                        });
+                    }
+                } catch (...) { failure=std::current_exception(); }
+                scheduleMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-schedulingStart).count();
+                const auto waitStart=std::chrono::steady_clock::now();
+                // Даже отказ второго Submit не обходит Wait первой задачи.
+                //
+                // RISK (A2, F3.5.3B): JobGroup::Wait() не имеет таймаута.
+                // GPU_WAIT_TIMEOUT_MS здесь не действует — это ожидание CPU.
+                // Если worker зависнет внутри callback, главный поток
+                // заблокируется навсегда без диагностики. API JobGroup в этой
+                // правке намеренно не меняется: риск зафиксирован здесь и в
+                // отчёте, смягчение — внешний watchdog на уровне smoke.
+                try { group.Wait(); } catch (...) { if (!failure) failure=std::current_exception(); }
+                recordWaitMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-waitStart).count();
+            } catch (...) { failure=std::current_exception(); }
+            if (faultDraw && faultStage!=~0u)
+                dx12log::Write("[parallel-fault] stage=%u list=%u entered=%u exited=%u overlap=%u submitted=%llu",
+                    faultStage,faultList,entered.load(),exited.load(),overlap.load()?1:0,(unsigned long long)m_recordFrames);
+            if (failure || !results[0].closed || !results[1].closed) {
+                m_recordFailed=true;
+                dx12log::Write("[parallel-recording] ABORTED drained=%u hr0=0x%08X hr1=0x%08X",
+                    entered.load()==exited.load()?1:0,(unsigned)results[0].hr,(unsigned)results[1].hr);
+                return false;
+            }
+        } else {
         for (unsigned i=0;i<2;++i) {
             cmd=commands[i+1];
             // Каждый Draw list самодостаточен: состояние соседнего list не наследуется.
@@ -1370,13 +1522,14 @@ bool CHW12::RenderFrame()
             cmd->RSSetViewports(1,&viewport); cmd->RSSetScissorRects(1,&scissor);
             const auto& packet=prepared.packets[i];
             // Draw задаёт PSO/root signature, topology, VB и root CBV.
-            m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount);
+            if (!m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount)) { m_recordFailed=true; return false; }
             if (!closeList(i+1)) return false;
+        }
         }
         cmd=commands[3];
     } else {
         for (const auto& packet : prepared.packets)
-            m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount);
+            if (!m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount)) { m_recordFailed=true; return false; }
     }
 
     // F3.1: readback для автоматического depth-тест (только тестовый режим).
@@ -1431,6 +1584,10 @@ bool CHW12::RenderFrame()
         cmd->ResourceBarrier(1, &toPresent);
     }
 
+    if (frame.timestamps) {
+        cmd->EndQuery(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
+        cmd->ResolveQueryData(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,frame.timestampReadback.Get(),0);
+    }
     if (!closeList(m_multiList?3u:0u)) return false;
     const double recordingMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-recordStart).count();
     ID3D12CommandList* lists[4]={commands[0],commands[1],commands[2],commands[3]};
@@ -1438,7 +1595,8 @@ bool CHW12::RenderFrame()
     m_commandQueue->ExecuteCommandLists(listCount,lists);
     const double submissionMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-submitStart).count();
     ++m_recordFrames;
-    if (m_recordFrames>30) { ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; }
+    frame.timestampPending=bool(frame.timestamps); frame.timestampSample=m_recordFrames>30;
+    if (m_recordFrames>30) { ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; m_recordScheduleMs+=scheduleMs; m_recordWaitMs+=recordWaitMs; }
     m_gpuWorkSubmitted = true;
 
     // Present — единственный источник DEVICE_REMOVED/DEVICE_RESET и единственное
@@ -1535,6 +1693,8 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
         for (auto& resource:m_frameResources[i].extra) {
             resource.list.Reset(); resource.allocator.Reset();
         }
+        CollectGpuTiming(m_frameResources[i]);
+        m_frameResources[i].timestamps.Reset(); m_frameResources[i].timestampReadback.Reset();
         m_frameResources[i].commandList.Reset();
         m_frameResources[i].commandAllocator.Reset();
         m_frameResources[i].renderTarget.Reset();
@@ -1678,9 +1838,11 @@ void CHW12::Shutdown()
         m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
         m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
     dx12log::Write("[recording] %s mode=%s lists=%u frames=%llu samples=%llu recording=%.6f submission=%.6f ms",
-        m_recordFailed?"ABORTED":"PASS",m_multiList?"multi":"legacy",m_multiList?4:1,
+        m_recordFailed?"ABORTED":"PASS",m_parallelRecording?"parallel":(m_multiList?"multi":"legacy"),m_multiList?4:1,
         (unsigned long long)m_recordFrames,(unsigned long long)m_recordSamples,
         m_recordSamples?m_recordMs/m_recordSamples:0,m_recordSamples?m_queueSubmitMs/m_recordSamples:0);
+    dx12log::Write("[recording-cpu] scheduling=%.6f wait=%.6f ms",
+        m_recordSamples?m_recordScheduleMs/m_recordSamples:0,m_recordSamples?m_recordWaitMs/m_recordSamples:0);
     ++m_sceneGeneration;
     m_jobs=nullptr;
 
@@ -1720,6 +1882,11 @@ void CHW12::Shutdown()
         break;
     }
 
+    if (lifetime==GpuLifetime::WorkCompleted)
+        for (auto& frame:m_frameResources) CollectGpuTiming(frame);
+    dx12log::Write("[recording-gpu] available=%u samples=%llu mean=%.6f ms",
+        m_timestampFrequency?1:0,(unsigned long long)m_gpuSamples,m_gpuSamples?m_gpuMs/m_gpuSamples:0);
+
     // Освобождение GPU-ресурсов выполняется во всех состояниях, кроме
     // Unknown. В Unknown ComPtr уже равны nullptr после Detach(), поэтому
     // эти Reset() стали бы no-op'ами, но явное разделение понятнее.
@@ -1735,6 +1902,7 @@ void CHW12::Shutdown()
             for (auto& resource:m_frameResources[i].extra) {
                 resource.list.Reset(); resource.allocator.Reset();
             }
+            m_frameResources[i].timestamps.Reset(); m_frameResources[i].timestampReadback.Reset();
             m_frameResources[i].commandList.Reset();
             m_frameResources[i].commandAllocator.Reset();
         }

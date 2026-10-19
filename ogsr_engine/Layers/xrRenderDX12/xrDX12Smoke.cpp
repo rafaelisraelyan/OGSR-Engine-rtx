@@ -409,8 +409,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // -freeaspect — отключает фиксацию 16:9 (свободный resize).
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
-    bool multiList=false; unsigned recordFault=~0u, recordFaultList=0;
+    bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
+    bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
     uint32_t prepFrames=0;
     bool fixedPose = false;
     bool depthTest = false;
@@ -424,8 +425,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             {
                 if (_wcsicmp(argv[i],L"-commandlists")==0) {
                     if (++i>=argc) badArgument=true;
-                    else if (!_wcsicmp(argv[i],L"multi")) multiList=true;
-                    else if (!_wcsicmp(argv[i],L"legacy")) multiList=false;
+                    else if (!_wcsicmp(argv[i],L"multi")) { multiList=true; parallelRecording=false; }
+                    else if (!_wcsicmp(argv[i],L"parallel")) { multiList=true; parallelRecording=true; }
+                    else if (!_wcsicmp(argv[i],L"legacy")) { multiList=false; parallelRecording=false; }
                     else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i],L"-recordfault")==0) {
@@ -435,6 +437,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     else if (!_wcsicmp(argv[i],L"reset")) recordFault=1;
                     else if (!_wcsicmp(argv[i],L"record")) recordFault=2;
                     else if (!_wcsicmp(argv[i],L"close")) recordFault=3;
+                    else if (!_wcsicmp(argv[i],L"submit")) recordFault=4;
+                    else if (!_wcsicmp(argv[i],L"throw")) recordFault=5;
                     else badArgument=true;
                     ++i;
                     if (wcslen(argv[i])!=1 || argv[i][0]<L'0' || argv[i][0]>L'3') badArgument=true;
@@ -446,6 +450,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
                 // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути.
                 else if (_wcsicmp(argv[i], L"-timerfault") == 0) timerFault=true;
+                // F3.5.3B TEST ONLY: отказ подготовки кадра + повторная инициализация.
+                else if (_wcsicmp(argv[i], L"-prepfault") == 0) prepFault=true;
                 else if (_wcsicmp(argv[i], L"-prepframes") == 0) {
                     if (i+1<argc && _wtoi(argv[i+1])>0) prepFrames=static_cast<uint32_t>(_wtoi(argv[++i]));
                     else badArgument=true;
@@ -600,6 +606,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
     if (recordFault!=~0u && (!multiList || !depthTest)) badArgument=true;
+    if (recordFault!=~0u && recordFault>=4 && (!parallelRecording || (recordFaultList!=1 && recordFaultList!=2))) badArgument=true;
     if (badArgument)
     {
         dx12log::Write("[smoke] FATAL: invalid command line argument, aborting");
@@ -690,7 +697,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     g_hw = &hw12;
 
     // F3.1: настройка режимов тестирования.
-    hw12.SetMultiList(multiList);
+    hw12.SetMultiList(multiList,parallelRecording);
     hw12.SetTestMode(depthTest);
     if (depthTest || fixedPose)
     {
@@ -717,27 +724,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 1;
     }
 
-    if (recordFault!=~0u) {
-        const auto failRecovery=[&]() {
-            dx12log::Write("[recording-recovery] FAIL");
-            hw12.Shutdown(); g_hw=nullptr; DestroyWindow(hwnd);
-            UnregisterClassW(kWindowClass,hInstance); dx12log::Close(); return 1;
-        };
-        // Сначала настоящая отправка: shutdown обязан дренировать ранее отправленную работу.
-        if (!hw12.RenderFrame()) return failRecovery();
-        const auto submitted=hw12.RecordingSubmissions();
-        hw12.ArmRecordingFailure(recordFault,recordFaultList);
-        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
-        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
-        hw12.Shutdown();
-        if (!hw12.Initialize(hwnd,clientWidth,clientHeight)) return failRecovery();
-        dx12log::Write("[recording-recovery] PASS stage=%u list=%u submittedUnchanged=1",recordFault,recordFaultList);
-        // Ниже обычный depth-test проверяет первый успешный кадр после восстановления.
-    }
-
     // F3.2C: один JobSystem на приложение. Initialize вызывается один раз,
     // Shutdown — один раз при выходе; в цикле кадра ничего не пересоздаётся.
-    if (prepMode!=renderprep12::Mode::Serial || (g_stressObjects > 0 && (g_jobsParallel || g_cpuVerify)))
+    if (parallelRecording || prepMode!=renderprep12::Mode::Serial || (g_stressObjects > 0 && (g_jobsParallel || g_cpuVerify)))
     {
         gr::jobs::JobConfig jobConfig;
         jobConfig.backgroundWorkers = g_jobWorkers;   // 0 = автоматическая политика
@@ -773,6 +762,56 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
     hw12.ConfigurePreparation(prepMode,g_jobSystemReady?g_jobSystem:nullptr);
+    if (recordFault!=~0u) {
+        const auto failRecovery=[&]() {
+            dx12log::Write("[recording-recovery] FAIL");
+            hw12.Shutdown(); g_hw=nullptr; DestroyWindow(hwnd);
+            UnregisterClassW(kWindowClass,hInstance); dx12log::Close(); return 1;
+        };
+        // Сначала настоящая отправка: shutdown обязан дренировать ранее отправленную работу.
+        if (!hw12.RenderFrame()) return failRecovery();
+        const auto submitted=hw12.RecordingSubmissions();
+        hw12.ArmRecordingFailure(recordFault,recordFaultList);
+        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
+        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
+        hw12.Shutdown();
+        if (!hw12.Initialize(hwnd,clientWidth,clientHeight)) return failRecovery();
+        hw12.ConfigurePreparation(prepMode,g_jobSystemReady?g_jobSystem:nullptr);
+        dx12log::Write("[recording-recovery] PASS stage=%u list=%u submittedUnchanged=1",recordFault,recordFaultList);
+        // Ниже обычный depth-test проверяет первый успешный кадр после восстановления.
+    }
+
+    // F3.5.3B TEST ONLY: восстановление после отказа подготовки кадра.
+    // Проверяет A1: Initialize обязан сбросить m_prepFailed. Без сброса
+    // RenderFrame после Shutdown → Initialize навсегда возвращает false,
+    // и такой прогон должен завершиться FAIL, а не тихим успехом.
+    if (prepFault)
+    {
+        const auto failPrep = [&](const char* stage) {
+            dx12log::Write("[prep-recovery] FAIL at %s", stage);
+            hw12.Shutdown(); g_hw=nullptr; DestroyWindow(hwnd);
+            StopJobs();
+            UnregisterClassW(kWindowClass,hInstance); dx12log::Close(); return 1;
+        };
+        // Базовая отправка: GPU уже получил работу, поэтому Shutdown обязан
+        // её дренировать, а не освобождать ресурсы вслепую.
+        if (!hw12.RenderFrame()) return failPrep("baseline frame");
+        hw12.ArmPreparationFailure();
+        if (hw12.RenderFrame()) return failPrep("fault injection did not fail");
+        if (!hw12.PreparationFailed()) return failPrep("m_prepFailed not set");
+        hw12.Shutdown();
+        if (!hw12.Initialize(hwnd,clientWidth,clientHeight)) return failPrep("re-initialize");
+        if (hw12.PreparationFailed()) return failPrep("m_prepFailed not reset by Initialize");
+        hw12.ConfigurePreparation(prepMode,g_jobSystemReady?g_jobSystem:nullptr);
+        if (!hw12.RenderFrame()) return failPrep("frame after re-initialize");
+        dx12log::Write("[prep-recovery] PASS: failure -> shutdown -> initialize -> frame");
+        hw12.Shutdown(); g_hw=nullptr;
+        StopJobs();
+        UnregisterClassW(kWindowClass,hInstance); dx12log::Close();
+        return 0;
+    }
+
+
     // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути. Флаг виден только
     // RenderFrameFromTimer(); главный цикл вызывает RenderFrame() и потому
     // инъекцию не израсходует и не заметит.

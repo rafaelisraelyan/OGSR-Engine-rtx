@@ -1,4 +1,4 @@
-﻿# F3.3.0a: WM_TIMER / modal sizing path test.
+# F3.3.0a: WM_TIMER / modal sizing path test.
 #
 # run-renderprep.ps1 never posted WM_ENTERSIZEMOVE/WM_TIMER, so the timer
 # render path added in F3.1-FIX B had no automated coverage at all. This
@@ -18,7 +18,7 @@
 param(
     [string]$Executable = '',
     [string]$Mode = 'parallel',
-    [ValidateSet('legacy','multi')][string]$CommandLists = 'legacy',
+    [ValidateSet('legacy','multi','parallel')][string]$CommandLists = 'legacy',
     [int]$Burst = 40,
     [int]$TimeoutMs = 60000,
     # F3.3.0a: launch with -timerfault (test-only one-shot WM_TIMER fault) and

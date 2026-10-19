@@ -59,13 +59,15 @@ public:
     // draw call используют один адрес.
     //
     // Валидация диапазона обязательна: firstVertex + vertexCount <= 72,
-    // иначе запись в лог и выход без рисования. Выход за пределы буфера
+    // иначе false без записи команд. Диагностика остаётся на owner thread. Выход за пределы буфера
     // был бы GPU page fault.
-    void Draw(
+    // Read-only mesh: параллельные вызовы допустимы с разными command lists,
+    // если Create/Release/Quarantine не перекрываются с записью.
+    bool Draw(
         ID3D12GraphicsCommandList* cmd,
         D3D12_GPU_VIRTUAL_ADDRESS cbVA,
         UINT firstVertex,
-        UINT vertexCount);
+        UINT vertexCount) const;
 
     // Передаёт владение ресурсами карантину. Владение передаётся через
     // Detach(), поэтому счётчики ссылок не меняются и AddRef не нужен.

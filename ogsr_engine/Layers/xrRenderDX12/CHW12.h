@@ -50,10 +50,16 @@ public:
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
     bool RenderFrame();
     // Режим выбирается до Initialize; legacy остаётся default.
-    bool SetMultiList(bool enabled) { if (m_initialized) return false; m_multiList=enabled; return true; }
-    // Только smoke-тест: 0=allocator Reset, 1=list Reset, 2=Record, 3=Close.
+    bool SetMultiList(bool enabled, bool parallel=false) { if (m_initialized) return false; m_multiList=enabled; m_parallelRecording=enabled && parallel; return true; }
+    // Только smoke-тест: 0=allocator Reset, 1=list Reset, 2=Record, 3=Close,
+    // 4=отказ второго Submit, 5=исключение callback (последние два только parallel).
     void ArmRecordingFailure(unsigned stage, unsigned list) { m_recordFaultStage=stage; m_recordFaultList=list; }
     uint64_t RecordingSubmissions() const { return m_recordFrames; }
+
+    // F3.5.3B TEST ONLY: одноразовый отказ подготовки кадра. Нужен, чтобы
+    // проверить восстановление после m_prepFailed: Shutdown → Initialize
+    // обязан сбросить флаг, иначе RenderFrame навсегда возвращает false.
+    void ArmPreparationFailure() { m_prepFaultArmed = true; }
 
 
     // F3.3.0a TEST ONLY — WM_TIMER fault injection.
@@ -109,15 +115,18 @@ public:
     DepthTestResult VerifyDepthTest();
 
 private:
-    bool m_multiList=false, m_recordFailed=false;
+    bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
     unsigned m_recordFaultStage=~0u, m_recordFaultList=~0u;
     uint64_t m_recordFrames=0, m_recordSamples=0;
-    double m_recordMs=0, m_queueSubmitMs=0;
+    uint64_t m_timestampFrequency=0, m_gpuSamples=0;
+    double m_gpuMs=0;
+    double m_recordMs=0, m_queueSubmitMs=0, m_recordScheduleMs=0, m_recordWaitMs=0;
     bool InjectRecordingFailure(unsigned stage, unsigned list);
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;
     bool m_timerFaultArmed=false; // F3.3.0a TEST ONLY, см. ArmTimerRenderFailure()
+    bool m_prepFaultArmed=false;  // F3.5.3B TEST ONLY, см. ArmPreparationFailure()
     uint64_t m_sceneGeneration=1, m_prepFrames=0, m_prepSamples=0;
     double m_snapshotMs=0, m_serialMs=0, m_parallelMs=0, m_submitMs=0, m_waitMs=0;
     // F3.3.0a: merge (финальная сборка PreparedFrame) и ожидание GPU fence
@@ -153,6 +162,9 @@ private:
     {
         ComPtr<ID3D12CommandAllocator> commandAllocator;
         ComPtr<ID3D12GraphicsCommandList> commandList;
+        ComPtr<ID3D12QueryHeap> timestamps;
+        ComPtr<ID3D12Resource> timestampReadback;
+        bool timestampPending=false, timestampSample=false;
         RecordingResource extra[3]; // Draw 0, Draw 1, Owner End; только multi-list.
         ComPtr<ID3D12Resource> renderTarget;
         ComPtr<ID3D12Resource> constantBuffer;
@@ -160,6 +172,7 @@ private:
         uint64_t fenceValue = 0;
     };
 
+    void CollectGpuTiming(FrameResource& frame);
     bool CreateDevice();
     bool CreateSwapChain(HWND hwnd, uint32_t width, uint32_t height);
     bool CreateRenderTargetViews();

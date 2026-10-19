@@ -603,24 +603,20 @@ bool SmokeMesh12::CreatePipelineState(ID3D12Device* device)
     return true;
 }
 
-void SmokeMesh12::Draw(
+bool SmokeMesh12::Draw(
     ID3D12GraphicsCommandList* cmd,
     D3D12_GPU_VIRTUAL_ADDRESS cbVA,
     UINT firstVertex,
-    UINT vertexCount)
+    UINT vertexCount) const
 {
     if (!m_created || !cmd)
-        return;
+        return false;
 
     // Валидация диапазона обязательна: выход за пределы буфера был бы GPU
     // page fault. GBV это не ловит: адрес выровнен и валиден, но чтение
     // за пределами буфера неопределённо.
-    if (firstVertex + vertexCount > kVertexCount)
-    {
-        dx12log::Write("[DX12][mesh] Draw refused: firstVertex=%u + vertexCount=%u > %u",
-                       firstVertex, vertexCount, kVertexCount);
-        return;
-    }
+    if (firstVertex > kVertexCount || vertexCount > kVertexCount-firstVertex)
+        return false;
 
     cmd->SetGraphicsRootSignature(m_rootSignature.Get());
     cmd->SetPipelineState(m_pipelineState.Get());
@@ -628,6 +624,7 @@ void SmokeMesh12::Draw(
     cmd->IASetVertexBuffers(0, 1, &m_vertexBufferView);
     cmd->SetGraphicsRootConstantBufferView(0, cbVA);
     cmd->DrawInstanced(vertexCount, 1, firstVertex, 0);
+    return true;
 }
 
 void SmokeMesh12::Quarantine(
