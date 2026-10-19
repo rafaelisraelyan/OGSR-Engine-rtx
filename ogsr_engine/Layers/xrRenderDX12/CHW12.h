@@ -49,6 +49,12 @@ public:
 
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
     bool RenderFrame();
+    // Режим выбирается до Initialize; legacy остаётся default.
+    bool SetMultiList(bool enabled) { if (m_initialized) return false; m_multiList=enabled; return true; }
+    // Только smoke-тест: 0=allocator Reset, 1=list Reset, 2=Record, 3=Close.
+    void ArmRecordingFailure(unsigned stage, unsigned list) { m_recordFaultStage=stage; m_recordFaultList=list; }
+    uint64_t RecordingSubmissions() const { return m_recordFrames; }
+
 
     // F3.3.0a TEST ONLY — WM_TIMER fault injection.
     //
@@ -103,6 +109,11 @@ public:
     DepthTestResult VerifyDepthTest();
 
 private:
+    bool m_multiList=false, m_recordFailed=false;
+    unsigned m_recordFaultStage=~0u, m_recordFaultList=~0u;
+    uint64_t m_recordFrames=0, m_recordSamples=0;
+    double m_recordMs=0, m_queueSubmitMs=0;
+    bool InjectRecordingFailure(unsigned stage, unsigned list);
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;
@@ -134,10 +145,15 @@ private:
         Ready
     };
 
+    struct RecordingResource {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+    };
     struct FrameResource
     {
         ComPtr<ID3D12CommandAllocator> commandAllocator;
         ComPtr<ID3D12GraphicsCommandList> commandList;
+        RecordingResource extra[3]; // Draw 0, Draw 1, Owner End; только multi-list.
         ComPtr<ID3D12Resource> renderTarget;
         ComPtr<ID3D12Resource> constantBuffer;
         void* mapped = nullptr;

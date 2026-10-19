@@ -409,6 +409,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // -freeaspect — отключает фиксацию 16:9 (свободный resize).
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
+    bool multiList=false; unsigned recordFault=~0u, recordFaultList=0;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     uint32_t prepFrames=0;
     bool fixedPose = false;
@@ -421,7 +422,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         {
             for (int i = 1; i < argc; ++i)
             {
-                if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
+                if (_wcsicmp(argv[i],L"-commandlists")==0) {
+                    if (++i>=argc) badArgument=true;
+                    else if (!_wcsicmp(argv[i],L"multi")) multiList=true;
+                    else if (!_wcsicmp(argv[i],L"legacy")) multiList=false;
+                    else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i],L"-recordfault")==0) {
+                    if (i+2>=argc) { badArgument=true; break; }
+                    ++i;
+                    if (!_wcsicmp(argv[i],L"allocator")) recordFault=0;
+                    else if (!_wcsicmp(argv[i],L"reset")) recordFault=1;
+                    else if (!_wcsicmp(argv[i],L"record")) recordFault=2;
+                    else if (!_wcsicmp(argv[i],L"close")) recordFault=3;
+                    else badArgument=true;
+                    ++i;
+                    if (wcslen(argv[i])!=1 || argv[i][0]<L'0' || argv[i][0]>L'3') badArgument=true;
+                    else recordFaultList=argv[i][0]-L'0';
+                }
+                else if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -580,6 +599,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
     }
 
+    if (recordFault!=~0u && (!multiList || !depthTest)) badArgument=true;
     if (badArgument)
     {
         dx12log::Write("[smoke] FATAL: invalid command line argument, aborting");
@@ -670,6 +690,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     g_hw = &hw12;
 
     // F3.1: настройка режимов тестирования.
+    hw12.SetMultiList(multiList);
     hw12.SetTestMode(depthTest);
     if (depthTest || fixedPose)
     {
@@ -694,6 +715,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         UnregisterClassW(kWindowClass, hInstance);
         dx12log::Close();
         return 1;
+    }
+
+    if (recordFault!=~0u) {
+        const auto failRecovery=[&]() {
+            dx12log::Write("[recording-recovery] FAIL");
+            hw12.Shutdown(); g_hw=nullptr; DestroyWindow(hwnd);
+            UnregisterClassW(kWindowClass,hInstance); dx12log::Close(); return 1;
+        };
+        // Сначала настоящая отправка: shutdown обязан дренировать ранее отправленную работу.
+        if (!hw12.RenderFrame()) return failRecovery();
+        const auto submitted=hw12.RecordingSubmissions();
+        hw12.ArmRecordingFailure(recordFault,recordFaultList);
+        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
+        if (hw12.RenderFrame() || hw12.RecordingSubmissions()!=submitted) return failRecovery();
+        hw12.Shutdown();
+        if (!hw12.Initialize(hwnd,clientWidth,clientHeight)) return failRecovery();
+        dx12log::Write("[recording-recovery] PASS stage=%u list=%u submittedUnchanged=1",recordFault,recordFaultList);
+        // Ниже обычный depth-test проверяет первый успешный кадр после восстановления.
     }
 
     // F3.2C: один JobSystem на приложение. Initialize вызывается один раз,

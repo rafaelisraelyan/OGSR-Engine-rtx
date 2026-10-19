@@ -64,6 +64,8 @@ struct GpuQuarantine
         ID3D12Resource* renderTarget = nullptr;
         ID3D12CommandAllocator* commandAllocator = nullptr;
         ID3D12GraphicsCommandList* commandList = nullptr;
+        ID3D12CommandAllocator* extraAllocators[3] = {};
+        ID3D12GraphicsCommandList* extraLists[3] = {};
         uint64_t fenceValue = 0;
     };
 

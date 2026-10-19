@@ -18,6 +18,7 @@
 param(
     [string]$Executable = '',
     [string]$Mode = 'parallel',
+    [ValidateSet('legacy','multi')][string]$CommandLists = 'legacy',
     [int]$Burst = 40,
     [int]$TimeoutMs = 60000,
     # F3.3.0a: launch with -timerfault (test-only one-shot WM_TIMER fault) and
@@ -46,7 +47,7 @@ $WM_CLOSE         = 0x0010
 $failures = [Collections.Generic.List[string]]::new()
 function Fail([string]$m) { $script:failures.Add($m); Write-Output "  FAIL: $m" }
 
-$exeArgs = "-renderprep $Mode -jobworkers 4 -fixedpose"
+$exeArgs = "-renderprep $Mode -jobworkers 4 -fixedpose -commandlists $CommandLists"
 if ($TimerFault) { $exeArgs = "$exeArgs -timerfault" }
 $p = Start-Process $Executable -ArgumentList $exeArgs -WindowStyle Hidden -PassThru
 

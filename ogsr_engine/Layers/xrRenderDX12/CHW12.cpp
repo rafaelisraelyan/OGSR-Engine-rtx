@@ -118,6 +118,9 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     // Shutdown уже приводил объект к исходному состоянию): идемпотентность
     // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
     m_shutdownComplete = false;
+    m_recordFailed=false; m_recordFrames=m_recordSamples=0;
+    m_recordMs=m_queueSubmitMs=0;
+
 
     m_width = width;
     m_height = height;
@@ -446,6 +449,15 @@ bool CHW12::CreateFrameResources()
         if (FAILED(hr))
             return false;
 
+        if (m_multiList) for (auto& resource:m_frameResources[i].extra) {
+            hr=m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&resource.allocator));
+            if (FAILED(hr)) return false;
+            hr=m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,resource.allocator.Get(),nullptr,IID_PPV_ARGS(&resource.list));
+            if (FAILED(hr)) return false;
+            hr=resource.list->Close();
+            if (FAILED(hr)) return false;
+        }
+
         // Per-frame constant buffer: 256 байт (требование выравнивания),
         // upload heap, GENERIC_READ (требование API для upload heap),
         // pOptimizedClearValue = nullptr (требование API для DIMENSION_BUFFER).
@@ -493,6 +505,7 @@ bool CHW12::CreateFrameResources()
         m_frameResources[i].mapped = mapped;
     }
 
+    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",m_multiList?"multi":"legacy",FRAME_COUNT,m_multiList?4:1);
     dx12log::Write("[DX12] Command allocators, lists and per-frame CBs created");
     return true;
 }
@@ -1053,6 +1066,10 @@ void CHW12::QuarantineGpuResources()
         q.slots[i].renderTarget     = m_frameResources[i].renderTarget.Detach();
         q.slots[i].commandAllocator = m_frameResources[i].commandAllocator.Detach();
         q.slots[i].commandList      = m_frameResources[i].commandList.Detach();
+        for (unsigned j=0;j<3;++j) {
+            q.slots[i].extraAllocators[j]=m_frameResources[i].extra[j].allocator.Detach();
+            q.slots[i].extraLists[j]=m_frameResources[i].extra[j].list.Detach();
+        }
         q.slots[i].fenceValue       = m_frameResources[i].fenceValue;
 
         // Per-frame constant buffer. Владение передаётся через Detach(),
@@ -1199,6 +1216,13 @@ bool CHW12::RenderFrameFromTimer()
     return RenderFrame();
 }
 
+bool CHW12::InjectRecordingFailure(unsigned stage, unsigned list) {
+    if (m_recordFaultStage!=stage || m_recordFaultList!=list) return false;
+    m_recordFaultStage=m_recordFaultList=~0u; m_recordFailed=true;
+    dx12log::Write("[recording-fault] stage=%u list=%u submitted=%llu",stage,list,(unsigned long long)m_recordFrames);
+    return true;
+}
+
 bool CHW12::RenderFrame()
 {
     if (!m_initialized)
@@ -1207,7 +1231,7 @@ bool CHW12::RenderFrame()
     if (m_deviceRemoved)
         return false;
 
-    if (m_prepFailed || m_preparing) return false;
+    if (m_recordFailed || m_prepFailed || m_preparing) return false;
     m_preparing=true;
     struct PreparingGuard { bool& active; ~PreparingGuard() { active=false; } } guard{m_preparing};
     renderprep12::PreparedFrame12 prepared;
@@ -1250,22 +1274,26 @@ bool CHW12::RenderFrame()
         }
     }
 
-    HRESULT hr = frame.commandAllocator->Reset();
-    if (FAILED(hr))
-    {
-        dx12log::Write("[DX12] allocator Reset failed, hr=0x%08X", static_cast<unsigned>(hr));
-        ReportGpuFailure(L"allocator Reset", hr);
-        return false;
+    const auto recordStart=std::chrono::steady_clock::now();
+    ID3D12GraphicsCommandList* commands[4]={frame.commandList.Get(),frame.extra[0].list.Get(),frame.extra[1].list.Get(),frame.extra[2].list.Get()};
+    ID3D12CommandAllocator* allocators[4]={frame.commandAllocator.Get(),frame.extra[0].allocator.Get(),frame.extra[1].allocator.Get(),frame.extra[2].allocator.Get()};
+    const unsigned listCount=m_multiList?4u:1u;
+    HRESULT hr=S_OK;
+    for (unsigned i=0;i<listCount;++i) {
+        if (InjectRecordingFailure(0,i)) return false;
+        hr=allocators[i]->Reset();
+        if (FAILED(hr)) { m_recordFailed=true; ReportGpuFailure(L"allocator Reset",hr); return false; }
+        if (InjectRecordingFailure(1,i)) return false;
+        hr=commands[i]->Reset(allocators[i],nullptr);
+        if (FAILED(hr)) { m_recordFailed=true; ReportGpuFailure(L"command list Reset",hr); return false; }
     }
-
-    ID3D12GraphicsCommandList* cmd = frame.commandList.Get();
-    hr = cmd->Reset(frame.commandAllocator.Get(), nullptr);
-    if (FAILED(hr))
-    {
-        dx12log::Write("[DX12] command list Reset failed, hr=0x%08X", static_cast<unsigned>(hr));
-        ReportGpuFailure(L"command list Reset", hr);
-        return false;
-    }
+    const auto closeList=[&](unsigned index) {
+        if (InjectRecordingFailure(2,index) || InjectRecordingFailure(3,index)) return false;
+        const HRESULT closeHr=commands[index]->Close();
+        if (FAILED(closeHr)) { m_recordFailed=true; ReportGpuFailure(L"command list Close",closeHr); return false; }
+        return true;
+    };
+    ID3D12GraphicsCommandList* cmd=commands[0];
 
     D3D12_RESOURCE_BARRIER toRenderTarget = {};
     toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1332,9 +1360,24 @@ bool CHW12::RenderFrame()
     // перезаписывает ближний — тест падает. При работающем depth-тесте
     // ближний куб первым пишет цвет A и глубину, дальний проваливает
     // LESS и не пишет ничего.
-    for (const auto& packet : prepared.packets)
-        m_mesh.Draw(cmd, frame.constantBuffer->GetGPUVirtualAddress(),
-            packet.object.firstVertex, packet.object.vertexCount); // visible не фильтрует Draw.
+    if (m_multiList) {
+        if (prepared.packets.size()!=2) { m_recordFailed=true; return false; }
+        if (!closeList(0)) return false;
+        for (unsigned i=0;i<2;++i) {
+            cmd=commands[i+1];
+            // Каждый Draw list самодостаточен: состояние соседнего list не наследуется.
+            cmd->OMSetRenderTargets(1,&rtvHandle,FALSE,&m_dsv);
+            cmd->RSSetViewports(1,&viewport); cmd->RSSetScissorRects(1,&scissor);
+            const auto& packet=prepared.packets[i];
+            // Draw задаёт PSO/root signature, topology, VB и root CBV.
+            m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount);
+            if (!closeList(i+1)) return false;
+        }
+        cmd=commands[3];
+    } else {
+        for (const auto& packet : prepared.packets)
+            m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount);
+    }
 
     // F3.1: readback для автоматического depth-тест (только тестовый режим).
     // Копирование выполняется после обоих Draw и ДО барьера в PRESENT.
@@ -1388,16 +1431,14 @@ bool CHW12::RenderFrame()
         cmd->ResourceBarrier(1, &toPresent);
     }
 
-    hr = cmd->Close();
-    if (FAILED(hr))
-    {
-        dx12log::Write("[DX12] command list Close failed, hr=0x%08X", static_cast<unsigned>(hr));
-        ReportGpuFailure(L"command list Close", hr);
-        return false;
-    }
-
-    ID3D12CommandList* lists[] = {cmd};
-    m_commandQueue->ExecuteCommandLists(1, lists);
+    if (!closeList(m_multiList?3u:0u)) return false;
+    const double recordingMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-recordStart).count();
+    ID3D12CommandList* lists[4]={commands[0],commands[1],commands[2],commands[3]};
+    const auto submitStart=std::chrono::steady_clock::now();
+    m_commandQueue->ExecuteCommandLists(listCount,lists);
+    const double submissionMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-submitStart).count();
+    ++m_recordFrames;
+    if (m_recordFrames>30) { ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; }
     m_gpuWorkSubmitted = true;
 
     // Present — единственный источник DEVICE_REMOVED/DEVICE_RESET и единственное
@@ -1491,6 +1532,9 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
     // Reset/Close для каждого.
     for (uint32_t i = 0; i < FRAME_COUNT; ++i)
     {
+        for (auto& resource:m_frameResources[i].extra) {
+            resource.list.Reset(); resource.allocator.Reset();
+        }
         m_frameResources[i].commandList.Reset();
         m_frameResources[i].commandAllocator.Reset();
         m_frameResources[i].renderTarget.Reset();
@@ -1633,6 +1677,10 @@ void CHW12::Shutdown()
         m_prepSamples?m_parallelMs/m_prepSamples:0,m_prepSamples?m_submitMs/m_prepSamples:0,
         m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
         m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
+    dx12log::Write("[recording] %s mode=%s lists=%u frames=%llu samples=%llu recording=%.6f submission=%.6f ms",
+        m_recordFailed?"ABORTED":"PASS",m_multiList?"multi":"legacy",m_multiList?4:1,
+        (unsigned long long)m_recordFrames,(unsigned long long)m_recordSamples,
+        m_recordSamples?m_recordMs/m_recordSamples:0,m_recordSamples?m_queueSubmitMs/m_recordSamples:0);
     ++m_sceneGeneration;
     m_jobs=nullptr;
 
@@ -1684,6 +1732,9 @@ void CHW12::Shutdown()
             m_frameResources[i].mapped = nullptr;
             m_frameResources[i].constantBuffer.Reset();
             m_frameResources[i].renderTarget.Reset();
+            for (auto& resource:m_frameResources[i].extra) {
+                resource.list.Reset(); resource.allocator.Reset();
+            }
             m_frameResources[i].commandList.Reset();
             m_frameResources[i].commandAllocator.Reset();
         }
