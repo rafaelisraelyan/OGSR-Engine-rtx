@@ -34,12 +34,20 @@ class RenderSceneSnapshot12 {
 public:
     RenderSceneSnapshot12(const DirectX::XMFLOAT4X4& cpuViewProjection,
         std::span<const Object12> objects, uint64_t generation);
+    // Ordering требует согласованную пару: VP вычисляется из этих копий.
+    RenderSceneSnapshot12(const DirectX::XMFLOAT4X4& view, const DirectX::XMFLOAT4X4& projection,
+        std::span<const Object12> objects, uint64_t generation);
+    bool HasView() const { return m_hasView; }
+    const DirectX::XMFLOAT4X4& View() const { return m_view; }
     const DirectX::XMFLOAT4X4& Camera() const { return m_camera; }
     const DirectX::XMFLOAT4X4& ShaderCamera() const { return m_shaderCamera; }
     const std::vector<Object12>& Objects() const { return m_objects; }
     uint64_t Generation() const { return m_generation; }
 private:
-    const DirectX::XMFLOAT4X4 m_camera, m_shaderCamera;
+    RenderSceneSnapshot12(const DirectX::XMFLOAT4X4& vp, const DirectX::XMFLOAT4X4& view,
+        std::span<const Object12>, uint64_t generation, bool hasView);
+    const DirectX::XMFLOAT4X4 m_camera, m_shaderCamera, m_view;
+    const bool m_hasView;
     const std::vector<Object12> m_objects;
     const uint64_t m_generation;
 };
@@ -73,4 +81,19 @@ PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12&, uint64_t liveGenera
 bool RunTests();
 bool RunRepresentativeTests();
 bool RunVisibilityTests();
+enum class DrawCategory12 : uint32_t { Opaque, Transparent, Hud };
+struct PacketRange12 {
+    uint32_t begin{}, count{};
+    bool operator==(const PacketRange12&) const = default;
+};
+struct OrderedFrame12 {
+    PreparedFrame12 frame;
+    std::array<PacketRange12,3> categories{};
+};
+struct OrderingPhases12 { double visibility{}, keyGeneration{}, ordering{}, total{}; };
+struct OrderingTimings12 { OrderingPhases12 serial{}, parallel{}; };
+OrderedFrame12 PrepareOrdered(const RenderSceneSnapshot12&, uint64_t liveGeneration,
+    Mode, gr::jobs::JobSystem*, OrderingTimings12&);
+bool Equivalent(const OrderedFrame12&, const OrderedFrame12&);
+bool RunOrderingTests();
 }

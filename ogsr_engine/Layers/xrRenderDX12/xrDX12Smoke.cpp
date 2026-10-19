@@ -408,7 +408,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // -depthtest — автоматический depth-тест через readback.
     // -freeaspect — отключает фиксацию 16:9 (свободный resize).
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
-    bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false;
+    bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     uint32_t prepFrames=0;
     bool fixedPose = false;
@@ -421,7 +421,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         {
             for (int i = 1; i < argc; ++i)
             {
-                if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
+                if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
+                else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
                 // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути.
@@ -585,6 +586,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
+    if (orderingSelfTest) { const bool ok=renderprep12::RunOrderingTests(); dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }

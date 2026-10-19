@@ -7,6 +7,7 @@ int main() {
     const bool old=renderprep12::RunTests();
     const bool snapshot=renderprep12::RunRepresentativeTests();
     const bool visibility=renderprep12::RunVisibilityTests();
+    const bool ordering=renderprep12::RunOrderingTests();
     dx12log::Close();
-    return old && snapshot && visibility ? 0 : 1;
+    return old && snapshot && visibility && ordering ? 0 : 1;
 }

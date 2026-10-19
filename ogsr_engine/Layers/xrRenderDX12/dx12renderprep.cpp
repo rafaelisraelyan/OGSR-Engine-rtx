@@ -1,4 +1,5 @@
 #include "dx12renderprep.h"
+#include "dx12draworder_internal.h"
 #include "gr/jobs/JobSystem.h"
 #include "gr/jobs/JobGroup.h"
 #include <algorithm>
@@ -19,18 +20,33 @@ static double Ms(Clock::time_point a) { return std::chrono::duration<double, std
 static XMFLOAT4X4 Transpose(const XMFLOAT4X4& m) {
     XMFLOAT4X4 out; XMStoreFloat4x4(&out, XMMatrixTranspose(XMLoadFloat4x4(&m))); return out;
 }
+static bool Finite(const XMFLOAT4X4& m) {
+    for (const auto& row : m.m) for (float x : row) if (!std::isfinite(x)) return false;
+    return true;
+}
+static XMFLOAT4X4 ViewProjection(const XMFLOAT4X4& view, const XMFLOAT4X4& projection) {
+    if (!Finite(view) || !Finite(projection) || view._14!=0 || view._24!=0 || view._34!=0 || view._44!=1)
+        throw std::invalid_argument("invalid ordering camera");
+    XMFLOAT4X4 result;
+    XMStoreFloat4x4(&result,XMMatrixMultiply(XMLoadFloat4x4(&view),XMLoadFloat4x4(&projection)));
+    if (!Finite(result)) throw std::overflow_error("view projection overflow");
+    return result;
+}
 RenderSceneSnapshot12::RenderSceneSnapshot12(const XMFLOAT4X4& camera,
     std::span<const Object12> objects, uint64_t generation)
-    : m_camera(camera), m_shaderCamera(Transpose(camera)), m_objects(objects.begin(),objects.end()), m_generation(generation) {
+    : RenderSceneSnapshot12(camera,XMFLOAT4X4{},objects,generation,false) {}
+RenderSceneSnapshot12::RenderSceneSnapshot12(const XMFLOAT4X4& view, const XMFLOAT4X4& projection,
+    std::span<const Object12> objects, uint64_t generation)
+    : RenderSceneSnapshot12(ViewProjection(view,projection),view,objects,generation,true) {}
+RenderSceneSnapshot12::RenderSceneSnapshot12(const XMFLOAT4X4& camera, const XMFLOAT4X4& view,
+    std::span<const Object12> objects, uint64_t generation, bool hasView)
+    : m_camera(camera), m_shaderCamera(Transpose(camera)), m_view(view), m_hasView(hasView),
+      m_objects(objects.begin(),objects.end()), m_generation(generation) {
     if (objects.size()>UINT32_MAX) throw std::length_error("snapshot too large");
     std::unordered_set<uint64_t> ids;
     ids.reserve(objects.size());
     for (const auto& o:objects)
         if (!o.id || !ids.insert(o.id).second) throw std::invalid_argument("invalid object ID");
-}
-static bool Finite(const XMFLOAT4X4& m) {
-    for (const auto& row : m.m) for (float x : row) if (!std::isfinite(x)) return false;
-    return true;
 }
 static bool Finite3(const XMFLOAT3& v) { return std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z); }
 // TwoSum сохраняет знак ошибки сложения. /fp:precise запрещает reassociation.
@@ -320,6 +336,94 @@ PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t l
     const auto serial=run(false,timings.serial);
     auto parallel=run(true,timings.parallel);
     if (!Equivalent(serial,parallel)) throw std::runtime_error("visibility mismatch");
+    return parallel;
+}
+}
+
+namespace renderprep12 {
+bool Equivalent(const OrderedFrame12& a, const OrderedFrame12& b) {
+    return a.categories==b.categories && Equivalent(a.frame,b.frame);
+}
+OrderedFrame12 PrepareOrdered(const RenderSceneSnapshot12& snapshot, uint64_t generation,
+    Mode mode, gr::jobs::JobSystem* jobs, OrderingTimings12& timings) {
+    timings={};
+    if (!snapshot.HasView()) throw std::invalid_argument("ordering requires immutable view");
+    if (mode!=Mode::Serial && mode!=Mode::Parallel && mode!=Mode::Verify)
+        throw std::invalid_argument("invalid ordering mode");
+    const auto run=[&](bool parallel, OrderingPhases12& time) {
+        const auto start=Clock::now();
+        VisibilityTimings12 visibility;
+        auto visible=PrepareVisible(snapshot,generation,parallel?Mode::Parallel:Mode::Serial,jobs,visibility);
+        time.visibility=Ms(start);
+        const auto keyStart=Clock::now();
+        const uint32_t count=detail::PacketCount(visible.packets.size());
+        std::vector<detail::OrderKey> keys(count);
+        // Compaction сохраняет исходный порядок; линейно восстанавливаем ordinal
+        // без hash map и без зависимости от порядка worker completion.
+        size_t source=0;
+        for (uint32_t i=0;i<count;++i) {
+            while (source<snapshot.Objects().size() && snapshot.Objects()[source].id!=visible.packets[i].object.id) ++source;
+            if (source==snapshot.Objects().size()) throw std::logic_error("ordering source mismatch");
+            keys[i].source=detail::PacketCount(source++); keys[i].packet=i;
+        }
+        const auto key=[&](uint32_t i) {
+            const auto& p=visible.packets[i]; const auto& o=p.object; auto& k=keys[i];
+            k.category=(o.flags&Hud)?DrawCategory12::Hud:(o.flags&Transparent)?DrawCategory12::Transparent:DrawCategory12::Opaque;
+            k.object=o.id; k.pso=o.pso; k.material=o.material; k.geometry=o.visual;
+            if (k.category==DrawCategory12::Transparent) {
+                // Центр мировой AABB; double не переполняется при сложении float bounds.
+                const double x=(double(p.worldMinimum.x)+p.worldMaximum.x)*0.5;
+                const double y=(double(p.worldMinimum.y)+p.worldMaximum.y)*0.5;
+                const double z=(double(p.worldMinimum.z)+p.worldMaximum.z)*0.5;
+                const auto& v=snapshot.View();
+                k.depth=detail::Depth(x*v._13+y*v._23+z*v._33+v._43);
+            }
+#ifdef GR_JOBS_TESTING
+            testing::FailAfterWrite(testing::Phase::Keys,parallel,i);
+#endif
+        };
+        if (parallel && count) {
+            auto group=jobs->CreateGroup();
+            if (!group.IsValid()) throw std::runtime_error("invalid ordering group");
+            group.ParallelFor(count,128,[&](uint32_t begin,uint32_t end,uint32_t) {
+#ifdef GR_JOBS_TESTING
+                testing::CallbackScope scope;
+#endif
+                for (uint32_t i=begin;i<end;++i) key(i);
+            });
+            group.Wait();
+        } else for (uint32_t i=0;i<count;++i) key(i);
+        time.keyGeneration=Ms(keyStart);
+        const auto orderingStart=Clock::now();
+        std::sort(keys.begin(),keys.end(),detail::Less);
+#ifdef GR_JOBS_TESTING
+        testing::FailAfterWrite(testing::Phase::Ordering,parallel,0);
+#endif
+        OrderedFrame12 result{};
+        result.frame.shaderCamera=visible.shaderCamera; result.frame.generation=visible.generation;
+        result.frame.packets.resize(count);
+        for (uint32_t i=0;i<count;++i) {
+            const auto& k=keys[i];
+            result.frame.packets[i]=visible.packets[k.packet];
+            auto& range=result.categories[static_cast<size_t>(k.category)];
+            range.count=detail::PacketCount(size_t(range.count)+1);
+#ifdef GR_JOBS_TESTING
+            testing::FailAfterWrite(testing::Phase::OrderedScatter,parallel,i);
+#endif
+        }
+        size_t offset=0;
+        for (auto& range:result.categories) {
+            range.begin=detail::PacketCount(offset);
+            offset+=range.count;
+        }
+        if (offset!=count) throw std::logic_error("ordering range mismatch");
+        time.ordering=Ms(orderingStart); time.total=Ms(start);
+        return result;
+    };
+    if (mode==Mode::Serial) return run(false,timings.serial);
+    if (mode==Mode::Parallel) return run(true,timings.parallel);
+    auto serial=run(false,timings.serial); auto parallel=run(true,timings.parallel);
+    if (!Equivalent(serial,parallel)) throw std::runtime_error("ordering mismatch");
     return parallel;
 }
 }

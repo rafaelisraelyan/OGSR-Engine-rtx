@@ -7,7 +7,7 @@
 
 namespace renderprep12::testing {
 // Только отдельная тестовая сборка. Переключать фазу можно после drain.
-enum class Phase { None, Counts, Scatter };
+enum class Phase { None, Counts, Scatter, Keys, Ordering, OrderedScatter };
 inline std::atomic<Phase> failPhase{Phase::None};
 inline std::atomic<unsigned> active{0}, entered{0}, exited{0}, failures{0};
 struct CallbackScope {
