@@ -3,6 +3,7 @@
 #include "dx12camera.h"
 #include "dx12log.h"
 #include "dx12cpuscene.h"
+#include "dx12packetplan.h"
 #include "gr/jobs/JobSystem.h"
 #include "gr/jobs/JobConfig.h"
 #include "gr/jobs/JobStats.h"
@@ -477,6 +478,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // -freeaspect — отключает фиксацию 16:9 (свободный resize).
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
+    bool packetPlanSelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
@@ -557,6 +559,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     else recordFaultList=argv[i][0]-L'0';
                 }
                 else if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
+                else if (_wcsicmp(argv[i], L"-packetplanselftest") == 0) packetPlanSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -783,6 +786,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 1;
     }
     if (orderingSelfTest) { const bool ok=renderprep12::RunOrderingTests(); dx12log::Close(); return ok?0:1; }
+    if (packetPlanSelfTest) { const bool ok=renderprep12::RunPacketBatchPlanTests(); dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
