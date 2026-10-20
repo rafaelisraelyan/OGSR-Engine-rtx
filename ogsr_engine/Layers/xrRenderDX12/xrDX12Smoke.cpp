@@ -410,6 +410,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
+    // F3.5.4A: независимые параметры нагрузки и числа списков.
+    uint32_t drawCount=2, drawLists=2;
+    bool noGbv=false;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
     uint32_t prepFrames=0;
@@ -430,6 +433,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     else if (!_wcsicmp(argv[i],L"legacy")) { multiList=false; parallelRecording=false; }
                     else badArgument=true;
                 }
+                // F3.5.4A: N draw calls и L draw lists независимы.
+                else if (_wcsicmp(argv[i],L"-draws")==0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<1 || value>1000000) badArgument=true;
+                        else drawCount=static_cast<uint32_t>(value);
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i],L"-lists")==0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value!=1 && value!=2 && value!=4 && value!=8) badArgument=true;
+                        else drawLists=static_cast<uint32_t>(value);
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i],L"-nogbv")==0) noGbv=true;
                 else if (_wcsicmp(argv[i],L"-recordfault")==0) {
                     if (i+2>=argc) { badArgument=true; break; }
                     ++i;
@@ -441,7 +460,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     else if (!_wcsicmp(argv[i],L"throw")) recordFault=5;
                     else badArgument=true;
                     ++i;
-                    if (wcslen(argv[i])!=1 || argv[i][0]<L'0' || argv[i][0]>L'3') badArgument=true;
+                    if (wcslen(argv[i])!=1 || argv[i][0]<L'0' || argv[i][0]>L'9') badArgument=true;
                     else recordFaultList=argv[i][0]-L'0';
                 }
                 else if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
@@ -605,8 +624,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
     }
 
+    // F3.5.4A: L не больше N. Конфигурация отклоняется явно: пустые draw
+    // lists не маскируются clamp'ом.
+    if (drawLists > drawCount)
+    {
+        dx12log::Write("[smoke] FATAL: -lists %u exceeds -draws %u; empty draw lists are not allowed",
+                       drawLists, drawCount);
+        badArgument = true;
+    }
+    if (depthTest && drawCount < 2)
+    {
+        dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
+        badArgument = true;
+    }
     if (recordFault!=~0u && (!multiList || !depthTest)) badArgument=true;
-    if (recordFault!=~0u && recordFault>=4 && (!parallelRecording || (recordFaultList!=1 && recordFaultList!=2))) badArgument=true;
+    if (recordFault!=~0u && recordFault<4 && recordFaultList > drawLists+1) badArgument=true;
+    if (recordFault!=~0u && recordFault>=4 && (!parallelRecording || recordFaultList<1 || recordFaultList>drawLists)) badArgument=true;
     if (badArgument)
     {
         dx12log::Write("[smoke] FATAL: invalid command line argument, aborting");
@@ -695,6 +728,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     CHW12 hw12;
     g_hw = &hw12;
+
+    // F3.5.4A: параметры нагрузки фиксируются до Initialize.
+    hw12.SetDrawCount(drawCount);
+    if (!hw12.SetDrawListCount(drawLists))
+    {
+        dx12log::Write("[smoke] FATAL: draw list configuration rejected (draws=%u lists=%u)",
+                       drawCount, drawLists);
+        dx12log::Close();
+        return 1;
+    }
+    if (noGbv) hw12.SetGpuValidation(false);
+    dx12log::Write("[smoke] draw calls=%u draw lists=%u gbv=%d",
+                   drawCount, drawLists, noGbv ? 0 : 1);
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);

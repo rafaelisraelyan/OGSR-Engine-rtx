@@ -34,6 +34,28 @@ CHW12::~CHW12()
     Shutdown();
 }
 
+// F3.5.4A: L фиксируется до Initialize, потому что каждая draw list слота
+// создаёт собственную пару allocator/list. Значение ограничено массивом
+// FrameResource; больше MAX_DRAW_LISTS не выделяется.
+bool CHW12::SetDrawListCount(uint32_t count)
+{
+    // Массивы карантина и FrameResource обязаны иметь один предел.
+    static_assert(MAX_DRAW_LISTS == kMaxDrawLists,
+                  "quarantine and FrameResource draw list bounds must match");
+    if (m_initialized)
+        return false;
+    if (count == 0)
+        return false;
+    if (count > MAX_DRAW_LISTS)
+        return false;
+    // Пустые draw lists не допускаются: L не больше N. Проверка явная,
+    // чтобы конфигурация отклонялась, а не молча вырождалась в пустые списки.
+    if (count > m_drawCount)
+        return false;
+    m_drawListCount = count;
+    return true;
+}
+
 // Debug Layer + DRED. Вызывается до создания устройства: позднее включение
 // валидации не применяется к уже созданному device.
 // Провал НЕ является фатальным: smoke должен запускаться и без validation,
@@ -51,9 +73,16 @@ bool CHW12::EnableDebugLayer()
     m_debugLayerEnabled = true;
 
 #if OGSR_DX12_ENABLE_GBV
-    ComPtr<ID3D12Debug1> debug1;
-    if (SUCCEEDED(debug.As(&debug1)))
-        debug1->SetEnableGPUBasedValidation(TRUE);
+    // F3.5.4A: GBV включается только по запросу. Корректность проверяется
+    // с ней, производительность — отдельным прогоном без неё.
+    if (m_gpuValidationRequested)
+    {
+        ComPtr<ID3D12Debug1> debug1;
+        if (SUCCEEDED(debug.As(&debug1)))
+            debug1->SetEnableGPUBasedValidation(TRUE);
+        else
+            dx12log::Write("[DX12] ID3D12Debug1 unavailable: GPU-based validation not enabled");
+    }
 #endif
 
     // DRED: авто-breadcrumbs и page-fault вывод выживают device removal,
@@ -71,7 +100,8 @@ bool CHW12::EnableDebugLayer()
         dx12log::Write("[DX12] DRED settings unavailable: device removal diagnostics will be limited");
     }
 
-    dx12log::Write("[DX12] Debug layer enabled, GPU-based validation=%d", OGSR_DX12_ENABLE_GBV);
+    dx12log::Write("[DX12] Debug layer enabled, GPU-based validation=%d",
+                   (OGSR_DX12_ENABLE_GBV && m_gpuValidationRequested) ? 1 : 0);
     m_stage = Stage::DebugLayer;
     return true;
 }
@@ -129,6 +159,7 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_recordFailed=false; m_recordFrames=m_recordSamples=0;
     m_recordMs=m_queueSubmitMs=m_recordScheduleMs=m_recordWaitMs=0;
     m_timestampFrequency=m_gpuSamples=0; m_gpuMs=0;
+    m_frameIntervalMs=0; m_frameIntervals=0; m_lastPresentTick={};
 
 
     m_width = width;
@@ -460,13 +491,57 @@ bool CHW12::CreateFrameResources()
         if (FAILED(hr))
             return false;
 
-        if (m_multiList) for (auto& resource:m_frameResources[i].extra) {
-            hr=m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&resource.allocator));
-            if (FAILED(hr)) return false;
-            hr=m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,resource.allocator.Get(),nullptr,IID_PPV_ARGS(&resource.list));
-            if (FAILED(hr)) return false;
-            hr=resource.list->Close();
-            if (FAILED(hr)) return false;
+        // F3.5.4A: bounded набор draw lists + отдельный End-список.
+        // Количество пар фиксируется до Initialize, поэтому кадр не создаёт
+        // новые allocator/list и не выходит за пределы массива.
+        if (m_multiList)
+        {
+            auto& frame = m_frameResources[i];
+            frame.drawListCount = m_drawListCount;
+            for (uint32_t j = 0; j < frame.drawListCount; ++j)
+            {
+                auto& resource = frame.drawRecording[j];
+                hr=m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&resource.allocator));
+                if (FAILED(hr)) {
+                    dx12log::Write("[DX12] CreateCommandAllocator(draw %u/%u) failed, hr=0x%08X",
+                                   j, frame.drawListCount, static_cast<unsigned>(hr));
+                    return false;
+                }
+                hr=m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,resource.allocator.Get(),nullptr,IID_PPV_ARGS(&resource.list));
+                if (FAILED(hr)) {
+                    dx12log::Write("[DX12] CreateCommandList(draw %u/%u) failed, hr=0x%08X",
+                                   j, frame.drawListCount, static_cast<unsigned>(hr));
+                    return false;
+                }
+                hr=resource.list->Close();
+                if (FAILED(hr))
+                {
+                    dx12log::Write("[DX12] Close(draw %u/%u) failed, hr=0x%08X",
+                                   j, frame.drawListCount, static_cast<unsigned>(hr));
+                    return false;
+                }
+            }
+
+            auto& end = frame.ownerEnd;
+            hr=m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&end.allocator));
+            if (FAILED(hr)) {
+                dx12log::Write("[DX12] CreateCommandAllocator(end) failed, hr=0x%08X",
+                               static_cast<unsigned>(hr));
+                return false;
+            }
+            hr=m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,end.allocator.Get(),nullptr,IID_PPV_ARGS(&end.list));
+            if (FAILED(hr)) {
+                dx12log::Write("[DX12] CreateCommandList(end) failed, hr=0x%08X",
+                               static_cast<unsigned>(hr));
+                return false;
+            }
+            hr=end.list->Close();
+            if (FAILED(hr))
+            {
+                dx12log::Write("[DX12] Close(end) failed, hr=0x%08X",
+                               static_cast<unsigned>(hr));
+                return false;
+            }
         }
 
         if (m_timestampFrequency) {
@@ -531,7 +606,7 @@ bool CHW12::CreateFrameResources()
         m_frameResources[i].mapped = mapped;
     }
 
-    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",m_parallelRecording?"parallel":(m_multiList?"multi":"legacy"),FRAME_COUNT,m_multiList?4:1);
+    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",(m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy"),FRAME_COUNT,m_multiList?(m_drawListCount+2):1);
     dx12log::Write("[DX12] Command allocators, lists and per-frame CBs created");
     return true;
 }
@@ -1092,10 +1167,12 @@ void CHW12::QuarantineGpuResources()
         q.slots[i].renderTarget     = m_frameResources[i].renderTarget.Detach();
         q.slots[i].commandAllocator = m_frameResources[i].commandAllocator.Detach();
         q.slots[i].commandList      = m_frameResources[i].commandList.Detach();
-        for (unsigned j=0;j<3;++j) {
-            q.slots[i].extraAllocators[j]=m_frameResources[i].extra[j].allocator.Detach();
-            q.slots[i].extraLists[j]=m_frameResources[i].extra[j].list.Detach();
+        for (uint32_t j=0;j<m_frameResources[i].drawListCount && j<kMaxDrawLists;++j) {
+            q.slots[i].drawAllocators[j]=m_frameResources[i].drawRecording[j].allocator.Detach();
+            q.slots[i].drawLists[j]=m_frameResources[i].drawRecording[j].list.Detach();
         }
+        q.slots[i].endAllocator=m_frameResources[i].ownerEnd.allocator.Detach();
+        q.slots[i].endList=m_frameResources[i].ownerEnd.list.Detach();
         q.slots[i].timestamps=m_frameResources[i].timestamps.Detach();
         q.slots[i].timestampReadback=m_frameResources[i].timestampReadback.Detach();
         q.slots[i].fenceValue       = m_frameResources[i].fenceValue;
@@ -1145,7 +1222,8 @@ void CHW12::QuarantineGpuResources()
 
     dx12log::Write("[DX12] GPU resources quarantined: ownership transferred to "
                    "process-lifetime storage via Detach(), GPU may still be "
-                   "reading them");
+                   "reading them; drawListsPerSlot=%u endLists=%u",
+                   m_multiList?m_drawListCount:0u,m_multiList?FRAME_COUNT:0u);
 }
 
 void CHW12::MoveToNextFrame()
@@ -1328,12 +1406,37 @@ bool CHW12::RenderFrame()
     CollectGpuTiming(frame);
     double scheduleMs=0, recordWaitMs=0;
     const auto recordStart=std::chrono::steady_clock::now();
-    ID3D12GraphicsCommandList* commands[4]={frame.commandList.Get(),frame.extra[0].list.Get(),frame.extra[1].list.Get(),frame.extra[2].list.Get()};
-    ID3D12CommandAllocator* allocators[4]={frame.commandAllocator.Get(),frame.extra[0].allocator.Get(),frame.extra[1].allocator.Get(),frame.extra[2].allocator.Get()};
-    const unsigned listCount=m_multiList?4u:1u;
+
+    // F3.5.4A: L draw lists + owner Begin + owner End. Legacy остаётся
+    // одним списком, который содержит Begin, все Draw и End.
+    const uint32_t drawLists = m_multiList ? frame.drawListCount : 0;
+    const uint32_t listCount = m_multiList ? (drawLists + 2) : 1;
+    const uint32_t drawCount = m_drawCount;
+    // Параллельная запись имеет смысл только при >=2 draw lists. При L=1
+    // режим вырождается в sequential multi, и Reset не должен пропускать
+    // единственный draw list.
+    const bool parallelDraw = m_parallelRecording && drawLists >= 2;
+
+    ID3D12GraphicsCommandList* commands[MAX_DRAW_LISTS + 2] = {};
+    ID3D12CommandAllocator* allocators[MAX_DRAW_LISTS + 2] = {};
+    commands[0] = frame.commandList.Get();
+    allocators[0] = frame.commandAllocator.Get();
+    for (uint32_t i = 0; i < drawLists; ++i)
+    {
+        commands[i + 1] = frame.drawRecording[i].list.Get();
+        allocators[i + 1] = frame.drawRecording[i].allocator.Get();
+    }
+    if (m_multiList)
+    {
+        commands[drawLists + 1] = frame.ownerEnd.list.Get();
+        allocators[drawLists + 1] = frame.ownerEnd.allocator.Get();
+    }
+
     HRESULT hr=S_OK;
-    for (unsigned i=0;i<listCount;++i) {
-        if (m_parallelRecording && (i==1 || i==2)) continue;
+    for (uint32_t i=0;i<listCount;++i) {
+        // Draw lists в parallel-режиме сбрасываются внутри своих задач:
+        // owner не трогает их allocator до Wait.
+        if (parallelDraw && i >= 1 && i <= drawLists) continue;
         if (InjectRecordingFailure(0,i)) return false;
         hr=allocators[i]->Reset();
         if (FAILED(hr)) { m_recordFailed=true; ReportGpuFailure(L"allocator Reset",hr); return false; }
@@ -1415,17 +1518,46 @@ bool CHW12::RenderFrame()
     // перезаписывает ближний — тест падает. При работающем depth-тесте
     // ближний куб первым пишет цвет A и глубину, дальний проваливает
     // LESS и не пишет ничего.
+    // F3.5.4A: Draw calls распределяются по L спискам в глобальном порядке.
+    // Диапазон [first, first+count) непрерывен, поэтому суммарный порядок
+    // Draw всегда 0..N-1 независимо от режима и числа списков.
+    const auto drawRange = [drawCount, drawLists](uint32_t listIndex) {
+        struct Range { uint32_t first; uint32_t count; };
+        if (drawLists == 0)
+            return Range{0, 0};
+        const uint32_t first = static_cast<uint32_t>(
+            static_cast<uint64_t>(drawCount) * listIndex / drawLists);
+        const uint32_t last = static_cast<uint32_t>(
+            static_cast<uint64_t>(drawCount) * (listIndex + 1) / drawLists);
+        return Range{first, last - first};
+    };
+    // Один и тот же набор команд во всех режимах: каждый Draw рисует один
+    // из двух кубов, глобальный порядок 0..N-1 не меняется.
+    const auto drawObject = [&](ID3D12GraphicsCommandList* list, uint32_t globalIndex) {
+        const UINT vertices = static_cast<UINT>(SmokeMesh12::kVertexCount / 2);
+        const UINT firstVertex = static_cast<UINT>(globalIndex % 2) * vertices;
+        return m_mesh.Draw(list, frame.constantBuffer->GetGPUVirtualAddress(),
+                           firstVertex, vertices);
+    };
+
+    // F3.5.4A: test-only диагностика фактически записанных Draw. Сумма по
+    // спискам обязана совпадать с N во всех режимах; расхождение — отказ
+    // кадра, а не «мягкое» предупреждение. Счётчики не влияют на команды.
+    uint32_t recordedPerList[MAX_DRAW_LISTS] = {};
+    uint32_t recordedTotal = 0;
+
     if (m_multiList) {
-        if (prepared.packets.size()!=2) { m_recordFailed=true; return false; }
         if (!closeList(0)) return false;
-        if (m_parallelRecording) {
+        // Параллельная запись имеет смысл только при >=2 draw lists.
+        // При L=1 режим вырождается в sequential multi с одним списком.
+        if (parallelDraw) {
             // Все заимствования живут до Wait; owner не меняет mesh/CB/descriptors.
             if (!m_jobs || !m_jobs->IsInitialized()) { m_recordFailed=true; return false; }
-            struct Result { HRESULT hr=E_PENDING; bool closed=false; } results[2];
+            struct Result { HRESULT hr=E_PENDING; bool closed=false; uint32_t draws=0; } results[MAX_DRAW_LISTS];
             std::atomic<unsigned> entered{0}, exited{0};
             std::atomic<bool> overlap{false};
             const unsigned faultStage=m_recordFaultStage, faultList=m_recordFaultList;
-            const bool faultDraw=faultList==1 || faultList==2;
+            const bool faultDraw=faultList>=1 && faultList<=drawLists;
             const bool rendezvous=faultDraw && faultStage!=~0u && faultStage!=4;
             // F3.5.3B: rendezvous требует минимум двух одновременных
             // исполнителей (background worker + поток, вызывающий Wait).
@@ -1452,15 +1584,15 @@ bool CHW12::RenderFrame()
             try {
                 auto group=m_jobs->CreateGroup();
                 try {
-                    for (unsigned i=0;i<2;++i) {
+                    for (uint32_t i=0;i<drawLists;++i) {
                         if (faultDraw && faultStage==4 && i==1)
                             throw std::runtime_error("recording submit injection");
                         auto* draw=commands[i+1]; auto* allocator=allocators[i+1];
                         const SmokeMesh12* mesh=&m_mesh;
-                        const auto object=prepared.packets[i].object;
+                        const auto range=drawRange(i);
                         const auto cb=frame.constantBuffer->GetGPUVirtualAddress();
                         const auto dsv=m_dsv;
-                        group.Submit([i,draw,allocator,mesh,object,cb,dsv,rtvHandle,viewport,scissor,
+                        group.Submit([i,draw,allocator,mesh,range,cb,dsv,rtvHandle,viewport,scissor,
                                       faultStage,faultList,rendezvous,&results,&entered,&exited,&overlap] {
                             struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
                             ++entered;
@@ -1484,11 +1616,16 @@ bool CHW12::RenderFrame()
                             if (FAILED(result.hr)) return;
                             draw->OMSetRenderTargets(1,&rtvHandle,FALSE,&dsv);
                             draw->RSSetViewports(1,&viewport); draw->RSSetScissorRects(1,&scissor);
-                            if (!mesh->Draw(draw,cb,object.firstVertex,object.vertexCount) || fault(2)) {
-                                result.hr=E_FAIL; return;
+                            for (uint32_t d=0;d<range.count;++d) {
+                                const uint32_t global=range.first+d;
+                                const UINT firstVertex=static_cast<UINT>(global%2)*(SmokeMesh12::kVertexCount/2);
+                                if (fault(2) || !mesh->Draw(draw,cb,firstVertex,SmokeMesh12::kVertexCount/2)) {
+                                    result.hr=E_FAIL; return;
+                                }
                             }
                             result.hr=fault(3)?E_FAIL:draw->Close();
                             result.closed=SUCCEEDED(result.hr);
+                            if (result.closed) result.draws=range.count;
                         });
                     }
                 } catch (...) { failure=std::current_exception(); }
@@ -1508,28 +1645,60 @@ bool CHW12::RenderFrame()
             if (faultDraw && faultStage!=~0u)
                 dx12log::Write("[parallel-fault] stage=%u list=%u entered=%u exited=%u overlap=%u submitted=%llu",
                     faultStage,faultList,entered.load(),exited.load(),overlap.load()?1:0,(unsigned long long)m_recordFrames);
-            if (failure || !results[0].closed || !results[1].closed) {
+            uint32_t closedCount=0;
+            for (uint32_t i=0;i<drawLists;++i) if (results[i].closed) ++closedCount;
+            if (failure || closedCount!=drawLists) {
                 m_recordFailed=true;
-                dx12log::Write("[parallel-recording] ABORTED drained=%u hr0=0x%08X hr1=0x%08X",
-                    entered.load()==exited.load()?1:0,(unsigned)results[0].hr,(unsigned)results[1].hr);
+                dx12log::Write("[parallel-recording] ABORTED drained=%u closed=%u/%u",
+                    entered.load()==exited.load()?1:0,closedCount,drawLists);
                 return false;
             }
+            for (uint32_t i=0;i<drawLists;++i) {
+                recordedPerList[i]=results[i].draws;
+                recordedTotal+=results[i].draws;
+            }
         } else {
-        for (unsigned i=0;i<2;++i) {
-            cmd=commands[i+1];
-            // Каждый Draw list самодостаточен: состояние соседнего list не наследуется.
-            cmd->OMSetRenderTargets(1,&rtvHandle,FALSE,&m_dsv);
-            cmd->RSSetViewports(1,&viewport); cmd->RSSetScissorRects(1,&scissor);
-            const auto& packet=prepared.packets[i];
-            // Draw задаёт PSO/root signature, topology, VB и root CBV.
-            if (!m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount)) { m_recordFailed=true; return false; }
-            if (!closeList(i+1)) return false;
+            for (uint32_t i=0;i<drawLists;++i) {
+                cmd=commands[i+1];
+                // Каждый Draw list самодостаточен: состояние соседнего list не наследуется.
+                cmd->OMSetRenderTargets(1,&rtvHandle,FALSE,&m_dsv);
+                cmd->RSSetViewports(1,&viewport); cmd->RSSetScissorRects(1,&scissor);
+                const auto range=drawRange(i);
+                for (uint32_t d=0;d<range.count;++d)
+                    if (!drawObject(cmd,range.first+d)) { m_recordFailed=true; return false; }
+                recordedPerList[i]=range.count;
+                recordedTotal+=range.count;
+                if (!closeList(i+1)) return false;
+            }
         }
-        }
-        cmd=commands[3];
+        cmd=commands[drawLists+1];
     } else {
-        for (const auto& packet : prepared.packets)
-            if (!m_mesh.Draw(cmd,frame.constantBuffer->GetGPUVirtualAddress(),packet.object.firstVertex,packet.object.vertexCount)) { m_recordFailed=true; return false; }
+        for (uint32_t d=0;d<drawCount;++d)
+            if (!drawObject(cmd,d)) { m_recordFailed=true; return false; }
+        recordedPerList[0]=drawCount;
+        recordedTotal=drawCount;
+    }
+
+    // Инвариант нагрузки: каждый режим записывает ровно N Draw.
+    if (recordedTotal != drawCount) {
+        m_recordFailed=true;
+        dx12log::Write("[recording-draws] FAIL mode=%s lists=%u total=%u expected=%u",
+            m_multiList?(parallelDraw?"parallel":"multi"):"legacy",
+            m_multiList?drawLists:1,recordedTotal,drawCount);
+        return false;
+    }
+    if (m_recordFrames==0) {
+        dx12log::Write("[recording-draws] mode=%s lists=%u total=%u expected=%u",
+            m_multiList?(parallelDraw?"parallel":"multi"):"legacy",
+            m_multiList?drawLists:1,recordedTotal,drawCount);
+        if (m_testMode) {
+            if (m_multiList) {
+                for (uint32_t i=0;i<drawLists;++i)
+                    dx12log::Write("[recording-draws] list=%u draws=%u",i+1,recordedPerList[i]);
+            } else {
+                dx12log::Write("[recording-draws] list=0 draws=%u",recordedPerList[0]);
+            }
+        }
     }
 
     // F3.1: readback для автоматического depth-тест (только тестовый режим).
@@ -1588,9 +1757,11 @@ bool CHW12::RenderFrame()
         cmd->EndQuery(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
         cmd->ResolveQueryData(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,frame.timestampReadback.Get(),0);
     }
-    if (!closeList(m_multiList?3u:0u)) return false;
+    if (!closeList(m_multiList ? (drawLists+1) : 0)) return false;
     const double recordingMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-recordStart).count();
-    ID3D12CommandList* lists[4]={commands[0],commands[1],commands[2],commands[3]};
+    ID3D12CommandList* lists[MAX_DRAW_LISTS + 2] = {};
+    for (uint32_t i = 0; i < listCount; ++i)
+        lists[i] = commands[i];
     const auto submitStart=std::chrono::steady_clock::now();
     m_commandQueue->ExecuteCommandLists(listCount,lists);
     const double submissionMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-submitStart).count();
@@ -1602,6 +1773,22 @@ bool CHW12::RenderFrame()
     // Present — единственный источник DEVICE_REMOVED/DEVICE_RESET и единственное
     // место, откуда приходит DXGI_STATUS_OCCLUDED для свёрнутого окна.
     hr = m_swapChain->Present(1, 0);
+
+    // F3.5.4A: интервал между Present. Present(1,0) ограничен vsync,
+    // поэтому это wall-clock диагностика, а не FPS игры.
+    {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        if (m_lastPresentTick.QuadPart != 0 && freq.QuadPart > 0)
+        {
+            m_frameIntervalMs +=
+                static_cast<double>(now.QuadPart - m_lastPresentTick.QuadPart) *
+                1000.0 / static_cast<double>(freq.QuadPart);
+            ++m_frameIntervals;
+        }
+        m_lastPresentTick = now;
+    }
 
     const bool occluded = (hr == DXGI_STATUS_OCCLUDED);
 
@@ -1690,9 +1877,12 @@ bool CHW12::Resize(uint32_t width, uint32_t height)
     // Reset/Close для каждого.
     for (uint32_t i = 0; i < FRAME_COUNT; ++i)
     {
-        for (auto& resource:m_frameResources[i].extra) {
-            resource.list.Reset(); resource.allocator.Reset();
+        for (uint32_t j=0;j<m_frameResources[i].drawListCount && j<MAX_DRAW_LISTS;++j) {
+            m_frameResources[i].drawRecording[j].list.Reset();
+            m_frameResources[i].drawRecording[j].allocator.Reset();
         }
+        m_frameResources[i].ownerEnd.list.Reset();
+        m_frameResources[i].ownerEnd.allocator.Reset();
         CollectGpuTiming(m_frameResources[i]);
         m_frameResources[i].timestamps.Reset(); m_frameResources[i].timestampReadback.Reset();
         m_frameResources[i].commandList.Reset();
@@ -1838,7 +2028,7 @@ void CHW12::Shutdown()
         m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
         m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
     dx12log::Write("[recording] %s mode=%s lists=%u frames=%llu samples=%llu recording=%.6f submission=%.6f ms",
-        m_recordFailed?"ABORTED":"PASS",m_parallelRecording?"parallel":(m_multiList?"multi":"legacy"),m_multiList?4:1,
+        m_recordFailed?"ABORTED":"PASS",(m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy"),m_multiList?(m_drawListCount+2):1,
         (unsigned long long)m_recordFrames,(unsigned long long)m_recordSamples,
         m_recordSamples?m_recordMs/m_recordSamples:0,m_recordSamples?m_queueSubmitMs/m_recordSamples:0);
     dx12log::Write("[recording-cpu] scheduling=%.6f wait=%.6f ms",
@@ -1886,6 +2076,9 @@ void CHW12::Shutdown()
         for (auto& frame:m_frameResources) CollectGpuTiming(frame);
     dx12log::Write("[recording-gpu] available=%u samples=%llu mean=%.6f ms",
         m_timestampFrequency?1:0,(unsigned long long)m_gpuSamples,m_gpuSamples?m_gpuMs/m_gpuSamples:0);
+    dx12log::Write("[frame] interval=%.6f ms samples=%llu",
+        m_frameIntervals?m_frameIntervalMs/static_cast<double>(m_frameIntervals):0.0,
+        static_cast<unsigned long long>(m_frameIntervals));
 
     // Освобождение GPU-ресурсов выполняется во всех состояниях, кроме
     // Unknown. В Unknown ComPtr уже равны nullptr после Detach(), поэтому
@@ -1899,9 +2092,12 @@ void CHW12::Shutdown()
             m_frameResources[i].mapped = nullptr;
             m_frameResources[i].constantBuffer.Reset();
             m_frameResources[i].renderTarget.Reset();
-            for (auto& resource:m_frameResources[i].extra) {
-                resource.list.Reset(); resource.allocator.Reset();
+            for (uint32_t j=0;j<m_frameResources[i].drawListCount && j<MAX_DRAW_LISTS;++j) {
+                m_frameResources[i].drawRecording[j].list.Reset();
+                m_frameResources[i].drawRecording[j].allocator.Reset();
             }
+            m_frameResources[i].ownerEnd.list.Reset();
+            m_frameResources[i].ownerEnd.allocator.Reset();
             m_frameResources[i].timestamps.Reset(); m_frameResources[i].timestampReadback.Reset();
             m_frameResources[i].commandList.Reset();
             m_frameResources[i].commandAllocator.Reset();

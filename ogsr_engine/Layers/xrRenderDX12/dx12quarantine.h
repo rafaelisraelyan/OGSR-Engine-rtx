@@ -55,6 +55,11 @@ using Microsoft::WRL::ComPtr;
 // не тянуть за собой весь bootstrap ради одной константы.
 constexpr uint32_t kQuarantineFrameCount = 3;
 
+// F3.5.4A: верхняя граница числа draw lists на слот кадра. Значение
+// совпадает с CHW12::MAX_DRAW_LISTS и задаётся здесь, чтобы quarantine
+// не зависел от CHW12.h.
+constexpr uint32_t kMaxDrawLists = 8;
+
 struct GpuQuarantine
 {
     // Слот кадра. Собственный тип, а не CHW12::FrameResource: тот является
@@ -66,8 +71,10 @@ struct GpuQuarantine
         ID3D12GraphicsCommandList* commandList = nullptr;
         ID3D12QueryHeap* timestamps = nullptr;
         ID3D12Resource* timestampReadback = nullptr;
-        ID3D12CommandAllocator* extraAllocators[3] = {};
-        ID3D12GraphicsCommandList* extraLists[3] = {};
+        ID3D12CommandAllocator* drawAllocators[kMaxDrawLists] = {};
+        ID3D12GraphicsCommandList* drawLists[kMaxDrawLists] = {};
+        ID3D12CommandAllocator* endAllocator = nullptr;
+        ID3D12GraphicsCommandList* endList = nullptr;
         uint64_t fenceValue = 0;
     };
 

@@ -51,6 +51,14 @@ public:
     bool RenderFrame();
     // Режим выбирается до Initialize; legacy остаётся default.
     bool SetMultiList(bool enabled, bool parallel=false) { if (m_initialized) return false; m_multiList=enabled; m_parallelRecording=enabled && parallel; return true; }
+    // F3.5.4A: число draw lists и общее число draw calls. Оба параметра
+    // фиксируются до Initialize: от них зависит число пар allocator/list
+    // в FrameResource.
+    bool SetDrawListCount(uint32_t count);
+    void SetDrawCount(uint32_t count) { if (!m_initialized) m_drawCount = count ? count : 1; }
+    // GPU-Based Validation применяется при создании device; менять позже
+    // бессмысленно.
+    void SetGpuValidation(bool enabled) { if (!m_initialized) m_gpuValidationRequested = enabled; }
     // Только smoke-тест: 0=allocator Reset, 1=list Reset, 2=Record, 3=Close,
     // 4=отказ второго Submit, 5=исключение callback (последние два только parallel).
     void ArmRecordingFailure(unsigned stage, unsigned list) { m_recordFaultStage=stage; m_recordFaultList=list; }
@@ -116,6 +124,15 @@ public:
 
 private:
     bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
+    // F3.5.4A: L — число draw lists, N — всего draw calls за кадр.
+    uint32_t m_drawListCount = 2;
+    uint32_t m_drawCount = 2;
+    bool m_gpuValidationRequested = true;
+    // Интервал между кадрами (wall clock). Present(1,0) ограничен vsync,
+    // поэтому это диагностика, а не FPS игры.
+    LARGE_INTEGER m_lastPresentTick = {};
+    double m_frameIntervalMs = 0;
+    uint64_t m_frameIntervals = 0;
     unsigned m_recordFaultStage=~0u, m_recordFaultList=~0u;
     uint64_t m_recordFrames=0, m_recordSamples=0;
     uint64_t m_timestampFrequency=0, m_gpuSamples=0;
@@ -136,6 +153,10 @@ private:
     double m_mergeMs=0, m_gpuFenceMs=0;
     uint64_t m_gpuFenceWaits=0;
     static constexpr uint32_t FRAME_COUNT = 3;
+    // F3.5.4A: жёсткая верхняя граница draw lists на слот кадра. Каждая
+    // list владеет собственным allocator и переиспользуется только после
+    // ожидания fence своего слота; общего пула между слотами нет.
+    static constexpr uint32_t MAX_DRAW_LISTS = kMaxDrawLists;
     static constexpr DXGI_FORMAT BACKBUFFER_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
     static constexpr DWORD GPU_WAIT_TIMEOUT_MS = 5000;
 
@@ -165,7 +186,9 @@ private:
         ComPtr<ID3D12QueryHeap> timestamps;
         ComPtr<ID3D12Resource> timestampReadback;
         bool timestampPending=false, timestampSample=false;
-        RecordingResource extra[3]; // Draw 0, Draw 1, Owner End; только multi-list.
+        RecordingResource drawRecording[MAX_DRAW_LISTS]; // Draw lists слота
+        RecordingResource ownerEnd;                      // End-список кадра
+        uint32_t drawListCount = 0;                      // фактическое L кадра
         ComPtr<ID3D12Resource> renderTarget;
         ComPtr<ID3D12Resource> constantBuffer;
         void* mapped = nullptr;
