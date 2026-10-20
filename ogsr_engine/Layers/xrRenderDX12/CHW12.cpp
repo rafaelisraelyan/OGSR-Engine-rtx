@@ -3,6 +3,7 @@
 #include "dx12log.h"
 #include "dx12camera.h"
 #include "dx12mesh.h"
+#include "dx12objectconstants.h"
 #include <chrono>
 #include <algorithm>
 #include <exception>
@@ -10,6 +11,7 @@
 #include <thread>
 #include <stdexcept>
 #include <vector>
+#include <cstring>
 #include "gr/jobs/JobGroup.h"
 
 #include <cstdio>
@@ -75,6 +77,12 @@ void ApplyPacketTestFault(std::vector<renderprep12::Object12>& objects,
         DirectX::XMStoreFloat4x4(&first.world,
             DirectX::XMMatrixTranslation(1.0f, 0.0f, 0.0f));
         break;
+    case CHW12::PacketTestFault::InvalidTransform:
+        // Affine but singular: Prepare can still build bounds; GPU validation
+        // must reject it before Reset/Execute.
+        DirectX::XMStoreFloat4x4(&first.world,
+            DirectX::XMMatrixScaling(0.0f, 1.0f, 1.0f));
+        break;
     }
 }
 
@@ -86,6 +94,17 @@ bool IsIdentityWorld(const DirectX::XMFLOAT4X4& world)
                 return false;
     return world.m[3][0] == 0.0f && world.m[3][1] == 0.0f &&
            world.m[3][2] == 0.0f && world.m[3][3] == 1.0f;
+}
+
+// TEST ONLY: debug tint for the transform-scene pixel oracle. Material/PSO
+// variants are F3.5.6C; object IDs 1/2 are stable in SmokeMesh12.
+DirectX::XMFLOAT4 TransformSceneTint(uint64_t objectId)
+{
+    if (objectId == 1)
+        return {1.0f, 0.0f, 0.0f, 1.0f};
+    if (objectId == 2)
+        return {0.0f, 1.0f, 0.0f, 1.0f};
+    return {1.0f, 1.0f, 1.0f, 1.0f};
 }
 }
 
@@ -318,7 +337,8 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
             m_device.Get(),
             m_commandQueue.Get(),
             m_frameResources[0].commandAllocator.Get(),
-            m_frameResources[0].commandList.Get()))
+            m_frameResources[0].commandList.Get(),
+            m_sceneMode))
     {
         dx12log::Write("[DX12] Initialize failed at mesh Create");
         return false;
@@ -656,12 +676,13 @@ bool CHW12::CreateFrameResources()
             frame.timestampPending=false;
         }
 
-        // Per-frame constant buffer: 256 байт (требование выравнивания),
-        // upload heap, GENERIC_READ (требование API для upload heap),
-        // pOptimizedClearValue = nullptr (требование API для DIMENSION_BUFFER).
+        // Per-frame constant buffer: upload heap, GENERIC_READ (требование API
+        // для upload heap), pOptimizedClearValue = nullptr (требование API для
+        // DIMENSION_BUFFER).
         //
-        // Содержимое — одна float4x4 ViewProjection (64 байта), остальное
-        // резерв. World-матрицы нет, поэтому WVP не существует как понятие.
+        // Offset 0: одна float4x4 ViewProjection (64 байта), остаток первого
+        // 256-байтового слота — резерв. F3.5.6A добавляет 256-байтовые
+        // per-object слоты; legacy tail не использует.
         D3D12_HEAP_PROPERTIES uploadHeapProps = {};
         uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
         uploadHeapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
@@ -669,7 +690,9 @@ bool CHW12::CreateFrameResources()
 
         D3D12_RESOURCE_DESC cbDesc = {};
         cbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        cbDesc.Width = 256;  // D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT
+        // F3.5.6A: frame ViewProjection at offset 0; object constants follow
+        // at 256-byte aligned slices. Legacy path simply leaves the tail unused.
+        cbDesc.Width = dx12object12::kUploadBytes;
         cbDesc.Height = 1;
         cbDesc.DepthOrArraySize = 1;
         cbDesc.MipLevels = 1;
@@ -889,10 +912,11 @@ bool CHW12::CreateReadback()
         m_readbackTotalBytes = totalBytes;
         m_readbackAllocatedBytes = totalBytes;
 
-        if (m_backgroundTest)
+        if (m_depthReadback)
         {
-            // F3.5.5A TEST ONLY: 4x4 D32 region in the tail of the same
-            // readback buffer. Offset must be 512-byte aligned.
+            // TEST ONLY: 4x4 D32 region in the tail of the same readback
+            // buffer, used by the background and transform-scene oracles.
+            // Offset must be 512-byte aligned.
             const UINT64 alignedOffset = (totalBytes + 511ull) & ~511ull;
             D3D12_RESOURCE_DESC depthDesc = {};
             depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1233,6 +1257,169 @@ CHW12::DepthTestResult CHW12::VerifyBackgroundOnly()
     snprintf(result.message, sizeof(result.message),
              "background color and depth clear verified");
     dx12log::Write("[background-frame] PASS: %s", result.message);
+    return result;
+}
+
+CHW12::DepthTestResult CHW12::VerifyTransformScene()
+{
+    DepthTestResult result;
+    result.passed = false;
+
+    if (m_sceneMode != MeshSceneMode12::Transforms ||
+        !m_transformTest || !m_readbackBuffer ||
+        m_backgroundDepthBytes == 0)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "transform oracle requires transform scene and depth readback");
+        return result;
+    }
+    if (m_visiblePackets != 2)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "transform oracle expects 2 packets, got %u", m_visiblePackets);
+        return result;
+    }
+
+    bool timedOut = false;
+    const uint64_t targetFence = m_fenceValue;
+    if (!WaitForFenceValue(targetFence, timedOut))
+    {
+        const char* reason = timedOut ? "GPU timeout" : "fence wait failed";
+        snprintf(result.message, sizeof(result.message),
+                 "GPU synchronization failed: %s (fence=%llu)", reason,
+                 static_cast<unsigned long long>(targetFence));
+        return result;
+    }
+
+    const UINT64 readBytes = m_backgroundDepthOffset + m_backgroundDepthBytes;
+    if (readBytes > m_readbackAllocatedBytes)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "transform readback range exceeds allocation");
+        return result;
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = readBytes;
+    if (FAILED(m_readbackBuffer->Map(0, &readRange, &mapped)))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "transform readback Map failed");
+        return result;
+    }
+
+    struct UnmapGuard
+    {
+        ID3D12Resource* resource;
+        ~UnmapGuard()
+        {
+            if (resource)
+            {
+                D3D12_RANGE written = {};
+                written.Begin = 0;
+                written.End = 0;
+                resource->Unmap(0, &written);
+            }
+        }
+    } unmapGuard{m_readbackBuffer.Get()};
+
+    const uint8_t* const data = static_cast<const uint8_t*>(mapped);
+    const UINT rowPitch = m_copyableFootprint.Footprint.RowPitch;
+    const UINT64 offset = m_copyableFootprint.Offset;
+
+    uint64_t imageHash = 14695981039346656037ull;
+    for (uint32_t y = 0; y < m_height; ++y)
+    {
+        const uint8_t* row = data + offset + static_cast<UINT64>(y) * rowPitch;
+        for (uint32_t x = 0; x < m_width; ++x)
+        {
+            const uint8_t* pixel = row + static_cast<UINT64>(x) * 4;
+            for (uint32_t c = 0; c < 4; ++c)
+            {
+                imageHash ^= pixel[c];
+                imageHash *= 1099511628211ull;
+            }
+        }
+    }
+    dx12log::Write("[transform-frame] hash=%016llx",
+                   static_cast<unsigned long long>(imageHash));
+
+    struct ControlPoint
+    {
+        uint32_t x, y;
+        const char* name;
+        uint8_t expected[4];
+    };
+    const ControlPoint points[] = {
+        {m_width / 2, m_height / 2, "near object front face",
+         {255, 0, 0, 255}},
+        {m_width / 2 + 100, m_height / 2, "far rotated scaled object",
+         {0, 255, 0, 255}},
+        {m_width / 2, m_height / 18, "background",
+         {18, 41, 82, 255}},
+    };
+
+    bool allPassed = true;
+    for (const ControlPoint& point : points)
+    {
+        if (point.x >= m_width || point.y >= m_height)
+        {
+            allPassed = false;
+            dx12log::Write("[transform-frame] FAIL: control point %s out of range",
+                           point.name);
+            continue;
+        }
+        const uint8_t* row = data + offset +
+                             static_cast<UINT64>(point.y) * rowPitch;
+        const uint8_t* pixel = row + static_cast<UINT64>(point.x) * 4;
+        const bool ok = pixel[0] == point.expected[0] &&
+                        pixel[1] == point.expected[1] &&
+                        pixel[2] == point.expected[2] &&
+                        pixel[3] == point.expected[3];
+        dx12log::Write("[transform-frame] %s at (%u,%u): "
+                       "expected(%u,%u,%u,%u) actual(%u,%u,%u,%u) %s",
+                       point.name, point.x, point.y,
+                       point.expected[0], point.expected[1],
+                       point.expected[2], point.expected[3],
+                       pixel[0], pixel[1], pixel[2], pixel[3],
+                       ok ? "PASS" : "FAIL");
+        if (!ok)
+            allPassed = false;
+    }
+
+    const UINT depthRowPitch = m_backgroundDepthFootprint.Footprint.RowPitch;
+    const uint8_t* const depthData = data + m_backgroundDepthOffset;
+    float minDepth = 1.0f;
+    float maxDepth = 0.0f;
+    for (uint32_t y = 0; y < 4; ++y)
+    {
+        for (uint32_t x = 0; x < 4; ++x)
+        {
+            float depth = 0.0f;
+            memcpy(&depth, depthData + static_cast<UINT64>(y) * depthRowPitch +
+                           static_cast<UINT64>(x) * sizeof(float), sizeof(depth));
+            minDepth = (std::min)(minDepth, depth);
+            maxDepth = (std::max)(maxDepth, depth);
+            if (!(depth > 0.0f && depth < 1.0f))
+            {
+                dx12log::Write("[transform-frame] depth at (%u,%u)=%f FAIL",
+                               x, y, static_cast<double>(depth));
+                allPassed = false;
+            }
+        }
+    }
+    dx12log::Write("[transform-frame] center depth min=%f max=%f (expected 0<d<1)",
+                   static_cast<double>(minDepth), static_cast<double>(maxDepth));
+
+    result.passed = allPassed;
+    snprintf(result.message, sizeof(result.message),
+             allPassed
+                 ? "two per-object transforms, pixels and depth verified"
+                 : "transform pixel/depth mismatch");
+    dx12log::Write("[transform-frame] %s: %s",
+                   allPassed ? "PASS" : "FAIL", result.message);
     return result;
 }
 
@@ -1682,6 +1869,9 @@ bool CHW12::InjectRecordingFailure(unsigned stage, unsigned list) {
 
 const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame) const
 {
+    const bool transforms = (m_sceneMode == MeshSceneMode12::Transforms);
+    if (transforms && m_mesh.Mode() != MeshSceneMode12::Transforms)
+        return "transform scene requires transform mesh";
     if (frame.frame.generation != m_sceneGeneration)
         return "stale frame generation";
     if (frame.categories[1].count != 0 || frame.categories[2].count != 0)
@@ -1689,6 +1879,8 @@ const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame
     if (frame.categories[0].begin != 0 ||
         frame.categories[0].count != frame.frame.packets.size())
         return "invalid opaque category range";
+    if (transforms && frame.frame.packets.size() > dx12object12::kMaxObjects)
+        return "too many transform objects for object constant buffer";
 
     for (const renderprep12::DrawPacket12& packet : frame.frame.packets)
     {
@@ -1711,20 +1903,67 @@ const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame
             packet.object.pso != bound->pso)
             return "stale or unsupported resource binding";
         if (packet.object.vertexCount == 0 ||
-            packet.object.firstVertex > SmokeMesh12::kVertexCount ||
+            packet.object.firstVertex > m_mesh.VertexCount() ||
             packet.object.vertexCount >
-                SmokeMesh12::kVertexCount - packet.object.firstVertex)
+                m_mesh.VertexCount() - packet.object.firstVertex)
             return "invalid vertex range";
         if (packet.object.flags & (renderprep12::Hud | renderprep12::Transparent))
             return "transparent/hud flags are unsupported";
         if (packet.object.opacity != 1.0f)
             return "non-opaque opacity is unsupported";
-        // F3.5.5A сохраняет world-baked vertices: world-матрица не должна
-        // молча игнорироваться GPU-путём.
-        if (!IsIdentityWorld(packet.object.world))
+        if (transforms)
+        {
+            if (!dx12object12::IsValidTransformWorld(packet.object.world))
+                return "non-finite, non-affine or singular world transform";
+        }
+        else if (!IsIdentityWorld(packet.object.world))
+        {
+            // Legacy vertices contain world coordinates; a non-identity
+            // matrix must not be silently ignored by the GPU path.
             return "non-identity world is unsupported";
+        }
     }
     return nullptr;
+}
+
+bool CHW12::WriteTransformConstants(
+    void* mapped,
+    const renderprep12::OrderedFrame12& ordered)
+{
+    if (m_sceneMode != MeshSceneMode12::Transforms)
+        return true;
+    if (!mapped)
+    {
+        dx12log::Write("[transform-cb] FAIL: slot constant buffer is not mapped");
+        return false;
+    }
+    const size_t count = ordered.frame.packets.size();
+    if (count > dx12object12::kMaxObjects)
+    {
+        dx12log::Write("[transform-cb] FAIL: %zu packets exceed capacity %u",
+                       count, dx12object12::kMaxObjects);
+        return false;
+    }
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        const renderprep12::DrawPacket12& packet = ordered.frame.packets[i];
+        uint8_t* const dst = static_cast<uint8_t*>(mapped) +
+                             dx12object12::ObjectConstantsOffset(
+                                 static_cast<uint32_t>(i));
+        std::memset(dst, 0, dx12object12::kObjectConstantsSize);
+
+        // HLSL cbuffers are column-major by default; CPU stores the transpose
+        // of the logical row-vector matrix, matching the existing VP path.
+        dx12object12::ObjectConstants12 constants{};
+        DirectX::XMStoreFloat4x4(
+            &constants.world,
+            DirectX::XMMatrixTranspose(
+                DirectX::XMLoadFloat4x4(&packet.object.world)));
+        constants.tint = TransformSceneTint(packet.object.id);
+        std::memcpy(dst, &constants, sizeof(constants));
+    }
+    return true;
 }
 
 bool CHW12::RecordPacketList(
@@ -1734,6 +1973,7 @@ bool CHW12::RecordPacketList(
     const renderprep12::FrameBatchPlan12& plan,
     uint32_t listIndex,
     D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+    D3D12_GPU_VIRTUAL_ADDRESS objectCBBase,
     uint32_t& draws)
 {
     draws = 0;
@@ -1759,9 +1999,29 @@ bool CHW12::RecordPacketList(
         {
             const renderprep12::DrawPacket12& packet =
                 ordered.frame.packets[static_cast<size_t>(packetIndex)];
-            if (!mesh.Draw(list, cbVA, packet.object.firstVertex,
-                           packet.object.vertexCount))
+            if (mesh.Mode() == MeshSceneMode12::Transforms)
+            {
+                if (packetIndex > UINT32_MAX ||
+                    !dx12object12::IsValidObjectIndex(
+                        static_cast<uint32_t>(packetIndex)))
+                    return false;
+                const uint64_t objectOffset =
+                    dx12object12::ObjectConstantsOffset(
+                        static_cast<uint32_t>(packetIndex));
+                if (objectCBBase > UINT64_MAX - objectOffset)
+                    return false;
+                const D3D12_GPU_VIRTUAL_ADDRESS objectCBVA =
+                    objectCBBase + objectOffset;
+                if (!mesh.DrawTransformed(list, cbVA, objectCBVA,
+                                          packet.object.firstVertex,
+                                          packet.object.vertexCount))
+                    return false;
+            }
+            else if (!mesh.Draw(list, cbVA, packet.object.firstVertex,
+                                packet.object.vertexCount))
+            {
                 return false;
+            }
             ++draws;
         }
     }
@@ -1938,6 +2198,15 @@ bool CHW12::RenderFrame()
             ReportGpuFailure(L"WaitForFenceValue", E_FAIL);
             return false;
         }
+    }
+
+    // F3.5.6A: slot fence is confirmed above. The owner writes per-object
+    // constants before Reset/recording; workers never touch mapped memory.
+    if (m_sceneMode == MeshSceneMode12::Transforms &&
+        !WriteTransformConstants(frame.mapped, ordered))
+    {
+        m_recordFailed = true;
+        return false;
     }
 
     CollectGpuTiming(frame);
@@ -2170,12 +2439,13 @@ bool CHW12::RenderFrame()
                         auto* draw=commands[i+1]; auto* allocator=allocators[i+1];
                         const SmokeMesh12* mesh=&m_mesh;
                         const auto cb=frame.constantBuffer->GetGPUVirtualAddress();
+                        const auto objectCB=frame.constantBuffer->GetGPUVirtualAddress();
                         const auto dsv=m_dsv;
                         if (packetDraw)
                         {
                             const renderprep12::OrderedFrame12* orderedPtr=&ordered;
                             const renderprep12::FrameBatchPlan12* planPtr=&packetPlan;
-                            group.Submit([i,draw,allocator,mesh,orderedPtr,planPtr,cb,dsv,
+                            group.Submit([i,draw,allocator,mesh,orderedPtr,planPtr,cb,objectCB,dsv,
                                           rtvHandle,viewport,scissor,faultStage,faultList,
                                           rendezvous,&results,&entered,&exited,&overlap] {
                                 struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
@@ -2207,7 +2477,7 @@ bool CHW12::RenderFrame()
                                 }
                                 uint32_t draws=0;
                                 if (!CHW12::RecordPacketList(draw,*mesh,*orderedPtr,*planPtr,
-                                                             i,cb,draws))
+                                                             i,cb,objectCB,draws))
                                 {
                                     result.hr=E_FAIL;
                                     result.draws=draws;
@@ -2311,6 +2581,7 @@ bool CHW12::RenderFrame()
                     if (InjectRecordingFailure(2,i+1)) return false;
                     uint32_t draws=0;
                     if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,i,
+                                          frame.constantBuffer->GetGPUVirtualAddress(),
                                           frame.constantBuffer->GetGPUVirtualAddress(),draws))
                     {
                         m_recordFailed=true;
@@ -2341,6 +2612,7 @@ bool CHW12::RenderFrame()
             if (InjectRecordingFailure(2,0)) return false;
             uint32_t draws=0;
             if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,0,
+                                  frame.constantBuffer->GetGPUVirtualAddress(),
                                   frame.constantBuffer->GetGPUVirtualAddress(),draws))
             {
                 m_recordFailed=true;
@@ -2416,10 +2688,10 @@ bool CHW12::RenderFrame()
 
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-        // F3.5.5A TEST ONLY: copy a 4x4 depth region into the tail of the
-        // same readback buffer. The frame still records exactly the same Draw
-        // set; this only adds a test readback.
-        if (m_backgroundTest && m_backgroundDepthFootprint.Footprint.Width >= 4)
+        // TEST ONLY: copy a 4x4 depth region into the tail of the same
+        // readback buffer. Used by the background and transform oracles; the
+        // frame still records exactly the same Draw set.
+        if (m_depthReadback && m_backgroundDepthFootprint.Footprint.Width >= 4)
         {
             D3D12_RESOURCE_BARRIER depthToCopy = {};
             depthToCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

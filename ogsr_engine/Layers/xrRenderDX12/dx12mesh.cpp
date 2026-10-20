@@ -177,6 +177,44 @@ VSOutput main(VSInput input)
 }
 )";
 
+// F3.5.6A: per-object transform path. ViewProjection and World are uploaded
+// in the project's transposed row-vector representation; HLSL's default
+// column-major load restores the logical matrices. The tint is a TEST ONLY
+// per-object debug color used by the transform-scene pixel oracle.
+static const char* kTransformVertexShaderSrc = R"(
+struct VSInput
+{
+    float3 position : POSITION;
+    float4 color    : COLOR;
+};
+
+struct VSOutput
+{
+    float4 position : SV_Position;
+    float4 color    : COLOR;
+};
+
+cbuffer FrameCB : register(b0)
+{
+    float4x4 ViewProjection;
+};
+
+cbuffer ObjectCB : register(b1)
+{
+    float4x4 World;
+    float4 Tint;
+};
+
+VSOutput main(VSInput input)
+{
+    VSOutput output;
+    // Row-vector convention: local -> World -> ViewProjection.
+    output.position = mul(mul(float4(input.position, 1.0f), World), ViewProjection);
+    output.color = Tint;
+    return output;
+}
+)";
+
 static const char* kPixelShaderSrc = R"(
 struct PSInput
 {
@@ -245,7 +283,8 @@ bool SmokeMesh12::Create(
     ID3D12Device* device,
     ID3D12CommandQueue* copyQueue,
     ID3D12CommandAllocator* copyAllocator,
-    ID3D12GraphicsCommandList* copyCommandList)
+    ID3D12GraphicsCommandList* copyCommandList,
+    MeshSceneMode12 mode)
 {
     if (m_created)
     {
@@ -258,6 +297,9 @@ bool SmokeMesh12::Create(
         dx12log::Write("[DX12][mesh] Create refused: null dependency");
         return false;
     }
+
+    m_mode = mode;
+    m_vertexCount = (mode == MeshSceneMode12::Legacy) ? kVertexCount : 36u;
 
     if (!CreateRootSignature(device))
         return false;
@@ -277,10 +319,10 @@ bool SmokeMesh12::Create(
     uploadHeapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
     uploadHeapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
 
-    // Размер — все 72 вершины. Вершинный буфер при resize не пересоздаётся.
+    // Размер — m_vertexCount вершин. Вершинный буфер при resize не пересоздаётся.
     D3D12_RESOURCE_DESC uploadDesc = {};
     uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDesc.Width = sizeof(Vertex) * kVertexCount;
+    uploadDesc.Width = sizeof(Vertex) * m_vertexCount;
     uploadDesc.Height = 1;
     uploadDesc.DepthOrArraySize = 1;
     uploadDesc.MipLevels = 1;
@@ -317,16 +359,63 @@ bool SmokeMesh12::Create(
     // по ссылке, поэтому memcpy выполняется один раз.
     Vertex vertices[kVertexCount];
     BuildCubeVertices(vertices);
-    // Bounds из того же массива, который копируется на GPU.
-    for (uint32_t i=0;i<2;++i) {
-        auto& o=m_objects[i]; o.id=i+1; o.firstVertex=i*36; o.vertexCount=36;
-        DirectX::XMStoreFloat4x4(&o.world,DirectX::XMMatrixIdentity());
-        o.minimum=o.maximum={vertices[i*36].x,vertices[i*36].y,vertices[i*36].z};
-        for (uint32_t j=i*36;j<(i+1)*36;++j) {
+
+    if (m_mode == MeshSceneMode12::Legacy)
+    {
+        // Bounds из того же массива, который копируется на GPU.
+        for (uint32_t i=0;i<2;++i) {
+            auto& o=m_objects[i]; o.id=i+1; o.firstVertex=i*36; o.vertexCount=36;
+            DirectX::XMStoreFloat4x4(&o.world,DirectX::XMMatrixIdentity());
+            o.minimum=o.maximum={vertices[i*36].x,vertices[i*36].y,vertices[i*36].z};
+            for (uint32_t j=i*36;j<(i+1)*36;++j) {
+                const auto& v=vertices[j];
+                o.minimum.x=(std::min)(o.minimum.x,v.x); o.maximum.x=(std::max)(o.maximum.x,v.x);
+                o.minimum.y=(std::min)(o.minimum.y,v.y); o.maximum.y=(std::max)(o.maximum.y,v.y);
+                o.minimum.z=(std::min)(o.minimum.z,v.z); o.maximum.z=(std::max)(o.maximum.z,v.z);
+            }
+        }
+    }
+    else
+    {
+        // Одна local-space геометрия (первые 36 вершин = локальный куб
+        // [-1,1]^3). Оба объекта используют один и тот же диапазон и
+        // различаются только World matrix в per-object CB.
+        renderprep12::Object12 local{};
+        local.minimum = local.maximum = {vertices[0].x, vertices[0].y, vertices[0].z};
+        for (uint32_t j=0;j<36;++j) {
             const auto& v=vertices[j];
-            o.minimum.x=(std::min)(o.minimum.x,v.x); o.maximum.x=(std::max)(o.maximum.x,v.x);
-            o.minimum.y=(std::min)(o.minimum.y,v.y); o.maximum.y=(std::max)(o.maximum.y,v.y);
-            o.minimum.z=(std::min)(o.minimum.z,v.z); o.maximum.z=(std::max)(o.maximum.z,v.z);
+            local.minimum.x=(std::min)(local.minimum.x,v.x); local.maximum.x=(std::max)(local.maximum.x,v.x);
+            local.minimum.y=(std::min)(local.minimum.y,v.y); local.maximum.y=(std::max)(local.maximum.y,v.y);
+            local.minimum.z=(std::min)(local.minimum.z,v.z); local.maximum.z=(std::max)(local.maximum.z,v.z);
+        }
+        local.sphere.center={
+            (local.minimum.x+local.maximum.x)*0.5f,
+            (local.minimum.y+local.maximum.y)*0.5f,
+            (local.minimum.z+local.maximum.z)*0.5f};
+        const auto ext=DirectX::XMVectorSubtract(
+            DirectX::XMLoadFloat3(&local.maximum),
+            DirectX::XMLoadFloat3(&local.sphere.center));
+        local.sphere.radius=DirectX::XMVectorGetX(DirectX::XMVector3Length(ext));
+
+        DirectX::XMMATRIX worldA =
+            DirectX::XMMatrixTranslation(-0.4f, 0.0f, 0.0f);
+        DirectX::XMMATRIX worldB =
+            DirectX::XMMatrixScaling(1.25f, 1.25f, 1.25f) *
+            DirectX::XMMatrixRotationY(DirectX::XMConvertToRadians(30.0f)) *
+            DirectX::XMMatrixTranslation(0.4f, 0.0f, 2.0f);
+
+        for (uint32_t i=0;i<2;++i) {
+            auto& o=m_objects[i];
+            o = local;
+            o.id=i+1;
+            o.firstVertex=0;
+            o.vertexCount=36;
+            DirectX::XMStoreFloat4x4(&o.world, i==0 ? worldA : worldB);
+            o.visual=renderprep12::SyntheticResources12[0];
+            o.material=renderprep12::SyntheticResources12[0];
+            o.pso=renderprep12::SyntheticResources12[0];
+            o.flags=0;
+            o.opacity=1.0f;
         }
     }
     for (auto& o:m_objects) {
@@ -335,7 +424,7 @@ bool SmokeMesh12::Create(
         o.sphere.radius=DirectX::XMVectorGetX(DirectX::XMVector3Length(ext));
     }
 
-    memcpy(mapped, vertices, sizeof(vertices));
+    memcpy(mapped, vertices, sizeof(Vertex) * m_vertexCount);
     m_uploadBuffer->Unmap(0, nullptr);
 
     // Командный лист для копии берём у вызывающего: CHW12::CreateFrameResources
@@ -351,7 +440,7 @@ bool SmokeMesh12::Create(
     }
 
     copyCommandList->CopyBufferRegion(
-        m_vertexBuffer.Get(), 0, m_uploadBuffer.Get(), 0, sizeof(Vertex) * kVertexCount);
+        m_vertexBuffer.Get(), 0, m_uploadBuffer.Get(), 0, sizeof(Vertex) * m_vertexCount);
 
     // StateBefore = COPY_DEST, хотя буфер создан в COMMON: при первом
     // использовании в CopyBufferRegion выше Debug Layer неявно продвинул
@@ -416,8 +505,17 @@ void SmokeMesh12::OnUploadComplete()
     m_copySubmitted = false;
     m_created = true;
 
-    dx12log::Write("[DX12][mesh] created: %u vertices (2 cubes), root signature and PSO ready",
-                   kVertexCount);
+    if (m_mode == MeshSceneMode12::Legacy)
+    {
+        dx12log::Write("[DX12][mesh] created: %u vertices (2 cubes), "
+                       "root signature and PSO ready", kVertexCount);
+    }
+    else
+    {
+        dx12log::Write("[DX12][mesh] created: %u vertices "
+                       "(local cube + per-object transforms), "
+                       "root signature and PSO ready", m_vertexCount);
+    }
 }
 
 bool SmokeMesh12::CreateVertexBuffer(ID3D12Device* device)
@@ -429,7 +527,7 @@ bool SmokeMesh12::CreateVertexBuffer(ID3D12Device* device)
 
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = sizeof(Vertex) * kVertexCount;
+    desc.Width = sizeof(Vertex) * m_vertexCount;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -474,7 +572,7 @@ bool SmokeMesh12::CreateVertexBuffer(ID3D12Device* device)
     }
 
     m_vertexBufferView.BufferLocation = m_vertexBuffer->GetGPUVirtualAddress();
-    m_vertexBufferView.SizeInBytes = sizeof(Vertex) * kVertexCount;
+    m_vertexBufferView.SizeInBytes = sizeof(Vertex) * m_vertexCount;
     m_vertexBufferView.StrideInBytes = sizeof(Vertex);
 
     return true;
@@ -482,23 +580,26 @@ bool SmokeMesh12::CreateVertexBuffer(ID3D12Device* device)
 
 bool SmokeMesh12::CreateRootSignature(ID3D12Device* device)
 {
-    // Один root parameter: CBV, register 0, ShaderVisibility_ALL.
-    // Дескриптор не нужен: адрес передаётся через
-    // SetGraphicsRootConstantBufferView. Убирает CBV_SRV_UAV heap,
-    // шейдер-visible heap и его пересоздание при resize.
+    // Legacy: один CBV b0 (ViewProjection). Transforms: b0 + b1 (World/Tint).
+    // Дескрипторы не нужны: адреса передаются через
+    // SetGraphicsRootConstantBufferView, без CBV_SRV_UAV heap.
     //
     // Флаг ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT обязателен, иначе лист
     // с IASetVertexBuffers не пройдёт validation: по умолчанию IA
     // считается выключенным для root signature.
-    D3D12_ROOT_PARAMETER rootParam = {};
-    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParam.Descriptor.ShaderRegister = 0;
-    rootParam.Descriptor.RegisterSpace = 0;
-    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_PARAMETER rootParams[2] = {};
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[0].Descriptor.ShaderRegister = 0;
+    rootParams[0].Descriptor.RegisterSpace = 0;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[1].Descriptor.ShaderRegister = 1;
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 1;
-    desc.pParameters = &rootParam;
+    desc.NumParameters = (m_mode == MeshSceneMode12::Transforms) ? 2u : 1u;
+    desc.pParameters = rootParams;
     desc.NumStaticSamplers = 0;
     desc.pStaticSamplers = nullptr;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -544,7 +645,10 @@ bool SmokeMesh12::CreatePipelineState(ID3D12Device* device)
     ComPtr<ID3D10Blob> vertexShader;
     ComPtr<ID3D10Blob> pixelShader;
 
-    if (!CompileShader(kVertexShaderSrc, "main", "vs_5_0", &vertexShader))
+    if (!CompileShader(m_mode == MeshSceneMode12::Transforms
+                           ? kTransformVertexShaderSrc
+                           : kVertexShaderSrc,
+                       "main", "vs_5_0", &vertexShader))
         return false;
 
     if (!CompileShader(kPixelShaderSrc, "main", "ps_5_0", &pixelShader))
@@ -608,7 +712,7 @@ bool SmokeMesh12::Draw(
     UINT firstVertex,
     UINT vertexCount) const
 {
-    if (!m_created || !cmd)
+    if (!m_created || !cmd || m_mode != MeshSceneMode12::Legacy)
         return false;
 
     // Валидация диапазона обязательна: выход за пределы буфера был бы GPU
@@ -622,6 +726,29 @@ bool SmokeMesh12::Draw(
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd->IASetVertexBuffers(0, 1, &m_vertexBufferView);
     cmd->SetGraphicsRootConstantBufferView(0, cbVA);
+    cmd->DrawInstanced(vertexCount, 1, firstVertex, 0);
+    return true;
+}
+
+bool SmokeMesh12::DrawTransformed(
+    ID3D12GraphicsCommandList* cmd,
+    D3D12_GPU_VIRTUAL_ADDRESS frameCBVA,
+    D3D12_GPU_VIRTUAL_ADDRESS objectCBVA,
+    UINT firstVertex,
+    UINT vertexCount) const
+{
+    if (!m_created || !cmd || m_mode != MeshSceneMode12::Transforms)
+        return false;
+
+    if (firstVertex > m_vertexCount || vertexCount > m_vertexCount - firstVertex)
+        return false;
+
+    cmd->SetGraphicsRootSignature(m_rootSignature.Get());
+    cmd->SetPipelineState(m_pipelineState.Get());
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->IASetVertexBuffers(0, 1, &m_vertexBufferView);
+    cmd->SetGraphicsRootConstantBufferView(0, frameCBVA);
+    cmd->SetGraphicsRootConstantBufferView(1, objectCBVA);
     cmd->DrawInstanced(vertexCount, 1, firstVertex, 0);
     return true;
 }

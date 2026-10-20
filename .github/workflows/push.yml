@@ -131,7 +131,7 @@ jobs:
       shell: pwsh
       run: |
         $exe = (Resolve-Path "x64\ReleaseDX12\xrDX12Smoke.exe").Path
-        foreach ($test in @("-fencewaitselftest", "-packetplanselftest", "-cpuselftest")) {
+        foreach ($test in @("-fencewaitselftest", "-packetplanselftest", "-transformselftest", "-cpuselftest")) {
           $process = Start-Process -FilePath $exe -ArgumentList $test -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) {
             throw "$test failed with exit code $($process.ExitCode)"

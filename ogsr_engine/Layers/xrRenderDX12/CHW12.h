@@ -38,6 +38,14 @@ public:
         m_drawSource = source;
         return true;
     }
+    // F3.5.6A: opt-in scene. Legacy remains default.
+    bool SetSceneMode(MeshSceneMode12 mode)
+    {
+        if (m_initialized) return false;
+        m_sceneMode = mode;
+        return true;
+    }
+    MeshSceneMode12 SceneMode() const { return m_sceneMode; }
     // TEST ONLY: детерминированно портит сцену до snapshot, чтобы проверить
     // validation packet-path без реального traversal/registry.
     enum class PacketTestFault : uint8_t
@@ -54,7 +62,8 @@ public:
         OverflowRange,
         Transparent,
         Hud,
-        WorldTransform
+        WorldTransform,
+        InvalidTransform
     };
     void SetPacketTestFault(PacketTestFault fault)
     {
@@ -185,12 +194,32 @@ public:
     DepthTestResult VerifyDepthTest();
     // F3.5.5A TEST ONLY: empty visible frame. Проверяет, что весь кадр равен
     // clear color, Draw=0, а центральный depth-регион равен 1.0 после clear.
-    void SetBackgroundTest(bool enabled) { if (!m_initialized) m_backgroundTest = enabled; }
+    void SetBackgroundTest(bool enabled)
+    {
+        if (!m_initialized)
+        {
+            m_backgroundTest = enabled;
+            m_depthReadback = m_backgroundTest || m_transformTest;
+        }
+    }
     DepthTestResult VerifyBackgroundOnly();
+
+    // F3.5.6A TEST ONLY: local geometry + per-object World matrices.
+    // Enables the 4x4 center depth readback and the transform-scene oracle.
+    void SetTransformTest(bool enabled)
+    {
+        if (!m_initialized)
+        {
+            m_transformTest = enabled;
+            m_depthReadback = m_backgroundTest || m_transformTest;
+        }
+    }
+    DepthTestResult VerifyTransformScene();
 
 private:
     bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
     DrawSource m_drawSource = DrawSource::Synthetic;
+    MeshSceneMode12 m_sceneMode = MeshSceneMode12::Legacy;
     PacketTestFault m_packetTestFault = PacketTestFault::None;
     // F3.5.4A: L — число draw lists, N — всего draw calls за кадр.
     uint32_t m_drawListCount = 2;
@@ -222,9 +251,10 @@ private:
     // nullptr при успехе или статическую причину отказа.
     const char* ValidatePacketFrame(const renderprep12::OrderedFrame12& frame) const;
     // F3.5.5C: общая запись одного PacketList12. Обходит batches и packets в
-    // плановом порядке, проверяет каждый m_mesh.Draw() и возвращает число
-    // успешно записанных Draw. Caller выставляет RT/viewport/scissor; Draw
-    // выставляет PSO, root signature, topology, VB и CBV на этом list.
+    // плановом порядке, проверяет каждый Draw и возвращает число успешно
+    // записанных Draw. Caller выставляет RT/viewport/scissor; legacy Draw
+    // выставляет PSO/root signature/topology/VB/b0, transform Draw additionally
+    // выставляет b1 per-object CBV на этом list.
     // Не пишет в лог, не меняет renderer state и пригодна для worker callback.
     static bool RecordPacketList(
         ID3D12GraphicsCommandList* list,
@@ -233,7 +263,14 @@ private:
         const renderprep12::FrameBatchPlan12& plan,
         uint32_t listIndex,
         D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+        D3D12_GPU_VIRTUAL_ADDRESS objectCBBase,
         uint32_t& draws);
+
+    // F3.5.6A: owner writes ObjectConstants for every visible packet after
+    // the slot fence wait and before Reset/Execute. Workers only receive GPU
+    // virtual addresses; they never touch the mapped upload memory.
+    bool WriteTransformConstants(void* mapped,
+                                 const renderprep12::OrderedFrame12& ordered);
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;
@@ -383,6 +420,9 @@ private:
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_copyableFootprint = {};
     // F3.5.5A TEST ONLY: 4x4 depth-регион в хвосте того же readback buffer.
     bool m_backgroundTest = false;
+    // F3.5.6A: opt-in transform scene uses the same depth readback region.
+    bool m_transformTest = false;
+    bool m_depthReadback = false;
     UINT64 m_backgroundDepthOffset = 0;
     UINT64 m_backgroundDepthBytes = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backgroundDepthFootprint = {};

@@ -4,6 +4,7 @@
 #include "dx12log.h"
 #include "dx12cpuscene.h"
 #include "dx12packetplan.h"
+#include "dx12transform_tests.h"
 #include "gr/jobs/JobSystem.h"
 #include "gr/jobs/JobConfig.h"
 #include "gr/jobs/JobStats.h"
@@ -90,6 +91,7 @@ static bool ParsePacketFault(const wchar_t* text, CHW12::PacketTestFault& fault)
     else if (!_wcsicmp(text, L"transparent")) fault = CHW12::PacketTestFault::Transparent;
     else if (!_wcsicmp(text, L"hud")) fault = CHW12::PacketTestFault::Hud;
     else if (!_wcsicmp(text, L"worldtransform")) fault = CHW12::PacketTestFault::WorldTransform;
+    else if (!_wcsicmp(text, L"invalidtransform")) fault = CHW12::PacketTestFault::InvalidTransform;
     else return false;
     return true;
 }
@@ -111,6 +113,7 @@ static const char* PacketFaultName(CHW12::PacketTestFault fault)
     case CHW12::PacketTestFault::Transparent: return "transparent";
     case CHW12::PacketTestFault::Hud: return "hud";
     case CHW12::PacketTestFault::WorldTransform: return "worldtransform";
+    case CHW12::PacketTestFault::InvalidTransform: return "invalidtransform";
     }
     return "unknown";
 }
@@ -480,6 +483,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
     bool packetPlanSelfTest=false;
     bool fenceWaitSelfTest=false;
+    bool transformSelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
@@ -490,6 +494,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool noGbv=false;
     bool noDebug=false;
     bool packetDraw=false;
+    bool transformsScene=false;
+    bool transformTest=false;
+    uint32_t transformFrames=1;
     bool drawsSpecified=false, listsSpecified=false;
     bool packetListsSpecified=false, packetBatchLimitSpecified=false;
     CHW12::PacketTestFault packetFault=CHW12::PacketTestFault::None;
@@ -521,6 +528,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                         ++i;
                         if (!_wcsicmp(argv[i],L"synthetic")) packetDraw=false;
                         else if (!_wcsicmp(argv[i],L"packets")) packetDraw=true;
+                        else badArgument=true;
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i],L"-scene")==0) {
+                    if (i+1<argc) {
+                        ++i;
+                        if (!_wcsicmp(argv[i],L"legacy")) transformsScene=false;
+                        else if (!_wcsicmp(argv[i],L"transforms")) transformsScene=true;
                         else badArgument=true;
                     } else badArgument=true;
                 }
@@ -584,6 +599,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-packetplanselftest") == 0) packetPlanSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-fencewaitselftest") == 0) fenceWaitSelfTest=true;
+                else if (_wcsicmp(argv[i], L"-transformselftest") == 0) transformSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -608,6 +624,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     fixedPose = true;
                 else if (_wcsicmp(argv[i], L"-depthtest") == 0)
                     depthTest = true;
+                else if (_wcsicmp(argv[i], L"-transformtest") == 0)
+                    transformTest = true;
+                else if (_wcsicmp(argv[i], L"-transformframes") == 0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<1 || value>256) badArgument=true;
+                        else transformFrames=static_cast<uint32_t>(value);
+                    } else badArgument=true;
+                }
                 else if (_wcsicmp(argv[i], L"-backgroundtest") == 0)
                     backgroundTest = true;
                 else if (_wcsicmp(argv[i], L"-freeaspect") == 0)
@@ -807,6 +832,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
         badArgument = true;
     }
+    if (transformsScene && !packetDraw)
+    {
+        dx12log::Write("[smoke] FATAL: -scene transforms requires -drawsource packets");
+        badArgument = true;
+    }
+    if (transformTest &&
+        (!transformsScene || !packetDraw || depthTest || backgroundTest))
+    {
+        dx12log::Write("[smoke] FATAL: -transformtest requires -scene transforms, "
+                       "-drawsource packets and no other oracle");
+        badArgument = true;
+    }
+    if (!transformTest && transformFrames != 1)
+    {
+        dx12log::Write("[smoke] FATAL: -transformframes requires -transformtest");
+        badArgument = true;
+    }
     const uint32_t faultLists = packetDraw
         ? (multiList ? packetListCount : 1) : drawLists;
     // Fault harness всегда работает в depth-test прогоне: после recovery
@@ -824,6 +866,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (orderingSelfTest) { const bool ok=renderprep12::RunOrderingTests(); dx12log::Close(); return ok?0:1; }
     if (packetPlanSelfTest) { const bool ok=renderprep12::RunPacketBatchPlanTests(); dx12log::Close(); return ok?0:1; }
     if (fenceWaitSelfTest) { const bool ok=dx12fence12::RunFenceWaitTests(); dx12log::Close(); return ok?0:1; }
+    if (transformSelfTest) { const bool ok=smoketransform12::RunTransformTests(); dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
@@ -844,7 +887,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // BLOCKER 4: при -depthtest камера должна оставаться неизменной до
     // завершения теста. Иначе UpdateCamera в цикле каждый кадр меняет
     // ракурс, и пиксели не воспроизводимы между прогонами.
-    fixedPose = fixedPose || depthTest;
+    fixedPose = fixedPose || depthTest || transformTest;
     g_fixedPose = fixedPose;
 
     dx12log::Write("[smoke] modes: fixedPose=%d, depthTest=%d, aspectLock=%s",
@@ -926,6 +969,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
+    if (!hw12.SetSceneMode(transformsScene ? MeshSceneMode12::Transforms
+                                           : MeshSceneMode12::Legacy))
+    {
+        dx12log::Write("[smoke] FATAL: scene mode rejected by CHW12");
+        dx12log::Close();
+        return 1;
+    }
     hw12.SetPacketTestFault(packetFault);
     if (packetDraw && multiList)
     {
@@ -955,12 +1005,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                        drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
     dx12log::Write("[smoke] drawsource=%s packetfault=%s",
                    packetDraw ? "packets" : "synthetic", PacketFaultName(packetFault));
+    dx12log::Write("[smoke] scene=%s transformframes=%u",
+                   transformsScene ? "transforms" : "legacy",
+                   transformTest ? transformFrames : 0u);
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);
     hw12.SetBackgroundTest(backgroundTest);
-    hw12.SetTestMode(depthTest || backgroundTest);
-    if (depthTest || fixedPose)
+    hw12.SetTransformTest(transformTest);
+    hw12.SetTestMode(depthTest || backgroundTest || transformTest);
+    if (depthTest || fixedPose || transformTest)
     {
         // Фиксированный ракурс для детерминированных тестов и сравнения
         // кадров между прогонами.
@@ -1174,6 +1228,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         g_hw = nullptr;
         UnregisterClassW(kWindowClass, hInstance);
         dx12log::Write("[smoke] -depthtest: %s", testResult.passed ? "PASS" : "FAIL");
+        dx12log::Close();
+        return testResult.passed && g_cpuScene.mismatchCount == 0 ? 0 : 1;
+    }
+
+    // F3.5.6A: opt-in transform scene oracle. Renders one or more frames
+    // through the normal packet path, then verifies per-object pixels and
+    // the center depth region. Legacy -depthtest is untouched.
+    if (transformTest)
+    {
+        PrepareSceneCPU();
+        for (uint32_t frame = 0; frame < transformFrames; ++frame)
+        {
+            if (!hw12.RenderFrame())
+            {
+                dx12log::Write("[smoke] -transformtest: RenderFrame failed at frame %u, "
+                               "device removed=%d, gpu state unknown=%d",
+                               frame,
+                               hw12.IsDeviceRemoved() ? 1 : 0,
+                               hw12.IsGpuStateUnknown() ? 1 : 0);
+                hw12.Shutdown();
+                StopJobs();
+                g_hw = nullptr;
+                DestroyWindow(hwnd);
+                UnregisterClassW(kWindowClass, hInstance);
+                dx12log::Close();
+                return 1;
+            }
+        }
+
+        CHW12::DepthTestResult testResult = hw12.VerifyTransformScene();
+        dx12log::Write("[smoke] -transformtest: %s", testResult.passed ? "PASS" : "FAIL");
+        hw12.Shutdown();
+        ReportCpuScene();
+        StopJobs();
+        g_hw = nullptr;
+        UnregisterClassW(kWindowClass, hInstance);
+        if (!testResult.passed)
+            dx12log::Write("[smoke] -transformtest: FAIL - %s", testResult.message);
         dx12log::Close();
         return testResult.passed && g_cpuScene.mismatchCount == 0 ? 0 : 1;
     }

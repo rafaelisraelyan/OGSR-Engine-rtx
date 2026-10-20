@@ -10,6 +10,10 @@ using Microsoft::WRL::ComPtr;
 // непосредственно в вершины (вариант A, §2.3 ТЗ). Depth-tested, с одной
 // общей ViewProjection на кадр.
 //
+// F3.5.6A: opt-in Transforms mode использует одну local-space геометрию;
+// World matrix каждого объекта приходит из per-object CB. Legacy остаётся
+// default и сохраняет прежний world-baked путь.
+//
 // Переименован из SmokeTriangle12: содержание изменилось принципиально
 // (depth, MVP, куб), и имя «Triangle» на кубе сделало бы код лгущим.
 // Структура Create/OnUploadComplete/Draw/Quarantine/Release сохранена.
@@ -26,6 +30,12 @@ using Microsoft::WRL::ComPtr;
 // зависит (§2.3), поэтому между двумя draw call CB не перезаписывается.
 // GBV это не ловит: адрес выровнен и валиден, но второй куб получил бы
 // матрицу первого, а первый — потенциально мусор.
+enum class MeshSceneMode12 : uint8_t
+{
+    Legacy,
+    Transforms
+};
+
 class SmokeMesh12
 {
 public:
@@ -45,7 +55,8 @@ public:
         ID3D12Device* device,
         ID3D12CommandQueue* copyQueue,
         ID3D12CommandAllocator* copyAllocator,
-        ID3D12GraphicsCommandList* copyCommandList);
+        ID3D12GraphicsCommandList* copyCommandList,
+        MeshSceneMode12 mode);
 
     // Вызывается после успешного WaitForGpu: GPU завершил копирование,
     // и upload buffer можно освободить. До этого вызова Draw() не рисует.
@@ -69,6 +80,17 @@ public:
         UINT firstVertex,
         UINT vertexCount) const;
 
+    // F3.5.6A: per-object draw path. frameCBVA — b0 ViewProjection,
+    // objectCBVA — b1 World/Tint текущего packet. Каждый вызов выставляет
+    // root signature, PSO, topology, VB и оба CBV, поэтому state не
+    // наследуется между command lists.
+    bool DrawTransformed(
+        ID3D12GraphicsCommandList* cmd,
+        D3D12_GPU_VIRTUAL_ADDRESS frameCBVA,
+        D3D12_GPU_VIRTUAL_ADDRESS objectCBVA,
+        UINT firstVertex,
+        UINT vertexCount) const;
+
     // Передаёт владение ресурсами карантину. Владение передаётся через
     // Detach(), поэтому счётчики ссылок не меняются и AddRef не нужен.
     // После вызова деструктор SmokeMesh12 эти объекты не освобождает:
@@ -87,9 +109,13 @@ public:
     const std::array<renderprep12::Object12, 2>& Objects() const { return m_objects; }
 
     bool IsCreated() const { return m_created; }
+    MeshSceneMode12 Mode() const { return m_mode; }
+    uint32_t VertexCount() const { return m_vertexCount; }
 
 private:
     std::array<renderprep12::Object12, 2> m_objects{};
+    MeshSceneMode12 m_mode = MeshSceneMode12::Legacy;
+    uint32_t m_vertexCount = kVertexCount;
     bool CreateVertexBuffer(ID3D12Device* device);
     bool CreateRootSignature(ID3D12Device* device);
     bool CreatePipelineState(ID3D12Device* device);
