@@ -9,32 +9,10 @@
 #include "dx12mesh.h"
 #include "dx12quarantine.h"
 #include "dx12packetplan.h"
+#include "dx12fencewait.h"
+#include "dx12lifetime.h"
 
 using Microsoft::WRL::ComPtr;
-
-// F3.0: фактическое состояние GPU на момент решения об освобождении
-// ресурсов. Каждое значение опирается на проверяемый факт, а не на
-// предположение о скорости завершения процесса.
-enum class GpuLifetime : uint8_t
-{
-    // GPU не получал команд: к памяти ресурсов не обращается никто.
-    // Освобождение безопасно.
-    NoWorkSubmitted,
-
-    // Fence completion подтверждён: GPU завершил всю работу, читавшую
-    // ресурсы. Освобождение безопасно.
-    WorkCompleted,
-
-    // GetDeviceRemovedReason() вернул код, отличный от S_OK: устройство
-    // потеряно, fence находится в состоянии UINT64_MAX, команд не
-    // выполняется. Освобождение безопасно.
-    // Это констатация состояния объекта устройства, не утверждение о железе.
-    DeviceRemoved,
-
-    // Состояние неизвестно: GPU может читать ресурсы прямо сейчас.
-    // Освобождение небезопасно, требуется карантин.
-    Unknown
-};
 
 // F2.1-B.1: минимальный DX12 bootstrap для отдельного smoke-исполняемого файла.
 // Debug Layer, DRED и явная синхронизация включены: smoke-сборка существует
@@ -151,7 +129,11 @@ public:
     void Shutdown();
 
     bool IsInitialized() const { return m_initialized; }
+    // Только подтверждённая потеря устройства (GetDeviceRemovedReason != S_OK).
     bool IsDeviceRemoved() const { return m_deviceRemoved; }
+    // Терминальная остановка из-за неизвестного состояния GPU (timeout,
+    // spurious wake, сбой API), но БЕЗ подтверждённой потери устройства.
+    bool IsGpuStateUnknown() const { return m_gpuStateUnknown; }
     bool IsOccluded() const { return m_occluded; }
 
     // F3.5.4B TEST ONLY: per-frame срезы для внешней статистики. Массив
@@ -328,7 +310,8 @@ private:
 
     // Подтверждённая потеря D3D12-устройства по фактическому HRESULT.
     // GetDeviceRemovedReason() возвращает S_OK, если устройство НЕ удалено.
-    // m_deviceRemoved для этого не используется: он диагностический.
+    // m_deviceRemoved выставляется только после этой проверки; неизвестное
+    // состояние GPU учитывается отдельно через m_gpuStateUnknown.
     bool IsDeviceRemovedConfirmed();
 
     // Передача владения GPU-ресурсами карантину через ComPtr::Detach().
@@ -351,10 +334,12 @@ private:
     // false, если ожидание нельзя считать успешным, и логирует причину.
     bool CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage);
 
-    // Ждёт конкретного значения fence. false только при аппаратной ошибке
-    // (нет fence/event или провал SetEventOnCompletion); timeout возвращает
-    // отдельно, чтобы вызывающий код мог отличить зависание GPU от сбоя API.
-    bool WaitForFenceValue(uint64_t value, bool& timedOut);
+    // Ждёт конкретного значения fence. false означает, что завершение не
+    // подтверждено: timeout, сбой API, stale/spurious wake или device removal.
+    // timedOut различает только Timeout; outcome (если передан) сохраняет
+    // полный диагноз, чтобы вызывающий код не объявлял removed без проверки.
+    bool WaitForFenceValue(uint64_t value, bool& timedOut,
+                           dx12fence12::Outcome* outcome = nullptr);
 
     // Полный дренаж GPU. Возвращает false, если очередь не смогла поставить
     // сигнал или ожидание не завершилось: в этом случае состояние GPU
@@ -412,7 +397,11 @@ private:
     uint32_t m_height = 0;
     Stage m_stage = Stage::None;
     bool m_initialized = false;
+    // Подтверждённая потеря устройства (GetDeviceRemovedReason != S_OK).
     bool m_deviceRemoved = false;
+    // Терминальная остановка при неизвестном состоянии GPU. Не означает
+    // device removal; освобождение ресурсов решается через DetermineGpuLifetime.
+    bool m_gpuStateUnknown = false;
     bool m_occluded = false;
     bool m_debugLayerEnabled = false;
 

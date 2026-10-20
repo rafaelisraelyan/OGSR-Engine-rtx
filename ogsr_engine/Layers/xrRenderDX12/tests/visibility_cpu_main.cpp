@@ -1,4 +1,6 @@
 #include "dx12renderprep.h"
+#include "dx12packetplan.h"
+#include "dx12fencewait.h"
 #include "dx12log.h"
 
 // Отдельный CPU harness: без GPU/window, со всей GR-библиотекой под ASan.
@@ -8,6 +10,8 @@ int main() {
     const bool snapshot=renderprep12::RunRepresentativeTests();
     const bool visibility=renderprep12::RunVisibilityTests();
     const bool ordering=renderprep12::RunOrderingTests();
+    const bool packetPlan=renderprep12::RunPacketBatchPlanTests();
+    const bool fenceWait=dx12fence12::RunFenceWaitTests();
     dx12log::Close();
-    return old && snapshot && visibility && ordering ? 0 : 1;
+    return old && snapshot && visibility && ordering && packetPlan && fenceWait ? 0 : 1;
 }

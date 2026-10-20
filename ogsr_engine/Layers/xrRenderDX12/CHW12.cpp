@@ -1127,7 +1127,7 @@ CHW12::DepthTestResult CHW12::VerifyDepthTest()
 // UINT64_MAX, поэтому сравнение >= value ложно принимало бы потерю
 // устройства за успешное завершение. Проверяем оба пути: до
 // SetEventOnCompletion и после пробуждения события.
-static constexpr uint64_t kFenceRemovedMarker = 0xFFFFFFFFFFFFFFFFull;
+static constexpr uint64_t kFenceRemovedMarker = dx12fence12::kRemovedMarker;
 
 CHW12::DepthTestResult CHW12::VerifyBackgroundOnly()
 {
@@ -1241,21 +1241,76 @@ bool CHW12::CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar
     if (completed != kFenceRemovedMarker)
         return true;
 
-    dx12log::WriteWide(L"[DX12] %s: GetCompletedValue returned UINT64_MAX, device removed "
-                       L"(waiting for %llu)", stage, static_cast<unsigned long long>(value));
-
-    if (m_device)
+    if (!m_device)
     {
-        const HRESULT reason = m_device->GetDeviceRemovedReason();
-        dx12log::Write("[DX12] GetDeviceRemovedReason: 0x%08X", static_cast<unsigned>(reason));
+        dx12log::WriteWide(L"[DX12] %s: GetCompletedValue returned UINT64_MAX, but "
+                           L"device object is missing (waiting for %llu); removal "
+                           L"cannot be confirmed",
+                           stage, static_cast<unsigned long long>(value));
+        return false;
     }
 
+    const HRESULT reason = m_device->GetDeviceRemovedReason();
+    if (reason == S_OK)
+    {
+        // UINT64_MAX от fence — маркер removed, но device removal без
+        // GetDeviceRemovedReason() не объявляем: состояние неизвестно.
+        dx12log::WriteWide(L"[DX12] %s: GetCompletedValue returned UINT64_MAX, but "
+                           L"GetDeviceRemovedReason returned S_OK (waiting for %llu); "
+                           L"treating GPU completion as unknown",
+                           stage, static_cast<unsigned long long>(value));
+        return false;
+    }
+
+    dx12log::WriteWide(L"[DX12] %s: GetCompletedValue returned UINT64_MAX, device removed "
+                       L"(waiting for %llu)", stage, static_cast<unsigned long long>(value));
+    dx12log::Write("[DX12] GetDeviceRemovedReason: 0x%08X", static_cast<unsigned>(reason));
     return false;
 }
 
-bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut)
+namespace
+{
+// Адаптер между ID3D12Fence/HANDLE и платформенно-независимым helper'ом.
+// Сохраняет фактические коды/HRESULT для диагностики, но не принимает
+// решения об успехе: это делает dx12fence12::WaitForValue().
+struct D3D12FenceWaitOps
+{
+    ID3D12Fence* fence = nullptr;
+    HANDLE event = nullptr;
+    HRESULT armHr = E_FAIL;
+    DWORD waitCode = 0;
+    DWORD waitError = 0;
+
+    uint64_t GetCompletedValue()
+    {
+        return fence->GetCompletedValue();
+    }
+
+    bool SetEventOnCompletion(uint64_t value)
+    {
+        armHr = fence->SetEventOnCompletion(value, event);
+        return SUCCEEDED(armHr);
+    }
+
+    dx12fence12::WaitStatus Wait(uint32_t timeoutMs)
+    {
+        waitCode = WaitForSingleObject(event, timeoutMs);
+        if (waitCode == WAIT_OBJECT_0)
+            return dx12fence12::WaitStatus::Signaled;
+        if (waitCode == WAIT_TIMEOUT)
+            return dx12fence12::WaitStatus::Timeout;
+        waitError = GetLastError();
+        return dx12fence12::WaitStatus::Failed;
+    }
+};
+} // namespace
+
+bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut,
+                              dx12fence12::Outcome* outcome)
 {
     timedOut = false;
+    if (outcome)
+        *outcome = dx12fence12::Outcome::WaitFailed;
 
     if (!m_fence || !m_fenceEvent)
     {
@@ -1263,49 +1318,60 @@ bool CHW12::WaitForFenceValue(uint64_t value, bool& timedOut)
         return false;
     }
 
-    // Путь 1: до SetEventOnCompletion. UINT64_MAX здесь означал бы, что
-    // устройство уже потеряно, и ожидание было бы ложным успехом.
-    const uint64_t completedBefore = m_fence->GetCompletedValue();
-    if (!CheckFenceForRemoval(completedBefore, value, L"WaitForFenceValue(before wait)"))
-        return false;
+    D3D12FenceWaitOps ops{m_fence.Get(), m_fenceEvent};
+    const dx12fence12::Result result =
+        dx12fence12::WaitForValue(ops, value, GPU_WAIT_TIMEOUT_MS);
+    if (outcome)
+        *outcome = result.outcome;
 
-    if (completedBefore >= value)
+    switch (result.outcome)
+    {
+    case dx12fence12::Outcome::Completed:
         return true;
 
-    HRESULT hr = m_fence->SetEventOnCompletion(value, m_fenceEvent);
-    if (FAILED(hr))
-    {
-        dx12log::Write("[DX12] SetEventOnCompletion(%llu) failed, hr=0x%08X",
-                       static_cast<unsigned long long>(value), static_cast<unsigned>(hr));
-        return false;
-    }
-
-    // Таймаут вместо INFINITE: повисший GPU должен давать диагностику,
-    // а не молча подвешивать приложение.
-    const DWORD wait = WaitForSingleObject(m_fenceEvent, GPU_WAIT_TIMEOUT_MS);
-    if (wait == WAIT_TIMEOUT)
-    {
+    case dx12fence12::Outcome::Timeout:
+        // Таймаут вместо INFINITE: повисший GPU должен давать диагностику,
+        // а не молча подвешивать приложение.
         timedOut = true;
         dx12log::Write("[DX12] GPU wait timed out after %lu ms on fence value %llu",
-                       GPU_WAIT_TIMEOUT_MS, static_cast<unsigned long long>(value));
+                       GPU_WAIT_TIMEOUT_MS,
+                       static_cast<unsigned long long>(value));
         return false;
-    }
 
-    if (wait != WAIT_OBJECT_0)
-    {
+    case dx12fence12::Outcome::WaitFailed:
         dx12log::Write("[DX12] WaitForSingleObject returned %lu, GetLastError=%lu",
-                       wait, GetLastError());
+                       ops.waitCode, ops.waitError);
+        return false;
+
+    case dx12fence12::Outcome::ArmFailed:
+        dx12log::Write("[DX12] SetEventOnCompletion(%llu) failed, hr=0x%08X",
+                       static_cast<unsigned long long>(value),
+                       static_cast<unsigned>(ops.armHr));
+        return false;
+
+    case dx12fence12::Outcome::SpuriousWake:
+        // Событие могло быть signaled устаревшей регистрацией предыдущего
+        // ожидания. completed < requested не подтверждает завершение GPU,
+        // поэтому это fail-stop, а не успех.
+        dx12log::Write("[DX12] WaitForFenceValue: event signaled for fence value %llu, "
+                       "but GetCompletedValue()=%llu; completion is not confirmed",
+                       static_cast<unsigned long long>(value),
+                       static_cast<unsigned long long>(result.completedAfter));
+        return false;
+
+    case dx12fence12::Outcome::DeviceRemoved:
+        CheckFenceForRemoval(
+            result.completedBefore == kFenceRemovedMarker
+                ? result.completedBefore
+                : result.completedAfter,
+            value,
+            result.completedBefore == kFenceRemovedMarker
+                ? L"WaitForFenceValue(before wait)"
+                : L"WaitForFenceValue(after wait)");
         return false;
     }
 
-    // Путь 2: после пробуждения. Событие может быть сигнализировано именно
-    // потому, что устройство удалено, и тогда GetCompletedValue равен
-    // UINT64_MAX. Проверка обязательна: без неё возвращался бы true.
-    const uint64_t completedAfter = m_fence->GetCompletedValue();
-    if (!CheckFenceForRemoval(completedAfter, value, L"WaitForFenceValue(after wait)"))
-        return false;
-
-    return true;
+    return false;
 }
 
 bool CHW12::WaitForGpu()
@@ -1342,9 +1408,9 @@ bool CHW12::IsDeviceRemovedConfirmed()
         return false;
 
     // GetDeviceRemovedReason() возвращает S_OK, если устройство НЕ удалено,
-    // и код причины в противном случае. Это фактический HRESULT, а не наш
-    // диагностический флаг m_deviceRemoved, который выставляется также при
-    // обычных ошибках API и таймаутах.
+    // и код причины в противном случае. Это фактический HRESULT. m_deviceRemoved
+    // выставляется только после этой проверки; неизвестное состояние GPU
+    // учитывается отдельно через m_gpuStateUnknown.
     const HRESULT reason = m_device->GetDeviceRemovedReason();
     if (reason == S_OK)
         return false;
@@ -1356,33 +1422,32 @@ bool CHW12::IsDeviceRemovedConfirmed()
 
 GpuLifetime CHW12::DetermineGpuLifetime()
 {
+    const bool workSubmitted = m_gpuWorkSubmitted;
+    const bool synchronizationAvailable =
+        (m_commandQueue && m_fence && m_fenceEvent);
+
     // 1. GPU не получал команд: к памяти ресурсов не обращается никто.
-    if (!m_gpuWorkSubmitted)
-        return GpuLifetime::NoWorkSubmitted;
+    if (!workSubmitted)
+        return ClassifyGpuLifetime(false, synchronizationAvailable, false, false);
 
     // 2. Работа отправлялась, но объекты синхронизации отсутствуют.
     //    Подтвердить завершение нечем, поэтому это НЕ «безопасно», а Unknown.
     //    Такой случай возникает при частично успешном Initialize, где
     //    CreateSynchronization() не был достигнут, но команды уже в очереди.
-    if (!m_commandQueue || !m_fence || !m_fenceEvent)
+    if (!synchronizationAvailable)
     {
         dx12log::Write("[DX12] GPU work was submitted but synchronization objects "
                        "are missing: completion cannot be confirmed");
-        return GpuLifetime::Unknown;
+        return ClassifyGpuLifetime(true, false, false, false);
     }
 
     // 3. Успешный дренаж — единственный путь подтверждённого завершения.
-    if (WaitForGpu())
-        return GpuLifetime::WorkCompleted;
-
-    // 4. Ожидание не удалось. Решает фактический HRESULT устройства, а не
-    //    диагностический m_deviceRemoved.
-    if (IsDeviceRemovedConfirmed())
-        return GpuLifetime::DeviceRemoved;
-
-    // 5. Устройство живо, но завершение не подтверждено: GPU может читать
-    //    ресурсы прямо сейчас.
-    return GpuLifetime::Unknown;
+    //    Неуспешный/неизвестный drain классификатор никогда не превращает
+    //    в WorkCompleted.
+    const bool drainSucceeded = WaitForGpu();
+    const bool removedConfirmed =
+        drainSucceeded ? false : IsDeviceRemovedConfirmed();
+    return ClassifyGpuLifetime(true, true, drainSucceeded, removedConfirmed);
 }
 
 void CHW12::QuarantineGpuResources()
@@ -1525,30 +1590,45 @@ void CHW12::DrainInfoQueue()
     m_infoQueue->ClearStoredMessages();
 }
 
-// Вызывается ТОЛЬКО при подтверждённой аппаратной проблеме: DEVICE_REMOVED,
-// DEVICE_RESET или провал синхронизации, после которого состояние GPU
-// неизвестно. Обычная ошибка вызова и таймаут сюда не попадают.
+// Вызывается при аппаратной ошибке, сбое синхронизации или API-сбое, после
+// которого состояние GPU неизвестно. Потеря устройства объявляется только
+// при подтверждении GetDeviceRemovedReason() != S_OK; иначе выставляется
+// m_gpuStateUnknown, а решение об освобождении принимает DetermineGpuLifetime.
 void CHW12::ReportGpuFailure(const wchar_t* stage, HRESULT hr)
 {
-    m_deviceRemoved = true;
-
-    dx12log::WriteWide(L"[DX12] FATAL at %s, hr=0x%08X: GPU state unknown, stopping",
-                       stage, static_cast<unsigned>(hr));
-
     if (!m_device)
+    {
+        m_gpuStateUnknown = true;
+        dx12log::WriteWide(L"[DX12] FATAL at %s, hr=0x%08X: device object missing, "
+                           L"GPU state unknown, stopping",
+                           stage, static_cast<unsigned>(hr));
+        DrainInfoQueue();
         return;
+    }
 
     const HRESULT reason = m_device->GetDeviceRemovedReason();
+    const bool removed = (reason != S_OK);
+    if (removed)
+        m_deviceRemoved = true;
+    else
+        m_gpuStateUnknown = true;
+
+    dx12log::WriteWide(L"[DX12] FATAL at %s, hr=0x%08X: %s, stopping",
+                       stage, static_cast<unsigned>(hr),
+                       removed ? L"device removed" : L"GPU state unknown");
     dx12log::Write("[DX12] GetDeviceRemovedReason: 0x%08X", static_cast<unsigned>(reason));
 
     // DRED: page-fault вывод сохраняется после removal и указывает на ресурс.
-    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
-    if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&dred))))
+    if (removed)
     {
-        D3D12_DRED_PAGE_FAULT_OUTPUT pageFault = {};
-        if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pageFault)))
-            dx12log::Write("[DX12] DRED page fault VA: 0x%016llX",
-                           static_cast<unsigned long long>(pageFault.PageFaultVA));
+        ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+        if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&dred))))
+        {
+            D3D12_DRED_PAGE_FAULT_OUTPUT pageFault = {};
+            if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pageFault)))
+                dx12log::Write("[DX12] DRED page fault VA: 0x%016llX",
+                               static_cast<unsigned long long>(pageFault.PageFaultVA));
+        }
     }
 
     DrainInfoQueue();
@@ -1693,7 +1773,7 @@ bool CHW12::RenderFrame()
     if (!m_initialized)
         return false;
 
-    if (m_deviceRemoved)
+    if (m_deviceRemoved || m_gpuStateUnknown)
         return false;
 
     if (m_recordFailed || m_prepFailed || m_preparing) return false;
@@ -1840,17 +1920,22 @@ bool CHW12::RenderFrame()
     if (frame.fenceValue != 0)
     {
         bool timedOut = false;
+        dx12fence12::Outcome fenceOutcome = dx12fence12::Outcome::WaitFailed;
         // F3.3.0a: ожидание GPU fence — отдельная синхронизация от CPU
         // JobGroup::Wait, поэтому измеряется отдельно и не смешивается с ним.
         const auto fenceStart=std::chrono::steady_clock::now();
-        const bool fenceCompleted=WaitForFenceValue(frame.fenceValue, timedOut);
+        const bool fenceCompleted=WaitForFenceValue(frame.fenceValue, timedOut, &fenceOutcome);
         m_gpuFenceMs+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fenceStart).count();
         ++m_gpuFenceWaits;
         if (!fenceCompleted)
         {
-            // Таймаут и сбой API оба означают, что аллокатор нельзя сбрасывать:
-            // GPU может всё ещё писать в его память.
-            ReportGpuFailure(L"WaitForFenceValue", DXGI_ERROR_DEVICE_REMOVED);
+            // Таймаут, сбой API или stale wake означают, что завершение GPU
+            // не подтверждено: аллокатор нельзя сбрасывать, а device removal
+            // нельзя объявлять без GetDeviceRemovedReason. ReportGpuFailure
+            // сам выбирает m_deviceRemoved/m_gpuStateUnknown по факту.
+            dx12log::Write("[DX12] fence wait failed: outcome=%s timedOut=%d",
+                           dx12fence12::ToString(fenceOutcome), timedOut ? 1 : 0);
+            ReportGpuFailure(L"WaitForFenceValue", E_FAIL);
             return false;
         }
     }
@@ -2478,7 +2563,7 @@ bool CHW12::RenderFrame()
 
 bool CHW12::Resize(uint32_t width, uint32_t height)
 {
-    if (!m_initialized || m_deviceRemoved)
+    if (!m_initialized || m_deviceRemoved || m_gpuStateUnknown)
         return false;
 
     // Нулевой размер — это WM_SIZE от свёрнутого окна, а не ошибка.
@@ -2711,6 +2796,7 @@ void CHW12::Shutdown()
         // Состояние неизвестно, устройство живо. GPU может читать ресурсы
         // прямо сейчас, поэтому освобождение небезопасно. Владение
         // передаётся карантину с process lifetime.
+        m_gpuStateUnknown = true;
         dx12log::Write("[DX12] LIMITATION: GPU drain failed and D3D12 device is "
                        "NOT removed: GPU may still be reading resources. GPU "
                        "resources are quarantined until process exit to avoid "
@@ -2823,6 +2909,7 @@ void CHW12::Shutdown()
         m_height = 0;
         m_occluded = false;
         m_deviceRemoved = false;
+        m_gpuStateUnknown = false;
         m_debugLayerEnabled = false;
         m_rtvDescriptorSize = 0;
         m_dsvDescriptorSize = 0;

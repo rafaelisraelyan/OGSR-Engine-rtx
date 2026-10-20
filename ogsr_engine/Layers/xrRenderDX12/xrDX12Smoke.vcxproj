@@ -89,6 +89,7 @@
     <ClCompile Include="dx12renderprep_tests.cpp" />
     <ClCompile Include="dx12snapshot_tests.cpp" />
     <ClCompile Include="dx12ordering_tests.cpp" />
+    <ClCompile Include="dx12fencewait_tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dx12log.h" />
@@ -97,6 +98,8 @@
     <ClInclude Include="dx12quarantine.h" />
     <ClInclude Include="dx12cpuscene.h" />
     <ClInclude Include="dx12cpuruntime.inl" />
+    <ClInclude Include="dx12fencewait.h" />
+    <ClInclude Include="dx12lifetime.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\xrRenderPC_R5_DX12\xrRender_R5_DX12.vcxproj">

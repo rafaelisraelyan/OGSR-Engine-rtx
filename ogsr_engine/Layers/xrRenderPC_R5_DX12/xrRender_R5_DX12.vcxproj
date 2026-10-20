@@ -108,6 +108,8 @@
     <ClInclude Include="..\xrRenderDX12\dx12camera.h" />
     <ClInclude Include="..\xrRenderDX12\dx12mesh.h" />
     <ClInclude Include="..\xrRenderDX12\dx12packetplan.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12fencewait.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12lifetime.h" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="..\JobSystem\gr_job_system.vcxproj"><Project>{7C4E9A1F-2D6B-4E8A-9F3C-5B1D7A2E8C64}</Project></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

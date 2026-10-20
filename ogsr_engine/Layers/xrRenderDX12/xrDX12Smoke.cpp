@@ -479,6 +479,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     renderprep12::Mode prepMode=renderprep12::Mode::Serial;
     bool prepSelfTest=false, snapshotSelfTest=false, visibilitySelfTest=false, orderingSelfTest=false;
     bool packetPlanSelfTest=false;
+    bool fenceWaitSelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
@@ -582,6 +583,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 }
                 else if (_wcsicmp(argv[i], L"-orderingselftest") == 0) orderingSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-packetplanselftest") == 0) packetPlanSelfTest=true;
+                else if (_wcsicmp(argv[i], L"-fencewaitselftest") == 0) fenceWaitSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -821,6 +823,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
     if (orderingSelfTest) { const bool ok=renderprep12::RunOrderingTests(); dx12log::Close(); return ok?0:1; }
     if (packetPlanSelfTest) { const bool ok=renderprep12::RunPacketBatchPlanTests(); dx12log::Close(); return ok?0:1; }
+    if (fenceWaitSelfTest) { const bool ok=dx12fence12::RunFenceWaitTests(); dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
@@ -1140,8 +1143,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         PrepareSceneCPU();
         if (!hw12.RenderFrame())
         {
-            dx12log::Write("[smoke] -depthtest: RenderFrame failed, device removed=%d",
-                           hw12.IsDeviceRemoved() ? 1 : 0);
+            dx12log::Write("[smoke] -depthtest: RenderFrame failed, device removed=%d, gpu state unknown=%d",
+                           hw12.IsDeviceRemoved() ? 1 : 0,
+                           hw12.IsGpuStateUnknown() ? 1 : 0);
             hw12.Shutdown();
             StopJobs();
             g_hw = nullptr;
@@ -1307,8 +1311,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
             if (!hw12.RenderFrame())
             {
-                dx12log::Write("[smoke] RenderFrame failed, device removed=%d, stopping",
-                               hw12.IsDeviceRemoved() ? 1 : 0);
+                dx12log::Write("[smoke] RenderFrame failed, device removed=%d, gpu state unknown=%d, stopping",
+                               hw12.IsDeviceRemoved() ? 1 : 0,
+                               hw12.IsGpuStateUnknown() ? 1 : 0);
                 g_running = false;
                 exitCode = 1;
                 break;

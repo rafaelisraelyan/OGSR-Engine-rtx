@@ -76,8 +76,8 @@ jobs:
         asset_content_type: application/x-7z-compressed
 
   # Independent DX12 bootstrap build. Separate job so Release/ReleaseTracyProfiler
-  # logic above stays untouched. Build-only: no GPU on the runner, so Smoke EXE is
-  # never executed here.
+  # logic above stays untouched. No GPU on the runner: only CPU-only selftests
+  # are executed, never a rendered frame.
   dx12-smoke-build:
     runs-on: windows-2022
     steps:
@@ -124,6 +124,20 @@ jobs:
         )
         echo OK: DX12 library and Smoke EXE built
         dir /b "ogsr_engine\_LIB\Engine\ReleaseDX12\x64\xrRender_R5_DX12.lib" "x64\ReleaseDX12\xrDX12Smoke.exe"
+
+    # CPU-only selftests run before window/device creation. This catches fence
+    # and packet-planner regressions on the build runner without requiring a GPU.
+    - name: Run DX12 CPU selftests
+      shell: pwsh
+      run: |
+        $exe = (Resolve-Path "x64\ReleaseDX12\xrDX12Smoke.exe").Path
+        foreach ($test in @("-fencewaitselftest", "-packetplanselftest", "-cpuselftest")) {
+          $process = Start-Process -FilePath $exe -ArgumentList $test -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "$test failed with exit code $($process.ExitCode)"
+          }
+          Write-Host "$test PASS"
+        }
 
     - name: Upload DX12 diagnostics
       uses: actions/upload-artifact@v7.0.1
