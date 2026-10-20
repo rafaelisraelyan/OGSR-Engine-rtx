@@ -59,6 +59,9 @@ public:
     // GPU-Based Validation применяется при создании device; менять позже
     // бессмысленно.
     void SetGpuValidation(bool enabled) { if (!m_initialized) m_gpuValidationRequested = enabled; }
+    // Debug Layer создаётся до device. Отключение обязательно для
+    // performance-прогонов: слой меняет и CPU-, и GPU-поведение.
+    void SetDebugLayer(bool enabled) { if (!m_initialized) m_debugLayerRequested = enabled; }
     // Только smoke-тест: 0=allocator Reset, 1=list Reset, 2=Record, 3=Close,
     // 4=отказ второго Submit, 5=исключение callback (последние два только parallel).
     void ArmRecordingFailure(unsigned stage, unsigned list) { m_recordFaultStage=stage; m_recordFaultList=list; }
@@ -95,6 +98,27 @@ public:
     bool IsDeviceRemoved() const { return m_deviceRemoved; }
     bool IsOccluded() const { return m_occluded; }
 
+    // F3.5.4B TEST ONLY: per-frame срезы для внешней статистики. Массив
+    // заполняется в RenderFrame без I/O и без логирования; smoke пишет его
+    // в CSV только после Shutdown, вне измеряемого участка.
+    struct FrameTimingSample
+    {
+        uint64_t frame = 0;
+        double recordingMs = 0;
+        double schedulingMs = 0;
+        double waitMs = 0;
+        double submissionMs = 0;
+        double gpuMs = -1;       // -1: timestamp ещё не прочитан
+        double intervalMs = -1;  // -1: Present не завершился
+    };
+    static constexpr uint32_t MAX_TIMING_SAMPLES = 512;
+    const FrameTimingSample* GetFrameTimings(uint32_t& count) const
+    {
+        count = m_timingSampleCount;
+        return m_timingSamples;
+    }
+    uint32_t TimingSamplesDropped() const { return m_timingSamplesDropped; }
+
     // F3.1: управление режимами тестирования.
     void SetTestMode(bool enabled) { m_testMode = enabled; }
     void SetFixedPose(bool enabled) { m_fixedPose = enabled; }
@@ -128,6 +152,11 @@ private:
     uint32_t m_drawListCount = 2;
     uint32_t m_drawCount = 2;
     bool m_gpuValidationRequested = true;
+    bool m_debugLayerRequested = true;
+    // F3.5.4B: кольцевой буфер не нужен — объём ограничен прогоном.
+    FrameTimingSample m_timingSamples[MAX_TIMING_SAMPLES] = {};
+    uint32_t m_timingSampleCount = 0;
+    uint32_t m_timingSamplesDropped = 0;
     // Интервал между кадрами (wall clock). Present(1,0) ограничен vsync,
     // поэтому это диагностика, а не FPS игры.
     LARGE_INTEGER m_lastPresentTick = {};
@@ -186,6 +215,8 @@ private:
         ComPtr<ID3D12QueryHeap> timestamps;
         ComPtr<ID3D12Resource> timestampReadback;
         bool timestampPending=false, timestampSample=false;
+        // F3.5.4B: индекс среза, в который CollectGpuTiming запишет GPU-время.
+        int32_t timestampSampleIndex=-1;
         RecordingResource drawRecording[MAX_DRAW_LISTS]; // Draw lists слота
         RecordingResource ownerEnd;                      // End-список кадра
         uint32_t drawListCount = 0;                      // фактическое L кадра

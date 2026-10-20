@@ -72,6 +72,7 @@ bool CHW12::EnableDebugLayer()
     debug->EnableDebugLayer();
     m_debugLayerEnabled = true;
 
+    bool gpuValidationEnabled = false;
 #if OGSR_DX12_ENABLE_GBV
     // F3.5.4A: GBV включается только по запросу. Корректность проверяется
     // с ней, производительность — отдельным прогоном без неё.
@@ -79,7 +80,10 @@ bool CHW12::EnableDebugLayer()
     {
         ComPtr<ID3D12Debug1> debug1;
         if (SUCCEEDED(debug.As(&debug1)))
+        {
             debug1->SetEnableGPUBasedValidation(TRUE);
+            gpuValidationEnabled = true;
+        }
         else
             dx12log::Write("[DX12] ID3D12Debug1 unavailable: GPU-based validation not enabled");
     }
@@ -101,7 +105,7 @@ bool CHW12::EnableDebugLayer()
     }
 
     dx12log::Write("[DX12] Debug layer enabled, GPU-based validation=%d",
-                   (OGSR_DX12_ENABLE_GBV && m_gpuValidationRequested) ? 1 : 0);
+                   gpuValidationEnabled ? 1 : 0);
     m_stage = Stage::DebugLayer;
     return true;
 }
@@ -160,12 +164,16 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_recordMs=m_queueSubmitMs=m_recordScheduleMs=m_recordWaitMs=0;
     m_timestampFrequency=m_gpuSamples=0; m_gpuMs=0;
     m_frameIntervalMs=0; m_frameIntervals=0; m_lastPresentTick={};
+    m_timingSampleCount=0; m_timingSamplesDropped=0;
 
 
     m_width = width;
     m_height = height;
 
-    EnableDebugLayer();
+    if (m_debugLayerRequested)
+        EnableDebugLayer();
+    else
+        dx12log::Write("[DX12] Debug layer disabled by request");
 
     if (!CreateDevice())
     {
@@ -1333,8 +1341,16 @@ void CHW12::CollectGpuTiming(FrameResource& frame)
         dx12log::Write("[recording-gpu] timestamp Map failed"); return;
     }
     if (frame.timestampSample && ticks[1]>=ticks[0]) {
-        m_gpuMs+=double(ticks[1]-ticks[0])*1000.0/double(m_timestampFrequency); ++m_gpuSamples;
+        const double gpuMs=double(ticks[1]-ticks[0])*1000.0/double(m_timestampFrequency);
+        m_gpuMs+=gpuMs; ++m_gpuSamples;
+        // F3.5.4B: GPU-время привязывается к срезу кадра, в котором был
+        // записан timestamp. Map/Unmap и запись в массив — вне Present.
+        if (frame.timestampSampleIndex>=0 &&
+            static_cast<uint32_t>(frame.timestampSampleIndex)<m_timingSampleCount)
+            m_timingSamples[frame.timestampSampleIndex].gpuMs=gpuMs;
     }
+    frame.timestampSampleIndex=-1;
+    frame.timestampSample=false;
     const D3D12_RANGE written={0,0}; frame.timestampReadback->Unmap(0,&written);
 }
 
@@ -1405,6 +1421,7 @@ bool CHW12::RenderFrame()
 
     CollectGpuTiming(frame);
     double scheduleMs=0, recordWaitMs=0;
+    int32_t timingIndex=-1;
     const auto recordStart=std::chrono::steady_clock::now();
 
     // F3.5.4A: L draw lists + owner Begin + owner End. Legacy остаётся
@@ -1767,7 +1784,24 @@ bool CHW12::RenderFrame()
     const double submissionMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-submitStart).count();
     ++m_recordFrames;
     frame.timestampPending=bool(frame.timestamps); frame.timestampSample=m_recordFrames>30;
-    if (m_recordFrames>30) { ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; m_recordScheduleMs+=scheduleMs; m_recordWaitMs+=recordWaitMs; }
+    if (m_recordFrames>30) {
+        ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; m_recordScheduleMs+=scheduleMs; m_recordWaitMs+=recordWaitMs;
+        // F3.5.4B: один срез на кадр, без I/O. Горячий участок не логируется.
+        if (m_timingSampleCount < MAX_TIMING_SAMPLES) {
+            timingIndex=static_cast<int32_t>(m_timingSampleCount++);
+            auto& sample=m_timingSamples[timingIndex];
+            sample.frame=m_recordFrames;
+            sample.recordingMs=recordingMs;
+            sample.schedulingMs=scheduleMs;
+            sample.waitMs=recordWaitMs;
+            sample.submissionMs=submissionMs;
+            sample.gpuMs=-1;
+            sample.intervalMs=-1;
+            if (frame.timestampSample) frame.timestampSampleIndex=timingIndex;
+        } else {
+            ++m_timingSamplesDropped;
+        }
+    }
     m_gpuWorkSubmitted = true;
 
     // Present — единственный источник DEVICE_REMOVED/DEVICE_RESET и единственное
@@ -1782,10 +1816,13 @@ bool CHW12::RenderFrame()
         QueryPerformanceFrequency(&freq);
         if (m_lastPresentTick.QuadPart != 0 && freq.QuadPart > 0)
         {
-            m_frameIntervalMs +=
+            const double intervalMs =
                 static_cast<double>(now.QuadPart - m_lastPresentTick.QuadPart) *
                 1000.0 / static_cast<double>(freq.QuadPart);
+            m_frameIntervalMs += intervalMs;
             ++m_frameIntervals;
+            if (timingIndex>=0)
+                m_timingSamples[timingIndex].intervalMs=intervalMs;
         }
         m_lastPresentTick = now;
     }
@@ -2079,6 +2116,8 @@ void CHW12::Shutdown()
     dx12log::Write("[frame] interval=%.6f ms samples=%llu",
         m_frameIntervals?m_frameIntervalMs/static_cast<double>(m_frameIntervals):0.0,
         static_cast<unsigned long long>(m_frameIntervals));
+    dx12log::Write("[metrics] per-frame samples=%u dropped=%u",
+        m_timingSampleCount,m_timingSamplesDropped);
 
     // Освобождение GPU-ресурсов выполняется во всех состояниях, кроме
     // Unknown. В Unknown ComPtr уже равны nullptr после Detach(), поэтому

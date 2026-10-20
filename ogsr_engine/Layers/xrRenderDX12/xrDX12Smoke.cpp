@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <exception>
+#include <string>
 
 static const wchar_t* kWindowClass = L"XRDX12Smoke";
 static const wchar_t* kWindowTitle = L"OGSR DX12 Smoke Test";
@@ -44,6 +45,32 @@ static double DiagElapsedMs(const LARGE_INTEGER& from, const LARGE_INTEGER& to)
         return 0.0;
     return static_cast<double>(to.QuadPart - from.QuadPart) * 1000.0 /
            static_cast<double>(g_diagFreq.QuadPart);
+}
+
+// F3.5.4B: per-frame телеметрия пишется один раз после Shutdown. Внутри
+// измеряемого участка нет ни fopen, ни fprintf, ни логирования кадров.
+static bool WriteFrameMetrics(const std::wstring& path, const CHW12& hw)
+{
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || !file)
+    {
+        dx12log::Write("[metrics] FATAL: cannot open per-frame metrics file");
+        return false;
+    }
+    fprintf(file, "frame,recording_ms,scheduling_ms,wait_ms,submission_ms,gpu_ms,frame_interval_ms\n");
+    uint32_t count = 0;
+    const CHW12::FrameTimingSample* samples = hw.GetFrameTimings(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const CHW12::FrameTimingSample& s = samples[i];
+        fprintf(file, "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                static_cast<unsigned long long>(s.frame),
+                s.recordingMs, s.schedulingMs, s.waitMs,
+                s.submissionMs, s.gpuMs, s.intervalMs);
+    }
+    fclose(file);
+    dx12log::Write("[metrics] wrote %u per-frame samples to CSV", count);
+    return true;
 }
 
 // F3.1-FIX A: отложенный resize во время интерактивного изменения размеров.
@@ -413,6 +440,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
     bool noGbv=false;
+    bool noDebug=false;
+    std::wstring metricsPath;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
     uint32_t prepFrames=0;
@@ -449,6 +478,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i],L"-nogbv")==0) noGbv=true;
+                else if (_wcsicmp(argv[i],L"-nodebug")==0) noDebug=true;
+                else if (_wcsicmp(argv[i],L"-metrics")==0) {
+                    if (i+1<argc) metricsPath=argv[++i];
+                    else badArgument=true;
+                }
                 else if (_wcsicmp(argv[i],L"-recordfault")==0) {
                     if (i+2>=argc) { badArgument=true; break; }
                     ++i;
@@ -738,9 +772,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
-    if (noGbv) hw12.SetGpuValidation(false);
-    dx12log::Write("[smoke] draw calls=%u draw lists=%u gbv=%d",
-                   drawCount, drawLists, noGbv ? 0 : 1);
+    if (noGbv || noDebug) hw12.SetGpuValidation(false);
+    hw12.SetDebugLayer(!noDebug);
+    dx12log::Write("[smoke] draw calls=%u draw lists=%u debug=%d gbv=%d",
+                   drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);
@@ -1101,6 +1136,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // F3.3.0a: сбой отрисовки в таймерном пути не должен давать код возврата 0.
     if (g_timerFrameFailed) exitCode=1;
     hw12.Shutdown();
+    if (!metricsPath.empty())
+        WriteFrameMetrics(metricsPath, hw12);
     g_hw = nullptr;
 
     // F3.2C: код выхода неинтерактивного теста отражает совпадение Serial/Parallel.
