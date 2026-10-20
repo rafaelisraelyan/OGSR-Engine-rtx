@@ -49,8 +49,48 @@ public:
 
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
     bool RenderFrame();
+    // F3.5.5A: источник Draw. Synthetic — прежний benchmark path; Packets —
+    // OrderedFrame12 → один owner command list. Packet path несовместим с
+    // multi-list recording.
+    enum class DrawSource : uint8_t { Synthetic = 0, Packets = 1 };
+    bool SetDrawSource(DrawSource source)
+    {
+        if (m_initialized) return false;
+        if (source == DrawSource::Packets && m_multiList) return false;
+        m_drawSource = source;
+        return true;
+    }
+    // TEST ONLY: детерминированно портит сцену до snapshot, чтобы проверить
+    // validation packet-path без реального traversal/registry.
+    enum class PacketTestFault : uint8_t
+    {
+        None = 0,
+        HideAll,
+        HideSecond,
+        CullSecond,
+        Reverse,
+        StaleVisual,
+        UnsupportedPso,
+        UnknownObject,
+        InvalidRange,
+        OverflowRange,
+        Transparent,
+        Hud,
+        WorldTransform
+    };
+    void SetPacketTestFault(PacketTestFault fault)
+    {
+        if (!m_initialized) m_packetTestFault = fault;
+    }
     // Режим выбирается до Initialize; legacy остаётся default.
-    bool SetMultiList(bool enabled, bool parallel=false) { if (m_initialized) return false; m_multiList=enabled; m_parallelRecording=enabled && parallel; return true; }
+    bool SetMultiList(bool enabled, bool parallel=false)
+    {
+        if (m_initialized) return false;
+        if (enabled && m_drawSource == DrawSource::Packets) return false;
+        m_multiList=enabled;
+        m_parallelRecording=enabled && parallel;
+        return true;
+    }
     // F3.5.4A: число draw lists и общее число draw calls. Оба параметра
     // фиксируются до Initialize: от них зависит число пар allocator/list
     // в FrameResource.
@@ -145,12 +185,19 @@ public:
     // Offset/RowPitch, проверяет три контрольных пикселя.
     // Возвращает структуру с результатом и диагностикой.
     DepthTestResult VerifyDepthTest();
+    // F3.5.5A TEST ONLY: empty visible frame. Проверяет, что весь кадр равен
+    // clear color, Draw=0, а центральный depth-регион равен 1.0 после clear.
+    void SetBackgroundTest(bool enabled) { if (!m_initialized) m_backgroundTest = enabled; }
+    DepthTestResult VerifyBackgroundOnly();
 
 private:
     bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
+    DrawSource m_drawSource = DrawSource::Synthetic;
+    PacketTestFault m_packetTestFault = PacketTestFault::None;
     // F3.5.4A: L — число draw lists, N — всего draw calls за кадр.
     uint32_t m_drawListCount = 2;
     uint32_t m_drawCount = 2;
+    uint32_t m_visiblePackets = 0;
     bool m_gpuValidationRequested = true;
     bool m_debugLayerRequested = true;
     // F3.5.4B: кольцевой буфер не нужен — объём ограничен прогоном.
@@ -168,6 +215,9 @@ private:
     double m_gpuMs=0;
     double m_recordMs=0, m_queueSubmitMs=0, m_recordScheduleMs=0, m_recordWaitMs=0;
     bool InjectRecordingFailure(unsigned stage, unsigned list);
+    // F3.5.5A: проверка packet binding до первого Reset/Execute. Возвращает
+    // nullptr при успехе или статическую причину отказа.
+    const char* ValidatePacketFrame(const renderprep12::OrderedFrame12& frame) const;
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;
@@ -310,7 +360,13 @@ private:
     ComPtr<ID3D12Resource> m_readbackBuffer;
     void* mappedReadback = nullptr;
     UINT64 m_readbackTotalBytes = 0;
+    UINT64 m_readbackAllocatedBytes = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_copyableFootprint = {};
+    // F3.5.5A TEST ONLY: 4x4 depth-регион в хвосте того же readback buffer.
+    bool m_backgroundTest = false;
+    UINT64 m_backgroundDepthOffset = 0;
+    UINT64 m_backgroundDepthBytes = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backgroundDepthFootprint = {};
 
     // Synchronization
     ComPtr<ID3D12Fence> m_fence;

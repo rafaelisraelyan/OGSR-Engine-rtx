@@ -69,6 +69,11 @@ public:
     // прямого вызова с невалидным состоянием).
     bool BuildViewProjection(DirectX::XMFLOAT4X4& out);
     DirectX::XMFLOAT4X4 CaptureViewProjection() const;
+    // F3.5.5A: согласованная пара для RenderSceneSnapshot12(view,proj,...).
+    // Возвращает те же view/projection, из которых CaptureViewProjection()
+    // строит VP; snapshot пересчитывает view*projection тем же порядком.
+    bool CaptureViewProjectionPair(
+        DirectX::XMFLOAT4X4& view, DirectX::XMFLOAT4X4& projection) const;
 
     float GetFovRadians() const { return m_fov; }
     float GetNear() const { return m_nearZ; }

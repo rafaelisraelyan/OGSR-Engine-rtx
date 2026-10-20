@@ -73,6 +73,47 @@ static bool WriteFrameMetrics(const std::wstring& path, const CHW12& hw)
     return true;
 }
 
+// F3.5.5A TEST ONLY: packet-path fault selection. No production behavior.
+static bool ParsePacketFault(const wchar_t* text, CHW12::PacketTestFault& fault)
+{
+    if (!_wcsicmp(text, L"none")) fault = CHW12::PacketTestFault::None;
+    else if (!_wcsicmp(text, L"hideall")) fault = CHW12::PacketTestFault::HideAll;
+    else if (!_wcsicmp(text, L"hidesecond")) fault = CHW12::PacketTestFault::HideSecond;
+    else if (!_wcsicmp(text, L"cullsecond")) fault = CHW12::PacketTestFault::CullSecond;
+    else if (!_wcsicmp(text, L"reverse")) fault = CHW12::PacketTestFault::Reverse;
+    else if (!_wcsicmp(text, L"stalevisual")) fault = CHW12::PacketTestFault::StaleVisual;
+    else if (!_wcsicmp(text, L"unsupportedpso")) fault = CHW12::PacketTestFault::UnsupportedPso;
+    else if (!_wcsicmp(text, L"unknownobject")) fault = CHW12::PacketTestFault::UnknownObject;
+    else if (!_wcsicmp(text, L"invalidrange")) fault = CHW12::PacketTestFault::InvalidRange;
+    else if (!_wcsicmp(text, L"overflowrange")) fault = CHW12::PacketTestFault::OverflowRange;
+    else if (!_wcsicmp(text, L"transparent")) fault = CHW12::PacketTestFault::Transparent;
+    else if (!_wcsicmp(text, L"hud")) fault = CHW12::PacketTestFault::Hud;
+    else if (!_wcsicmp(text, L"worldtransform")) fault = CHW12::PacketTestFault::WorldTransform;
+    else return false;
+    return true;
+}
+
+static const char* PacketFaultName(CHW12::PacketTestFault fault)
+{
+    switch (fault)
+    {
+    case CHW12::PacketTestFault::None: return "none";
+    case CHW12::PacketTestFault::HideAll: return "hideall";
+    case CHW12::PacketTestFault::HideSecond: return "hidesecond";
+    case CHW12::PacketTestFault::CullSecond: return "cullsecond";
+    case CHW12::PacketTestFault::Reverse: return "reverse";
+    case CHW12::PacketTestFault::StaleVisual: return "stalevisual";
+    case CHW12::PacketTestFault::UnsupportedPso: return "unsupportedpso";
+    case CHW12::PacketTestFault::UnknownObject: return "unknownobject";
+    case CHW12::PacketTestFault::InvalidRange: return "invalidrange";
+    case CHW12::PacketTestFault::OverflowRange: return "overflowrange";
+    case CHW12::PacketTestFault::Transparent: return "transparent";
+    case CHW12::PacketTestFault::Hud: return "hud";
+    case CHW12::PacketTestFault::WorldTransform: return "worldtransform";
+    }
+    return "unknown";
+}
+
 // F3.1-FIX A: отложенный resize во время интерактивного изменения размеров.
 // Во время WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE Windows генерирует десятки
 // WM_SIZE. Каждый вызов Resize() делал полный GPU drain + ResizeBuffers +
@@ -441,12 +482,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     uint32_t drawCount=2, drawLists=2;
     bool noGbv=false;
     bool noDebug=false;
+    bool packetDraw=false;
+    bool drawsSpecified=false, listsSpecified=false;
+    CHW12::PacketTestFault packetFault=CHW12::PacketTestFault::None;
     std::wstring metricsPath;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
     uint32_t prepFrames=0;
     bool fixedPose = false;
     bool depthTest = false;
+    bool backgroundTest = false;
     bool badArgument = false;
     {
         int argc = 0;
@@ -462,19 +507,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     else if (!_wcsicmp(argv[i],L"legacy")) { multiList=false; parallelRecording=false; }
                     else badArgument=true;
                 }
+                // F3.5.5A: packet-driven draw source. Default remains synthetic.
+                else if (_wcsicmp(argv[i],L"-drawsource")==0) {
+                    if (i+1<argc) {
+                        ++i;
+                        if (!_wcsicmp(argv[i],L"synthetic")) packetDraw=false;
+                        else if (!_wcsicmp(argv[i],L"packets")) packetDraw=true;
+                        else badArgument=true;
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i],L"-packetfault")==0) {
+                    if (i+1<argc) {
+                        if (!ParsePacketFault(argv[++i],packetFault)) badArgument=true;
+                    } else badArgument=true;
+                }
                 // F3.5.4A: N draw calls и L draw lists независимы.
                 else if (_wcsicmp(argv[i],L"-draws")==0) {
                     if (i+1<argc) {
                         const int value=_wtoi(argv[++i]);
                         if (value<1 || value>1000000) badArgument=true;
-                        else drawCount=static_cast<uint32_t>(value);
+                        else { drawCount=static_cast<uint32_t>(value); drawsSpecified=true; }
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i],L"-lists")==0) {
                     if (i+1<argc) {
                         const int value=_wtoi(argv[++i]);
                         if (value!=1 && value!=2 && value!=4 && value!=8) badArgument=true;
-                        else drawLists=static_cast<uint32_t>(value);
+                        else { drawLists=static_cast<uint32_t>(value); listsSpecified=true; }
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i],L"-nogbv")==0) noGbv=true;
@@ -522,6 +581,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     fixedPose = true;
                 else if (_wcsicmp(argv[i], L"-depthtest") == 0)
                     depthTest = true;
+                else if (_wcsicmp(argv[i], L"-backgroundtest") == 0)
+                    backgroundTest = true;
                 else if (_wcsicmp(argv[i], L"-freeaspect") == 0)
                     g_freeAspect = true;
                 else if (_wcsicmp(argv[i], L"-cpuselftest") == 0)
@@ -666,6 +727,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                        drawLists, drawCount);
         badArgument = true;
     }
+    if (packetDraw)
+    {
+        if (multiList || parallelRecording)
+        {
+            dx12log::Write("[smoke] FATAL: -drawsource packets supports a single owner command list only");
+            badArgument = true;
+        }
+        if (drawsSpecified || listsSpecified)
+        {
+            dx12log::Write("[smoke] FATAL: -drawsource packets cannot be mixed with -draws/-lists benchmark load");
+            badArgument = true;
+        }
+        if (recordFault != ~0u)
+        {
+            dx12log::Write("[smoke] FATAL: -drawsource packets cannot be combined with -recordfault");
+            badArgument = true;
+        }
+    }
+    else if (packetFault != CHW12::PacketTestFault::None)
+    {
+        dx12log::Write("[smoke] FATAL: -packetfault requires -drawsource packets");
+        badArgument = true;
+    }
+    if (backgroundTest)
+    {
+        if (depthTest)
+        {
+            dx12log::Write("[smoke] FATAL: -backgroundtest and -depthtest are mutually exclusive");
+            badArgument = true;
+        }
+        if (!packetDraw)
+        {
+            dx12log::Write("[smoke] FATAL: -backgroundtest requires -drawsource packets");
+            badArgument = true;
+        }
+        if (packetFault != CHW12::PacketTestFault::HideAll)
+        {
+            dx12log::Write("[smoke] FATAL: -backgroundtest requires -packetfault hideall");
+            badArgument = true;
+        }
+    }
     if (depthTest && drawCount < 2)
     {
         dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
@@ -763,23 +865,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     CHW12 hw12;
     g_hw = &hw12;
 
-    // F3.5.4A: параметры нагрузки фиксируются до Initialize.
-    hw12.SetDrawCount(drawCount);
-    if (!hw12.SetDrawListCount(drawLists))
+    // F3.5.4A: параметры нагрузки фиксируются до Initialize. Packet path
+    // не использует synthetic N/L и не смешивается с benchmark load.
+    if (!packetDraw)
     {
-        dx12log::Write("[smoke] FATAL: draw list configuration rejected (draws=%u lists=%u)",
-                       drawCount, drawLists);
+        hw12.SetDrawCount(drawCount);
+        if (!hw12.SetDrawListCount(drawLists))
+        {
+            dx12log::Write("[smoke] FATAL: draw list configuration rejected (draws=%u lists=%u)",
+                           drawCount, drawLists);
+            dx12log::Close();
+            return 1;
+        }
+    }
+    if (!hw12.SetDrawSource(packetDraw ? CHW12::DrawSource::Packets
+                                       : CHW12::DrawSource::Synthetic))
+    {
+        dx12log::Write("[smoke] FATAL: draw source rejected by CHW12");
         dx12log::Close();
         return 1;
     }
+    hw12.SetPacketTestFault(packetFault);
     if (noGbv || noDebug) hw12.SetGpuValidation(false);
     hw12.SetDebugLayer(!noDebug);
-    dx12log::Write("[smoke] draw calls=%u draw lists=%u debug=%d gbv=%d",
-                   drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
+    if (packetDraw)
+        dx12log::Write("[smoke] draw calls=packets draw lists=1 debug=%d gbv=%d",
+                       noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
+    else
+        dx12log::Write("[smoke] draw calls=%u draw lists=%u debug=%d gbv=%d",
+                       drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
+    dx12log::Write("[smoke] drawsource=%s packetfault=%s",
+                   packetDraw ? "packets" : "synthetic", PacketFaultName(packetFault));
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);
-    hw12.SetTestMode(depthTest);
+    hw12.SetBackgroundTest(backgroundTest);
+    hw12.SetTestMode(depthTest || backgroundTest);
     if (depthTest || fixedPose)
     {
         // Фиксированный ракурс для детерминированных тестов и сравнения
@@ -928,6 +1049,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+
+    if (backgroundTest)
+    {
+        if (!hw12.RenderFrame())
+        {
+            dx12log::Write("[smoke] -backgroundtest: RenderFrame FAILED");
+            hw12.Shutdown();
+            StopJobs();
+            g_hw = nullptr;
+            DestroyWindow(hwnd);
+            UnregisterClassW(kWindowClass, hInstance);
+            dx12log::Close();
+            return 1;
+        }
+        CHW12::DepthTestResult testResult = hw12.VerifyBackgroundOnly();
+        dx12log::Write("[smoke] -backgroundtest: %s", testResult.passed ? "PASS" : "FAIL");
+        if (!testResult.passed)
+            dx12log::Write("[smoke] -backgroundtest: FAIL - %s", testResult.message);
+        hw12.Shutdown();
+        StopJobs();
+        g_hw = nullptr;
+        DestroyWindow(hwnd);
+        UnregisterClassW(kWindowClass, hInstance);
+        dx12log::Close();
+        return testResult.passed ? 0 : 1;
+    }
 
     // F3.1: -depthtest — автоматический GPU depth-test с самостоятельным
     // завершением. Рисует один кадр, синхронизирует GPU, проверяет пиксели

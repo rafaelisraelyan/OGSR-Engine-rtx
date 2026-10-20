@@ -4,10 +4,12 @@
 #include "dx12camera.h"
 #include "dx12mesh.h"
 #include <chrono>
+#include <algorithm>
 #include <exception>
 #include <atomic>
 #include <thread>
 #include <stdexcept>
+#include <vector>
 #include "gr/jobs/JobGroup.h"
 
 #include <cstdio>
@@ -15,6 +17,77 @@
 #include <dxgidebug.h>
 
 static const float kClearColor[4] = {0.07f, 0.16f, 0.32f, 1.0f};
+
+namespace
+{
+// F3.5.5A TEST ONLY: сцена из m_mesh.Objects() копируется и детерминированно
+// портится до snapshot. Это не traversal и не registry: только проверка
+// packet validation.
+void ApplyPacketTestFault(std::vector<renderprep12::Object12>& objects,
+                          CHW12::PacketTestFault fault)
+{
+    if (objects.empty())
+        return;
+    auto& first = objects[0];
+    auto& second = objects.size() > 1 ? objects[1] : objects[0];
+    switch (fault)
+    {
+    case CHW12::PacketTestFault::None:
+        break;
+    case CHW12::PacketTestFault::HideAll:
+        for (auto& object : objects)
+            object.flags |= renderprep12::Invisible;
+        break;
+    case CHW12::PacketTestFault::HideSecond:
+        second.flags |= renderprep12::Invisible;
+        break;
+    case CHW12::PacketTestFault::CullSecond:
+        DirectX::XMStoreFloat4x4(&second.world,
+            DirectX::XMMatrixTranslation(1000.0f, 0.0f, 0.0f));
+        break;
+    case CHW12::PacketTestFault::Reverse:
+        std::reverse(objects.begin(), objects.end());
+        break;
+    case CHW12::PacketTestFault::StaleVisual:
+        first.visual.generation += 1;
+        break;
+    case CHW12::PacketTestFault::UnsupportedPso:
+        first.pso = renderprep12::SyntheticResources12[1];
+        break;
+    case CHW12::PacketTestFault::UnknownObject:
+        first.id = 999;
+        break;
+    case CHW12::PacketTestFault::InvalidRange:
+        first.vertexCount = 37;
+        break;
+    case CHW12::PacketTestFault::OverflowRange:
+        first.firstVertex = UINT32_MAX;
+        first.vertexCount = 36;
+        break;
+    case CHW12::PacketTestFault::Transparent:
+        first.flags |= renderprep12::Transparent;
+        first.opacity = 0.5f;
+        break;
+    case CHW12::PacketTestFault::Hud:
+        first.flags |= renderprep12::Hud;
+        break;
+    case CHW12::PacketTestFault::WorldTransform:
+        DirectX::XMStoreFloat4x4(&first.world,
+            DirectX::XMMatrixTranslation(1.0f, 0.0f, 0.0f));
+        break;
+    }
+}
+
+bool IsIdentityWorld(const DirectX::XMFLOAT4X4& world)
+{
+    for (uint32_t row = 0; row < 3; ++row)
+        for (uint32_t column = 0; column < 3; ++column)
+            if (world.m[row][column] != (row == column ? 1.0f : 0.0f))
+                return false;
+    return world.m[3][0] == 0.0f && world.m[3][1] == 0.0f &&
+           world.m[3][2] == 0.0f && world.m[3][3] == 1.0f;
+}
+}
 
 // DXGI_DEBUG_ALL из dxgidebug.h — extern-объявление, требующее dxguid.lib.
 // Для smoke-целей достаточно локального значения: линковка остаётся минимальной.
@@ -152,6 +225,18 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
+    // F3.5.5A: packet path is owner-list only; test faults exist only for it.
+    if (m_drawSource == DrawSource::Packets && m_multiList)
+    {
+        dx12log::Write("[DX12] Initialize refused: packet draw requires a single owner list");
+        return false;
+    }
+    if (m_drawSource != DrawSource::Packets && m_packetTestFault != PacketTestFault::None)
+    {
+        dx12log::Write("[DX12] Initialize refused: packet test fault requires packet draw");
+        return false;
+    }
+
     // Новая попытка инициализации (в том числе после неуспешной, когда
     // Shutdown уже приводил объект к исходному состоянию): идемпотентность
     // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
@@ -161,6 +246,7 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     // и последовательность Shutdown → Initialize не восстанавливает рендер.
     m_prepFailed = false;
     m_recordFailed=false; m_recordFrames=m_recordSamples=0;
+    m_visiblePackets=0;
     m_recordMs=m_queueSubmitMs=m_recordScheduleMs=m_recordWaitMs=0;
     m_timestampFrequency=m_gpuSamples=0; m_gpuMs=0;
     m_frameIntervalMs=0; m_frameIntervals=0; m_lastPresentTick={};
@@ -614,7 +700,7 @@ bool CHW12::CreateFrameResources()
         m_frameResources[i].mapped = mapped;
     }
 
-    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",(m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy"),FRAME_COUNT,m_multiList?(m_drawListCount+2):1);
+    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),FRAME_COUNT,m_multiList?(m_drawListCount+2):1);
     dx12log::Write("[DX12] Command allocators, lists and per-frame CBs created");
     return true;
 }
@@ -798,6 +884,46 @@ bool CHW12::CreateReadback()
 
         m_copyableFootprint = layout;
         m_readbackTotalBytes = totalBytes;
+        m_readbackAllocatedBytes = totalBytes;
+
+        if (m_backgroundTest)
+        {
+            // F3.5.5A TEST ONLY: 4x4 D32 region in the tail of the same
+            // readback buffer. Offset must be 512-byte aligned.
+            const UINT64 alignedOffset = (totalBytes + 511ull) & ~511ull;
+            D3D12_RESOURCE_DESC depthDesc = {};
+            depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            depthDesc.Width = 4;
+            depthDesc.Height = 4;
+            depthDesc.DepthOrArraySize = 1;
+            depthDesc.MipLevels = 1;
+            depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
+            depthDesc.SampleDesc.Count = 1;
+            depthDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthLayout = {};
+            UINT depthRows = 0;
+            UINT64 depthRowSize = 0;
+            UINT64 depthTotal = 0;
+            m_device->GetCopyableFootprints(
+                &depthDesc, 0, 1, alignedOffset,
+                &depthLayout, &depthRows, &depthRowSize, &depthTotal);
+            if (depthTotal == 0 || depthTotal == UINT64_MAX ||
+                depthRows != 4 || depthLayout.Footprint.Width < 4 ||
+                depthLayout.Footprint.Height < 4 ||
+                alignedOffset > UINT64_MAX - depthTotal)
+            {
+                dx12log::Write("[DX12][readback] invalid background depth layout: "
+                               "rows=%u total=%llu", depthRows,
+                               static_cast<unsigned long long>(depthTotal));
+                return false;
+            }
+            m_backgroundDepthOffset = alignedOffset;
+            m_backgroundDepthBytes = depthTotal;
+            m_backgroundDepthFootprint = depthLayout;
+            m_readbackAllocatedBytes = alignedOffset + depthTotal;
+        }
     }
 
     D3D12_HEAP_PROPERTIES heapProps = {};
@@ -807,7 +933,7 @@ bool CHW12::CreateReadback()
 
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = m_readbackTotalBytes;
+    desc.Width = m_readbackAllocatedBytes;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -999,6 +1125,113 @@ CHW12::DepthTestResult CHW12::VerifyDepthTest()
 // устройства за успешное завершение. Проверяем оба пути: до
 // SetEventOnCompletion и после пробуждения события.
 static constexpr uint64_t kFenceRemovedMarker = 0xFFFFFFFFFFFFFFFFull;
+
+CHW12::DepthTestResult CHW12::VerifyBackgroundOnly()
+{
+    DepthTestResult result;
+    result.passed = false;
+
+    if (!m_backgroundTest || !m_readbackBuffer || m_backgroundDepthBytes == 0)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "background oracle requires test readback buffers");
+        return result;
+    }
+    if (m_visiblePackets != 0)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "background oracle expects zero Draw, got %u visible packets",
+                 m_visiblePackets);
+        return result;
+    }
+
+    bool timedOut = false;
+    if (!WaitForFenceValue(m_fenceValue, timedOut))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "background oracle fence wait failed%s",
+                 timedOut ? " (timeout)" : "");
+        return result;
+    }
+
+    const UINT64 readBytes = m_backgroundDepthOffset + m_backgroundDepthBytes;
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = readBytes;
+    if (FAILED(m_readbackBuffer->Map(0, &readRange, &mapped)))
+    {
+        snprintf(result.message, sizeof(result.message), "background oracle Map failed");
+        return result;
+    }
+
+    struct BackgroundUnmapGuard
+    {
+        ID3D12Resource* resource;
+        ~BackgroundUnmapGuard()
+        {
+            if (resource)
+            {
+                D3D12_RANGE written = {};
+                written.Begin = 0;
+                written.End = 0;
+                resource->Unmap(0, &written);
+            }
+        }
+    } unmapGuard{m_readbackBuffer.Get()};
+
+    const uint8_t* data = static_cast<const uint8_t*>(mapped);
+    const uint8_t expected[4] = {
+        static_cast<uint8_t>(kClearColor[0] * 255.0f + 0.5f),
+        static_cast<uint8_t>(kClearColor[1] * 255.0f + 0.5f),
+        static_cast<uint8_t>(kClearColor[2] * 255.0f + 0.5f),
+        255
+    };
+
+    const UINT rowPitch = m_copyableFootprint.Footprint.RowPitch;
+    const UINT64 offset = m_copyableFootprint.Offset;
+    for (uint32_t y = 0; y < m_height; ++y)
+    {
+        const uint8_t* row = data + offset + static_cast<UINT64>(y) * rowPitch;
+        for (uint32_t x = 0; x < m_width; ++x)
+        {
+            const uint8_t* pixel = row + static_cast<UINT64>(x) * 4;
+            if (pixel[0] != expected[0] || pixel[1] != expected[1] ||
+                pixel[2] != expected[2] || pixel[3] != expected[3])
+            {
+                snprintf(result.message, sizeof(result.message),
+                         "background mismatch at (%u,%u): got %u,%u,%u,%u",
+                         x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
+                return result;
+            }
+        }
+    }
+
+    const UINT depthRowPitch = m_backgroundDepthFootprint.Footprint.RowPitch;
+    const uint8_t* depthData = data + m_backgroundDepthOffset;
+    for (uint32_t y = 0; y < 4; ++y)
+    {
+        for (uint32_t x = 0; x < 4; ++x)
+        {
+            float depth = 0.0f;
+            memcpy(&depth, depthData + static_cast<UINT64>(y) * depthRowPitch +
+                           static_cast<UINT64>(x) * sizeof(float), sizeof(depth));
+            if (depth != 1.0f)
+            {
+                snprintf(result.message, sizeof(result.message),
+                         "depth clear mismatch at (%u,%u): %f", x, y,
+                         static_cast<double>(depth));
+                return result;
+            }
+        }
+    }
+
+    result.passed = true;
+    snprintf(result.message, sizeof(result.message),
+             "background color and depth clear verified");
+    dx12log::Write("[background-frame] PASS: %s", result.message);
+    return result;
+}
 
 bool CHW12::CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage)
 {
@@ -1361,6 +1594,53 @@ bool CHW12::InjectRecordingFailure(unsigned stage, unsigned list) {
     return true;
 }
 
+const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame) const
+{
+    if (frame.frame.generation != m_sceneGeneration)
+        return "stale frame generation";
+    if (frame.categories[1].count != 0 || frame.categories[2].count != 0)
+        return "transparent/hud packets are unsupported";
+    if (frame.categories[0].begin != 0 ||
+        frame.categories[0].count != frame.frame.packets.size())
+        return "invalid opaque category range";
+
+    for (const renderprep12::DrawPacket12& packet : frame.frame.packets)
+    {
+        if (!packet.visible)
+            return "hidden packet in ordered frame";
+        const renderprep12::Object12* bound = nullptr;
+        for (const renderprep12::Object12& object : m_mesh.Objects())
+            if (object.id == packet.object.id)
+            {
+                bound = &object;
+                break;
+            }
+        if (!bound)
+            return "unknown object id";
+        if (packet.object.firstVertex != bound->firstVertex ||
+            packet.object.vertexCount != bound->vertexCount)
+            return "vertex range does not match binding";
+        if (packet.object.visual != bound->visual ||
+            packet.object.material != bound->material ||
+            packet.object.pso != bound->pso)
+            return "stale or unsupported resource binding";
+        if (packet.object.vertexCount == 0 ||
+            packet.object.firstVertex > SmokeMesh12::kVertexCount ||
+            packet.object.vertexCount >
+                SmokeMesh12::kVertexCount - packet.object.firstVertex)
+            return "invalid vertex range";
+        if (packet.object.flags & (renderprep12::Hud | renderprep12::Transparent))
+            return "transparent/hud flags are unsupported";
+        if (packet.object.opacity != 1.0f)
+            return "non-opaque opacity is unsupported";
+        // F3.5.5A сохраняет world-baked vertices: world-матрица не должна
+        // молча игнорироваться GPU-путём.
+        if (!IsIdentityWorld(packet.object.world))
+            return "non-identity world is unsupported";
+    }
+    return nullptr;
+}
+
 bool CHW12::RenderFrame()
 {
     if (!m_initialized)
@@ -1373,6 +1653,12 @@ bool CHW12::RenderFrame()
     m_preparing=true;
     struct PreparingGuard { bool& active; ~PreparingGuard() { active=false; } } guard{m_preparing};
     renderprep12::PreparedFrame12 prepared;
+    // F3.5.5A lifetime: OrderedFrame12 (CPU packets) is local to RenderFrame
+    // and outlives Reset/record/Close/Execute. GPU never reads packet memory:
+    // command lists and GPU resources are owned by FrameResource and released
+    // only under the existing per-slot fence invariant.
+    renderprep12::OrderedFrame12 ordered;
+    const bool packetDraw = (m_drawSource == DrawSource::Packets);
     try {
         // F3.5.3B TEST ONLY: одноразовый отказ внутри prepare-пути. Нужен,
         // чтобы получить реальный m_prepFailed через штатный catch, а не
@@ -1381,21 +1667,71 @@ bool CHW12::RenderFrame()
             m_prepFaultArmed = false;
             throw std::runtime_error("preparation fault injection");
         }
-        const auto start=std::chrono::steady_clock::now();
-        const renderprep12::RenderSceneSnapshot12 snapshot(m_camera.CaptureViewProjection(),m_mesh.Objects(),m_sceneGeneration);
-        const double snapshotMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
-        renderprep12::Timings12 timing;
-        prepared=renderprep12::Prepare(snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing);
+        std::vector<renderprep12::Object12> modifiedObjects;
+        std::span<const renderprep12::Object12> objects = m_mesh.Objects();
+        if (packetDraw && m_packetTestFault != PacketTestFault::None)
+        {
+            modifiedObjects.assign(m_mesh.Objects().begin(), m_mesh.Objects().end());
+            ApplyPacketTestFault(modifiedObjects, m_packetTestFault);
+            objects = modifiedObjects;
+        }
+
+        double snapshotMs=0, serialMs=0, parallelMs=0;
+        double submitMs=0, waitMs=0, mergeMs=0;
+        if (packetDraw)
+        {
+            DirectX::XMFLOAT4X4 view, projection;
+            if (!m_camera.CaptureViewProjectionPair(view, projection))
+                throw std::runtime_error("camera view/projection capture failed");
+            const auto snapshotStart=std::chrono::steady_clock::now();
+            const renderprep12::RenderSceneSnapshot12 snapshot(
+                view, projection, objects, m_sceneGeneration);
+            snapshotMs=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-snapshotStart).count();
+            renderprep12::OrderingTimings12 timing;
+            ordered=renderprep12::PrepareOrdered(
+                snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing);
+            serialMs=timing.serial.total;
+            parallelMs=timing.parallel.total;
+        }
+        else
+        {
+            const auto snapshotStart=std::chrono::steady_clock::now();
+            const renderprep12::RenderSceneSnapshot12 snapshot(
+                m_camera.CaptureViewProjection(), objects, m_sceneGeneration);
+            snapshotMs=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-snapshotStart).count();
+            renderprep12::Timings12 timing;
+            prepared=renderprep12::Prepare(snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing);
+            serialMs=timing.serial; parallelMs=timing.parallel;
+            submitMs=timing.submit; waitMs=timing.wait; mergeMs=timing.merge;
+        }
         ++m_prepFrames;
         if (m_prepFrames>30) {
-            ++m_prepSamples; m_snapshotMs+=snapshotMs; m_serialMs+=timing.serial;
-            m_parallelMs+=timing.parallel; m_submitMs+=timing.submit; m_waitMs+=timing.wait;
-            m_mergeMs+=timing.merge;
+            ++m_prepSamples; m_snapshotMs+=snapshotMs; m_serialMs+=serialMs;
+            m_parallelMs+=parallelMs; m_submitMs+=submitMs; m_waitMs+=waitMs;
+            m_mergeMs+=mergeMs;
         }
     } catch (const std::exception& e) {
         m_prepFailed=true; dx12log::Write("[renderprep] FAIL: %s",e.what()); return false;
     } catch (...) {
         m_prepFailed=true; dx12log::Write("[renderprep] FAIL: unknown exception"); return false;
+    }
+
+    uint32_t packetDrawCount=0;
+    if (packetDraw)
+    {
+        const char* reason=ValidatePacketFrame(ordered);
+        if (reason)
+        {
+            // Явный отказ до Reset/Execute: GPU не получает частичный кадр.
+            m_prepFailed=true;
+            m_recordFailed=true;
+            dx12log::Write("[packet-draw] FAIL: %s",reason);
+            return false;
+        }
+        packetDrawCount=static_cast<uint32_t>(ordered.frame.packets.size());
+        m_visiblePackets=packetDrawCount;
     }
     FrameResource& frame = m_frameResources[m_frameIndex];
 
@@ -1428,11 +1764,13 @@ bool CHW12::RenderFrame()
     // одним списком, который содержит Begin, все Draw и End.
     const uint32_t drawLists = m_multiList ? frame.drawListCount : 0;
     const uint32_t listCount = m_multiList ? (drawLists + 2) : 1;
-    const uint32_t drawCount = m_drawCount;
+    const uint32_t drawCount = packetDraw ? packetDrawCount : m_drawCount;
     // Параллельная запись имеет смысл только при >=2 draw lists. При L=1
     // режим вырождается в sequential multi, и Reset не должен пропускать
     // единственный draw list.
     const bool parallelDraw = m_parallelRecording && drawLists >= 2;
+    const char* modeName = packetDraw ? "packets" :
+        (m_multiList ? (parallelDraw ? "parallel" : "multi") : "legacy");
 
     ID3D12GraphicsCommandList* commands[MAX_DRAW_LISTS + 2] = {};
     ID3D12CommandAllocator* allocators[MAX_DRAW_LISTS + 2] = {};
@@ -1515,7 +1853,7 @@ bool CHW12::RenderFrame()
 
     // F3.1: расчёт ViewProjection камерой. Одна матрица на кадр, world-матрицы
     // нет (мировые координаты запечены в вершины).
-    const auto& viewProj = prepared.shaderCamera;
+    const auto& viewProj = packetDraw ? ordered.frame.shaderCamera : prepared.shaderCamera;
 
     // F3.1: единственная запись CB за кадр. memcpy, а не поэлементная
     // запись: содержимое — одна float4x4, и memcpy быстрее и проще.
@@ -1689,6 +2027,19 @@ bool CHW12::RenderFrame()
             }
         }
         cmd=commands[drawLists+1];
+    } else if (packetDraw) {
+        // F3.5.5A: Draw-параметры берутся только из OrderedFrame12.
+        // m_drawCount и synthetic %2 в этой ветке не участвуют.
+        const auto cbVA=frame.constantBuffer->GetGPUVirtualAddress();
+        for (const renderprep12::DrawPacket12& packet : ordered.frame.packets) {
+            if (!m_mesh.Draw(cmd,cbVA,packet.object.firstVertex,packet.object.vertexCount)) {
+                m_recordFailed=true;
+                dx12log::Write("[packet-draw] FAIL: Draw rejected packet range");
+                return false;
+            }
+            ++recordedTotal;
+            ++recordedPerList[0];
+        }
     } else {
         for (uint32_t d=0;d<drawCount;++d)
             if (!drawObject(cmd,d)) { m_recordFailed=true; return false; }
@@ -1700,14 +2051,14 @@ bool CHW12::RenderFrame()
     if (recordedTotal != drawCount) {
         m_recordFailed=true;
         dx12log::Write("[recording-draws] FAIL mode=%s lists=%u total=%u expected=%u",
-            m_multiList?(parallelDraw?"parallel":"multi"):"legacy",
-            m_multiList?drawLists:1,recordedTotal,drawCount);
+            modeName,m_multiList?drawLists:1,recordedTotal,drawCount);
         return false;
     }
     if (m_recordFrames==0) {
         dx12log::Write("[recording-draws] mode=%s lists=%u total=%u expected=%u",
-            m_multiList?(parallelDraw?"parallel":"multi"):"legacy",
-            m_multiList?drawLists:1,recordedTotal,drawCount);
+            modeName,m_multiList?drawLists:1,recordedTotal,drawCount);
+        if (packetDraw)
+            dx12log::Write("[packet-draw] visible=%u draws=%u",packetDrawCount,recordedTotal);
         if (m_testMode) {
             if (m_multiList) {
                 for (uint32_t i=0;i<drawLists;++i)
@@ -1754,6 +2105,40 @@ bool CHW12::RenderFrame()
         src.SubresourceIndex = 0;
 
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        // F3.5.5A TEST ONLY: copy a 4x4 depth region into the tail of the
+        // same readback buffer. The frame still records exactly the same Draw
+        // set; this only adds a test readback.
+        if (m_backgroundTest && m_backgroundDepthFootprint.Footprint.Width >= 4)
+        {
+            D3D12_RESOURCE_BARRIER depthToCopy = {};
+            depthToCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            depthToCopy.Transition.pResource = m_depthBuffer.Get();
+            depthToCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            depthToCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            depthToCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmd->ResourceBarrier(1, &depthToCopy);
+
+            D3D12_TEXTURE_COPY_LOCATION depthDst = {};
+            depthDst.pResource = m_readbackBuffer.Get();
+            depthDst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            depthDst.PlacedFootprint = m_backgroundDepthFootprint;
+
+            D3D12_TEXTURE_COPY_LOCATION depthSrc = {};
+            depthSrc.pResource = m_depthBuffer.Get();
+            depthSrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            depthSrc.SubresourceIndex = 0;
+
+            const UINT depthX = (m_width - 4) / 2;
+            const UINT depthY = (m_height - 4) / 2;
+            D3D12_BOX depthBox = {depthX, depthY, 0, depthX + 4, depthY + 4, 1};
+            cmd->CopyTextureRegion(&depthDst, 0, 0, 0, &depthSrc, &depthBox);
+
+            D3D12_RESOURCE_BARRIER depthToWrite = depthToCopy;
+            depthToWrite.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            depthToWrite.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            cmd->ResourceBarrier(1, &depthToWrite);
+        }
 
         // Барьер обратно COPY_SOURCE -> PRESENT.
         D3D12_RESOURCE_BARRIER toPresentFromCopy = toCopySource;
@@ -2057,15 +2442,16 @@ void CHW12::Shutdown()
         return;
 
     m_shutdownComplete = true;
-    dx12log::Write("[renderprep] %s mode=%u frames=%llu samples=%llu packets=2 snapshot=%.6f serial=%.6f parallel=%.6f submit=%.6f wait=%.6f merge=%.6f gpuFence=%.6f ms",
+    dx12log::Write("[renderprep] %s mode=%u frames=%llu samples=%llu packets=%u snapshot=%.6f serial=%.6f parallel=%.6f submit=%.6f wait=%.6f merge=%.6f gpuFence=%.6f ms",
         m_prepFailed ? "FAIL" : "PASS",static_cast<unsigned>(m_prepMode),
         (unsigned long long)m_prepFrames,(unsigned long long)m_prepSamples,
+        m_drawSource==DrawSource::Packets?m_visiblePackets:2u,
         m_prepSamples?m_snapshotMs/m_prepSamples:0,m_prepSamples?m_serialMs/m_prepSamples:0,
         m_prepSamples?m_parallelMs/m_prepSamples:0,m_prepSamples?m_submitMs/m_prepSamples:0,
         m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
         m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
     dx12log::Write("[recording] %s mode=%s lists=%u frames=%llu samples=%llu recording=%.6f submission=%.6f ms",
-        m_recordFailed?"ABORTED":"PASS",(m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy"),m_multiList?(m_drawListCount+2):1,
+        m_recordFailed?"ABORTED":"PASS",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),m_multiList?(m_drawListCount+2):1,
         (unsigned long long)m_recordFrames,(unsigned long long)m_recordSamples,
         m_recordSamples?m_recordMs/m_recordSamples:0,m_recordSamples?m_queueSubmitMs/m_recordSamples:0);
     dx12log::Write("[recording-cpu] scheduling=%.6f wait=%.6f ms",
