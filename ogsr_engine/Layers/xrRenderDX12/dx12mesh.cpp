@@ -157,13 +157,12 @@ struct VSOutput
     float4 color    : COLOR;
 };
 
-// ViewProjection приходит из constant buffer (register b0).
-// mul(float4, float4x4) — вектор СЛЕВА, что согласовано с row-vector
-// конвенцией DirectXMath и транспонированием на CPU (§6.3 ТЗ).
-// Комбинация «transpose на CPU + mul(matrix, vector)» ЗАПРЕЩЕНА:
-// она применит матрицу дважды транспонированно, то есть исходную
-// viewProj в другом порядке. Рендер даст искажённую геометрию,
-// validation промолчит.
+// ViewProjection comes from the per-frame constant buffer (register b0).
+// mul(float4, float4x4) applies the matrix to a row vector on the left,
+// matching DirectXMath's row-vector convention and the CPU-side transpose.
+// Do NOT combine a CPU transpose with mul(matrix, vector): the matrix would
+// be transposed twice and applied in the wrong order. The render would be
+// distorted while validation stays silent.
 cbuffer ViewProjectionCB : register(b0)
 {
     float4x4 ViewProjection;
