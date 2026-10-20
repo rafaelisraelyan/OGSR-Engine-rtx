@@ -19,6 +19,9 @@ param(
     [string]$Executable = '',
     [string]$Mode = 'parallel',
     [ValidateSet('legacy','multi','parallel')][string]$CommandLists = 'legacy',
+    # F3.5.5C: exercise the same WM_TIMER path with packet-driven recording.
+    [ValidateSet('synthetic','packets')][string]$DrawSource = 'synthetic',
+    [int]$PacketLists = 2,
     [int]$Burst = 40,
     [int]$TimeoutMs = 60000,
     # F3.3.0a: launch with -timerfault (test-only one-shot WM_TIMER fault) and
@@ -48,6 +51,9 @@ $failures = [Collections.Generic.List[string]]::new()
 function Fail([string]$m) { $script:failures.Add($m); Write-Output "  FAIL: $m" }
 
 $exeArgs = "-renderprep $Mode -jobworkers 4 -fixedpose -commandlists $CommandLists"
+if ($DrawSource -eq 'packets') {
+    $exeArgs = "$exeArgs -drawsource packets -packetlists $PacketLists"
+}
 if ($TimerFault) { $exeArgs = "$exeArgs -timerfault" }
 $p = Start-Process $Executable -ArgumentList $exeArgs -WindowStyle Hidden -PassThru
 

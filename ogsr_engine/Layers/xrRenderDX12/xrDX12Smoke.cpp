@@ -482,10 +482,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
+    // F3.5.5C: packet path имеет собственный предел lists и test-only batch
+    // limit; synthetic -draws/-lists с ним не смешиваются.
+    uint32_t packetListCount=2;
+    uint32_t packetBatchLimit=0;
     bool noGbv=false;
     bool noDebug=false;
     bool packetDraw=false;
     bool drawsSpecified=false, listsSpecified=false;
+    bool packetListsSpecified=false, packetBatchLimitSpecified=false;
     CHW12::PacketTestFault packetFault=CHW12::PacketTestFault::None;
     std::wstring metricsPath;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
@@ -536,6 +541,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                         const int value=_wtoi(argv[++i]);
                         if (value!=1 && value!=2 && value!=4 && value!=8) badArgument=true;
                         else { drawLists=static_cast<uint32_t>(value); listsSpecified=true; }
+                    } else badArgument=true;
+                }
+                // F3.5.5C: число logical packet lists. Только для packets;
+                // synthetic -lists/-draws остаются отдельным benchmark load.
+                else if (_wcsicmp(argv[i],L"-packetlists")==0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<1 || value>8) badArgument=true;
+                        else { packetListCount=static_cast<uint32_t>(value); packetListsSpecified=true; }
+                    } else badArgument=true;
+                }
+                // TEST ONLY: несколько batches внутри одного list.
+                else if (_wcsicmp(argv[i],L"-packetbatchlimit")==0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<0 || value>1000000) badArgument=true;
+                        else { packetBatchLimit=static_cast<uint32_t>(value); packetBatchLimitSpecified=true; }
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i],L"-nogbv")==0) noGbv=true;
@@ -723,8 +745,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
     // F3.5.4A: L не больше N. Конфигурация отклоняется явно: пустые draw
-    // lists не маскируются clamp'ом.
-    if (drawLists > drawCount)
+    // lists не маскируются clamp'ом. Для packet path действует отдельный
+    // -packetlists и отдельная проверка.
+    if (!packetDraw && drawLists > drawCount)
     {
         dx12log::Write("[smoke] FATAL: -lists %u exceeds -draws %u; empty draw lists are not allowed",
                        drawLists, drawCount);
@@ -732,26 +755,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
     if (packetDraw)
     {
-        if (multiList || parallelRecording)
-        {
-            dx12log::Write("[smoke] FATAL: -drawsource packets supports a single owner command list only");
-            badArgument = true;
-        }
         if (drawsSpecified || listsSpecified)
         {
             dx12log::Write("[smoke] FATAL: -drawsource packets cannot be mixed with -draws/-lists benchmark load");
             badArgument = true;
         }
-        if (recordFault != ~0u)
+        // L=1 owner-only допускает явный -packetlists 1. Legacy с L>1
+        // противоречит выбранному числу owner lists.
+        if (packetListsSpecified && (!multiList && packetListCount != 1))
         {
-            dx12log::Write("[smoke] FATAL: -drawsource packets cannot be combined with -recordfault");
+            dx12log::Write("[smoke] FATAL: -packetlists %u requires -commandlists multi|parallel",
+                           packetListCount);
             badArgument = true;
         }
     }
-    else if (packetFault != CHW12::PacketTestFault::None)
+    else
     {
-        dx12log::Write("[smoke] FATAL: -packetfault requires -drawsource packets");
-        badArgument = true;
+        if (packetListsSpecified || packetBatchLimitSpecified)
+        {
+            dx12log::Write("[smoke] FATAL: -packetlists/-packetbatchlimit require -drawsource packets");
+            badArgument = true;
+        }
+        if (packetFault != CHW12::PacketTestFault::None)
+        {
+            dx12log::Write("[smoke] FATAL: -packetfault requires -drawsource packets");
+            badArgument = true;
+        }
     }
     if (backgroundTest)
     {
@@ -776,9 +805,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
         badArgument = true;
     }
+    const uint32_t faultLists = packetDraw
+        ? (multiList ? packetListCount : 1) : drawLists;
+    // Fault harness всегда работает в depth-test прогоне: после recovery
+    // smoke завершается штатно, а не остаётся в интерактивном цикле.
     if (recordFault!=~0u && (!multiList || !depthTest)) badArgument=true;
-    if (recordFault!=~0u && recordFault<4 && recordFaultList > drawLists+1) badArgument=true;
-    if (recordFault!=~0u && recordFault>=4 && (!parallelRecording || recordFaultList<1 || recordFaultList>drawLists)) badArgument=true;
+    if (recordFault!=~0u && recordFault<4 && recordFaultList > faultLists+1) badArgument=true;
+    if (recordFault!=~0u && recordFault>=4 &&
+        (!parallelRecording || recordFaultList<1 || recordFaultList>faultLists)) badArgument=true;
     if (badArgument)
     {
         dx12log::Write("[smoke] FATAL: invalid command line argument, aborting");
@@ -890,10 +924,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 1;
     }
     hw12.SetPacketTestFault(packetFault);
+    if (packetDraw && multiList)
+    {
+        if (!hw12.SetPacketListCount(packetListCount))
+        {
+            dx12log::Write("[smoke] FATAL: packet list configuration rejected (lists=%u)",
+                           packetListCount);
+            dx12log::Close();
+            return 1;
+        }
+    }
+    if (packetDraw && !hw12.SetPacketBatchLimit(packetBatchLimit))
+    {
+        dx12log::Write("[smoke] FATAL: packet batch limit rejected (limit=%u)",
+                       packetBatchLimit);
+        dx12log::Close();
+        return 1;
+    }
     if (noGbv || noDebug) hw12.SetGpuValidation(false);
     hw12.SetDebugLayer(!noDebug);
     if (packetDraw)
-        dx12log::Write("[smoke] draw calls=packets draw lists=1 debug=%d gbv=%d",
+        dx12log::Write("[smoke] draw calls=packets draw lists=%u batchlimit=%u debug=%d gbv=%d",
+                       multiList ? packetListCount : 1, packetBatchLimit,
                        noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
     else
         dx12log::Write("[smoke] draw calls=%u draw lists=%u debug=%d gbv=%d",

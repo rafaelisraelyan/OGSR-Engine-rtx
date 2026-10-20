@@ -8,6 +8,7 @@
 #include "dx12camera.h"
 #include "dx12mesh.h"
 #include "dx12quarantine.h"
+#include "dx12packetplan.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -49,14 +50,13 @@ public:
 
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
     bool RenderFrame();
-    // F3.5.5A: источник Draw. Synthetic — прежний benchmark path; Packets —
-    // OrderedFrame12 → один owner command list. Packet path несовместим с
-    // multi-list recording.
+    // F3.5.5A/C: источник Draw. Synthetic — прежний benchmark path; Packets —
+    // OrderedFrame12 → FrameBatchPlan12. План может использовать один owner
+    // list (L=1/empty) либо несколько draw lists.
     enum class DrawSource : uint8_t { Synthetic = 0, Packets = 1 };
     bool SetDrawSource(DrawSource source)
     {
         if (m_initialized) return false;
-        if (source == DrawSource::Packets && m_multiList) return false;
         m_drawSource = source;
         return true;
     }
@@ -86,7 +86,6 @@ public:
     bool SetMultiList(bool enabled, bool parallel=false)
     {
         if (m_initialized) return false;
-        if (enabled && m_drawSource == DrawSource::Packets) return false;
         m_multiList=enabled;
         m_parallelRecording=enabled && parallel;
         return true;
@@ -96,6 +95,23 @@ public:
     // в FrameResource.
     bool SetDrawListCount(uint32_t count);
     void SetDrawCount(uint32_t count) { if (!m_initialized) m_drawCount = count ? count : 1; }
+    // F3.5.5C: верхняя граница числа logical packet lists (1..MAX_DRAW_LISTS).
+    // Не переиспользует synthetic m_drawListCount/m_drawCount: packet load и
+    // benchmark load разделены.
+    bool SetPacketListCount(uint32_t count)
+    {
+        if (m_initialized || count == 0 || count > MAX_DRAW_LISTS) return false;
+        m_packetListCount = count;
+        return true;
+    }
+    // TEST ONLY: верхняя граница packets в одном PacketBatch12. 0 — без
+    // ограничения. Нужна для проверки нескольких batches в одном list.
+    bool SetPacketBatchLimit(uint32_t limit)
+    {
+        if (m_initialized || limit > 1000000u) return false;
+        m_packetBatchLimit = limit;
+        return true;
+    }
     // GPU-Based Validation применяется при создании device; менять позже
     // бессмысленно.
     void SetGpuValidation(bool enabled) { if (!m_initialized) m_gpuValidationRequested = enabled; }
@@ -197,6 +213,11 @@ private:
     // F3.5.4A: L — число draw lists, N — всего draw calls за кадр.
     uint32_t m_drawListCount = 2;
     uint32_t m_drawCount = 2;
+    uint32_t m_packetListCount = 2;
+    uint32_t m_packetBatchLimit = 0;
+    // Фактическое число списков последнего записанного кадра (Begin + draw
+    // lists + End либо один owner list). Нужно для честного shutdown-лога.
+    uint32_t m_lastRecordingListCount = 1;
     uint32_t m_visiblePackets = 0;
     bool m_gpuValidationRequested = true;
     bool m_debugLayerRequested = true;
@@ -218,6 +239,19 @@ private:
     // F3.5.5A: проверка packet binding до первого Reset/Execute. Возвращает
     // nullptr при успехе или статическую причину отказа.
     const char* ValidatePacketFrame(const renderprep12::OrderedFrame12& frame) const;
+    // F3.5.5C: общая запись одного PacketList12. Обходит batches и packets в
+    // плановом порядке, проверяет каждый m_mesh.Draw() и возвращает число
+    // успешно записанных Draw. Caller выставляет RT/viewport/scissor; Draw
+    // выставляет PSO, root signature, topology, VB и CBV на этом list.
+    // Не пишет в лог, не меняет renderer state и пригодна для worker callback.
+    static bool RecordPacketList(
+        ID3D12GraphicsCommandList* list,
+        const SmokeMesh12& mesh,
+        const renderprep12::OrderedFrame12& ordered,
+        const renderprep12::FrameBatchPlan12& plan,
+        uint32_t listIndex,
+        D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+        uint32_t& draws);
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;

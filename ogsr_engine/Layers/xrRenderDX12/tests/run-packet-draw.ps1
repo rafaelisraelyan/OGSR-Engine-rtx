@@ -122,7 +122,7 @@ Record $r
 
 # Invalid CLI combinations must be rejected explicitly.
 $invalid = @(
-    @{ name='reject-parallel'; args='-drawsource packets -commandlists parallel -prepframes 5'; text='single owner command list only' },
+    @{ name='reject-packetlists-legacy'; args='-drawsource packets -commandlists legacy -packetlists 2 -prepframes 5'; text='requires -commandlists multi|parallel' },
     @{ name='reject-draws'; args='-drawsource packets -draws 128 -prepframes 5'; text='cannot be mixed with -draws/-lists' },
     @{ name='reject-lists'; args='-drawsource packets -lists 2 -prepframes 5'; text='cannot be mixed with -draws/-lists' },
     @{ name='reject-fault-without-source'; args='-packetfault hideall -prepframes 5'; text='requires -drawsource packets' }

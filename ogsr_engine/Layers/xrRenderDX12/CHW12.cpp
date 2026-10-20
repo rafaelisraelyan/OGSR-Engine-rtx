@@ -225,12 +225,8 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
-    // F3.5.5A: packet path is owner-list only; test faults exist only for it.
-    if (m_drawSource == DrawSource::Packets && m_multiList)
-    {
-        dx12log::Write("[DX12] Initialize refused: packet draw requires a single owner list");
-        return false;
-    }
+    // F3.5.5A: test faults exist only for the packet path. F3.5.5C allows
+    // packet + multi/parallel; the batch plan decides the actual list count.
     if (m_drawSource != DrawSource::Packets && m_packetTestFault != PacketTestFault::None)
     {
         dx12log::Write("[DX12] Initialize refused: packet test fault requires packet draw");
@@ -247,6 +243,7 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_prepFailed = false;
     m_recordFailed=false; m_recordFrames=m_recordSamples=0;
     m_visiblePackets=0;
+    m_lastRecordingListCount=1;
     m_recordMs=m_queueSubmitMs=m_recordScheduleMs=m_recordWaitMs=0;
     m_timestampFrequency=m_gpuSamples=0; m_gpuMs=0;
     m_frameIntervalMs=0; m_frameIntervals=0; m_lastPresentTick={};
@@ -557,6 +554,12 @@ bool CHW12::CreateFrameResources()
 {
     if (FAILED(m_commandQueue->GetTimestampFrequency(&m_timestampFrequency))) m_timestampFrequency=0;
 
+    // F3.5.5C: packet lists имеют собственный предел, независимый от
+    // synthetic m_drawListCount. План на кадр может использовать меньше
+    // списков; неиспользованные пары остаются выделенными, но не пишутся.
+    const uint32_t configuredDrawLists =
+        (m_drawSource == DrawSource::Packets) ? m_packetListCount : m_drawListCount;
+
     for (uint32_t i = 0; i < FRAME_COUNT; ++i)
     {
         HRESULT hr = m_device->CreateCommandAllocator(
@@ -591,7 +594,7 @@ bool CHW12::CreateFrameResources()
         if (m_multiList)
         {
             auto& frame = m_frameResources[i];
-            frame.drawListCount = m_drawListCount;
+            frame.drawListCount = configuredDrawLists;
             for (uint32_t j = 0; j < frame.drawListCount; ++j)
             {
                 auto& resource = frame.drawRecording[j];
@@ -700,7 +703,7 @@ bool CHW12::CreateFrameResources()
         m_frameResources[i].mapped = mapped;
     }
 
-    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),FRAME_COUNT,m_multiList?(m_drawListCount+2):1);
+    dx12log::Write("[recording] resources mode=%s slots=%u listsPerSlot=%u",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),FRAME_COUNT,m_multiList?(configuredDrawLists+2):1);
     dx12log::Write("[DX12] Command allocators, lists and per-frame CBs created");
     return true;
 }
@@ -1461,10 +1464,13 @@ void CHW12::QuarantineGpuResources()
 
     q.occupied = true;
 
+    const uint32_t quarantinedDrawLists = m_multiList
+        ? ((m_drawSource == DrawSource::Packets) ? m_packetListCount : m_drawListCount)
+        : 0u;
     dx12log::Write("[DX12] GPU resources quarantined: ownership transferred to "
                    "process-lifetime storage via Detach(), GPU may still be "
                    "reading them; drawListsPerSlot=%u endLists=%u",
-                   m_multiList?m_drawListCount:0u,m_multiList?FRAME_COUNT:0u);
+                   quarantinedDrawLists,m_multiList?FRAME_COUNT:0u);
 }
 
 void CHW12::MoveToNextFrame()
@@ -1641,6 +1647,47 @@ const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame
     return nullptr;
 }
 
+bool CHW12::RecordPacketList(
+    ID3D12GraphicsCommandList* list,
+    const SmokeMesh12& mesh,
+    const renderprep12::OrderedFrame12& ordered,
+    const renderprep12::FrameBatchPlan12& plan,
+    uint32_t listIndex,
+    D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+    uint32_t& draws)
+{
+    draws = 0;
+    if (!list || listIndex >= plan.lists.size())
+        return false;
+
+    const renderprep12::PacketList12& packetList = plan.lists[listIndex];
+    for (uint32_t batchOffset = 0; batchOffset < packetList.batchCount; ++batchOffset)
+    {
+        const uint64_t batchIndex =
+            static_cast<uint64_t>(packetList.firstBatch) + batchOffset;
+        if (batchIndex >= plan.batches.size())
+            return false;
+        const renderprep12::PacketBatch12& batch =
+            plan.batches[static_cast<size_t>(batchIndex)];
+        const uint64_t first = batch.firstPacket;
+        const uint64_t end = first + batch.packetCount;
+        if (first > ordered.frame.packets.size() ||
+            end > ordered.frame.packets.size())
+            return false;
+
+        for (uint64_t packetIndex = first; packetIndex < end; ++packetIndex)
+        {
+            const renderprep12::DrawPacket12& packet =
+                ordered.frame.packets[static_cast<size_t>(packetIndex)];
+            if (!mesh.Draw(list, cbVA, packet.object.firstVertex,
+                           packet.object.vertexCount))
+                return false;
+            ++draws;
+        }
+    }
+    return true;
+}
+
 bool CHW12::RenderFrame()
 {
     if (!m_initialized)
@@ -1658,6 +1705,9 @@ bool CHW12::RenderFrame()
     // command lists and GPU resources are owned by FrameResource and released
     // only under the existing per-slot fence invariant.
     renderprep12::OrderedFrame12 ordered;
+    // F3.5.5C: план владеет только диапазонами. OrderedFrame12 и plan живут
+    // до JobGroup::Wait и ExecuteCommandLists; worker'ы читают их как const.
+    renderprep12::FrameBatchPlan12 packetPlan;
     const bool packetDraw = (m_drawSource == DrawSource::Packets);
     try {
         // F3.5.3B TEST ONLY: одноразовый отказ внутри prepare-пути. Нужен,
@@ -1721,6 +1771,9 @@ bool CHW12::RenderFrame()
     uint32_t packetDrawCount=0;
     if (packetDraw)
     {
+        // Не оставлять packet count предыдущего кадра в shutdown-логе, если
+        // этот кадр отклонён до записи.
+        m_visiblePackets=0;
         const char* reason=ValidatePacketFrame(ordered);
         if (reason)
         {
@@ -1730,10 +1783,57 @@ bool CHW12::RenderFrame()
             dx12log::Write("[packet-draw] FAIL: %s",reason);
             return false;
         }
-        packetDrawCount=static_cast<uint32_t>(ordered.frame.packets.size());
+
+        // F3.5.5C: plan строится и проверяется до первого GPU Reset. Ошибка
+        // построения/валидации не оставляет частично записанный кадр.
+        const uint32_t packetMaxLists = m_multiList ? m_packetListCount : 1;
+        try
+        {
+            packetPlan = renderprep12::BuildPacketBatchPlan(
+                ordered, packetMaxLists, m_packetBatchLimit);
+        }
+        catch (const std::exception& e)
+        {
+            m_prepFailed=true;
+            m_recordFailed=true;
+            dx12log::Write("[packet-plan] FAIL: %s",e.what());
+            return false;
+        }
+        catch (...)
+        {
+            m_prepFailed=true;
+            m_recordFailed=true;
+            dx12log::Write("[packet-plan] FAIL: unknown exception");
+            return false;
+        }
+
+        const renderprep12::BatchPlanValidation12 planValidation =
+            renderprep12::ValidatePacketBatchPlan(ordered, packetPlan);
+        if (!planValidation.ok)
+        {
+            m_prepFailed=true;
+            m_recordFailed=true;
+            dx12log::Write("[packet-plan] FAIL: %s",planValidation.reason);
+            return false;
+        }
+
+        packetDrawCount=packetPlan.packetCount;
         m_visiblePackets=packetDrawCount;
+        if (m_recordFrames==0)
+            dx12log::Write("[packet-plan] maxLists=%u lists=%zu batches=%zu draws=%u batchLimit=%u",
+                packetMaxLists, packetPlan.lists.size(), packetPlan.batches.size(),
+                packetDrawCount, m_packetBatchLimit);
     }
     FrameResource& frame = m_frameResources[m_frameIndex];
+    if (packetDraw && m_multiList && packetPlan.lists.size() > frame.drawListCount)
+    {
+        // Валидация конфигурации до Reset: план не должен ссылаться на
+        // несуществующую пару allocator/list.
+        m_recordFailed=true;
+        dx12log::Write("[packet-plan] FAIL: plan lists=%zu exceed frame lists=%u",
+            packetPlan.lists.size(), frame.drawListCount);
+        return false;
+    }
 
     // Ждём завершения именно этого слота: его аллокатор и лист не должны
     // трогаться CPU, пока GPU читает записанные в них команды.
@@ -1762,8 +1862,17 @@ bool CHW12::RenderFrame()
 
     // F3.5.4A: L draw lists + owner Begin + owner End. Legacy остаётся
     // одним списком, который содержит Begin, все Draw и End.
-    const uint32_t drawLists = m_multiList ? frame.drawListCount : 0;
-    const uint32_t listCount = m_multiList ? (drawLists + 2) : 1;
+    // F3.5.5C: packet path использует только непустые lists из плана. При
+    // L<=1 (включая empty frame) owner list содержит Begin+Draw+End и не
+    // запускает ни одной параллельной задачи.
+    const uint32_t packetListCount =
+        packetDraw ? static_cast<uint32_t>(packetPlan.lists.size()) : 0;
+    const bool packetOwnerOnly = packetDraw && packetListCount <= 1;
+    const uint32_t drawLists = packetDraw
+        ? (packetOwnerOnly ? 0 : packetListCount)
+        : (m_multiList ? frame.drawListCount : 0);
+    const bool useOwnerEnd = m_multiList && !packetOwnerOnly;
+    const uint32_t listCount = useOwnerEnd ? (drawLists + 2) : 1;
     const uint32_t drawCount = packetDraw ? packetDrawCount : m_drawCount;
     // Параллельная запись имеет смысл только при >=2 draw lists. При L=1
     // режим вырождается в sequential multi, и Reset не должен пропускать
@@ -1771,6 +1880,16 @@ bool CHW12::RenderFrame()
     const bool parallelDraw = m_parallelRecording && drawLists >= 2;
     const char* modeName = packetDraw ? "packets" :
         (m_multiList ? (parallelDraw ? "parallel" : "multi") : "legacy");
+    const uint32_t recordedListCount = useOwnerEnd ? drawLists : 1;
+    m_lastRecordingListCount = listCount;
+
+    if (parallelDraw && packetDraw &&
+        (!m_jobs || !m_jobs->IsInitialized()))
+    {
+        m_recordFailed=true;
+        dx12log::Write("[packet-recording] FAIL: JobSystem is not initialized");
+        return false;
+    }
 
     ID3D12GraphicsCommandList* commands[MAX_DRAW_LISTS + 2] = {};
     ID3D12CommandAllocator* allocators[MAX_DRAW_LISTS + 2] = {};
@@ -1781,10 +1900,21 @@ bool CHW12::RenderFrame()
         commands[i + 1] = frame.drawRecording[i].list.Get();
         allocators[i + 1] = frame.drawRecording[i].allocator.Get();
     }
-    if (m_multiList)
+    if (useOwnerEnd)
     {
         commands[drawLists + 1] = frame.ownerEnd.list.Get();
         allocators[drawLists + 1] = frame.ownerEnd.allocator.Get();
+    }
+
+    if (packetDraw && m_recordFrames==0)
+    {
+        const gr::jobs::JobStats stats =
+            (m_jobs && m_jobs->IsInitialized()) ? m_jobs->GetStats() : gr::jobs::JobStats{};
+        dx12log::Write("[packet-recording] parallel=%u tasks=%u backgroundWorkers=%u "
+                       "totalParticipants=%u drawLists=%u commands=%u draws=%u",
+            parallelDraw?1:0, parallelDraw?drawLists:0,
+            stats.backgroundWorkers, stats.totalParticipants,
+            drawLists, listCount, drawCount);
     }
 
     HRESULT hr=S_OK;
@@ -1900,8 +2030,18 @@ bool CHW12::RenderFrame()
     // кадра, а не «мягкое» предупреждение. Счётчики не влияют на команды.
     uint32_t recordedPerList[MAX_DRAW_LISTS] = {};
     uint32_t recordedTotal = 0;
+    uint32_t expectedPerList[MAX_DRAW_LISTS] = {};
+    if (packetDraw)
+    {
+        for (uint32_t i=0;i<drawLists;++i)
+        {
+            const renderprep12::PacketList12& packetList=packetPlan.lists[i];
+            for (uint32_t b=0;b<packetList.batchCount;++b)
+                expectedPerList[i]+=packetPlan.batches[packetList.firstBatch+b].packetCount;
+        }
+    }
 
-    if (m_multiList) {
+    if (useOwnerEnd) {
         if (!closeList(0)) return false;
         // Параллельная запись имеет смысл только при >=2 draw lists.
         // При L=1 режим вырождается в sequential multi с одним списком.
@@ -1944,44 +2084,94 @@ bool CHW12::RenderFrame()
                             throw std::runtime_error("recording submit injection");
                         auto* draw=commands[i+1]; auto* allocator=allocators[i+1];
                         const SmokeMesh12* mesh=&m_mesh;
-                        const auto range=drawRange(i);
                         const auto cb=frame.constantBuffer->GetGPUVirtualAddress();
                         const auto dsv=m_dsv;
-                        group.Submit([i,draw,allocator,mesh,range,cb,dsv,rtvHandle,viewport,scissor,
-                                      faultStage,faultList,rendezvous,&results,&entered,&exited,&overlap] {
-                            struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
-                            ++entered;
-                            // Только fault harness: подтверждённое перекрытие двух callbacks.
-                            if (rendezvous) {
-                                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-                                while (entered.load()<2) {
-                                    if (std::chrono::steady_clock::now()>deadline) {
-                                        results[i].hr=E_ABORT; return;
+                        if (packetDraw)
+                        {
+                            const renderprep12::OrderedFrame12* orderedPtr=&ordered;
+                            const renderprep12::FrameBatchPlan12* planPtr=&packetPlan;
+                            group.Submit([i,draw,allocator,mesh,orderedPtr,planPtr,cb,dsv,
+                                          rtvHandle,viewport,scissor,faultStage,faultList,
+                                          rendezvous,&results,&entered,&exited,&overlap] {
+                                struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
+                                ++entered;
+                                if (rendezvous) {
+                                    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+                                    while (entered.load()<2) {
+                                        if (std::chrono::steady_clock::now()>deadline) {
+                                            results[i].hr=E_ABORT; return;
+                                        }
+                                        std::this_thread::yield();
                                     }
-                                    std::this_thread::yield();
+                                    overlap=true;
                                 }
-                                overlap=true;
-                            }
-                            const auto fault=[&](unsigned stage) { return faultList==i+1 && faultStage==stage; };
-                            if (fault(5)) throw std::runtime_error("recording callback injection");
-                            auto& result=results[i];
-                            result.hr=fault(0)?E_FAIL:allocator->Reset();
-                            if (FAILED(result.hr)) return;
-                            result.hr=fault(1)?E_FAIL:draw->Reset(allocator,nullptr);
-                            if (FAILED(result.hr)) return;
-                            draw->OMSetRenderTargets(1,&rtvHandle,FALSE,&dsv);
-                            draw->RSSetViewports(1,&viewport); draw->RSSetScissorRects(1,&scissor);
-                            for (uint32_t d=0;d<range.count;++d) {
-                                const uint32_t global=range.first+d;
-                                const UINT firstVertex=static_cast<UINT>(global%2)*(SmokeMesh12::kVertexCount/2);
-                                if (fault(2) || !mesh->Draw(draw,cb,firstVertex,SmokeMesh12::kVertexCount/2)) {
-                                    result.hr=E_FAIL; return;
+                                const auto fault=[&](unsigned stage) { return faultList==i+1 && faultStage==stage; };
+                                if (fault(5)) throw std::runtime_error("recording callback injection");
+                                auto& result=results[i];
+                                result.hr=fault(0)?E_FAIL:allocator->Reset();
+                                if (FAILED(result.hr)) return;
+                                result.hr=fault(1)?E_FAIL:draw->Reset(allocator,nullptr);
+                                if (FAILED(result.hr)) return;
+                                draw->OMSetRenderTargets(1,&rtvHandle,FALSE,&dsv);
+                                draw->RSSetViewports(1,&viewport);
+                                draw->RSSetScissorRects(1,&scissor);
+                                if (fault(2))
+                                {
+                                    result.hr=E_FAIL;
+                                    return;
                                 }
-                            }
-                            result.hr=fault(3)?E_FAIL:draw->Close();
-                            result.closed=SUCCEEDED(result.hr);
-                            if (result.closed) result.draws=range.count;
-                        });
+                                uint32_t draws=0;
+                                if (!CHW12::RecordPacketList(draw,*mesh,*orderedPtr,*planPtr,
+                                                             i,cb,draws))
+                                {
+                                    result.hr=E_FAIL;
+                                    result.draws=draws;
+                                    return;
+                                }
+                                result.hr=fault(3)?E_FAIL:draw->Close();
+                                result.closed=SUCCEEDED(result.hr);
+                                if (result.closed) result.draws=draws;
+                            });
+                        }
+                        else
+                        {
+                            const auto range=drawRange(i);
+                            group.Submit([i,draw,allocator,mesh,range,cb,dsv,rtvHandle,viewport,scissor,
+                                          faultStage,faultList,rendezvous,&results,&entered,&exited,&overlap] {
+                                struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
+                                ++entered;
+                                // Только fault harness: подтверждённое перекрытие двух callbacks.
+                                if (rendezvous) {
+                                    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+                                    while (entered.load()<2) {
+                                        if (std::chrono::steady_clock::now()>deadline) {
+                                            results[i].hr=E_ABORT; return;
+                                        }
+                                        std::this_thread::yield();
+                                    }
+                                    overlap=true;
+                                }
+                                const auto fault=[&](unsigned stage) { return faultList==i+1 && faultStage==stage; };
+                                if (fault(5)) throw std::runtime_error("recording callback injection");
+                                auto& result=results[i];
+                                result.hr=fault(0)?E_FAIL:allocator->Reset();
+                                if (FAILED(result.hr)) return;
+                                result.hr=fault(1)?E_FAIL:draw->Reset(allocator,nullptr);
+                                if (FAILED(result.hr)) return;
+                                draw->OMSetRenderTargets(1,&rtvHandle,FALSE,&dsv);
+                                draw->RSSetViewports(1,&viewport); draw->RSSetScissorRects(1,&scissor);
+                                for (uint32_t d=0;d<range.count;++d) {
+                                    const uint32_t global=range.first+d;
+                                    const UINT firstVertex=static_cast<UINT>(global%2)*(SmokeMesh12::kVertexCount/2);
+                                    if (fault(2) || !mesh->Draw(draw,cb,firstVertex,SmokeMesh12::kVertexCount/2)) {
+                                        result.hr=E_FAIL; return;
+                                    }
+                                }
+                                result.hr=fault(3)?E_FAIL:draw->Close();
+                                result.closed=SUCCEEDED(result.hr);
+                                if (result.closed) result.draws=range.count;
+                            });
+                        }
                     }
                 } catch (...) { failure=std::current_exception(); }
                 scheduleMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-schedulingStart).count();
@@ -2008,6 +2198,19 @@ bool CHW12::RenderFrame()
                     entered.load()==exited.load()?1:0,closedCount,drawLists);
                 return false;
             }
+            if (packetDraw)
+            {
+                for (uint32_t i=0;i<drawLists;++i)
+                {
+                    if (results[i].draws!=expectedPerList[i])
+                    {
+                        m_recordFailed=true;
+                        dx12log::Write("[packet-recording] ABORTED list=%u draws=%u expected=%u",
+                            i+1,results[i].draws,expectedPerList[i]);
+                        return false;
+                    }
+                }
+            }
             for (uint32_t i=0;i<drawLists;++i) {
                 recordedPerList[i]=results[i].draws;
                 recordedTotal+=results[i].draws;
@@ -2018,27 +2221,49 @@ bool CHW12::RenderFrame()
                 // Каждый Draw list самодостаточен: состояние соседнего list не наследуется.
                 cmd->OMSetRenderTargets(1,&rtvHandle,FALSE,&m_dsv);
                 cmd->RSSetViewports(1,&viewport); cmd->RSSetScissorRects(1,&scissor);
-                const auto range=drawRange(i);
-                for (uint32_t d=0;d<range.count;++d)
-                    if (!drawObject(cmd,range.first+d)) { m_recordFailed=true; return false; }
-                recordedPerList[i]=range.count;
-                recordedTotal+=range.count;
+                if (packetDraw)
+                {
+                    if (InjectRecordingFailure(2,i+1)) return false;
+                    uint32_t draws=0;
+                    if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,i,
+                                          frame.constantBuffer->GetGPUVirtualAddress(),draws))
+                    {
+                        m_recordFailed=true;
+                        dx12log::Write("[packet-draw] FAIL: Draw rejected packet range");
+                        return false;
+                    }
+                    recordedPerList[i]=draws;
+                    recordedTotal+=draws;
+                }
+                else
+                {
+                    const auto range=drawRange(i);
+                    for (uint32_t d=0;d<range.count;++d)
+                        if (!drawObject(cmd,range.first+d)) { m_recordFailed=true; return false; }
+                    recordedPerList[i]=range.count;
+                    recordedTotal+=range.count;
+                }
                 if (!closeList(i+1)) return false;
             }
         }
         cmd=commands[drawLists+1];
     } else if (packetDraw) {
-        // F3.5.5A: Draw-параметры берутся только из OrderedFrame12.
-        // m_drawCount и synthetic %2 в этой ветке не участвуют.
-        const auto cbVA=frame.constantBuffer->GetGPUVirtualAddress();
-        for (const renderprep12::DrawPacket12& packet : ordered.frame.packets) {
-            if (!m_mesh.Draw(cmd,cbVA,packet.object.firstVertex,packet.object.vertexCount)) {
+        // F3.5.5A/C: owner-only path для L<=1 и empty frame. Draw-параметры
+        // берутся только из plan batches; m_drawCount и synthetic %2 не
+        // участвуют. Плана нет только для пустого кадра.
+        if (!packetPlan.lists.empty())
+        {
+            if (InjectRecordingFailure(2,0)) return false;
+            uint32_t draws=0;
+            if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,0,
+                                  frame.constantBuffer->GetGPUVirtualAddress(),draws))
+            {
                 m_recordFailed=true;
                 dx12log::Write("[packet-draw] FAIL: Draw rejected packet range");
                 return false;
             }
-            ++recordedTotal;
-            ++recordedPerList[0];
+            recordedPerList[0]=draws;
+            recordedTotal=draws;
         }
     } else {
         for (uint32_t d=0;d<drawCount;++d)
@@ -2051,16 +2276,16 @@ bool CHW12::RenderFrame()
     if (recordedTotal != drawCount) {
         m_recordFailed=true;
         dx12log::Write("[recording-draws] FAIL mode=%s lists=%u total=%u expected=%u",
-            modeName,m_multiList?drawLists:1,recordedTotal,drawCount);
+            modeName,recordedListCount,recordedTotal,drawCount);
         return false;
     }
     if (m_recordFrames==0) {
         dx12log::Write("[recording-draws] mode=%s lists=%u total=%u expected=%u",
-            modeName,m_multiList?drawLists:1,recordedTotal,drawCount);
+            modeName,recordedListCount,recordedTotal,drawCount);
         if (packetDraw)
             dx12log::Write("[packet-draw] visible=%u draws=%u",packetDrawCount,recordedTotal);
         if (m_testMode) {
-            if (m_multiList) {
+            if (useOwnerEnd) {
                 for (uint32_t i=0;i<drawLists;++i)
                     dx12log::Write("[recording-draws] list=%u draws=%u",i+1,recordedPerList[i]);
             } else {
@@ -2159,7 +2384,7 @@ bool CHW12::RenderFrame()
         cmd->EndQuery(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
         cmd->ResolveQueryData(frame.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,frame.timestampReadback.Get(),0);
     }
-    if (!closeList(m_multiList ? (drawLists+1) : 0)) return false;
+    if (!closeList(useOwnerEnd ? (drawLists+1) : 0)) return false;
     const double recordingMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-recordStart).count();
     ID3D12CommandList* lists[MAX_DRAW_LISTS + 2] = {};
     for (uint32_t i = 0; i < listCount; ++i)
@@ -2451,7 +2676,8 @@ void CHW12::Shutdown()
         m_prepSamples?m_waitMs/m_prepSamples:0,m_prepSamples?m_mergeMs/m_prepSamples:0,
         m_gpuFenceWaits?m_gpuFenceMs/m_gpuFenceWaits:0);
     dx12log::Write("[recording] %s mode=%s lists=%u frames=%llu samples=%llu recording=%.6f submission=%.6f ms",
-        m_recordFailed?"ABORTED":"PASS",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),m_multiList?(m_drawListCount+2):1,
+        m_recordFailed?"ABORTED":"PASS",(m_drawSource==DrawSource::Packets)?"packets":((m_parallelRecording && m_drawListCount>=2)?"parallel":(m_multiList?"multi":"legacy")),
+        m_lastRecordingListCount?m_lastRecordingListCount:1,
         (unsigned long long)m_recordFrames,(unsigned long long)m_recordSamples,
         m_recordSamples?m_recordMs/m_recordSamples:0,m_recordSamples?m_queueSubmitMs/m_recordSamples:0);
     dx12log::Write("[recording-cpu] scheduling=%.6f wait=%.6f ms",
