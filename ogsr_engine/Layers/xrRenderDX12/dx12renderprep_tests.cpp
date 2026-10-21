@@ -17,7 +17,7 @@ bool RunTests() {
         DirectX::XMFLOAT4X4 identity;
         DirectX::XMStoreFloat4x4(&identity,DirectX::XMMatrixIdentity());
         std::array<Object12,2> objects{};
-        for (unsigned i=0;i<2;++i) objects[i]={i+1,i*36,36,identity,{-0.5f,-0.5f,0.1f},{0.5f,0.5f,0.9f}};
+        for (unsigned i=0;i<2;++i) objects[i]={i+1,i*36,36,0,0,0,identity,{-0.5f,-0.5f,0.1f},{0.5f,0.5f,0.9f}};
         Timings12 timing;
         const RenderSceneSnapshot12 snapshot(identity,objects,7);
         objects[0].id=99; // Snapshot не ссылается на изменяемый источник.

@@ -96,6 +96,8 @@
     <ClCompile Include="..\xrRenderDX12\dx12renderprep.cpp"><FloatingPointModel>Precise</FloatingPointModel></ClCompile>
     <ClCompile Include="..\xrRenderDX12\dx12packetplan.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12packetplan_tests.cpp" />
+    <ClCompile Include="..\xrRenderDX12\dx12geometrycatalog.cpp" />
+    <ClCompile Include="..\xrRenderDX12\dx12geometryregistry.cpp" />
     <ClCompile Include="..\xrRenderDX12\CHW12.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12quarantine.cpp" />
     <ClCompile Include="..\xrRenderDX12\dx12camera.cpp" />
@@ -111,6 +113,9 @@
     <ClInclude Include="..\xrRenderDX12\dx12fencewait.h" />
     <ClInclude Include="..\xrRenderDX12\dx12lifetime.h" />
     <ClInclude Include="..\xrRenderDX12\dx12objectconstants.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12geometrycatalog.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12geometryregistry.h" />
+    <ClInclude Include="..\xrRenderDX12\dx12transformshader.h" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="..\JobSystem\gr_job_system.vcxproj"><Project>{7C4E9A1F-2D6B-4E8A-9F3C-5B1D7A2E8C64}</Project></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

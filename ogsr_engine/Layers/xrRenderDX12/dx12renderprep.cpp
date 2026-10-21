@@ -82,8 +82,20 @@ static bool ValidResource(Resource12 r) {
     return std::find(SyntheticResources12.begin(),SyntheticResources12.end(),r)!=SyntheticResources12.end();
 }
 static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera, bool diagnosticClip=true) {
-    if (!o.vertexCount || o.firstVertex > 72 || o.vertexCount > 72-o.firstVertex ||
-        !Finite(o.world) || o.world._14 != 0 || o.world._24 != 0 || o.world._34 != 0 || o.world._44 != 1)
+    if (o.indexCount != 0)
+    {
+        // Indexed geometry range is validated against the render-owned mesh
+        // registry during owner resolution; here only reject arithmetic
+        // overflow so Prepare can build bounds for the object.
+        if (o.firstIndex > UINT32_MAX - o.indexCount)
+            throw std::invalid_argument("invalid indexed range");
+    }
+    else if (!o.vertexCount || o.firstVertex > 72 || o.vertexCount > 72-o.firstVertex)
+    {
+        throw std::invalid_argument("invalid render object");
+    }
+    if (!Finite(o.world) || o.world._14 != 0 || o.world._24 != 0 ||
+        o.world._34 != 0 || o.world._44 != 1)
         throw std::invalid_argument("invalid render object");
     if ((o.flags & ~(Hud|Invisible|Transparent)) || !std::isfinite(o.opacity) || o.opacity<0 || o.opacity>1 ||
         (o.opacity<1 && !(o.flags&Transparent)) || !Finite3(o.sphere.center) ||
@@ -164,6 +176,7 @@ bool Equivalent(const PreparedFrame12& a, const PreparedFrame12& b) {
             std::memcmp(&x.object.sphere.center,&y.object.sphere.center,sizeof(XMFLOAT3)) || x.object.sphere.radius!=y.object.sphere.radius ||
             std::memcmp(&x.worldSphere.center,&y.worldSphere.center,sizeof(XMFLOAT3)) || x.worldSphere.radius!=y.worldSphere.radius ||
             x.object.id!=y.object.id || x.object.firstVertex!=y.object.firstVertex || x.object.vertexCount!=y.object.vertexCount ||
+            x.object.firstIndex!=y.object.firstIndex || x.object.indexCount!=y.object.indexCount || x.object.baseVertex!=y.object.baseVertex ||
             x.visible!=y.visible || !Finite(x.object.world) || !Finite(y.object.world) ||
             std::memcmp(&x.object.world,&y.object.world,sizeof(x.object.world)) ||
             std::memcmp(&x.object.minimum,&y.object.minimum,sizeof(XMFLOAT3)) ||

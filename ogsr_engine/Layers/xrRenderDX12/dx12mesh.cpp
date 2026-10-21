@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "dx12mesh.h"
 #include "dx12log.h"
+#include "dx12transformshader.h"
 
 #include <d3dcompiler.h>
 #include <cstring>
@@ -177,44 +178,9 @@ VSOutput main(VSInput input)
 }
 )";
 
-// F3.5.6A: per-object transform path. ViewProjection and World are uploaded
-// in the project's transposed row-vector representation; HLSL's default
-// column-major load restores the logical matrices. The tint is a TEST ONLY
-// per-object debug color used by the transform-scene pixel oracle.
-static const char* kTransformVertexShaderSrc = R"(
-struct VSInput
-{
-    float3 position : POSITION;
-    float4 color    : COLOR;
-};
-
-struct VSOutput
-{
-    float4 position : SV_Position;
-    float4 color    : COLOR;
-};
-
-cbuffer FrameCB : register(b0)
-{
-    float4x4 ViewProjection;
-};
-
-cbuffer ObjectCB : register(b1)
-{
-    float4x4 World;
-    float4 Tint;
-};
-
-VSOutput main(VSInput input)
-{
-    VSOutput output;
-    // Row-vector convention: local -> World -> ViewProjection.
-    output.position = mul(mul(float4(input.position, 1.0f), World), ViewProjection);
-    output.color = Tint;
-    return output;
-}
-)";
-
+// F3.5.6A: per-object transform path uses the shared HLSL source from
+// dx12transformshader.h. The tint is a TEST ONLY per-object debug color used
+// by the transform-scene pixel oracle.
 static const char* kPixelShaderSrc = R"(
 struct PSInput
 {
@@ -295,6 +261,11 @@ bool SmokeMesh12::Create(
     if (!device || !copyQueue || !copyAllocator || !copyCommandList)
     {
         dx12log::Write("[DX12][mesh] Create refused: null dependency");
+        return false;
+    }
+    if (mode == MeshSceneMode12::Geometry)
+    {
+        dx12log::Write("[DX12][mesh] Create refused: geometry scene uses GpuMeshRegistry12");
         return false;
     }
 
@@ -646,12 +617,15 @@ bool SmokeMesh12::CreatePipelineState(ID3D12Device* device)
     ComPtr<ID3D10Blob> pixelShader;
 
     if (!CompileShader(m_mode == MeshSceneMode12::Transforms
-                           ? kTransformVertexShaderSrc
+                           ? dx12transformshader12::kVertexSource
                            : kVertexShaderSrc,
                        "main", "vs_5_0", &vertexShader))
         return false;
 
-    if (!CompileShader(kPixelShaderSrc, "main", "ps_5_0", &pixelShader))
+    if (!CompileShader(m_mode == MeshSceneMode12::Transforms
+                           ? dx12transformshader12::kPixelSource
+                           : kPixelShaderSrc,
+                       "main", "ps_5_0", &pixelShader))
         return false;
 
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {

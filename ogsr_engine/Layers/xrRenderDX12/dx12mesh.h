@@ -33,7 +33,8 @@ using Microsoft::WRL::ComPtr;
 enum class MeshSceneMode12 : uint8_t
 {
     Legacy,
-    Transforms
+    Transforms,
+    Geometry
 };
 
 class SmokeMesh12

@@ -7,6 +7,7 @@
 
 #include "dx12camera.h"
 #include "dx12mesh.h"
+#include "dx12geometryregistry.h"
 #include "dx12quarantine.h"
 #include "dx12packetplan.h"
 #include "dx12fencewait.h"
@@ -63,7 +64,8 @@ public:
         Transparent,
         Hud,
         WorldTransform,
-        InvalidTransform
+        InvalidTransform,
+        InvalidIndexRange
     };
     void SetPacketTestFault(PacketTestFault fault)
     {
@@ -114,6 +116,10 @@ public:
     // проверить восстановление после m_prepFailed: Shutdown → Initialize
     // обязан сбросить флаг, иначе RenderFrame навсегда возвращает false.
     void ArmPreparationFailure() { m_prepFaultArmed = true; }
+
+    // F3.5.6B TEST ONLY: fail Initialize after geometry copy commands were
+    // submitted but before the normal drain. Exercises Shutdown lifetime.
+    void ArmGeometryPostSubmitFailure() { m_geometryPostSubmitFault = true; }
 
 
     // F3.3.0a TEST ONLY — WM_TIMER fault injection.
@@ -199,7 +205,7 @@ public:
         if (!m_initialized)
         {
             m_backgroundTest = enabled;
-            m_depthReadback = m_backgroundTest || m_transformTest;
+            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
         }
     }
     DepthTestResult VerifyBackgroundOnly();
@@ -211,10 +217,21 @@ public:
         if (!m_initialized)
         {
             m_transformTest = enabled;
-            m_depthReadback = m_backgroundTest || m_transformTest;
+            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
         }
     }
     DepthTestResult VerifyTransformScene();
+
+    // F3.5.6B TEST ONLY: indexed geometry registry scene oracle.
+    void SetGeometryTest(bool enabled)
+    {
+        if (!m_initialized)
+        {
+            m_geometryTest = enabled;
+            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
+        }
+    }
+    DepthTestResult VerifyGeometryScene();
 
 private:
     bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
@@ -266,11 +283,21 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS objectCBBase,
         uint32_t& draws);
 
-    // F3.5.6A: owner writes ObjectConstants for every visible packet after
+    static bool RecordGeometryPacketList(
+        ID3D12GraphicsCommandList* list,
+        const GpuMeshRegistry12& registry,
+        const ResolvedFrame12& resolved,
+        const renderprep12::FrameBatchPlan12& plan,
+        uint32_t listIndex,
+        D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+        D3D12_GPU_VIRTUAL_ADDRESS objectCBBase,
+        uint32_t& draws);
+
+    // F3.5.6A/B: owner writes ObjectConstants for every visible packet after
     // the slot fence wait and before Reset/Execute. Workers only receive GPU
     // virtual addresses; they never touch the mapped upload memory.
-    bool WriteTransformConstants(void* mapped,
-                                 const renderprep12::OrderedFrame12& ordered);
+    bool WriteObjectConstants(void* mapped,
+                              const renderprep12::OrderedFrame12& ordered);
     renderprep12::Mode m_prepMode=renderprep12::Mode::Serial;
     gr::jobs::JobSystem* m_jobs=nullptr;
     bool m_preparing=false, m_prepFailed=false;
@@ -363,6 +390,10 @@ private:
     // не даёт, деструктор вызовет Release().
     SmokeMesh12 m_mesh;
 
+    // F3.5.6B: indexed geometry registry and its immutable CPU scene.
+    GpuMeshRegistry12 m_geometryRegistry;
+    std::vector<renderprep12::Object12> m_geometryObjects;
+
     // F3.1: камера. Значение-член, как m_mesh: без COM-объектов, только
     // математика. Тестируема на CPU без GPU и переносима в IX-Ray-адаптер.
     SmokeCamera12 m_camera;
@@ -420,8 +451,9 @@ private:
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_copyableFootprint = {};
     // F3.5.5A TEST ONLY: 4x4 depth-регион в хвосте того же readback buffer.
     bool m_backgroundTest = false;
-    // F3.5.6A: opt-in transform scene uses the same depth readback region.
+    // F3.5.6A/B: opt-in transform/geometry scenes use the same depth region.
     bool m_transformTest = false;
+    bool m_geometryTest = false;
     bool m_depthReadback = false;
     UINT64 m_backgroundDepthOffset = 0;
     UINT64 m_backgroundDepthBytes = 0;
@@ -448,6 +480,8 @@ private:
     // GPU получал команды: до первой отправки WaitForGpu бессмысленен,
     // а SetEventOnCompletion на fence без signal завис бы навсегда.
     bool m_gpuWorkSubmitted = false;
+    // TEST ONLY: controlled post-submit Initialize failure (geometry).
+    bool m_geometryPostSubmitFault = false;
 
     // Идемпотентность Shutdown. Отдельный флаг, а не m_stage: см. Shutdown().
     // НЕ является терминальным флагом: после штатного Shutdown повторный

@@ -18,6 +18,11 @@ struct Visibility12 {
 struct Object12 {
     uint64_t id{};
     uint32_t firstVertex{}, vertexCount{};
+    // F3.5.6B: indexed submesh range. indexCount == 0 preserves the
+    // legacy/transforms non-indexed path; geometry registry objects use
+    // firstIndex/indexCount/baseVertex and leave the vertex range zero.
+    uint32_t firstIndex{}, indexCount{};
+    int32_t baseVertex{};
     DirectX::XMFLOAT4X4 world{};
     // Локальные bounds; kernel выдаёт мировые AABB и консервативную сферу.
     DirectX::XMFLOAT3 minimum{}, maximum{};

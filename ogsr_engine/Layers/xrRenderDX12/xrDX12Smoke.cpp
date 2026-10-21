@@ -5,6 +5,7 @@
 #include "dx12cpuscene.h"
 #include "dx12packetplan.h"
 #include "dx12transform_tests.h"
+#include "dx12geometry_tests.h"
 #include "gr/jobs/JobSystem.h"
 #include "gr/jobs/JobConfig.h"
 #include "gr/jobs/JobStats.h"
@@ -92,6 +93,7 @@ static bool ParsePacketFault(const wchar_t* text, CHW12::PacketTestFault& fault)
     else if (!_wcsicmp(text, L"hud")) fault = CHW12::PacketTestFault::Hud;
     else if (!_wcsicmp(text, L"worldtransform")) fault = CHW12::PacketTestFault::WorldTransform;
     else if (!_wcsicmp(text, L"invalidtransform")) fault = CHW12::PacketTestFault::InvalidTransform;
+    else if (!_wcsicmp(text, L"invalidindexrange")) fault = CHW12::PacketTestFault::InvalidIndexRange;
     else return false;
     return true;
 }
@@ -114,6 +116,7 @@ static const char* PacketFaultName(CHW12::PacketTestFault fault)
     case CHW12::PacketTestFault::Hud: return "hud";
     case CHW12::PacketTestFault::WorldTransform: return "worldtransform";
     case CHW12::PacketTestFault::InvalidTransform: return "invalidtransform";
+    case CHW12::PacketTestFault::InvalidIndexRange: return "invalidindexrange";
     }
     return "unknown";
 }
@@ -484,6 +487,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool packetPlanSelfTest=false;
     bool fenceWaitSelfTest=false;
     bool transformSelfTest=false;
+    bool geometrySelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
@@ -495,14 +499,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool noDebug=false;
     bool packetDraw=false;
     bool transformsScene=false;
+    bool geometryScene=false;
     bool transformTest=false;
+    bool geometryTest=false;
     uint32_t transformFrames=1;
+    uint32_t geometryFrames=1;
     bool drawsSpecified=false, listsSpecified=false;
     bool packetListsSpecified=false, packetBatchLimitSpecified=false;
     CHW12::PacketTestFault packetFault=CHW12::PacketTestFault::None;
     std::wstring metricsPath;
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
+    bool geometryPostSubmitFault=false; // F3.5.6B TEST ONLY: lifetime после GPU submit
     uint32_t prepFrames=0;
     bool fixedPose = false;
     bool depthTest = false;
@@ -534,8 +542,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i],L"-scene")==0) {
                     if (i+1<argc) {
                         ++i;
-                        if (!_wcsicmp(argv[i],L"legacy")) transformsScene=false;
-                        else if (!_wcsicmp(argv[i],L"transforms")) transformsScene=true;
+                        if (!_wcsicmp(argv[i],L"legacy")) { transformsScene=false; geometryScene=false; }
+                        else if (!_wcsicmp(argv[i],L"transforms")) { transformsScene=true; geometryScene=false; }
+                        else if (!_wcsicmp(argv[i],L"geometry")) { transformsScene=false; geometryScene=true; }
                         else badArgument=true;
                     } else badArgument=true;
                 }
@@ -600,6 +609,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-packetplanselftest") == 0) packetPlanSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-fencewaitselftest") == 0) fenceWaitSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-transformselftest") == 0) transformSelfTest=true;
+                else if (_wcsicmp(argv[i], L"-geometryselftest") == 0) geometrySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -607,6 +617,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-timerfault") == 0) timerFault=true;
                 // F3.5.3B TEST ONLY: отказ подготовки кадра + повторная инициализация.
                 else if (_wcsicmp(argv[i], L"-prepfault") == 0) prepFault=true;
+                else if (_wcsicmp(argv[i], L"-geometrypostsubmitfault") == 0)
+                    geometryPostSubmitFault=true;
                 else if (_wcsicmp(argv[i], L"-prepframes") == 0) {
                     if (i+1<argc && _wtoi(argv[i+1])>0) prepFrames=static_cast<uint32_t>(_wtoi(argv[++i]));
                     else badArgument=true;
@@ -626,11 +638,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     depthTest = true;
                 else if (_wcsicmp(argv[i], L"-transformtest") == 0)
                     transformTest = true;
+                else if (_wcsicmp(argv[i], L"-geometrytest") == 0)
+                    geometryTest = true;
                 else if (_wcsicmp(argv[i], L"-transformframes") == 0) {
                     if (i+1<argc) {
                         const int value=_wtoi(argv[++i]);
                         if (value<1 || value>256) badArgument=true;
                         else transformFrames=static_cast<uint32_t>(value);
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i], L"-geometryframes") == 0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<1 || value>256) badArgument=true;
+                        else geometryFrames=static_cast<uint32_t>(value);
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i], L"-backgroundtest") == 0)
@@ -832,21 +853,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
         badArgument = true;
     }
-    if (transformsScene && !packetDraw)
+    if ((transformsScene || geometryScene) && !packetDraw)
     {
-        dx12log::Write("[smoke] FATAL: -scene transforms requires -drawsource packets");
+        dx12log::Write("[smoke] FATAL: -scene transforms|geometry requires -drawsource packets");
         badArgument = true;
     }
     if (transformTest &&
-        (!transformsScene || !packetDraw || depthTest || backgroundTest))
+        (!transformsScene || !packetDraw || depthTest || backgroundTest || geometryTest))
     {
         dx12log::Write("[smoke] FATAL: -transformtest requires -scene transforms, "
+                       "-drawsource packets and no other oracle");
+        badArgument = true;
+    }
+    if (geometryTest &&
+        (!geometryScene || !packetDraw || depthTest || backgroundTest || transformTest))
+    {
+        dx12log::Write("[smoke] FATAL: -geometrytest requires -scene geometry, "
                        "-drawsource packets and no other oracle");
         badArgument = true;
     }
     if (!transformTest && transformFrames != 1)
     {
         dx12log::Write("[smoke] FATAL: -transformframes requires -transformtest");
+        badArgument = true;
+    }
+    if (!geometryTest && geometryFrames != 1)
+    {
+        dx12log::Write("[smoke] FATAL: -geometryframes requires -geometrytest");
+        badArgument = true;
+    }
+    if (geometryPostSubmitFault && !geometryScene)
+    {
+        dx12log::Write("[smoke] FATAL: -geometrypostsubmitfault requires -scene geometry");
         badArgument = true;
     }
     const uint32_t faultLists = packetDraw
@@ -867,6 +905,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (packetPlanSelfTest) { const bool ok=renderprep12::RunPacketBatchPlanTests(); dx12log::Close(); return ok?0:1; }
     if (fenceWaitSelfTest) { const bool ok=dx12fence12::RunFenceWaitTests(); dx12log::Close(); return ok?0:1; }
     if (transformSelfTest) { const bool ok=smoketransform12::RunTransformTests(); dx12log::Close(); return ok?0:1; }
+    if (geometrySelfTest) { const bool ok=smokegeometry12::RunGeometryTests(); dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
@@ -887,7 +926,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // BLOCKER 4: при -depthtest камера должна оставаться неизменной до
     // завершения теста. Иначе UpdateCamera в цикле каждый кадр меняет
     // ракурс, и пиксели не воспроизводимы между прогонами.
-    fixedPose = fixedPose || depthTest || transformTest;
+    fixedPose = fixedPose || depthTest || transformTest || geometryTest;
     g_fixedPose = fixedPose;
 
     dx12log::Write("[smoke] modes: fixedPose=%d, depthTest=%d, aspectLock=%s",
@@ -969,8 +1008,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
-    if (!hw12.SetSceneMode(transformsScene ? MeshSceneMode12::Transforms
-                                           : MeshSceneMode12::Legacy))
+    if (!hw12.SetSceneMode(geometryScene
+                               ? MeshSceneMode12::Geometry
+                               : (transformsScene ? MeshSceneMode12::Transforms
+                                                  : MeshSceneMode12::Legacy)))
     {
         dx12log::Write("[smoke] FATAL: scene mode rejected by CHW12");
         dx12log::Close();
@@ -1005,16 +1046,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                        drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
     dx12log::Write("[smoke] drawsource=%s packetfault=%s",
                    packetDraw ? "packets" : "synthetic", PacketFaultName(packetFault));
-    dx12log::Write("[smoke] scene=%s transformframes=%u",
-                   transformsScene ? "transforms" : "legacy",
-                   transformTest ? transformFrames : 0u);
+    dx12log::Write("[smoke] scene=%s transformframes=%u geometryframes=%u",
+                   geometryScene ? "geometry" : (transformsScene ? "transforms" : "legacy"),
+                   transformTest ? transformFrames : 0u,
+                   geometryTest ? geometryFrames : 0u);
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);
     hw12.SetBackgroundTest(backgroundTest);
     hw12.SetTransformTest(transformTest);
-    hw12.SetTestMode(depthTest || backgroundTest || transformTest);
-    if (depthTest || fixedPose || transformTest)
+    hw12.SetGeometryTest(geometryTest);
+    hw12.SetTestMode(depthTest || backgroundTest || transformTest || geometryTest);
+    if (geometryPostSubmitFault)
+    {
+        dx12log::Write("[smoke] TEST ONLY: geometry post-submit failure armed");
+        hw12.ArmGeometryPostSubmitFailure();
+    }
+    if (depthTest || fixedPose || transformTest || geometryTest)
     {
         // Фиксированный ракурс для детерминированных тестов и сравнения
         // кадров между прогонами.
@@ -1032,6 +1080,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (!hw12.Initialize(hwnd, clientWidth, clientHeight))
     {
         dx12log::Write("[smoke] CHW12::Initialize failed, see [DX12] lines above for the stage");
+        // Resolve submitted GPU work (drain/quarantine) while the log is still
+        // open; the destructor alone would run after dx12log::Close().
+        hw12.Shutdown();
         DestroyWindow(hwnd);
         g_hw = nullptr;
         UnregisterClassW(kWindowClass, hInstance);
@@ -1266,6 +1317,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         UnregisterClassW(kWindowClass, hInstance);
         if (!testResult.passed)
             dx12log::Write("[smoke] -transformtest: FAIL - %s", testResult.message);
+        dx12log::Close();
+        return testResult.passed && g_cpuScene.mismatchCount == 0 ? 0 : 1;
+    }
+
+    // F3.5.6B: indexed geometry registry oracle. 49 objects reuse three
+    // handles (cube/plane/pyramid) and verify pixel/depth/hash determinism.
+    if (geometryTest)
+    {
+        PrepareSceneCPU();
+        for (uint32_t frame = 0; frame < geometryFrames; ++frame)
+        {
+            if (!hw12.RenderFrame())
+            {
+                dx12log::Write("[smoke] -geometrytest: RenderFrame failed at frame %u, "
+                               "device removed=%d, gpu state unknown=%d",
+                               frame, hw12.IsDeviceRemoved() ? 1 : 0,
+                               hw12.IsGpuStateUnknown() ? 1 : 0);
+                hw12.Shutdown();
+                StopJobs();
+                g_hw = nullptr;
+                DestroyWindow(hwnd);
+                UnregisterClassW(kWindowClass, hInstance);
+                dx12log::Close();
+                return 1;
+            }
+        }
+        CHW12::DepthTestResult testResult = hw12.VerifyGeometryScene();
+        dx12log::Write("[smoke] -geometrytest: %s",
+                       testResult.passed ? "PASS" : "FAIL");
+        hw12.Shutdown();
+        ReportCpuScene();
+        StopJobs();
+        g_hw = nullptr;
+        UnregisterClassW(kWindowClass, hInstance);
+        if (!testResult.passed)
+            dx12log::Write("[smoke] -geometrytest: FAIL - %s", testResult.message);
         dx12log::Close();
         return testResult.passed && g_cpuScene.mismatchCount == 0 ? 0 : 1;
     }

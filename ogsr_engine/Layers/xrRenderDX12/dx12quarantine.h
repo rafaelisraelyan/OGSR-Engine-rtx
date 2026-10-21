@@ -96,6 +96,20 @@ struct GpuQuarantine
     ID3D12RootSignature* rootSignature = nullptr;
     ID3D12PipelineState* pipelineState = nullptr;
 
+    // F3.5.6B: indexed geometry registry (three independent VB/IB pairs).
+    // Rendering remains stopped; ownership is retained until process exit.
+    static constexpr uint32_t kRegistryMeshCount = 3;
+    struct RegistryMesh
+    {
+        ID3D12Resource* vertexBuffer = nullptr;
+        ID3D12Resource* indexBuffer = nullptr;
+        ID3D12Resource* uploadVertex = nullptr;
+        ID3D12Resource* uploadIndex = nullptr;
+    };
+    RegistryMesh registryMeshes[kRegistryMeshCount]{};
+    ID3D12RootSignature* registryRootSignature = nullptr;
+    ID3D12PipelineState* registryPipelineState = nullptr;
+
     // F3.1: depth buffer и DSV heap. Depth buffer — чистый GPU-ресурс,
     // CPU в него не пишет никогда, но при неизвестном GPU completion
     // он может ещё читаться, поэтому передаётся карантину.

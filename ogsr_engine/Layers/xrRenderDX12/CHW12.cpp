@@ -83,6 +83,10 @@ void ApplyPacketTestFault(std::vector<renderprep12::Object12>& objects,
         DirectX::XMStoreFloat4x4(&first.world,
             DirectX::XMMatrixScaling(0.0f, 1.0f, 1.0f));
         break;
+    case CHW12::PacketTestFault::InvalidIndexRange:
+        if (first.indexCount != 0)
+            first.firstIndex += 1;
+        break;
     }
 }
 
@@ -96,13 +100,24 @@ bool IsIdentityWorld(const DirectX::XMFLOAT4X4& world)
            world.m[3][2] == 0.0f && world.m[3][3] == 1.0f;
 }
 
-// TEST ONLY: debug tint for the transform-scene pixel oracle. Material/PSO
-// variants are F3.5.6C; object IDs 1/2 are stable in SmokeMesh12.
-DirectX::XMFLOAT4 TransformSceneTint(uint64_t objectId)
+// TEST ONLY: debug tint for the transform/geometry pixel oracles. Material/PSO
+// variants are F3.5.6C.
+DirectX::XMFLOAT4 ObjectDebugTint(MeshSceneMode12 mode,
+                                  const renderprep12::Object12& object)
 {
-    if (objectId == 1)
+    if (mode == MeshSceneMode12::Geometry)
+    {
+        if (object.visual.id == 1)
+            return {1.0f, 0.0f, 0.0f, 1.0f}; // cube
+        if (object.visual.id == 2)
+            return {0.0f, 1.0f, 0.0f, 1.0f}; // plane
+        if (object.visual.id == 3)
+            return {0.0f, 0.0f, 1.0f, 1.0f}; // pyramid
+        return {1.0f, 1.0f, 1.0f, 1.0f};
+    }
+    if (object.id == 1)
         return {1.0f, 0.0f, 0.0f, 1.0f};
-    if (objectId == 2)
+    if (object.id == 2)
         return {0.0f, 1.0f, 0.0f, 1.0f};
     return {1.0f, 1.0f, 1.0f, 1.0f};
 }
@@ -328,27 +343,54 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
-    // F3.1: два куба. Загружаем ПОСЛЕ CreateSynchronization, когда
-    // command queue и fence существуют: команды копии вершин идут в очередь,
-    // а ожидание их завершения выполняется сразу ниже через WaitForGpu.
-    // До этого ожидания upload buffer не освобождается, поэтому GPU успевает
-    // прочитать данные. Вершинный буфер при resize не пересоздаётся.
-    if (!m_mesh.Create(
-            m_device.Get(),
-            m_commandQueue.Get(),
-            m_frameResources[0].commandAllocator.Get(),
-            m_frameResources[0].commandList.Get(),
-            m_sceneMode))
+    // Geometry is uploaded after CreateSynchronization, when queue/fence
+    // exist. The owner waits below before releasing upload buffers.
+    if (m_sceneMode == MeshSceneMode12::Geometry)
+    {
+        // CPU-only scene construction must finish before the registry submits
+        // GPU copy commands. After Create() returns true there is no fallible
+        // CPU setup between ExecuteCommandLists and the lifetime flag.
+        if (!m_geometryRegistry.BuildScene(m_geometryObjects))
+        {
+            dx12log::Write("[DX12] Initialize failed to build geometry scene");
+            return false;
+        }
+        if (!m_geometryRegistry.Create(
+                m_device.Get(),
+                m_commandQueue.Get(),
+                m_frameResources[0].commandAllocator.Get(),
+                m_frameResources[0].commandList.Get()))
+        {
+            dx12log::Write("[DX12] Initialize failed at geometry registry Create");
+            return false;
+        }
+        m_gpuWorkSubmitted = true;
+
+        // TEST ONLY: controlled failure after GPU copy submission and before
+        // the normal drain. Shutdown must observe submitted work and drain or
+        // quarantine instead of classifying NoWorkSubmitted.
+        if (m_geometryPostSubmitFault)
+        {
+            dx12log::Write("[geometry-init-fault] post-submit failure after "
+                           "ExecuteCommandLists, before GPU drain");
+            return false;
+        }
+    }
+    else if (!m_mesh.Create(
+                 m_device.Get(),
+                 m_commandQueue.Get(),
+                 m_frameResources[0].commandAllocator.Get(),
+                 m_frameResources[0].commandList.Get(),
+                 m_sceneMode))
     {
         dx12log::Write("[DX12] Initialize failed at mesh Create");
         return false;
     }
-
-    // Треугольник отправил команды копии через ExecuteCommandLists, поэтому
-    // GPU теперь точно получил работу. Флаг обязателен: без него WaitForGpu
-    // решит, что ждать нечего, и вернёт true, не дождавшись копии, после
-    // чего upload buffer был бы освобождён при ещё читающем его GPU.
-    m_gpuWorkSubmitted = true;
+    else
+    {
+        // Create() only returns true after its copy commands were submitted.
+        m_gpuWorkSubmitted = true;
+    }
 
     // Разоваое ожидание GPU на загрузку геометрии. Signal нового значения
     // fence ожидает всю ранее отправленную работу, включая копию вершин.
@@ -378,7 +420,10 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
-    m_mesh.OnUploadComplete();
+    if (m_sceneMode == MeshSceneMode12::Geometry)
+        m_geometryRegistry.OnUploadComplete();
+    else
+        m_mesh.OnUploadComplete();
 
     // F3.1: readback buffer для автоматического depth-теста (только тестовый
     // режим). Создаётся после depth buffer, потому что GetCopyableFootprints
@@ -1423,6 +1468,271 @@ CHW12::DepthTestResult CHW12::VerifyTransformScene()
     return result;
 }
 
+CHW12::DepthTestResult CHW12::VerifyGeometryScene()
+{
+    DepthTestResult result;
+    result.passed = false;
+
+    if (m_sceneMode != MeshSceneMode12::Geometry || !m_geometryTest ||
+        !m_readbackBuffer || m_backgroundDepthBytes == 0)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "geometry oracle requires geometry scene and depth readback");
+        return result;
+    }
+    if (m_geometryObjects.size() != 49 || m_visiblePackets != 49)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "geometry oracle expects 49 objects, got objects=%zu packets=%u",
+                 m_geometryObjects.size(), m_visiblePackets);
+        return result;
+    }
+
+    bool timedOut = false;
+    const uint64_t targetFence = m_fenceValue;
+    if (!WaitForFenceValue(targetFence, timedOut))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "geometry GPU synchronization failed: %s",
+                 timedOut ? "GPU timeout" : "fence wait failed");
+        return result;
+    }
+
+    const UINT64 readBytes = m_backgroundDepthOffset + m_backgroundDepthBytes;
+    if (readBytes > m_readbackAllocatedBytes)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "geometry readback range exceeds allocation");
+        return result;
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = readBytes;
+    if (FAILED(m_readbackBuffer->Map(0, &readRange, &mapped)))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "geometry readback Map failed");
+        return result;
+    }
+
+    struct UnmapGuard
+    {
+        ID3D12Resource* resource;
+        ~UnmapGuard()
+        {
+            if (resource)
+            {
+                D3D12_RANGE written = {};
+                written.Begin = 0;
+                written.End = 0;
+                resource->Unmap(0, &written);
+            }
+        }
+    } unmapGuard{m_readbackBuffer.Get()};
+
+    const uint8_t* const data = static_cast<const uint8_t*>(mapped);
+    const UINT rowPitch = m_copyableFootprint.Footprint.RowPitch;
+    const UINT64 offset = m_copyableFootprint.Offset;
+
+    uint64_t imageHash = 14695981039346656037ull;
+    for (uint32_t y = 0; y < m_height; ++y)
+    {
+        const uint8_t* row = data + offset + static_cast<UINT64>(y) * rowPitch;
+        for (uint32_t x = 0; x < m_width; ++x)
+        {
+            const uint8_t* pixel = row + static_cast<UINT64>(x) * 4;
+            for (uint32_t c = 0; c < 4; ++c)
+            {
+                imageHash ^= pixel[c];
+                imageHash *= 1099511628211ull;
+            }
+        }
+    }
+    dx12log::Write("[geometry-frame] hash=%016llx",
+                   static_cast<unsigned long long>(imageHash));
+
+    const DirectX::XMFLOAT4X4 viewProjection =
+        m_camera.CaptureViewProjection();
+    const auto projectLocal = [&](const renderprep12::Object12& object,
+                                  float localX, float localY, float localZ,
+                                  uint32_t& px, uint32_t& py) -> bool
+    {
+        const DirectX::XMVECTOR local = DirectX::XMVectorSet(
+            localX, localY, localZ, 1.0f);
+        const DirectX::XMVECTOR clip = DirectX::XMVector4Transform(
+            DirectX::XMVector4Transform(
+                local, DirectX::XMLoadFloat4x4(&object.world)),
+            DirectX::XMLoadFloat4x4(&viewProjection));
+        DirectX::XMFLOAT4 values;
+        DirectX::XMStoreFloat4(&values, clip);
+        if (values.w <= 0.0f)
+            return false;
+        const float ndcX = values.x / values.w;
+        const float ndcY = values.y / values.w;
+        px = static_cast<uint32_t>(
+            (ndcX * 0.5f + 0.5f) * static_cast<float>(m_width));
+        py = static_cast<uint32_t>(
+            (0.5f - ndcY * 0.5f) * static_cast<float>(m_height));
+        return px < m_width && py < m_height;
+    };
+
+    bool allPassed = true;
+    for (uint32_t objectIndex : {24u, 25u, 26u})
+    {
+        const renderprep12::Object12& object = m_geometryObjects[objectIndex];
+        const DirectX::XMFLOAT3 center = {
+            (object.minimum.x + object.maximum.x) * 0.5f,
+            (object.minimum.y + object.maximum.y) * 0.5f,
+            (object.minimum.z + object.maximum.z) * 0.5f};
+        const DirectX::XMVECTOR local =
+            DirectX::XMVectorSet(center.x, center.y, center.z, 1.0f);
+        const DirectX::XMVECTOR clip = DirectX::XMVector4Transform(
+            DirectX::XMVector4Transform(
+                local, DirectX::XMLoadFloat4x4(&object.world)),
+            DirectX::XMLoadFloat4x4(&viewProjection));
+        DirectX::XMFLOAT4 clipValues;
+        DirectX::XMStoreFloat4(&clipValues, clip);
+        if (clipValues.w <= 0.0f)
+        {
+            allPassed = false;
+            continue;
+        }
+        const float ndcX = clipValues.x / clipValues.w;
+        const float ndcY = clipValues.y / clipValues.w;
+        const uint32_t px = static_cast<uint32_t>(
+            (ndcX * 0.5f + 0.5f) * static_cast<float>(m_width));
+        const uint32_t py = static_cast<uint32_t>(
+            (0.5f - ndcY * 0.5f) * static_cast<float>(m_height));
+        if (px >= m_width || py >= m_height)
+        {
+            allPassed = false;
+            continue;
+        }
+
+        uint8_t expected[4] = {255, 255, 255, 255};
+        if (object.visual.id == 1)
+            expected[1] = expected[2] = 0;
+        else if (object.visual.id == 2)
+            expected[0] = expected[2] = 0;
+        else if (object.visual.id == 3)
+            expected[0] = expected[1] = 0;
+
+        const uint8_t* row = data + offset +
+                             static_cast<UINT64>(py) * rowPitch;
+        const uint8_t* pixel = row + static_cast<UINT64>(px) * 4;
+        const bool ok = pixel[0] == expected[0] &&
+                        pixel[1] == expected[1] &&
+                        pixel[2] == expected[2] &&
+                        pixel[3] == 255;
+        dx12log::Write("[geometry-frame] object=%llu geom=%u at (%u,%u): "
+                       "expected(%u,%u,%u,255) actual(%u,%u,%u,%u) %s",
+                       static_cast<unsigned long long>(object.id),
+                       object.visual.id, px, py,
+                       expected[0], expected[1], expected[2],
+                       pixel[0], pixel[1], pixel[2], pixel[3],
+                       ok ? "PASS" : "FAIL");
+        if (!ok)
+            allPassed = false;
+    }
+
+    // Silhouette probes: the same local (x,y) lies inside the plane but
+    // outside the pyramid. This distinguishes a filled rectangle from the
+    // narrowing pyramid; object 25 is plane, object 26 is pyramid.
+    {
+        uint32_t px = 0, py = 0;
+        const bool projected = projectLocal(m_geometryObjects[25],
+                                            0.5f, 0.3f, 0.0f, px, py);
+        bool ok = false;
+        uint8_t actual[4] = {};
+        if (projected)
+        {
+            const uint8_t* row = data + offset +
+                                 static_cast<UINT64>(py) * rowPitch;
+            const uint8_t* pixel = row + static_cast<UINT64>(px) * 4;
+            memcpy(actual, pixel, sizeof(actual));
+            ok = actual[0] == 0 && actual[1] == 255 &&
+                 actual[2] == 0 && actual[3] == 255;
+        }
+        dx12log::Write("[geometry-frame] plane silhouette at (%u,%u): "
+                       "expected(0,255,0,255) actual(%u,%u,%u,%u) %s",
+                       px, py, actual[0], actual[1], actual[2], actual[3],
+                       ok ? "PASS" : "FAIL");
+        if (!ok)
+            allPassed = false;
+    }
+    {
+        uint32_t px = 0, py = 0;
+        const bool projected = projectLocal(m_geometryObjects[26],
+                                            0.5f, 0.3f, 0.0f, px, py);
+        bool ok = false;
+        uint8_t actual[4] = {};
+        if (projected)
+        {
+            const uint8_t* row = data + offset +
+                                 static_cast<UINT64>(py) * rowPitch;
+            const uint8_t* pixel = row + static_cast<UINT64>(px) * 4;
+            memcpy(actual, pixel, sizeof(actual));
+            ok = actual[0] == 18 && actual[1] == 41 &&
+                 actual[2] == 82 && actual[3] == 255;
+        }
+        dx12log::Write("[geometry-frame] pyramid notch at (%u,%u): "
+                       "expected(18,41,82,255) actual(%u,%u,%u,%u) %s",
+                       px, py, actual[0], actual[1], actual[2], actual[3],
+                       ok ? "PASS" : "FAIL");
+        if (!ok)
+            allPassed = false;
+    }
+
+    // Background at top (away from the 7x7 grid) and centre depth of the
+    // central cube object.
+    const uint32_t bgX = m_width / 2;
+    const uint32_t bgY = m_height / 18;
+    const uint8_t* bgRow = data + offset + static_cast<UINT64>(bgY) * rowPitch;
+    const uint8_t* bgPixel = bgRow + static_cast<UINT64>(bgX) * 4;
+    const bool bgOk = bgPixel[0] == 18 && bgPixel[1] == 41 &&
+                      bgPixel[2] == 82 && bgPixel[3] == 255;
+    dx12log::Write("[geometry-frame] background at (%u,%u): "
+                   "expected(18,41,82,255) actual(%u,%u,%u,%u) %s",
+                   bgX, bgY, bgPixel[0], bgPixel[1], bgPixel[2], bgPixel[3],
+                   bgOk ? "PASS" : "FAIL");
+    if (!bgOk)
+        allPassed = false;
+
+    const UINT depthRowPitch = m_backgroundDepthFootprint.Footprint.RowPitch;
+    const uint8_t* const depthData = data + m_backgroundDepthOffset;
+    float minDepth = 1.0f;
+    float maxDepth = 0.0f;
+    for (uint32_t y = 0; y < 4; ++y)
+    {
+        for (uint32_t x = 0; x < 4; ++x)
+        {
+            float depth = 0.0f;
+            memcpy(&depth, depthData + static_cast<UINT64>(y) * depthRowPitch +
+                           static_cast<UINT64>(x) * sizeof(float), sizeof(depth));
+            minDepth = (std::min)(minDepth, depth);
+            maxDepth = (std::max)(maxDepth, depth);
+            if (!(depth > 0.0f && depth < 1.0f))
+            {
+                dx12log::Write("[geometry-frame] depth at (%u,%u)=%f FAIL",
+                               x, y, static_cast<double>(depth));
+                allPassed = false;
+            }
+        }
+    }
+    dx12log::Write("[geometry-frame] center depth min=%f max=%f (expected 0<d<1)",
+                   static_cast<double>(minDepth), static_cast<double>(maxDepth));
+
+    result.passed = allPassed;
+    snprintf(result.message, sizeof(result.message),
+             allPassed ? "three indexed silhouettes, pixels and depth verified"
+                       : "geometry pixel/depth mismatch");
+    dx12log::Write("[geometry-frame] %s: %s",
+                   allPassed ? "PASS" : "FAIL", result.message);
+    return result;
+}
+
 bool CHW12::CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage)
 {
     if (completed != kFenceRemovedMarker)
@@ -1709,6 +2019,7 @@ void CHW12::QuarantineGpuResources()
     // Ресурсы меша передаются тем же способом.
     m_mesh.Quarantine(q.vertexBuffer, q.uploadBuffer,
                       q.rootSignature, q.pipelineState);
+    m_geometryRegistry.Quarantine(q);
 
     // m_infoQueue намеренно НЕ карантинируется: это CPU-объект сбора
     // validation-сообщений, GPU к его памяти не обращается. Он освобождается
@@ -1898,6 +2209,9 @@ const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame
         if (packet.object.firstVertex != bound->firstVertex ||
             packet.object.vertexCount != bound->vertexCount)
             return "vertex range does not match binding";
+        if (packet.object.indexCount != 0 || packet.object.firstIndex != 0 ||
+            packet.object.baseVertex != 0)
+            return "indexed range is unsupported for this scene";
         if (packet.object.visual != bound->visual ||
             packet.object.material != bound->material ||
             packet.object.pso != bound->pso)
@@ -1926,11 +2240,12 @@ const char* CHW12::ValidatePacketFrame(const renderprep12::OrderedFrame12& frame
     return nullptr;
 }
 
-bool CHW12::WriteTransformConstants(
+bool CHW12::WriteObjectConstants(
     void* mapped,
     const renderprep12::OrderedFrame12& ordered)
 {
-    if (m_sceneMode != MeshSceneMode12::Transforms)
+    if (m_sceneMode != MeshSceneMode12::Transforms &&
+        m_sceneMode != MeshSceneMode12::Geometry)
         return true;
     if (!mapped)
     {
@@ -1960,8 +2275,57 @@ bool CHW12::WriteTransformConstants(
             &constants.world,
             DirectX::XMMatrixTranspose(
                 DirectX::XMLoadFloat4x4(&packet.object.world)));
-        constants.tint = TransformSceneTint(packet.object.id);
+        constants.tint = ObjectDebugTint(m_sceneMode, packet.object);
         std::memcpy(dst, &constants, sizeof(constants));
+    }
+    return true;
+}
+
+bool CHW12::RecordGeometryPacketList(
+    ID3D12GraphicsCommandList* list,
+    const GpuMeshRegistry12& registry,
+    const ResolvedFrame12& resolved,
+    const renderprep12::FrameBatchPlan12& plan,
+    uint32_t listIndex,
+    D3D12_GPU_VIRTUAL_ADDRESS cbVA,
+    D3D12_GPU_VIRTUAL_ADDRESS objectCBBase,
+    uint32_t& draws)
+{
+    draws = 0;
+    if (!list || listIndex >= plan.lists.size())
+        return false;
+
+    const renderprep12::PacketList12& packetList = plan.lists[listIndex];
+    for (uint32_t batchOffset = 0; batchOffset < packetList.batchCount; ++batchOffset)
+    {
+        const uint64_t batchIndex =
+            static_cast<uint64_t>(packetList.firstBatch) + batchOffset;
+        if (batchIndex >= plan.batches.size())
+            return false;
+        const renderprep12::PacketBatch12& batch =
+            plan.batches[static_cast<size_t>(batchIndex)];
+        const uint64_t first = batch.firstPacket;
+        const uint64_t end = first + batch.packetCount;
+        if (first > resolved.draws.size() || end > resolved.draws.size())
+            return false;
+
+        for (uint64_t packetIndex = first; packetIndex < end; ++packetIndex)
+        {
+            if (packetIndex > UINT32_MAX)
+                return false;
+            const uint32_t constantIndex = static_cast<uint32_t>(packetIndex);
+            if (!dx12object12::IsValidObjectIndex(constantIndex))
+                return false;
+            const uint64_t objectOffset =
+                dx12object12::ObjectConstantsOffset(constantIndex);
+            if (objectCBBase > UINT64_MAX - objectOffset)
+                return false;
+            const GpuDraw12& draw = resolved.draws[static_cast<size_t>(packetIndex)];
+            if (!registry.RecordDraw(list, draw, cbVA,
+                                     objectCBBase + objectOffset))
+                return false;
+            ++draws;
+        }
     }
     return true;
 }
@@ -2048,6 +2412,8 @@ bool CHW12::RenderFrame()
     // F3.5.5C: план владеет только диапазонами. OrderedFrame12 и plan живут
     // до JobGroup::Wait и ExecuteCommandLists; worker'ы читают их как const.
     renderprep12::FrameBatchPlan12 packetPlan;
+    ResolvedFrame12 resolvedFrame;
+    const bool geometryScene = (m_sceneMode == MeshSceneMode12::Geometry);
     const bool packetDraw = (m_drawSource == DrawSource::Packets);
     try {
         // F3.5.3B TEST ONLY: одноразовый отказ внутри prepare-пути. Нужен,
@@ -2058,10 +2424,15 @@ bool CHW12::RenderFrame()
             throw std::runtime_error("preparation fault injection");
         }
         std::vector<renderprep12::Object12> modifiedObjects;
-        std::span<const renderprep12::Object12> objects = m_mesh.Objects();
+        std::span<const renderprep12::Object12> sceneObjects;
+        if (m_sceneMode == MeshSceneMode12::Geometry)
+            sceneObjects = std::span<const renderprep12::Object12>(m_geometryObjects);
+        else
+            sceneObjects = std::span<const renderprep12::Object12>(m_mesh.Objects());
+        std::span<const renderprep12::Object12> objects = sceneObjects;
         if (packetDraw && m_packetTestFault != PacketTestFault::None)
         {
-            modifiedObjects.assign(m_mesh.Objects().begin(), m_mesh.Objects().end());
+            modifiedObjects.assign(sceneObjects.begin(), sceneObjects.end());
             ApplyPacketTestFault(modifiedObjects, m_packetTestFault);
             objects = modifiedObjects;
         }
@@ -2114,7 +2485,42 @@ bool CHW12::RenderFrame()
         // Не оставлять packet count предыдущего кадра в shutdown-логе, если
         // этот кадр отклонён до записи.
         m_visiblePackets=0;
-        const char* reason=ValidatePacketFrame(ordered);
+        const char* reason=nullptr;
+        if (geometryScene)
+        {
+            try
+            {
+                if (!ResolveGeometryFrame(ordered, m_sceneGeneration,
+                                          m_geometryRegistry.Catalog(),
+                                          resolvedFrame, &reason))
+                {
+                    m_prepFailed=true;
+                    m_recordFailed=true;
+                    dx12log::Write("[geometry-frame] FAIL: %s",
+                                   reason ? reason : "resolution failed");
+                    return false;
+                }
+            }
+            catch (const std::exception& error)
+            {
+                m_prepFailed=true;
+                m_recordFailed=true;
+                dx12log::Write("[geometry-frame] FAIL: resolution exception: %s",
+                               error.what());
+                return false;
+            }
+            catch (...)
+            {
+                m_prepFailed=true;
+                m_recordFailed=true;
+                dx12log::Write("[geometry-frame] FAIL: unknown resolution exception");
+                return false;
+            }
+        }
+        else
+        {
+            reason=ValidatePacketFrame(ordered);
+        }
         if (reason)
         {
             // Явный отказ до Reset/Execute: GPU не получает частичный кадр.
@@ -2202,8 +2608,9 @@ bool CHW12::RenderFrame()
 
     // F3.5.6A: slot fence is confirmed above. The owner writes per-object
     // constants before Reset/recording; workers never touch mapped memory.
-    if (m_sceneMode == MeshSceneMode12::Transforms &&
-        !WriteTransformConstants(frame.mapped, ordered))
+    if ((m_sceneMode == MeshSceneMode12::Transforms ||
+         m_sceneMode == MeshSceneMode12::Geometry) &&
+        !WriteObjectConstants(frame.mapped, ordered))
     {
         m_recordFailed = true;
         return false;
@@ -2440,12 +2847,16 @@ bool CHW12::RenderFrame()
                         const SmokeMesh12* mesh=&m_mesh;
                         const auto cb=frame.constantBuffer->GetGPUVirtualAddress();
                         const auto objectCB=frame.constantBuffer->GetGPUVirtualAddress();
+                        const GpuMeshRegistry12* geometryRegistry=&m_geometryRegistry;
+                        const ResolvedFrame12* resolvedPtr=&resolvedFrame;
+                        const bool geometry=geometryScene;
                         const auto dsv=m_dsv;
                         if (packetDraw)
                         {
                             const renderprep12::OrderedFrame12* orderedPtr=&ordered;
                             const renderprep12::FrameBatchPlan12* planPtr=&packetPlan;
-                            group.Submit([i,draw,allocator,mesh,orderedPtr,planPtr,cb,objectCB,dsv,
+                            group.Submit([i,draw,allocator,mesh,geometryRegistry,resolvedPtr,geometry,
+                                          orderedPtr,planPtr,cb,objectCB,dsv,
                                           rtvHandle,viewport,scissor,faultStage,faultList,
                                           rendezvous,&results,&entered,&exited,&overlap] {
                                 struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
@@ -2476,8 +2887,14 @@ bool CHW12::RenderFrame()
                                     return;
                                 }
                                 uint32_t draws=0;
-                                if (!CHW12::RecordPacketList(draw,*mesh,*orderedPtr,*planPtr,
-                                                             i,cb,objectCB,draws))
+                                const bool recorded = geometry
+                                    ? CHW12::RecordGeometryPacketList(
+                                          draw,*geometryRegistry,*resolvedPtr,
+                                          *planPtr,i,cb,objectCB,draws)
+                                    : CHW12::RecordPacketList(
+                                          draw,*mesh,*orderedPtr,*planPtr,
+                                          i,cb,objectCB,draws);
+                                if (!recorded)
                                 {
                                     result.hr=E_FAIL;
                                     result.draws=draws;
@@ -2580,9 +2997,15 @@ bool CHW12::RenderFrame()
                 {
                     if (InjectRecordingFailure(2,i+1)) return false;
                     uint32_t draws=0;
-                    if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,i,
-                                          frame.constantBuffer->GetGPUVirtualAddress(),
-                                          frame.constantBuffer->GetGPUVirtualAddress(),draws))
+                    const bool recorded = geometryScene
+                        ? RecordGeometryPacketList(
+                              cmd,m_geometryRegistry,resolvedFrame,packetPlan,i,
+                              frame.constantBuffer->GetGPUVirtualAddress(),
+                              frame.constantBuffer->GetGPUVirtualAddress(),draws)
+                        : RecordPacketList(cmd,m_mesh,ordered,packetPlan,i,
+                                           frame.constantBuffer->GetGPUVirtualAddress(),
+                                           frame.constantBuffer->GetGPUVirtualAddress(),draws);
+                    if (!recorded)
                     {
                         m_recordFailed=true;
                         dx12log::Write("[packet-draw] FAIL: Draw rejected packet range");
@@ -2611,9 +3034,15 @@ bool CHW12::RenderFrame()
         {
             if (InjectRecordingFailure(2,0)) return false;
             uint32_t draws=0;
-            if (!RecordPacketList(cmd,m_mesh,ordered,packetPlan,0,
-                                  frame.constantBuffer->GetGPUVirtualAddress(),
-                                  frame.constantBuffer->GetGPUVirtualAddress(),draws))
+            const bool recorded = geometryScene
+                ? RecordGeometryPacketList(
+                      cmd,m_geometryRegistry,resolvedFrame,packetPlan,0,
+                      frame.constantBuffer->GetGPUVirtualAddress(),
+                      frame.constantBuffer->GetGPUVirtualAddress(),draws)
+                : RecordPacketList(cmd,m_mesh,ordered,packetPlan,0,
+                                   frame.constantBuffer->GetGPUVirtualAddress(),
+                                   frame.constantBuffer->GetGPUVirtualAddress(),draws);
+            if (!recorded)
             {
                 m_recordFailed=true;
                 dx12log::Write("[packet-draw] FAIL: Draw rejected packet range");
@@ -3129,6 +3558,8 @@ void CHW12::Shutdown()
         // Ресурсы меша. В карантин они уходят через Quarantine(),
         // поэтому здесь вызов достигается только в штатных состояниях.
         m_mesh.Release();
+        m_geometryRegistry.Release();
+        m_geometryObjects.clear();
     }
 
     if (m_debugLayerEnabled)
