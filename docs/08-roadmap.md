@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-10-21. Исторические статусы A/B1/F и их
+> **Дата обновления планов:** 2026-10-22. Исторические статусы A/B1/F и их
 > даты оставлены как ранее зафиксированные отчёты, а не результат новой
 > проверки GPU/CI. Изменение roadmap **не означает** реализации или тестирования
 > добавленных этапов.
@@ -9,6 +9,15 @@
 **Конечная техническая цель:** сохранить стабильный DX11/R4 и поэтапно получить
 **нативный DirectX 12**, затем **аппаратный DXR** (сначала RT-тени, затем — при
 успешных измерениях — отражения/глобальное освещение).
+
+**Принятый архитектурный ориентир (решение 2026-10-22):**
+**X-Ray DX12/DXR — Hybrid Rendering Architecture**. Изучать гибридную
+реализацию RTX в *Control* (Remedy / Northlight) как эталон выборочных
+RT-эффектов и их интеграции в raster pipeline, а *Metro Exodus PC Enhanced
+Edition* (4A Games) — как исследовательский ориентир динамического RTGI для
+открытых пространств. **Это проектное решение, а не реализованный RT backend.**
+Приоритет F3.6/F4.0 и порядок F4 → G3/G4 → опциональный G5 не меняются;
+никакого обязательного path tracing, DDGI или RT для запуска игры.
 
 **Новый приоритет после F3.5.6A–C (решение 2026-10-21):** перейти к раннему
 **F4.0 — первому реальному игровому кадру CoP/OGSR на DX12**, не дожидаясь
@@ -45,7 +54,7 @@
 | F3.2 · GR Job System (DX12 only) | 🛠 Локальная интеграция Stage 1 по отчёту, не закоммичена | C.1: ownership/lifecycle; затем DX12 Smoke runtime/CPU scene |
 | F3.5 · Multithreaded Renderer Foundation | ✅ ADR принят (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата | F3.5.1 — representative snapshot prototype |
 | F3.5.1 · Representative snapshot prototype | ⏭ NEXT / NOT STARTED | Расширить snapshot представительными полями X-Ray; синтетические `(id, generation)`; не трогать R4 |
-| G · DXR | 🆕 План, зависит от F | G0: проверка возможностей GPU/драйвера |
+| G · DXR | 🆕 План, зависит от F | G0: проверка возможностей GPU/драйвера; архитектурный ориентир Control + Metro закреплён 2026-10-22, реализация не начата |
 | H · Многопоточность | ⬜ План | H0: базовые профили, H1 после RT-теней и отражений |
 | I · World Streaming | ⬜ Концепция | I0: аудит X-Ray ресурсов/уровней и ownership |
 | J · Высота / LOD / растения / тени | ⬜ Концепция | J0: инвентаризация LOD/detail/CSM |
@@ -616,13 +625,99 @@ streaming, оптимизация FPS. Их перенос остаётся в �
 | **G4 — динамика и материалы** | Skinned/dynamic objects, обновление/rebuild BLAS/TLAS, alpha-tested foliage, invalidation, emissive и material lookup. | Нет существенных артефактов при анимации NPC/растительности и движении камеры. |
 | **G5 — дополнительные эффекты (опц.)** | Только после G3/G4: **RT-отражения как отдельный проверяемый рубеж**, затем по отдельному решению diffuse GI и denoise; DLSS Ray Reconstruction — отдельная интеграция при проверенной поддержке SDK/API. | Для RT-отражений отдельно зафиксированы качество, GPU ms, CPU ms и frametime. После работающих RT-теней и отражений — переход к H1 (аудит многопоточности всего движка). Каждый дополнительный эффект имеет собственный performance budget. |
 
-### Исследовательская пометка по архитектуре освещения (2026-10-16)
+### X-Ray DX12/DXR — Hybrid Rendering Architecture (решение 2026-10-22)
 
-**Статус: обсуждается, не утверждено к реализации.** В качестве ориентиров для возможной архитектуры непрямого освещения OGSR RTX изучаем опубликованные решения 4A Games в Metro Exodus Enhanced Edition: гибридная raster + ray tracing схема, RTGI, DDGI/временное накопление освещения, упрощённое представление материалов для GI, гибридные SSR/RT-отражения и оптимизацию GPU. Это идеи для оценки после появления полноценного игрового кадра и измерений, **не новый этап, не обязательство внедрить DDGI и не изменение порядка F4 → G3/G4 → опциональный G5**. Сохранить совместимость Legacy Materials и каноничную визуальную атмосферу X-Ray.
+**Статус:** ✅ **принято как направление проектирования; НЕ реализовано и НЕ
+протестировано на GPU**. Это архитектурные ограничения и исследовательские
+ориентиры, а не обещание конкретного качества, FPS или буквального
+воспроизведения Northlight/4A Games. Решения о каждом алгоритме — отдельные
+ADR, прототип и гейт с измерениями.
 
-**Первоисточники 4A Games для быстрого возврата:**
-- [In-Depth Technical Dive into Metro Exodus PC Enhanced Edition](https://www.4a-games.com.mt/4a-dna/in-depth-technical-dive-into-metro-exodus-pc-enhanced-edition) — архитектура RTGI, DDGI, материалы, отражения.
-- [Everything Technical about Metro Exodus Upgrade for PlayStation 5 and Xbox Series X|S](https://www.4a-games.com.mt/4a-dna/everything-technical-about-metro-exodus-upgrade-for-playstation-5-and-xbox-series-x-s) — оптимизация рендеринга и производительности.
+**Главный принцип:** обычный **DX12 raster — самостоятельный полнофункциональный
+рендерер** (основная геометрия, G-buffer, CSM/shadow maps, свет и постобработка);
+**DXR добавляет выборочные проходы**, устраняющие конкретные ограничения
+raster/SSR. Сохранить рабочий **DX11/R4** как независимый baseline и откат.
+Отсутствие DXR-capable GPU, ошибка RT-инициализации или отключение RT **не
+должны препятствовать** запуску базового игрового DX12-пути. DX12 raster,
+DX12 + DXR и DX11 сравниваются и тестируются раздельно.
+
+| Источник | Что изучаем | Что НЕ переносим автоматически |
+|---|---|---|
+| **Control / Remedy Northlight** | Общие acceleration structures для нескольких RT-эффектов; выборочные opaque/transparent reflections, near-field indirect diffuse и contact shadows поверх raster; облегчённый ray-hit shading, отдельное вычисление света, специализированные spatial/temporal denoisers. | Фиксированные дистанции лучей, лимиты источников света, предположения об интерьерах и готовом baked/voxel GI: параметры определяются **сценами X-Ray и профилями**. |
+| **Metro Exodus PC Enhanced Edition / 4A Games** | Динамический RTGI от солнца, неба и локальных/эмиссивных источников; представление сцены для лучей, упрощённые GI-материалы, временное накопление, кандидаты вроде DDGI для дальнего непрямого освещения открытых пространств. | Обязательный DDGI/RTXGI, полный path tracing, перенос конкретной структуры проб или бескомпромиссная замена shadow maps. RTGI — отдельное решение **после** стабильных теней и отражений. |
+| **X-Ray / OGSR** | Большие outdoor-локации, динамические сутки/погода, ветер и foliage, сталкерская атмосфера, Legacy Materials, скелетная анимация и совместимость с игровым runtime. | Требование массовой переконвертации моделей и текстур; слом DX11 и «RTX-only» игра. |
+
+**Технические контракты, которые должны пережить F → G:**
+
+1. **Базовые данные кадра (F4/F5):** стабильные depth/normal/material IDs,
+   преобразование существующего gloss в документированную roughness/BRDF
+   политику; motion vectors, jitter, exposure и сигналы сброса temporal history
+   для denoisers/upscalers. Данные и их формат фиксировать в контракте
+   deferred lighting; не объявлять все карты PBR обязательными для Legacy.
+2. **RT Scene и lifetime (G1/G4):** общий для выбранных RT-проходов
+   BLAS/TLAS path на базе существующей геометрии, стабильные render handles,
+   explicit GPU lifetime/fences и проверяемые правила build/refit/rebuild.
+   Геометрия RT должна учитывать объекты **вне camera frustum**, влияющие
+   на отражения/освещение/тени; RT selection, LOD, distance masks и residency
+   измерять, а не просто копировать raster visibility или весь игровой мир.
+   Динамика, NPC, foliage и streaming имеют отдельные invalidation-гейты.
+3. **Ray-hit material lookup (G2/G4/G5):** точка попадания вне экранного
+   G-buffer обязана получить material ID, UV, нормаль и нужные ресурсы.
+   Изучить компактную запись hit attributes и отдельный compute shading pass
+   как **кандидат оптимизации**, не как обязательный API. Alpha-tested
+   растительность/заборы и прозрачность не объявлять opaque по умолчанию.
+4. **Гибридные эффекты (G3/G5):** G3 — ограниченные RT contact/local shadows
+   как дополнение к CSM/shadow maps, со строго определённым fallback.
+   В G5 **сначала отражения** с отдельным A/B-гейтом (SSR/environment
+   fallback, шероховатость, стекло и мокрые поверхности); **затем** отдельно
+   исследовать near-field indirect diffuse и RTGI/DDGI для смены погоды и суток.
+   Никакой перенос G5 в F4.0 и никакого «всё RTX сразу».
+5. **Denoising/temporal (F5, G3/G5):** для shadows, reflections и diffuse GI
+   предусмотреть *разные* фильтры/истории, используя depth, normals, motion и
+   confidence/roughness при необходимости. Проверять disocclusion, смену
+   камеры/уровня, resize, движение NPC/ветра и смену солнца/погоды; историю
+   инвалидировать предсказуемо, без ghosting/light leaking. Сначала baseline
+   denoiser с проверяемым поведением; DLSS Ray Reconstruction — **отдельная
+   интеграция**, не автоматическая часть DXR.
+
+**Порядок принятия (не меняет номера и зависимости существующих этапов):**
+
+- **F3.6/F4.0:** завершить реальный игровой DX12 geometry frame; никакой
+  зависимости от трассировки. **F4/F5:** полноценные raster-проходы и
+  готовность G-buffer/temporal данных; только затем RT в штатном игровом кадре.
+- **G0–G2:** feature query, BLAS/TLAS, raygen/miss/hit и диагностика без
+  объявления игрового RTX. **G3:** первые контактные тени + fallback и
+  GPU budget. **G4:** skinned/foliage/material/RT lifetime validation.
+- **G5:** независимый milestone RT reflections; после его измерений отдельный
+  ADR о целесообразности near-field GI, DDGI или иного outdoor RTGI.
+  Path tracing — только самостоятельное долгосрочное исследование без
+  обязательства реализации.
+
+**Матрица доказательств и критерии для каждого RT milestone:**
+
+- Сравнивать **DX11/R4**, **DX12 raster (RT off)** и **DX12 + конкретный
+  RT-эффект (RT on)** на одной сцене, разрешении, погоде и времени суток;
+  фиксировать неизвестные/различающиеся функции renderer.
+- Набор сцен: **помещение/подвал**, улица **Припяти** (окна, мокрые поверхности),
+  **Кордон/лес** (листва, alpha test, ветер), открытый горизонт/солнце;
+  день/ночь и переход освещения/погоды — по мере доступности runtime.
+- Сохранять GPU captures/markers, отдельные visual debug outputs
+  (shadow/reflection/GI mask, ray hit/miss, history validity), A/B screenshots,
+  Debug Layer/GBV/DRED; показатели GPU pass ms, CPU frame, p50/p95/p99
+  frametime, VRAM/residency и изменение количества RT primitives/instances.
+- Проверять холодный старт/переключение RT off/on, GPU без DXR, resize,
+  level reload, teleport/camera cut, массовые dynamic objects, wind/foliage
+  и длительный прогон. При ошибке или неподдерживаемом tier — корректный
+  fallback, а не device loss. **Нет объявленного FPS-бюджета до baseline**.
+  Положительный результат измерений не заменяет проверку артефактов и отката.
+
+**Первоисточники (для выбора алгоритмов, не доказательство их реализации):**
+
+- [Remedy / NVIDIA: Ray Tracing in Control, Ray Tracing Gems II, глава 46](https://link.springer.com/chapter/10.1007/978-1-4842-7185-8_46) — архитектура гибридного RT, reflections, indirect diffuse, contact shadows и denoisers.
+- [4A Games: In-Depth Technical Dive into Metro Exodus PC Enhanced Edition](https://www.4a-games.com.mt/4a-dna/in-depth-technical-dive-into-metro-exodus-pc-enhanced-edition) — динамический RTGI/DDGI и материалы.
+- [4A Games: Everything Technical about Metro Exodus Upgrade for PS5 and Xbox Series X|S](https://www.4a-games.com.mt/4a-dna/everything-technical-about-metro-exodus-upgrade-for-playstation-5-and-xbox-series-x-s) — аппаратные/производительные ограничения.
+- [Microsoft: DirectX Raytracing Functional Specification](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html) — нормативные DXR API, capabilities, BLAS/TLAS и dispatch.
+- [Microsoft: Direct3D 12 Programming Guide](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide) — resource lifetime, command lists, descriptor/barrier model.
 
 ### Совместимость материалов Legacy / Enhanced (проектное правило)
 
