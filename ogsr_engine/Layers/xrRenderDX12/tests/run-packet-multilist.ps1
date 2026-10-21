@@ -163,7 +163,8 @@ $faults = @(
     @{ name='draw-2'; stage='record'; code=2; list=2; marker='entered=2 exited=2 overlap=1'; failures=0 },
     @{ name='close-1'; stage='close'; code=3; list=1; marker='entered=2 exited=2 overlap=1'; failures=0 },
     @{ name='close-2'; stage='close'; code=3; list=2; marker='entered=2 exited=2 overlap=1'; failures=0 },
-    @{ name='submit-1'; stage='submit'; code=4; list=1; marker='entered=1 exited=1 overlap=0'; failures=0 },
+    @{ name='submit-1'; stage='submit'; code=4; list=1; marker='entered=0 exited=0 overlap=0'; failures=0 },
+    @{ name='submit-2'; stage='submit'; code=4; list=2; marker='entered=1 exited=1 overlap=0'; failures=0 },
     @{ name='throw-1'; stage='throw'; code=5; list=1; marker='entered=2 exited=2 overlap=1'; failures=1 },
     @{ name='throw-2'; stage='throw'; code=5; list=2; marker='entered=2 exited=2 overlap=1'; failures=1 }
 )
@@ -174,6 +175,9 @@ foreach ($fault in $faults) {
     Assert $r.Log.Contains('[recording] ABORTED mode=packets lists=4 frames=1') "fault-$($fault.name): aborted"
     Assert $r.Log.Contains("[parallel-fault] stage=") "fault-$($fault.name): fault marker"
     Assert $r.Log.Contains($fault.marker) "fault-$($fault.name): task completion"
+    $accepted = if ($fault.code -eq 4) { $fault.list - 1 } else { 2 }
+    Assert $r.Log.Contains("accepted=$accepted completed=$accepted groupComplete=1") "fault-$($fault.name): accepted/drained"
+    Assert $r.Log.Contains('ABORTED drained=1') "fault-$($fault.name): no pending callbacks"
     Assert (JobsClean $r.Log $fault.failures) "fault-$($fault.name): jobs"
     Assert (([regex]::Matches($r.Log,'GPU drained before shutdown')).Count -eq 2) "fault-$($fault.name): GPU drain"
     Assert (NoValidation $r.Log) "fault-$($fault.name): validation"

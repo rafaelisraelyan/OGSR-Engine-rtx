@@ -24,8 +24,10 @@ function Run([string]$Name, [string]$Arguments, [int]$Stage = -1, [int]$List = -
             $log.Contains('[recording] ABORTED mode=parallel lists=4 frames=1') -and
             ([regex]::Matches($log,'GPU drained before shutdown').Count -eq 2)
         if ($List -in 1,2) {
-            $marker = if ($Stage -eq 4) { 'entered=1 exited=1 overlap=0' } else { 'entered=2 exited=2 overlap=1' }
-            $pass = $pass -and $log.Contains("[parallel-fault] stage=$Stage list=$List $marker submitted=1") -and $log.Contains('ABORTED drained=1')
+            $accepted = if ($Stage -eq 4) { $List - 1 } else { 2 }
+            $marker = if ($Stage -eq 4) { "entered=$accepted exited=$accepted overlap=0" } else { 'entered=2 exited=2 overlap=1' }
+            $pass = $pass -and $log.Contains("[parallel-fault] stage=$Stage list=$List $marker submitted=1") -and $log.Contains('ABORTED drained=1') -and
+                $log.Contains("accepted=$accepted completed=$accepted groupComplete=1")
         }
         $expectedFailures = if ($Stage -eq 5) { '1' } else { '0' }
         $pass = $pass -and $jobs.Groups[4].Value -eq $expectedFailures

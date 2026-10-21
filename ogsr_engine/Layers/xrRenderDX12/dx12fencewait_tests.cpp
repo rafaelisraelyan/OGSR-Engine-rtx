@@ -1,5 +1,7 @@
 #include "dx12fencewait.h"
 #include "dx12lifetime.h"
+#include "dx12timing.h"
+#include <array>
 
 #include <cstdint>
 #include <cstdio>
@@ -182,6 +184,72 @@ void TestLifetimeClassification(TestState& test)
         }
     }
 }
+// L1: тот же helper, который вызывает CollectGpuTiming после fence/drain.
+void TestTimestampMapFailure(TestState& test)
+{
+    struct Frame {
+        bool timestampPending = true, timestampSample = true;
+        int32_t timestampSampleIndex = 511;
+    } frame;
+    std::array<double, 512> samples;
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = 100.0 + double(i);
+    const auto published = samples;
+    unsigned reads = 0, aggregates = 0;
+    bool failMap = true;
+    bool reversed = false;
+    const auto read = [&](uint64_t (&ticks)[2]) {
+        ++reads;
+        if (failMap) return false; // Управляемый отказ Map, не случайный OOM.
+        ticks[0] = 100;
+        ticks[1] = reversed ? 99 : 300;
+        return true;
+    };
+    const auto publish = [&](int32_t index, double ms) {
+        ++aggregates;
+        if (index >= 0 && static_cast<size_t>(index) < samples.size())
+            samples[index] = ms;
+    };
+    using dx12timing12::Consume;
+    using dx12timing12::ConsumeResult;
+    test.Expect(Consume(frame, 1000, read, publish) == ConsumeResult::MapFailed,
+                "timestamp Map failure observed");
+    test.Expect(!frame.timestampPending && !frame.timestampSample &&
+                frame.timestampSampleIndex == -1, "failed Map clears binding");
+    test.Expect(samples == published && aggregates == 0, "failed Map does not publish");
+
+    // Все 512 samples уже заняты. Новый кадр не получает нового индекса.
+    frame.timestampPending = frame.timestampSample = true;
+    failMap = false;
+    test.Expect(Consume(frame, 1000, read, publish) == ConsumeResult::Consumed,
+                "later readback succeeds after Map failure");
+    test.Expect(samples == published, "exhausted 512 samples remain unchanged");
+    test.Expect(aggregates == 1, "unbound frame contributes only to aggregate");
+    test.Expect(frame.timestampSampleIndex == -1, "unbound frame stays unbound");
+
+    // Новая валидная привязка меняет только свой сэмпл.
+    frame.timestampPending = frame.timestampSample = true;
+    frame.timestampSampleIndex = 7;
+    Consume(frame, 1000, read, publish);
+    auto expected = published;
+    expected[7] = 200.0;
+    test.Expect(samples == expected, "valid GPU sample uses its own frame index");
+    test.Expect(aggregates == 2, "valid GPU sample counted once");
+    Consume(frame, 1000, read, publish);
+    test.Expect(reads == 3 && aggregates == 2, "consumed timestamp cannot be read twice");
+
+    frame.timestampPending = frame.timestampSample = true;
+    frame.timestampSampleIndex = 511;
+    test.Expect(Consume(frame, 0, read, publish) == ConsumeResult::Empty &&
+                frame.timestampSampleIndex == -1 && reads == 3,
+                "unavailable frequency invalidates binding without Map");
+    frame.timestampPending = frame.timestampSample = true;
+    frame.timestampSampleIndex = 7;
+    reversed = true;
+    Consume(frame, 1000, read, publish);
+    test.Expect(samples == expected && aggregates == 2 && frame.timestampSampleIndex == -1,
+                "invalid timestamp interval cannot publish or retain binding");
+}
 } // namespace
 
 bool RunFenceWaitTests()
@@ -191,6 +259,7 @@ bool RunFenceWaitTests()
     TestFailureModes(test);
     TestDeviceRemoved(test);
     TestLifetimeClassification(test);
+    TestTimestampMapFailure(test);
 
     std::printf("[fencewait] %s checks=%u failures=%u\n",
                 test.failures == 0 ? "PASS" : "FAIL", test.checks, test.failures);

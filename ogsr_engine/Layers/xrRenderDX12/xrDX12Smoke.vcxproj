@@ -101,6 +101,7 @@
     <ClInclude Include="dx12cpuscene.h" />
     <ClInclude Include="dx12cpuruntime.inl" />
     <ClInclude Include="dx12fencewait.h" />
+    <ClInclude Include="dx12timing.h" />
     <ClInclude Include="dx12lifetime.h" />
     <ClInclude Include="dx12objectconstants.h" />
     <ClInclude Include="dx12transform_tests.h" />

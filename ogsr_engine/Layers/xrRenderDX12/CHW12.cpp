@@ -4,6 +4,7 @@
 #include "dx12camera.h"
 #include "dx12mesh.h"
 #include "dx12objectconstants.h"
+#include "dx12timing.h"
 #include <chrono>
 #include <algorithm>
 #include <exception>
@@ -22,6 +23,19 @@ static const float kClearColor[4] = {0.07f, 0.16f, 0.32f, 1.0f};
 
 namespace
 {
+#ifdef GR_RECORDING_TRACE
+// Только отдельная диагностическая сборка. Никакого rendezvous/sleep:
+// разные callbacks пишут свои интервалы, owner читает их после Wait.
+struct RecordingInterval {
+    std::chrono::steady_clock::time_point begin{}, end{};
+};
+struct RecordingIntervalScope {
+    RecordingInterval& interval;
+    explicit RecordingIntervalScope(RecordingInterval& value) : interval(value)
+    { interval.begin = std::chrono::steady_clock::now(); }
+    ~RecordingIntervalScope() { interval.end = std::chrono::steady_clock::now(); }
+};
+#endif
 // F3.5.5A TEST ONLY: сцена из m_mesh.Objects() копируется и детерминированно
 // портится до snapshot. Это не traversal и не registry: только проверка
 // packet validation.
@@ -2149,26 +2163,28 @@ bool CHW12::RenderFrameFromTimer()
 
 void CHW12::CollectGpuTiming(FrameResource& frame)
 {
-    // Только owner, после подтверждённого fence/drain; новых ожиданий нет.
-    if (!frame.timestampPending || !m_timestampFrequency) return;
-    frame.timestampPending=false;
-    uint64_t* ticks=nullptr;
-    const D3D12_RANGE read={0,16};
-    if (FAILED(frame.timestampReadback->Map(0,&read,reinterpret_cast<void**>(&ticks)))) {
-        dx12log::Write("[recording-gpu] timestamp Map failed"); return;
-    }
-    if (frame.timestampSample && ticks[1]>=ticks[0]) {
-        const double gpuMs=double(ticks[1]-ticks[0])*1000.0/double(m_timestampFrequency);
-        m_gpuMs+=gpuMs; ++m_gpuSamples;
-        // F3.5.4B: GPU-время привязывается к срезу кадра, в котором был
-        // записан timestamp. Map/Unmap и запись в массив — вне Present.
-        if (frame.timestampSampleIndex>=0 &&
-            static_cast<uint32_t>(frame.timestampSampleIndex)<m_timingSampleCount)
-            m_timingSamples[frame.timestampSampleIndex].gpuMs=gpuMs;
-    }
-    frame.timestampSampleIndex=-1;
-    frame.timestampSample=false;
-    const D3D12_RANGE written={0,0}; frame.timestampReadback->Unmap(0,&written);
+    // Только owner после slot fence/drain. Helper не добавляет ожиданий.
+    const auto result = dx12timing12::Consume(frame, m_timestampFrequency,
+        [&](uint64_t (&ticks)[2]) {
+            uint64_t* mapped = nullptr;
+            const D3D12_RANGE read = {0, 16};
+            if (FAILED(frame.timestampReadback->Map(
+                    0, &read, reinterpret_cast<void**>(&mapped))))
+                return false;
+            ticks[0] = mapped[0];
+            ticks[1] = mapped[1];
+            const D3D12_RANGE written = {0, 0};
+            frame.timestampReadback->Unmap(0, &written);
+            return true;
+        },
+        [&](int32_t index, double gpuMs) {
+            m_gpuMs += gpuMs;
+            ++m_gpuSamples;
+            if (index >= 0 && static_cast<uint32_t>(index) < m_timingSampleCount)
+                m_timingSamples[index].gpuMs = gpuMs;
+        });
+    if (result == dx12timing12::ConsumeResult::MapFailed)
+        dx12log::Write("[recording-gpu] timestamp Map failed");
 }
 
 bool CHW12::InjectRecordingFailure(unsigned stage, unsigned list) {
@@ -2809,7 +2825,12 @@ bool CHW12::RenderFrame()
         if (parallelDraw) {
             // Все заимствования живут до Wait; owner не меняет mesh/CB/descriptors.
             if (!m_jobs || !m_jobs->IsInitialized()) { m_recordFailed=true; return false; }
-            struct Result { HRESULT hr=E_PENDING; bool closed=false; uint32_t draws=0; } results[MAX_DRAW_LISTS];
+            struct Result {
+                HRESULT hr=E_PENDING; bool closed=false; uint32_t draws=0;
+#ifdef GR_RECORDING_TRACE
+                RecordingInterval trace;
+#endif
+            } results[MAX_DRAW_LISTS];
             std::atomic<unsigned> entered{0}, exited{0};
             std::atomic<bool> overlap{false};
             const unsigned faultStage=m_recordFaultStage, faultList=m_recordFaultList;
@@ -2835,13 +2856,15 @@ bool CHW12::RenderFrame()
                 }
             }
             if (faultDraw) m_recordFaultStage=m_recordFaultList=~0u;
+            unsigned accepted = 0;
+            bool groupComplete = false;
             std::exception_ptr failure;
             const auto schedulingStart=std::chrono::steady_clock::now();
             try {
                 auto group=m_jobs->CreateGroup();
                 try {
                     for (uint32_t i=0;i<drawLists;++i) {
-                        if (faultDraw && faultStage==4 && i==1)
+                        if (faultDraw && faultStage==4 && i+1==faultList)
                             throw std::runtime_error("recording submit injection");
                         auto* draw=commands[i+1]; auto* allocator=allocators[i+1];
                         const SmokeMesh12* mesh=&m_mesh;
@@ -2859,6 +2882,9 @@ bool CHW12::RenderFrame()
                                           orderedPtr,planPtr,cb,objectCB,dsv,
                                           rtvHandle,viewport,scissor,faultStage,faultList,
                                           rendezvous,&results,&entered,&exited,&overlap] {
+#ifdef GR_RECORDING_TRACE
+                                RecordingIntervalScope trace(results[i].trace);
+#endif
                                 struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
                                 ++entered;
                                 if (rendezvous) {
@@ -2910,6 +2936,9 @@ bool CHW12::RenderFrame()
                             const auto range=drawRange(i);
                             group.Submit([i,draw,allocator,mesh,range,cb,dsv,rtvHandle,viewport,scissor,
                                           faultStage,faultList,rendezvous,&results,&entered,&exited,&overlap] {
+#ifdef GR_RECORDING_TRACE
+                                RecordingIntervalScope trace(results[i].trace);
+#endif
                                 struct Exit { std::atomic<unsigned>& value; ~Exit() { ++value; } } exit{exited};
                                 ++entered;
                                 // Только fault harness: подтверждённое перекрытие двух callbacks.
@@ -2944,6 +2973,7 @@ bool CHW12::RenderFrame()
                                 if (result.closed) result.draws=range.count;
                             });
                         }
+                        ++accepted; // Только после принятого Submit.
                     }
                 } catch (...) { failure=std::current_exception(); }
                 scheduleMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-schedulingStart).count();
@@ -2957,17 +2987,37 @@ bool CHW12::RenderFrame()
                 // правке намеренно не меняется: риск зафиксирован здесь и в
                 // отчёте, смягчение — внешний watchdog на уровне smoke.
                 try { group.Wait(); } catch (...) { if (!failure) failure=std::current_exception(); }
+                groupComplete = group.IsComplete();
                 recordWaitMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-waitStart).count();
             } catch (...) { failure=std::current_exception(); }
             if (faultDraw && faultStage!=~0u)
-                dx12log::Write("[parallel-fault] stage=%u list=%u entered=%u exited=%u overlap=%u submitted=%llu",
-                    faultStage,faultList,entered.load(),exited.load(),overlap.load()?1:0,(unsigned long long)m_recordFrames);
+                dx12log::Write("[parallel-fault] stage=%u list=%u entered=%u exited=%u overlap=%u submitted=%llu accepted=%u completed=%u groupComplete=%u",
+                    faultStage,faultList,entered.load(),exited.load(),overlap.load()?1:0,
+                    (unsigned long long)m_recordFrames,accepted,exited.load(),groupComplete?1:0);
+#ifdef GR_RECORDING_TRACE
+            if (!faultDraw && groupComplete && accepted==drawLists) {
+                unsigned pairs=0, overlapping=0;
+                double overlapUs=0;
+                for (uint32_t i=0;i<drawLists;++i)
+                    for (uint32_t j=i+1;j<drawLists;++j) {
+                        ++pairs;
+                        const auto begin=(std::max)(results[i].trace.begin,results[j].trace.begin);
+                        const auto end=(std::min)(results[i].trace.end,results[j].trace.end);
+                        if (end>begin) {
+                            ++overlapping;
+                            overlapUs+=std::chrono::duration<double,std::micro>(end-begin).count();
+                        }
+                    }
+                dx12log::Write("[recording-natural] callbacks=%u pairs=%u overlapping=%u overlapUs=%.3f",
+                    accepted,pairs,overlapping,overlapUs);
+            }
+#endif
             uint32_t closedCount=0;
             for (uint32_t i=0;i<drawLists;++i) if (results[i].closed) ++closedCount;
             if (failure || closedCount!=drawLists) {
                 m_recordFailed=true;
                 dx12log::Write("[parallel-recording] ABORTED drained=%u closed=%u/%u",
-                    entered.load()==exited.load()?1:0,closedCount,drawLists);
+                    groupComplete && entered.load()==accepted && exited.load()==accepted ? 1:0,closedCount,drawLists);
                 return false;
             }
             if (packetDraw)
@@ -3180,6 +3230,8 @@ bool CHW12::RenderFrame()
     const double submissionMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-submitStart).count();
     ++m_recordFrames;
     frame.timestampPending=bool(frame.timestamps); frame.timestampSample=m_recordFrames>30;
+    // Новый submission не наследует привязку, даже если CPU-массив заполнен.
+    frame.timestampSampleIndex=-1;
     if (m_recordFrames>30) {
         ++m_recordSamples; m_recordMs+=recordingMs; m_queueSubmitMs+=submissionMs; m_recordScheduleMs+=scheduleMs; m_recordWaitMs+=recordWaitMs;
         // F3.5.4B: один срез на кадр, без I/O. Горячий участок не логируется.

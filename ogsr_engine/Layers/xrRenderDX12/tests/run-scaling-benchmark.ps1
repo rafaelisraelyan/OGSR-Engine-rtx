@@ -55,7 +55,7 @@ function Get-Stats {
     param($Values)
     $clean = @($Values | Where-Object { $null -ne $_ -and -not [double]::IsNaN($_) })
     if ($clean.Count -eq 0) {
-        return [pscustomobject]@{ Count = 0; Mean = $null; Min = $null; P5 = $null; P25 = $null; Median = $null; P75 = $null; P95 = $null; Max = $null; IQR = $null }
+        return [pscustomobject]@{ Count = 0; Mean = $null; Min = $null; P5 = $null; P25 = $null; Median = $null; P75 = $null; P95 = $null; P99 = $null; Max = $null; IQR = $null }
     }
     $sorted = @($clean | Sort-Object)
     $p25 = Get-Percentile -Sorted $sorted -Percent 25
@@ -70,6 +70,7 @@ function Get-Stats {
         Median = Get-Percentile -Sorted $sorted -Percent 50
         P75    = $p75
         P95    = Get-Percentile -Sorted $sorted -Percent 95
+        P99    = Get-Percentile -Sorted $sorted -Percent 99
         Max    = [double]$sorted[$sorted.Count - 1]
         IQR    = [double]$p75 - [double]$p25
     }
@@ -428,7 +429,7 @@ for ($runIndex = 0; $runIndex -lt $Runs; $runIndex++) {
                 if ($null -ne $v -and $v -ge 0) { $values += $v }
             }
             $st = Get-Stats -Values $values
-            foreach ($name in @("Count", "Mean", "Min", "P5", "P25", "Median", "P75", "P95", "Max", "IQR")) {
+            foreach ($name in @("Count", "Mean", "Min", "P5", "P25", "Median", "P75", "P95", "P99", "Max", "IQR")) {
                 $runStats[($metric + "_" + $name)] = $st.$name
             }
             foreach ($row in $frameRows) {
@@ -514,6 +515,7 @@ foreach ($group in $groups) {
             IQR     = $betweenStats.IQR
             P5      = $betweenStats.P5
             P95     = $betweenStats.P95
+            P99     = $betweenStats.P99
             Min     = $betweenStats.Min
             Max     = $betweenStats.Max
             Mean    = $betweenStats.Mean
@@ -521,6 +523,7 @@ foreach ($group in $groups) {
 
         $runIqrs = @($group.Group | ForEach-Object { [double]$_.($metric + "_IQR") })
         $runP95 = @($group.Group | ForEach-Object { [double]$_.($metric + "_P95") })
+        $runP99 = @($group.Group | ForEach-Object { [double]$_.($metric + "_P99") })
         [void]$within.Add([pscustomobject]@{
             Mode          = $first.Mode
             Draws         = $first.Draws
@@ -530,6 +533,7 @@ foreach ($group in $groups) {
             Runs          = $group.Count
             MedianOfIQR   = (Get-Stats -Values $runIqrs).Median
             MedianOfP95   = (Get-Stats -Values $runP95).Median
+            MedianOfP99   = (Get-Stats -Values $runP99).Median
         })
     }
 }
