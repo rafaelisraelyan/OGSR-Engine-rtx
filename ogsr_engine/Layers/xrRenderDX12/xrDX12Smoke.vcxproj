@@ -92,6 +92,7 @@
     <ClCompile Include="dx12fencewait_tests.cpp" />
     <ClCompile Include="dx12transform_tests.cpp" />
     <ClCompile Include="dx12geometry_tests.cpp" />
+    <ClCompile Include="dx12xrayasset_tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dx12log.h" />
@@ -106,8 +107,10 @@
     <ClInclude Include="dx12objectconstants.h" />
     <ClInclude Include="dx12transform_tests.h" />
     <ClInclude Include="dx12geometry_tests.h" />
+    <ClInclude Include="dx12xrayasset_tests.h" />
     <ClInclude Include="dx12geometrycatalog.h" />
     <ClInclude Include="dx12geometryregistry.h" />
+    <ClInclude Include="dx12xrayasset.h" />
     <ClInclude Include="dx12transformshader.h" />
   </ItemGroup>
   <ItemGroup>

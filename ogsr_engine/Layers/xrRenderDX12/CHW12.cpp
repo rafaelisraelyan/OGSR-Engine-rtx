@@ -119,6 +119,8 @@ bool IsIdentityWorld(const DirectX::XMFLOAT4X4& world)
 DirectX::XMFLOAT4 ObjectDebugTint(MeshSceneMode12 mode,
                                   const renderprep12::Object12& object)
 {
+    if (mode == MeshSceneMode12::XrayAsset)
+        return {1.0f, 1.0f, 1.0f, 1.0f};
     if (mode == MeshSceneMode12::Geometry)
     {
         if (object.visual.id == 1)
@@ -359,7 +361,57 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 
     // Geometry is uploaded after CreateSynchronization, when queue/fence
     // exist. The owner waits below before releasing upload buffers.
-    if (m_sceneMode == MeshSceneMode12::Geometry)
+    if (m_sceneMode == MeshSceneMode12::XrayAsset)
+    {
+        const char* reason = nullptr;
+        if (!LoadXrayOgf12(m_xrayOgfPath, m_xrayAsset, &reason))
+        {
+            dx12log::Write("[DX12] Initialize failed at X-Ray OGF: %s",
+                           reason ? reason : "unknown error");
+            return false;
+        }
+        m_xrayTexture = {};
+        m_xrayDdsLoadFailed = false;
+        if (!m_xrayDdsPath.empty())
+        {
+            if (!LoadXrayDds12(m_xrayDdsPath, m_xrayTexture, &reason))
+            {
+                m_xrayDdsLoadFailed = true;
+                dx12log::Write("[DX12] X-Ray DDS unavailable, using fallback: %s",
+                               reason ? reason : "unknown error");
+                m_xrayTexture = {};
+            }
+        }
+        else
+        {
+            dx12log::Write("[DX12] X-Ray DDS path omitted, using fallback texture");
+        }
+
+        m_xrayResources = {kXrayVisual12, kXrayMaterial12, kXrayPso12};
+        if (!m_geometryRegistry.BuildXrayScene(m_xrayAsset, m_xrayObjects))
+        {
+            dx12log::Write("[DX12] Initialize failed to build X-Ray scene");
+            return false;
+        }
+        if (!m_geometryRegistry.CreateXrayAsset(
+                m_device.Get(), m_commandQueue.Get(),
+                m_frameResources[0].commandAllocator.Get(),
+                m_frameResources[0].commandList.Get(),
+                m_xrayAsset,
+                m_xrayTexture.data.empty() ? nullptr : &m_xrayTexture))
+        {
+            dx12log::Write("[DX12] Initialize failed at X-Ray asset Create");
+            return false;
+        }
+        m_gpuWorkSubmitted = true;
+        if (m_xrayPostSubmitFault)
+        {
+            dx12log::Write("[xray-init-fault] post-submit failure after "
+                           "ExecuteCommandLists, before GPU drain");
+            return false;
+        }
+    }
+    else if (m_sceneMode == MeshSceneMode12::Geometry)
     {
         // CPU-only scene construction must finish before the registry submits
         // GPU copy commands. After Create() returns true there is no fallible
@@ -434,10 +486,13 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
-    if (m_sceneMode == MeshSceneMode12::Geometry)
+    if (m_sceneMode == MeshSceneMode12::Geometry ||
+        m_sceneMode == MeshSceneMode12::XrayAsset)
         m_geometryRegistry.OnUploadComplete();
     else
         m_mesh.OnUploadComplete();
+    if (m_sceneMode == MeshSceneMode12::XrayAsset)
+        m_xrayTextureFallback = m_geometryRegistry.AssetTextureFallback();
 
     // F3.1: readback buffer для автоматического depth-теста (только тестовый
     // режим). Создаётся после depth buffer, потому что GetCopyableFootprints
@@ -1747,6 +1802,176 @@ CHW12::DepthTestResult CHW12::VerifyGeometryScene()
     return result;
 }
 
+CHW12::DepthTestResult CHW12::VerifyXrayAsset()
+{
+    DepthTestResult result;
+    result.passed = false;
+    if (m_sceneMode != MeshSceneMode12::XrayAsset || !m_xrayTest ||
+        !m_readbackBuffer || m_backgroundDepthBytes == 0)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "X-Ray oracle requires xray scene and depth readback");
+        return result;
+    }
+    if (m_xrayObjects.size() != 4 ||
+        m_visiblePackets != m_xrayObjects.size())
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "X-Ray oracle expects four instances, got objects=%zu packets=%u",
+                 m_xrayObjects.size(), m_visiblePackets);
+        return result;
+    }
+    if (m_xrayDdsExplicit &&
+        (m_xrayDdsLoadFailed || m_xrayTextureFallback))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "explicit X-Ray DDS failed to load; fallback is not a textured PASS");
+        dx12log::Write("[xray-frame] FAIL: %s", result.message);
+        return result;
+    }
+    if (!m_xrayTextureFallback && m_xrayTexture.data.empty())
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "textured X-Ray oracle has no loaded DDS");
+        return result;
+    }
+    {
+        const renderprep12::Object12& object = m_xrayObjects[0];
+        const DirectX::XMFLOAT4X4 vp = m_camera.CaptureViewProjection();
+        const DirectX::XMVECTOR center = DirectX::XMVectorSet(
+            object.sphere.center.x, object.sphere.center.y,
+            object.sphere.center.z, 1.0f);
+        const DirectX::XMVECTOR clip = DirectX::XMVector4Transform(
+            DirectX::XMVector4Transform(center, DirectX::XMLoadFloat4x4(&object.world)),
+            DirectX::XMLoadFloat4x4(&vp));
+        DirectX::XMFLOAT4 c{};
+        DirectX::XMStoreFloat4(&c, clip);
+        dx12log::Write("[xray-frame] object bounds=(%f,%f,%f)..(%f,%f,%f) clip=(%f,%f,%f,%f)",
+                       object.minimum.x, object.minimum.y, object.minimum.z,
+                       object.maximum.x, object.maximum.y, object.maximum.z,
+                       c.x, c.y, c.z, c.w);
+    }
+
+    bool timedOut = false;
+    if (!WaitForFenceValue(m_fenceValue, timedOut))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "X-Ray GPU synchronization failed: %s",
+                 timedOut ? "GPU timeout" : "fence wait failed");
+        return result;
+    }
+    const UINT64 readBytes = m_backgroundDepthOffset + m_backgroundDepthBytes;
+    if (readBytes > m_readbackAllocatedBytes)
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "X-Ray readback range exceeds allocation");
+        return result;
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = readBytes;
+    if (FAILED(m_readbackBuffer->Map(0, &readRange, &mapped)))
+    {
+        snprintf(result.message, sizeof(result.message),
+                 "X-Ray readback Map failed");
+        return result;
+    }
+    struct UnmapGuard
+    {
+        ID3D12Resource* resource;
+        ~UnmapGuard()
+        {
+            if (resource)
+            {
+                D3D12_RANGE written = {};
+                written.Begin = 0;
+                written.End = 0;
+                resource->Unmap(0, &written);
+            }
+        }
+    } unmapGuard{m_readbackBuffer.Get()};
+
+    const uint8_t* const data = static_cast<const uint8_t*>(mapped);
+    const UINT rowPitch = m_copyableFootprint.Footprint.RowPitch;
+    const UINT64 offset = m_copyableFootprint.Offset;
+    uint64_t imageHash = 14695981039346656037ull;
+    for (uint32_t y = 0; y < m_height; ++y)
+    {
+        const uint8_t* row = data + offset + static_cast<UINT64>(y) * rowPitch;
+        for (uint32_t x = 0; x < m_width; ++x)
+        {
+            const uint8_t* pixel = row + static_cast<UINT64>(x) * 4;
+            for (uint32_t c = 0; c < 4; ++c)
+            {
+                imageHash ^= pixel[c];
+                imageHash *= 1099511628211ull;
+            }
+        }
+    }
+    dx12log::Write("[xray-frame] hash=%016llx texture=%s fallback=%d",
+                   static_cast<unsigned long long>(imageHash),
+                   m_xrayAsset.textureName.c_str(),
+                   m_xrayTextureFallback ? 1 : 0);
+
+    const uint32_t px = m_width / 2;
+    const uint32_t py = m_height / 2;
+    const uint8_t* row = data + offset + static_cast<UINT64>(py) * rowPitch;
+    const uint8_t* pixel = row + static_cast<UINT64>(px) * 4;
+    bool pixelOk = pixel[3] == 255 &&
+                   !(pixel[0] == 18 && pixel[1] == 41 && pixel[2] == 82);
+    if (m_xrayTextureFallback)
+        pixelOk = pixel[0] == 255 && pixel[1] == 128 &&
+                  pixel[2] == 32 && pixel[3] == 255;
+    dx12log::Write("[xray-frame] center (%u,%u) actual(%u,%u,%u,%u) %s",
+                   px, py, pixel[0], pixel[1], pixel[2], pixel[3],
+                   pixelOk ? "PASS" : "FAIL");
+
+    const UINT depthRowPitch = m_backgroundDepthFootprint.Footprint.RowPitch;
+    const uint8_t* const depthData = data + m_backgroundDepthOffset;
+    bool depthOk = true;
+    float minDepth = 1.0f;
+    float maxDepth = 0.0f;
+    for (uint32_t y = 0; y < 4; ++y)
+    {
+        for (uint32_t x = 0; x < 4; ++x)
+        {
+            float depth = 0.0f;
+            memcpy(&depth, depthData + static_cast<UINT64>(y) * depthRowPitch +
+                           static_cast<UINT64>(x) * sizeof(float), sizeof(depth));
+            minDepth = (std::min)(minDepth, depth);
+            maxDepth = (std::max)(maxDepth, depth);
+            if (!(depth > 0.0f && depth < 1.0f))
+                depthOk = false;
+        }
+    }
+    dx12log::Write("[xray-frame] center depth min=%f max=%f %s",
+                   static_cast<double>(minDepth), static_cast<double>(maxDepth),
+                   depthOk ? "PASS" : "FAIL");
+
+    const uint32_t bgX = m_width / 2;
+    const uint32_t bgY = m_height / 18;
+    const uint8_t* bgRow = data + offset + static_cast<UINT64>(bgY) * rowPitch;
+    const uint8_t* bgPixel = bgRow + static_cast<UINT64>(bgX) * 4;
+    const bool bgOk = bgPixel[0] == 18 && bgPixel[1] == 41 &&
+                      bgPixel[2] == 82 && bgPixel[3] == 255;
+    dx12log::Write("[xray-frame] background actual(%u,%u,%u,%u) %s",
+                   bgPixel[0], bgPixel[1], bgPixel[2], bgPixel[3],
+                   bgOk ? "PASS" : "FAIL");
+
+    result.passed = pixelOk && depthOk && bgOk;
+    snprintf(result.message, sizeof(result.message),
+             result.passed
+                 ? (m_xrayTextureFallback
+                        ? "real OGF rendered with explicit fallback texture"
+                        : "real OGF/DDS rendered through indexed packet path")
+                 : "X-Ray pixel/depth mismatch");
+    dx12log::Write("[xray-frame] %s: %s",
+                   result.passed ? "PASS" : "FAIL", result.message);
+    return result;
+}
+
 bool CHW12::CheckFenceForRemoval(uint64_t completed, uint64_t value, const wchar_t* stage)
 {
     if (completed != kFenceRemovedMarker)
@@ -2261,7 +2486,8 @@ bool CHW12::WriteObjectConstants(
     const renderprep12::OrderedFrame12& ordered)
 {
     if (m_sceneMode != MeshSceneMode12::Transforms &&
-        m_sceneMode != MeshSceneMode12::Geometry)
+        m_sceneMode != MeshSceneMode12::Geometry &&
+        m_sceneMode != MeshSceneMode12::XrayAsset)
         return true;
     if (!mapped)
     {
@@ -2430,6 +2656,8 @@ bool CHW12::RenderFrame()
     renderprep12::FrameBatchPlan12 packetPlan;
     ResolvedFrame12 resolvedFrame;
     const bool geometryScene = (m_sceneMode == MeshSceneMode12::Geometry);
+    const bool xrayScene = (m_sceneMode == MeshSceneMode12::XrayAsset);
+    const bool registryScene = geometryScene || xrayScene;
     const bool packetDraw = (m_drawSource == DrawSource::Packets);
     try {
         // F3.5.3B TEST ONLY: одноразовый отказ внутри prepare-пути. Нужен,
@@ -2443,6 +2671,8 @@ bool CHW12::RenderFrame()
         std::span<const renderprep12::Object12> sceneObjects;
         if (m_sceneMode == MeshSceneMode12::Geometry)
             sceneObjects = std::span<const renderprep12::Object12>(m_geometryObjects);
+        else if (m_sceneMode == MeshSceneMode12::XrayAsset)
+            sceneObjects = std::span<const renderprep12::Object12>(m_xrayObjects);
         else
             sceneObjects = std::span<const renderprep12::Object12>(m_mesh.Objects());
         std::span<const renderprep12::Object12> objects = sceneObjects;
@@ -2467,7 +2697,9 @@ bool CHW12::RenderFrame()
                 std::chrono::steady_clock::now()-snapshotStart).count();
             renderprep12::OrderingTimings12 timing;
             ordered=renderprep12::PrepareOrdered(
-                snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing);
+                snapshot,m_sceneGeneration,m_prepMode,m_jobs,timing,
+                xrayScene ? std::span<const renderprep12::Resource12>(m_xrayResources)
+                          : std::span<const renderprep12::Resource12>());
             serialMs=timing.serial.total;
             parallelMs=timing.parallel.total;
         }
@@ -2530,6 +2762,40 @@ bool CHW12::RenderFrame()
                 m_prepFailed=true;
                 m_recordFailed=true;
                 dx12log::Write("[geometry-frame] FAIL: unknown resolution exception");
+                return false;
+            }
+        }
+        else if (xrayScene)
+        {
+            try
+            {
+                if (!ResolveXrayFrame(
+                        ordered, m_sceneGeneration,
+                        m_geometryRegistry.AssetVertexView(),
+                        m_geometryRegistry.AssetIndexView(),
+                        m_geometryRegistry.AssetIndexCount(),
+                        resolvedFrame, &reason))
+                {
+                    m_prepFailed=true;
+                    m_recordFailed=true;
+                    dx12log::Write("[xray-frame] FAIL: %s",
+                                   reason ? reason : "resolution failed");
+                    return false;
+                }
+            }
+            catch (const std::exception& error)
+            {
+                m_prepFailed=true;
+                m_recordFailed=true;
+                dx12log::Write("[xray-frame] FAIL: resolution exception: %s",
+                               error.what());
+                return false;
+            }
+            catch (...)
+            {
+                m_prepFailed=true;
+                m_recordFailed=true;
+                dx12log::Write("[xray-frame] FAIL: unknown resolution exception");
                 return false;
             }
         }
@@ -2625,7 +2891,8 @@ bool CHW12::RenderFrame()
     // F3.5.6A: slot fence is confirmed above. The owner writes per-object
     // constants before Reset/recording; workers never touch mapped memory.
     if ((m_sceneMode == MeshSceneMode12::Transforms ||
-         m_sceneMode == MeshSceneMode12::Geometry) &&
+         m_sceneMode == MeshSceneMode12::Geometry ||
+         m_sceneMode == MeshSceneMode12::XrayAsset) &&
         !WriteObjectConstants(frame.mapped, ordered))
     {
         m_recordFailed = true;
@@ -2872,7 +3139,7 @@ bool CHW12::RenderFrame()
                         const auto objectCB=frame.constantBuffer->GetGPUVirtualAddress();
                         const GpuMeshRegistry12* geometryRegistry=&m_geometryRegistry;
                         const ResolvedFrame12* resolvedPtr=&resolvedFrame;
-                        const bool geometry=geometryScene;
+                        const bool geometry=registryScene;
                         const auto dsv=m_dsv;
                         if (packetDraw)
                         {
@@ -3047,7 +3314,7 @@ bool CHW12::RenderFrame()
                 {
                     if (InjectRecordingFailure(2,i+1)) return false;
                     uint32_t draws=0;
-                    const bool recorded = geometryScene
+                    const bool recorded = registryScene
                         ? RecordGeometryPacketList(
                               cmd,m_geometryRegistry,resolvedFrame,packetPlan,i,
                               frame.constantBuffer->GetGPUVirtualAddress(),
@@ -3084,7 +3351,7 @@ bool CHW12::RenderFrame()
         {
             if (InjectRecordingFailure(2,0)) return false;
             uint32_t draws=0;
-            const bool recorded = geometryScene
+            const bool recorded = registryScene
                 ? RecordGeometryPacketList(
                       cmd,m_geometryRegistry,resolvedFrame,packetPlan,0,
                       frame.constantBuffer->GetGPUVirtualAddress(),
@@ -3612,6 +3879,12 @@ void CHW12::Shutdown()
         m_mesh.Release();
         m_geometryRegistry.Release();
         m_geometryObjects.clear();
+        m_xrayObjects.clear();
+        m_xrayResources.clear();
+        m_xrayAsset = {};
+        m_xrayTexture = {};
+        m_xrayDdsLoadFailed = false;
+        m_xrayTextureFallback = false;
     }
 
     if (m_debugLayerEnabled)

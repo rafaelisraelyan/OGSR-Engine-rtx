@@ -190,6 +190,7 @@ bool Equivalent(const ResolvedFrame12& a, const ResolvedFrame12& b)
         const GpuDraw12& x = a.draws[i];
         const GpuDraw12& y = b.draws[i];
         if (x.meshIndex != y.meshIndex ||
+            x.pipeline != y.pipeline ||
             x.objectConstantIndex != y.objectConstantIndex ||
             x.firstIndex != y.firstIndex ||
             x.indexCount != y.indexCount ||

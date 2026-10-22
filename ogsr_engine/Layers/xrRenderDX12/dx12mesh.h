@@ -34,7 +34,8 @@ enum class MeshSceneMode12 : uint8_t
 {
     Legacy,
     Transforms,
-    Geometry
+    Geometry,
+    XrayAsset
 };
 
 class SmokeMesh12

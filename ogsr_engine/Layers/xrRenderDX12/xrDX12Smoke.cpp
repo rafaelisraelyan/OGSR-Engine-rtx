@@ -6,6 +6,7 @@
 #include "dx12packetplan.h"
 #include "dx12transform_tests.h"
 #include "dx12geometry_tests.h"
+#include "dx12xrayasset_tests.h"
 #include "gr/jobs/JobSystem.h"
 #include "gr/jobs/JobConfig.h"
 #include "gr/jobs/JobStats.h"
@@ -74,6 +75,36 @@ static bool WriteFrameMetrics(const std::wstring& path, const CHW12& hw)
     fclose(file);
     dx12log::Write("[metrics] wrote %u per-frame samples to CSV", count);
     return true;
+}
+
+// F3.6A FINAL CLI: recognize the parser's own options when a required value
+// is omitted. A path such as "-custom.dds" remains a valid file name.
+static bool IsKnownCliOption(const wchar_t* text)
+{
+    if (!text)
+        return false;
+    static const wchar_t* const options[] = {
+        L"-backgroundtest", L"-commandlists", L"-cpubench", L"-cpuselftest",
+        L"-cputest", L"-depthtest", L"-draws", L"-drawsource",
+        L"-fencewaitselftest",
+        L"-fixedpose", L"-freeaspect", L"-geometryframes",
+        L"-geometrypostsubmitfault", L"-geometryselftest", L"-geometrytest",
+        L"-jobgrain", L"-jobs", L"-jobsverify", L"-jobworkers", L"-lists",
+        L"-metrics", L"-nodebug", L"-nogbv", L"-orderingselftest",
+        L"-packetbatchlimit", L"-packetfault", L"-packetlists",
+        L"-packetplanselftest", L"-prepfault", L"-prepframes",
+        L"-prepselftest", L"-recordfault", L"-renderprep", L"-resizetest",
+        L"-scene", L"-snapshotselftest", L"-stress", L"-timerfault",
+        L"-transformframes", L"-transformselftest", L"-transformtest",
+        L"-visibilityselftest", L"-xrayassetselftest", L"-xraydds",
+        L"-xrayframes", L"-xrayogf", L"-xraypostsubmitfault", L"-xraytest"
+    };
+    for (const wchar_t* option : options)
+    {
+        if (_wcsicmp(text, option) == 0)
+            return true;
+    }
+    return false;
 }
 
 // F3.5.5A TEST ONLY: packet-path fault selection. No production behavior.
@@ -488,6 +519,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool fenceWaitSelfTest=false;
     bool transformSelfTest=false;
     bool geometrySelfTest=false;
+    bool xraySelfTest=false;
     bool multiList=false, parallelRecording=false; unsigned recordFault=~0u, recordFaultList=0;
     // F3.5.4A: независимые параметры нагрузки и числа списков.
     uint32_t drawCount=2, drawLists=2;
@@ -500,10 +532,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool packetDraw=false;
     bool transformsScene=false;
     bool geometryScene=false;
+    bool xrayScene=false;
     bool transformTest=false;
     bool geometryTest=false;
+    bool xrayTest=false;
     uint32_t transformFrames=1;
     uint32_t geometryFrames=1;
+    uint32_t xrayFrames=1;
+    std::wstring xrayOgfPath;
+    std::wstring xrayDdsPath;
     bool drawsSpecified=false, listsSpecified=false;
     bool packetListsSpecified=false, packetBatchLimitSpecified=false;
     CHW12::PacketTestFault packetFault=CHW12::PacketTestFault::None;
@@ -511,6 +548,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     bool timerFault=false; // F3.3.0a TEST ONLY: одноразовый отказ WM_TIMER-пути
     bool prepFault=false;  // F3.5.3B TEST ONLY: восстановление после m_prepFailed
     bool geometryPostSubmitFault=false; // F3.5.6B TEST ONLY: lifetime после GPU submit
+    bool xrayPostSubmitFault=false; // F3.6A TEST ONLY: lifetime после asset submit
     uint32_t prepFrames=0;
     bool fixedPose = false;
     bool depthTest = false;
@@ -542,9 +580,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i],L"-scene")==0) {
                     if (i+1<argc) {
                         ++i;
-                        if (!_wcsicmp(argv[i],L"legacy")) { transformsScene=false; geometryScene=false; }
-                        else if (!_wcsicmp(argv[i],L"transforms")) { transformsScene=true; geometryScene=false; }
-                        else if (!_wcsicmp(argv[i],L"geometry")) { transformsScene=false; geometryScene=true; }
+                        if (!_wcsicmp(argv[i],L"legacy")) { transformsScene=false; geometryScene=false; xrayScene=false; }
+                        else if (!_wcsicmp(argv[i],L"transforms")) { transformsScene=true; geometryScene=false; xrayScene=false; }
+                        else if (!_wcsicmp(argv[i],L"geometry")) { transformsScene=false; geometryScene=true; xrayScene=false; }
+                        else if (!_wcsicmp(argv[i],L"xrayasset") || !_wcsicmp(argv[i],L"xray")) { transformsScene=false; geometryScene=false; xrayScene=true; }
                         else badArgument=true;
                     } else badArgument=true;
                 }
@@ -610,6 +649,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-fencewaitselftest") == 0) fenceWaitSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-transformselftest") == 0) transformSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-geometryselftest") == 0) geometrySelfTest=true;
+                else if (_wcsicmp(argv[i], L"-xrayassetselftest") == 0) xraySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-visibilityselftest") == 0) visibilitySelfTest=true;
                 else if (_wcsicmp(argv[i], L"-snapshotselftest") == 0) snapshotSelfTest=true;
                 else if (_wcsicmp(argv[i], L"-prepselftest") == 0) prepSelfTest=true;
@@ -619,6 +659,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 else if (_wcsicmp(argv[i], L"-prepfault") == 0) prepFault=true;
                 else if (_wcsicmp(argv[i], L"-geometrypostsubmitfault") == 0)
                     geometryPostSubmitFault=true;
+                else if (_wcsicmp(argv[i], L"-xraypostsubmitfault") == 0)
+                    xrayPostSubmitFault=true;
                 else if (_wcsicmp(argv[i], L"-prepframes") == 0) {
                     if (i+1<argc && _wtoi(argv[i+1])>0) prepFrames=static_cast<uint32_t>(_wtoi(argv[++i]));
                     else badArgument=true;
@@ -652,6 +694,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                         const int value=_wtoi(argv[++i]);
                         if (value<1 || value>256) badArgument=true;
                         else geometryFrames=static_cast<uint32_t>(value);
+                    } else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i], L"-xrayogf") == 0) {
+                    if (i+1<argc) xrayOgfPath=argv[++i];
+                    else badArgument=true;
+                }
+                else if (_wcsicmp(argv[i], L"-xraydds") == 0) {
+                    if (i+1>=argc) {
+                        badArgument=true;
+                        dx12log::Write("[smoke] -xraydds requires a non-empty path");
+                    }
+                    else {
+                        ++i;
+                        if (!argv[i] || argv[i][0] == L'\0' ||
+                            IsKnownCliOption(argv[i])) {
+                            badArgument=true;
+                            dx12log::Write("[smoke] -xraydds requires a non-empty path");
+                        }
+                        else xrayDdsPath=argv[i];
+                    }
+                }
+                else if (_wcsicmp(argv[i], L"-xraytest") == 0)
+                    xrayTest = true;
+                else if (_wcsicmp(argv[i], L"-xrayframes") == 0) {
+                    if (i+1<argc) {
+                        const int value=_wtoi(argv[++i]);
+                        if (value<1 || value>256) badArgument=true;
+                        else xrayFrames=static_cast<uint32_t>(value);
                     } else badArgument=true;
                 }
                 else if (_wcsicmp(argv[i], L"-backgroundtest") == 0)
@@ -853,20 +923,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Write("[smoke] FATAL: -depthtest requires -draws >= 2 (two-cube oracle)");
         badArgument = true;
     }
-    if ((transformsScene || geometryScene) && !packetDraw)
+    if ((transformsScene || geometryScene || xrayScene) && !packetDraw)
     {
-        dx12log::Write("[smoke] FATAL: -scene transforms|geometry requires -drawsource packets");
+        dx12log::Write("[smoke] FATAL: -scene transforms|geometry|xrayasset requires -drawsource packets");
         badArgument = true;
     }
     if (transformTest &&
-        (!transformsScene || !packetDraw || depthTest || backgroundTest || geometryTest))
+        (!transformsScene || !packetDraw || depthTest || backgroundTest ||
+         geometryTest || xrayTest))
     {
         dx12log::Write("[smoke] FATAL: -transformtest requires -scene transforms, "
                        "-drawsource packets and no other oracle");
         badArgument = true;
     }
     if (geometryTest &&
-        (!geometryScene || !packetDraw || depthTest || backgroundTest || transformTest))
+        (!geometryScene || !packetDraw || depthTest || backgroundTest ||
+         transformTest || xrayTest))
     {
         dx12log::Write("[smoke] FATAL: -geometrytest requires -scene geometry, "
                        "-drawsource packets and no other oracle");
@@ -882,9 +954,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Write("[smoke] FATAL: -geometryframes requires -geometrytest");
         badArgument = true;
     }
+    if (xrayTest &&
+        (!xrayScene || !packetDraw || depthTest || backgroundTest ||
+         transformTest || geometryTest || xrayOgfPath.empty()))
+    {
+        dx12log::Write("[smoke] FATAL: -xraytest requires -scene xrayasset, "
+                       "-drawsource packets, -xrayogf and no other oracle");
+        badArgument = true;
+    }
+    if (xrayScene && xrayOgfPath.empty())
+    {
+        dx12log::Write("[smoke] FATAL: -scene xrayasset requires -xrayogf");
+        badArgument = true;
+    }
+    if (!xrayTest && xrayFrames != 1)
+    {
+        dx12log::Write("[smoke] FATAL: -xrayframes requires -xraytest");
+        badArgument = true;
+    }
     if (geometryPostSubmitFault && !geometryScene)
     {
         dx12log::Write("[smoke] FATAL: -geometrypostsubmitfault requires -scene geometry");
+        badArgument = true;
+    }
+    if (xrayPostSubmitFault && !xrayScene)
+    {
+        dx12log::Write("[smoke] FATAL: -xraypostsubmitfault requires -scene xrayasset");
         badArgument = true;
     }
     const uint32_t faultLists = packetDraw
@@ -906,6 +1001,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (fenceWaitSelfTest) { const bool ok=dx12fence12::RunFenceWaitTests(); dx12log::Close(); return ok?0:1; }
     if (transformSelfTest) { const bool ok=smoketransform12::RunTransformTests(); dx12log::Close(); return ok?0:1; }
     if (geometrySelfTest) { const bool ok=smokegeometry12::RunGeometryTests(); dx12log::Close(); return ok?0:1; }
+    if (xraySelfTest) { const bool ok=smokexray12::RunXrayAssetTests(
+        xrayOgfPath.empty()?nullptr:xrayOgfPath.c_str(),
+        xrayDdsPath.empty()?nullptr:xrayDdsPath.c_str());
+        dx12log::Close(); return ok?0:1; }
     if (visibilitySelfTest) { const bool ok=renderprep12::RunVisibilityTests(); dx12log::Close(); return ok?0:1; }
     if (snapshotSelfTest) { const bool ok=renderprep12::RunRepresentativeTests(); dx12log::Close(); return ok?0:1; }
     if (prepSelfTest) { const bool ok=renderprep12::RunTests(); dx12log::Close(); return ok?0:1; }
@@ -926,7 +1025,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // BLOCKER 4: при -depthtest камера должна оставаться неизменной до
     // завершения теста. Иначе UpdateCamera в цикле каждый кадр меняет
     // ракурс, и пиксели не воспроизводимы между прогонами.
-    fixedPose = fixedPose || depthTest || transformTest || geometryTest;
+    fixedPose = fixedPose || depthTest || transformTest || geometryTest || xrayTest;
     g_fixedPose = fixedPose;
 
     dx12log::Write("[smoke] modes: fixedPose=%d, depthTest=%d, aspectLock=%s",
@@ -1008,14 +1107,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         dx12log::Close();
         return 1;
     }
-    if (!hw12.SetSceneMode(geometryScene
-                               ? MeshSceneMode12::Geometry
-                               : (transformsScene ? MeshSceneMode12::Transforms
-                                                  : MeshSceneMode12::Legacy)))
+    if (!hw12.SetSceneMode(xrayScene
+                               ? MeshSceneMode12::XrayAsset
+                               : (geometryScene
+                                      ? MeshSceneMode12::Geometry
+                                      : (transformsScene ? MeshSceneMode12::Transforms
+                                                         : MeshSceneMode12::Legacy))))
     {
         dx12log::Write("[smoke] FATAL: scene mode rejected by CHW12");
         dx12log::Close();
         return 1;
+    }
+    if (xrayScene)
+    {
+        if (!hw12.SetXrayAssetPaths(xrayOgfPath, xrayDdsPath))
+        {
+            dx12log::Write("[smoke] FATAL: X-Ray asset paths rejected by CHW12");
+            dx12log::Close();
+            return 1;
+        }
     }
     hw12.SetPacketTestFault(packetFault);
     if (packetDraw && multiList)
@@ -1046,23 +1156,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                        drawCount, drawLists, noDebug ? 0 : 1, (noDebug || noGbv) ? 0 : 1);
     dx12log::Write("[smoke] drawsource=%s packetfault=%s",
                    packetDraw ? "packets" : "synthetic", PacketFaultName(packetFault));
-    dx12log::Write("[smoke] scene=%s transformframes=%u geometryframes=%u",
-                   geometryScene ? "geometry" : (transformsScene ? "transforms" : "legacy"),
+    dx12log::Write("[smoke] scene=%s transformframes=%u geometryframes=%u xrayframes=%u",
+                   xrayScene ? "xrayasset"
+                             : (geometryScene ? "geometry"
+                                              : (transformsScene ? "transforms" : "legacy")),
                    transformTest ? transformFrames : 0u,
-                   geometryTest ? geometryFrames : 0u);
+                   geometryTest ? geometryFrames : 0u,
+                   xrayTest ? xrayFrames : 0u);
 
     // F3.1: настройка режимов тестирования.
     hw12.SetMultiList(multiList,parallelRecording);
     hw12.SetBackgroundTest(backgroundTest);
     hw12.SetTransformTest(transformTest);
     hw12.SetGeometryTest(geometryTest);
-    hw12.SetTestMode(depthTest || backgroundTest || transformTest || geometryTest);
+    hw12.SetXrayTest(xrayTest);
+    hw12.SetTestMode(depthTest || backgroundTest || transformTest ||
+                     geometryTest || xrayTest);
     if (geometryPostSubmitFault)
     {
         dx12log::Write("[smoke] TEST ONLY: geometry post-submit failure armed");
         hw12.ArmGeometryPostSubmitFailure();
     }
-    if (depthTest || fixedPose || transformTest || geometryTest)
+    if (xrayPostSubmitFault)
+    {
+        dx12log::Write("[smoke] TEST ONLY: X-Ray post-submit failure armed");
+        hw12.ArmXrayPostSubmitFailure();
+    }
+    if (depthTest || fixedPose || transformTest || geometryTest || xrayTest)
     {
         // Фиксированный ракурс для детерминированных тестов и сравнения
         // кадров между прогонами.
@@ -1355,6 +1475,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             dx12log::Write("[smoke] -geometrytest: FAIL - %s", testResult.message);
         dx12log::Close();
         return testResult.passed && g_cpuScene.mismatchCount == 0 ? 0 : 1;
+    }
+
+    if (xrayTest)
+    {
+        for (uint32_t frame = 0; frame < xrayFrames; ++frame)
+        {
+            if (!hw12.RenderFrame())
+            {
+                dx12log::Write("[smoke] -xraytest: RenderFrame failed at frame %u, "
+                               "device removed=%d, gpu state unknown=%d",
+                               frame, hw12.IsDeviceRemoved() ? 1 : 0,
+                               hw12.IsGpuStateUnknown() ? 1 : 0);
+                hw12.Shutdown();
+                StopJobs();
+                g_hw = nullptr;
+                DestroyWindow(hwnd);
+                UnregisterClassW(kWindowClass, hInstance);
+                dx12log::Close();
+                return 1;
+            }
+        }
+        CHW12::DepthTestResult testResult = hw12.VerifyXrayAsset();
+        dx12log::Write("[smoke] -xraytest: %s",
+                       testResult.passed ? "PASS" : "FAIL");
+        hw12.Shutdown();
+        StopJobs();
+        g_hw = nullptr;
+        UnregisterClassW(kWindowClass, hInstance);
+        if (!testResult.passed)
+            dx12log::Write("[smoke] -xraytest: FAIL - %s", testResult.message);
+        dx12log::Close();
+        return testResult.passed ? 0 : 1;
     }
 
     MSG msg = {};

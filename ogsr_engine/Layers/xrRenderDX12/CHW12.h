@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -120,6 +122,7 @@ public:
     // F3.5.6B TEST ONLY: fail Initialize after geometry copy commands were
     // submitted but before the normal drain. Exercises Shutdown lifetime.
     void ArmGeometryPostSubmitFailure() { m_geometryPostSubmitFault = true; }
+    void ArmXrayPostSubmitFailure() { m_xrayPostSubmitFault = true; }
 
 
     // F3.3.0a TEST ONLY — WM_TIMER fault injection.
@@ -205,7 +208,8 @@ public:
         if (!m_initialized)
         {
             m_backgroundTest = enabled;
-            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
+            m_depthReadback = m_backgroundTest || m_transformTest ||
+                              m_geometryTest || m_xrayTest;
         }
     }
     DepthTestResult VerifyBackgroundOnly();
@@ -217,7 +221,8 @@ public:
         if (!m_initialized)
         {
             m_transformTest = enabled;
-            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
+            m_depthReadback = m_backgroundTest || m_transformTest ||
+                              m_geometryTest || m_xrayTest;
         }
     }
     DepthTestResult VerifyTransformScene();
@@ -228,10 +233,33 @@ public:
         if (!m_initialized)
         {
             m_geometryTest = enabled;
-            m_depthReadback = m_backgroundTest || m_transformTest || m_geometryTest;
+            m_depthReadback = m_backgroundTest || m_transformTest ||
+                              m_geometryTest || m_xrayTest;
         }
     }
     DepthTestResult VerifyGeometryScene();
+
+    // F3.6A TEST ONLY: one real X-Ray OGF + BC1 DDS loaded from external
+    // loose files. Missing DDS selects the explicit fallback texture.
+    bool SetXrayAssetPaths(const std::wstring& ogf, const std::wstring& dds)
+    {
+        if (m_initialized || ogf.empty())
+            return false;
+        m_xrayOgfPath = ogf;
+        m_xrayDdsPath = dds;
+        m_xrayDdsExplicit = !dds.empty();
+        return true;
+    }
+    void SetXrayTest(bool enabled)
+    {
+        if (!m_initialized)
+        {
+            m_xrayTest = enabled;
+            m_depthReadback = m_backgroundTest || m_transformTest ||
+                              m_geometryTest || m_xrayTest;
+        }
+    }
+    DepthTestResult VerifyXrayAsset();
 
 private:
     bool m_multiList=false, m_parallelRecording=false, m_recordFailed=false;
@@ -394,6 +422,18 @@ private:
     GpuMeshRegistry12 m_geometryRegistry;
     std::vector<renderprep12::Object12> m_geometryObjects;
 
+    // F3.6A: one real external X-Ray asset and its immutable packet scene.
+    XrayAssetData12 m_xrayAsset;
+    XrayTextureData12 m_xrayTexture;
+    std::vector<renderprep12::Object12> m_xrayObjects;
+    std::vector<renderprep12::Resource12> m_xrayResources;
+    std::wstring m_xrayOgfPath;
+    std::wstring m_xrayDdsPath;
+    bool m_xrayDdsExplicit = false;
+    bool m_xrayDdsLoadFailed = false;
+    bool m_xrayTextureFallback = false;
+    bool m_xrayTest = false;
+
     // F3.1: камера. Значение-член, как m_mesh: без COM-объектов, только
     // математика. Тестируема на CPU без GPU и переносима в IX-Ray-адаптер.
     SmokeCamera12 m_camera;
@@ -480,8 +520,9 @@ private:
     // GPU получал команды: до первой отправки WaitForGpu бессмысленен,
     // а SetEventOnCompletion на fence без signal завис бы навсегда.
     bool m_gpuWorkSubmitted = false;
-    // TEST ONLY: controlled post-submit Initialize failure (geometry).
+    // TEST ONLY: controlled post-submit Initialize failure (geometry/xray).
     bool m_geometryPostSubmitFault = false;
+    bool m_xrayPostSubmitFault = false;
 
     // Идемпотентность Shutdown. Отдельный флаг, а не m_stage: см. Shutdown().
     // НЕ является терминальным флагом: после штатного Shutdown повторный

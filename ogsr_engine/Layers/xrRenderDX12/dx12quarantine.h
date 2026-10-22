@@ -110,6 +110,18 @@ struct GpuQuarantine
     ID3D12RootSignature* registryRootSignature = nullptr;
     ID3D12PipelineState* registryPipelineState = nullptr;
 
+    // F3.6A: one fixed textured X-Ray asset. All storage is fixed-size; the
+    // emergency quarantine path performs no heap allocation.
+    ID3D12Resource* xrayVertexBuffer = nullptr;
+    ID3D12Resource* xrayIndexBuffer = nullptr;
+    ID3D12Resource* xrayUploadVertex = nullptr;
+    ID3D12Resource* xrayUploadIndex = nullptr;
+    ID3D12Resource* xrayTexture = nullptr;
+    ID3D12Resource* xrayTextureUpload = nullptr;
+    ID3D12DescriptorHeap* xraySrvHeap = nullptr;
+    ID3D12RootSignature* xrayRootSignature = nullptr;
+    ID3D12PipelineState* xrayPipelineState = nullptr;
+
     // F3.1: depth buffer и DSV heap. Depth buffer — чистый GPU-ресурс,
     // CPU в него не пишет никогда, но при неизвестном GPU completion
     // он может ещё читаться, поэтому передаётся карантину.

@@ -78,10 +78,12 @@ static void AffineInterval(const float* lo, const float* hi, const XMFLOAT4X4& m
         }
     }
 }
-static bool ValidResource(Resource12 r) {
-    return std::find(SyntheticResources12.begin(),SyntheticResources12.end(),r)!=SyntheticResources12.end();
+static bool ValidResource(Resource12 r, std::span<const Resource12> extraResources) {
+    return std::find(SyntheticResources12.begin(),SyntheticResources12.end(),r)!=SyntheticResources12.end() ||
+        std::find(extraResources.begin(),extraResources.end(),r)!=extraResources.end();
 }
-static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera, bool diagnosticClip=true) {
+static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera,
+    std::span<const Resource12> extraResources, bool diagnosticClip=true) {
     if (o.indexCount != 0)
     {
         // Indexed geometry range is validated against the render-owned mesh
@@ -101,7 +103,9 @@ static DrawPacket12 Kernel(const Object12& o, const XMFLOAT4X4& camera, bool dia
         (o.opacity<1 && !(o.flags&Transparent)) || !Finite3(o.sphere.center) ||
         !std::isfinite(o.sphere.radius) || o.sphere.radius<0)
         throw std::invalid_argument("invalid flags, opacity or sphere");
-    if (!ValidResource(o.visual) || !ValidResource(o.material) || !ValidResource(o.pso))
+    if (!ValidResource(o.visual, extraResources) ||
+        !ValidResource(o.material, extraResources) ||
+        !ValidResource(o.pso, extraResources))
         throw std::invalid_argument("stale or unknown synthetic resource");
     const float lo[] = {o.minimum.x,o.minimum.y,o.minimum.z}, hi[] = {o.maximum.x,o.maximum.y,o.maximum.z};
     for (int a=0;a<3;++a) if (!std::isfinite(lo[a]) || !std::isfinite(hi[a]) || lo[a]>hi[a])
@@ -203,10 +207,14 @@ PreparedFrame12 Prepare(const RenderSceneSnapshot12& snapshot, uint64_t liveGene
             auto group=jobs->CreateGroup();
             const auto submit=Clock::now();
             group.ParallelFor(static_cast<uint32_t>(snapshot.Objects().size()),snapshot.Objects().size()>2?64:1,[&](uint32_t begin,uint32_t end,uint32_t) {
-                for (auto i=begin;i<end;++i) scratch[i]=Kernel(snapshot.Objects()[i],snapshot.Camera());
+                for (auto i=begin;i<end;++i) scratch[i]=Kernel(
+                    snapshot.Objects()[i],snapshot.Camera(),
+                    std::span<const Resource12>());
             });
             time.submit=Ms(submit); const auto wait=Clock::now(); group.Wait(); time.wait=Ms(wait);
-        } else for (size_t i=0;i<snapshot.Objects().size();++i) scratch[i]=Kernel(snapshot.Objects()[i],snapshot.Camera());
+        } else for (size_t i=0;i<snapshot.Objects().size();++i)
+            scratch[i]=Kernel(snapshot.Objects()[i],snapshot.Camera(),
+                              std::span<const Resource12>());
         const double prepare=Ms(start);
         const auto merge=Clock::now();
         // Порядок исходного списка — порядок draw, без worker-dependent push_back.
@@ -262,7 +270,8 @@ bool VisibleWorld(const DrawPacket12& packet, const DirectX::XMFLOAT4X4& camera)
 }
 }
 PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t liveGeneration,
-    Mode mode, gr::jobs::JobSystem* jobs, VisibilityTimings12& timings) {
+    Mode mode, gr::jobs::JobSystem* jobs, VisibilityTimings12& timings,
+    std::span<const Resource12> extraResources) {
     timings={};
     if (!liveGeneration || snapshot.Generation()!=liveGeneration || !Finite(snapshot.Camera()))
         throw std::invalid_argument("invalid visibility snapshot");
@@ -296,7 +305,8 @@ PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t l
         auto phase=Clock::now();
         ranges(blocks,[&](size_t b) {
             const size_t end=std::min(count,(b+1)*blockSize);
-            for (size_t i=b*blockSize;i<end;++i) scratch[i]=Kernel(snapshot.Objects()[i],snapshot.Camera(),false);
+            for (size_t i=b*blockSize;i<end;++i) scratch[i]=Kernel(
+                snapshot.Objects()[i],snapshot.Camera(),extraResources,false);
         });
         time.preparation=Ms(phase);
         phase=Clock::now();
@@ -358,7 +368,8 @@ bool Equivalent(const OrderedFrame12& a, const OrderedFrame12& b) {
     return a.categories==b.categories && Equivalent(a.frame,b.frame);
 }
 OrderedFrame12 PrepareOrdered(const RenderSceneSnapshot12& snapshot, uint64_t generation,
-    Mode mode, gr::jobs::JobSystem* jobs, OrderingTimings12& timings) {
+    Mode mode, gr::jobs::JobSystem* jobs, OrderingTimings12& timings,
+    std::span<const Resource12> extraResources) {
     timings={};
     if (!snapshot.HasView()) throw std::invalid_argument("ordering requires immutable view");
     if (mode!=Mode::Serial && mode!=Mode::Parallel && mode!=Mode::Verify)
@@ -366,7 +377,8 @@ OrderedFrame12 PrepareOrdered(const RenderSceneSnapshot12& snapshot, uint64_t ge
     const auto run=[&](bool parallel, OrderingPhases12& time) {
         const auto start=Clock::now();
         VisibilityTimings12 visibility;
-        auto visible=PrepareVisible(snapshot,generation,parallel?Mode::Parallel:Mode::Serial,jobs,visibility);
+        auto visible=PrepareVisible(snapshot,generation,
+            parallel?Mode::Parallel:Mode::Serial,jobs,visibility,extraResources);
         time.visibility=Ms(start);
         const auto keyStart=Clock::now();
         const uint32_t count=detail::PacketCount(visible.packets.size());

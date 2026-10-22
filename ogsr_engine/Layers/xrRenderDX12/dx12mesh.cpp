@@ -263,9 +263,10 @@ bool SmokeMesh12::Create(
         dx12log::Write("[DX12][mesh] Create refused: null dependency");
         return false;
     }
-    if (mode == MeshSceneMode12::Geometry)
+    if (mode == MeshSceneMode12::Geometry ||
+        mode == MeshSceneMode12::XrayAsset)
     {
-        dx12log::Write("[DX12][mesh] Create refused: geometry scene uses GpuMeshRegistry12");
+        dx12log::Write("[DX12][mesh] Create refused: registry scene uses GpuMeshRegistry12");
         return false;
     }
 

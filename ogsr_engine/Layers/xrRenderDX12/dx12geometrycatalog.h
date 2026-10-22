@@ -59,6 +59,9 @@ private:
 struct GpuDraw12
 {
     uint32_t meshIndex = 0;
+    // 0 = existing synthetic/geometry pipeline, 1 = F3.6A textured X-Ray
+    // pipeline. This is immutable resolved-frame data, never a worker lookup.
+    uint32_t pipeline = 0;
     uint32_t objectConstantIndex = 0;
     D3D12_VERTEX_BUFFER_VIEW vertexView{};
     D3D12_INDEX_BUFFER_VIEW indexView{};

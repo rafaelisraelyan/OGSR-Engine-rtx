@@ -3,6 +3,7 @@
 #include "dx12fencewait.h"
 #include "dx12transform_tests.h"
 #include "dx12geometry_tests.h"
+#include "dx12xrayasset_tests.h"
 #include "dx12log.h"
 
 // Отдельный CPU harness: без GPU/window, со всей GR-библиотекой под ASan.
@@ -16,6 +17,7 @@ int main() {
     const bool fenceWait=dx12fence12::RunFenceWaitTests();
     const bool transform=smoketransform12::RunTransformTests();
     const bool geometry=smokegeometry12::RunGeometryTests();
+    const bool xray=smokexray12::RunXrayAssetTests(nullptr, nullptr);
     dx12log::Close();
-    return old && snapshot && visibility && ordering && packetPlan && fenceWait && transform && geometry ? 0 : 1;
+    return old && snapshot && visibility && ordering && packetPlan && fenceWait && transform && geometry && xray ? 0 : 1;
 }

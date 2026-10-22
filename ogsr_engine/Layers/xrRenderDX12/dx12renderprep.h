@@ -82,7 +82,8 @@ struct VisibilityTimings12 { VisibilityPhases12 serial{}, parallel{}; };
 // Только representative CPU-сцена. GPU-потребитель продолжает вызывать Prepare.
 // Все стадии завершены до возврата; при исключении кадр не публикуется.
 PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12&, uint64_t liveGeneration,
-    Mode, gr::jobs::JobSystem*, VisibilityTimings12&);
+    Mode, gr::jobs::JobSystem*, VisibilityTimings12&,
+    std::span<const Resource12> extraResources = {});
 bool RunTests();
 bool RunRepresentativeTests();
 bool RunVisibilityTests();
@@ -98,7 +99,8 @@ struct OrderedFrame12 {
 struct OrderingPhases12 { double visibility{}, keyGeneration{}, ordering{}, total{}; };
 struct OrderingTimings12 { OrderingPhases12 serial{}, parallel{}; };
 OrderedFrame12 PrepareOrdered(const RenderSceneSnapshot12&, uint64_t liveGeneration,
-    Mode, gr::jobs::JobSystem*, OrderingTimings12&);
+    Mode, gr::jobs::JobSystem*, OrderingTimings12&,
+    std::span<const Resource12> extraResources = {});
 bool Equivalent(const OrderedFrame12&, const OrderedFrame12&);
 bool RunOrderingTests();
 }
