@@ -18,12 +18,18 @@ required = [
     src / "Renderer.cpp",
     src / "NoiseVolume.cpp",
     src / "SliceViewer.cpp",
+    src / "CloudRayMarcher.cpp",
+    src / "CloudCompositor.cpp",
+    src / "CloudProfiler.cpp",
+    src / "CloudTypes.h",
     src / "Validation.cpp",
     src / "Window.cpp",
     src / "AuditPolicy.h",
     root / "tests" / "audit_policy_test.cpp",
     shaders / "NoiseGenerate.hlsl",
     shaders / "SliceViewer.hlsl",
+    shaders / "CloudRayMarch.hlsl",
+    shaders / "CloudComposite.hlsl",
 ]
 for path in required:
     assert path.is_file(), f"missing {path}"
@@ -35,6 +41,8 @@ sources = "\n".join(
 cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
 noise = (shaders / "NoiseGenerate.hlsl").read_text(encoding="utf-8")
 viewer = (shaders / "SliceViewer.hlsl").read_text(encoding="utf-8")
+cloud_march = (shaders / "CloudRayMarch.hlsl").read_text(encoding="utf-8")
+cloud_composite = (shaders / "CloudComposite.hlsl").read_text(encoding="utf-8")
 
 # Isolation: this tool must never touch the game renderer.
 for forbidden in ("xrCore", "xrRenderDX12", "xrRender_R4", "Game/", "Game\\"):
@@ -46,20 +54,19 @@ for library in ("d3d12", "dxgi", "d3dcompiler", "user32"):
 
 # Entry points must exist and match the profiles compiled by the C++ code.
 contracts = {
-    "GenerateNoise": "cs_5_1",
-    "ProbePeriodicity": "cs_5_1",
-    "ProbeSamplerWrap": "cs_5_1",
-    "FullscreenVS": "vs_5_1",
-    "SlicePS": "ps_5_1",
+    "GenerateNoise": ("cs_5_1", noise),
+    "ProbePeriodicity": ("cs_5_1", noise),
+    "ProbeSamplerWrap": ("cs_5_1", noise),
+    "CloudRayMarch": ("cs_5_1", cloud_march),
+    "FullscreenVS": ("vs_5_1", viewer),
+    "SlicePS": ("ps_5_1", viewer),
+    "CloudCompositePS": ("ps_5_1", cloud_composite),
 }
-for entry, profile in contracts.items():
+for entry, (profile, shader) in contracts.items():
     assert re.search(rf"CompileShaderFile\([^;]*\"{entry}\"[^;]*\"{profile}\"", sources, re.S), \
         f"missing CompileShaderFile contract for {entry}/{profile}"
-for entry in ("GenerateNoise", "ProbePeriodicity", "ProbeSamplerWrap",
-              "FullscreenVS", "SlicePS"):
-    shader = noise if entry in ("GenerateNoise", "ProbePeriodicity",
-                                "ProbeSamplerWrap") else viewer
     assert re.search(rf"\b{entry}\s*\(", shader), f"missing shader entry {entry}"
+assert re.search(r"\bFullscreenVS\s*\(", cloud_composite), "missing cloud composite VS"
 
 assert "numthreads(8, 8, 4)" in noise, "thread group contract changed"
 assert "kThreadGroupX = 8" in sources and "kThreadGroupZ = 4" in sources
@@ -82,9 +89,20 @@ assert "AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP" in sources
 
 assert "SliceIndex + 0.5" in viewer
 assert "id >= uint3(Resolution, Resolution, Resolution)" in noise
+assert "kSrvUavDescriptorCount = 16" in sources
+assert "CloudFrameConstants" in sources
+assert "D3D12_QUERY_HEAP_TYPE_TIMESTAMP" in sources
+assert "ResolveQueryData" in sources
+assert "RWTexture2D<float4> CloudOutput" in cloud_march
+assert "CloudTexture.SampleLevel" in cloud_composite
+assert "WindOffsetWorld" in sources
+assert "position.x - windOffset.x" in cloud_march
+assert "executedSteps" in cloud_march
+assert "CloudDebugMode::Occupancy" in sources
+assert "--time=" in sources
 
-print("PASS: V0 source checks")
+print("PASS: V1 source checks")
 print("  isolation: no engine renderer/runtime references")
-print("  shaders: GenerateNoise/ProbePeriodicity/ProbeSamplerWrap cs_5_1, FullscreenVS/vs_5_1, SlicePS/ps_5_1")
-print("  compute: numthreads(8,8,4), UAV barrier, SRV transition")
+print("  shaders: Noise + slices + CloudRayMarch/CloudComposite entry points")
+print("  cloud: per-frame output, descriptor capacity, timestamp queries")
 print("  readback/capture: copyable footprints and COPY_SOURCE transitions")

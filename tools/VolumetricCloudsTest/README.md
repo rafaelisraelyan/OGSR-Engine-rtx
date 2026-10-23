@@ -1,13 +1,17 @@
-# OGSR Volumetric Clouds — V0 standalone D3D12 test
+# OGSR Volumetric Clouds — standalone DX12 test
 
-Изолированный Windows-инструмент для генерации и визуализации процедурных
-3D-шумов. Не является интеграцией в игровой рендерер: не использует X-Ray,
-`xrCore`, `xrRenderDX12`, `xrRender_R4`, игровую физику или материалы.
-Собирается только с системными библиотеками Windows SDK.
+Изолированный Windows-инструмент для V0 NoiseVolume/SliceViewer и V1
+volumetric clouds. Не использует X-Ray, `xrCore`, `xrRenderDX12`,
+`xrRender_R4`, игровую физику или материалы. Собирается только с системными
+библиотеками Windows SDK.
 
-Текущий этап — **V0**. Ray marching, scattering и облачная плотность появятся
-в V1. V0 проверяет фундамент: D3D12-каркас, периодические 3D-шумы на compute
-shader, срезы объёма, воспроизводимость и отсутствие validation errors.
+Текущий этап — **V1**: ограниченный облачный слой, DX12 compute ray marching,
+Beer–Lambert, Henyey–Greenstein, Clear/Overcast пресеты, compositing и GPU
+timestamps. V0 срезы шума сохранены и являются режимом по умолчанию для
+обратной совместимости. Игровой DX11/DX12 и F4.0 не изменяются.
+
+Статус V1 после audit correction: **READY FOR V1 FINAL DELTA REVIEW**.
+PASS не присваивается до независимой приёмки.
 
 ## Сборка
 
@@ -15,199 +19,293 @@ shader, срезы объёма, воспроизводимость и отсу�
 10.0.19041 или новее, CMake 3.21+.
 
 ```powershell
-cmake -S tools/VolumetricCloudsTest -B tools/VolumetricCloudsTest/build -G "Visual Studio 17 2022" -A x64
+cmake -S tools/VolumetricCloudsTest -B tools/VolumetricCloudsTest/build `
+  -G "Visual Studio 17 2022" -A x64
 cmake --build tools/VolumetricCloudsTest/build --config Release
 ctest --test-dir tools/VolumetricCloudsTest/build -C Release --output-on-failure
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --mode=clouds
 ```
 
-EXE использует консольную подсистему, чтобы логи и коды ошибок были видны при
-запуске из терминала. HLSL-файлы копируются в `shaders/` рядом с EXE и
-загружаются во время выполнения. При сборке, если найден `fxc.exe`, все entry
-points дополнительно проверяются на этапе build.
+HLSL-файлы копируются в `shaders/` рядом с EXE и загружаются во время
+выполнения. При сборке, если найден `fxc.exe`, все entry points дополнительно
+проверяются на этапе build.
 
-## Режимы запуска
+## Режимы
 
 | Команда | Назначение |
 |---|---|
-| `OGSRCloudsTest.exe` | интерактивный просмотр |
-| `--selftest` | readback, периодичность, детерминизм, seed; пишет `selftest.txt` |
-| `--capture[=DIR]` | 10 BMP-снимков (3 канала × 3 среза + диагностика швов) |
-| `--frames=N` | ограничить число кадров (автоматизация) |
-| `--resize-test` | во время `--frames` дважды изменить размер окна |
-| `--size=64` / `--size=128` | начальное разрешение объёма |
-| `--seed=N` | seed (по умолчанию 1337) |
-| `--format=16f` / `--format=unorm` | принудительный формат объёма; по умолчанию 16F, затем UNORM |
-| `--adapter=N` | номер DXGI-адаптера из списка при старте |
-| `--warp` | принудительно Microsoft WARP |
-| `--debug` | включить D3D12 debug layer в Release |
+| `--mode=slices` | V0 просмотр срезов шума; режим по умолчанию |
+| `--mode=clouds` | V1 volumetric clouds |
+| `--preset=clear` | Clear Day: умеренная облачность, светлые объёмы |
+| `--preset=overcast` | Overcast: плотный слой, тёмные основания |
+| `--steps=N` | шаги ray marching, 8..128 (обычно 32/64) |
+| `--window=WxH` | клиентский размер окна, например `1920x1080` |
+| `--coverage=F` | покрытие неба 0..1 |
+| `--density=F` | множитель плотности 0..2 |
+| `--debug-mode=final\|density\|transmittance\|steps\|occupancy` | debug-вывод |
+| `--time=SECONDS` | фиксированное время ветра для captures |
+| `--selftest` | V0 + V1 проверки, пишет `selftest.txt` |
+| `--capture[=DIR]` | снимки; в clouds mode — 11 сцен, в slices — 10 BMP |
+| `--frames=N` | ограничить число кадров |
+| `--resize-test` | два resize во время `--frames` |
+| `--size=64` / `--size=128` | разрешение 3D NoiseVolume |
+| `--seed=N` | seed шума |
+| `--format=16f` / `--format=unorm` | формат 3D-объёма |
+| `--adapter=N`, `--warp` | выбор адаптера / WARP |
+| `--debug` | D3D12 debug layer в Release |
 | `--gpu-validation` | GPU-based validation (включает debug layer) |
-| `--test-no-validation` | служебный negative-тест: имитировать отсутствие validation |
-| `--test-no-info-queue` | служебный negative-тест: скрыть `ID3D12InfoQueue` при включённом debug layer |
+| `--test-no-validation` | служебный negative-тест недоступной validation |
+| `--test-no-info-queue` | служебный negative-тест без `ID3D12InfoQueue` |
 | `--no-vsync` | отключить vsync |
 
 `--selftest` возвращает 0 при PASS, 1 при functional FAIL, 3 при
-INCONCLUSIVE (запрошенная validation недоступна). `--test-no-validation`
-предназначен только для аудита.
-
-`--selftest` и `--capture` можно совместить: сначала выполнятся проверки, затем
-снимки. WARP предназначен только для проверки корректности, не для оценки
-производительности.
+INCONCLUSIVE. `--test-no-validation` и `--test-no-info-queue` предназначены
+только для аудита. `--capture` и `--selftest` можно совмещать.
 
 ## Управление
 
+### Облака (`--mode=clouds`)
+
 | Клавиша | Действие |
 |---|---|
-| `1` / `2` / `3` | Perlin fBm / Worley F1 / Perlin-Worley |
-| стрелки, колесо | срез по Z |
-| `Space` | автоматическое движение по Z |
-| `R` | сброс среза и остановка |
-| `D` | диагностика швов: плитка 3×3 |
-| `N` | принудительная перегенерация |
-| `4` | переключение 64³ ↔ 128³ |
-| `G` / `Shift+G` | seed ±1 |
-| `F` / `Shift+F` | базовая частота ±1 |
-| `O` / `Shift+O` | число октав ±1 |
-| `W` / `Shift+W` | частота Worley ±1 |
-| `B` / `Shift+B` | blend ±0.05 |
-| `E` / `Shift+E` | erosion ±0.05 |
-| `K` / `Shift+K` | gain ±0.05 |
+| ЛКМ + мышь | mouse look |
+| `W/S/A/D/Q/E` | движение; `Shift` — быстрее |
+| колесо, `Z/X` | FOV |
+| `J/L`, `I/K` | азимут / высота солнца |
+| `1` / `2` | Clear Day / Overcast |
+| `5` / `6` / `7` / `8` | final / density / transmittance / executed steps |
+| `9` | occupancy: шаги с ненулевой плотностью |
+| `M` | циклически сменить debug-режим |
+| `+/-` | density |
+| `[` / `]` | coverage |
+| `,` / `.` | скорость ветра |
+| `P` | пауза анимации ветра |
+| `R` | сброс к воспроизводимой Clear Day сцене |
+| `N` | перегенерация NoiseVolume |
+| `4` | переключить 64³ / 128³ |
+| `F2` | переключить slices / clouds |
 | `H` / `F1` | справка |
 | `Esc` | выход |
 
-Параметры меняются без пересоздания окна. Перегенерация выполняется один раз
-после изменения, а не каждый кадр.
+### Срезы (`--mode=slices`)
 
-## Архитектура
+`1/2/3` — Perlin/Worley/Combined, стрелки и колесо — Z-срез, `Space` —
+анимация, `D` — диагностика швов, `N` — перегенерация, `4` — 64/128,
+`G/F/O/W/B/E/K` — параметры шума, `F2` — clouds, `H/F1` — справка.
+
+## Архитектура V1
+
+```
+NoiseVolume (Texture3D SRV, WRAP)
+        │
+        ▼
+CloudRayMarcher (compute, half resolution)
+        │  RGBA16F: rgb = in-scattered radiance, a = transmittance
+        ▼
+CloudCompositor (fullscreen graphics)
+        │  sky * T + cloudRGB, exposure, linear → sRGB
+        ▼
+Swap chain (R8G8B8A8_UNORM)
+```
+
+Новые компоненты не зависят от Win32 и игрового runtime:
 
 ```
 src/
-  main.cpp          CLI, DPI, сообщения об ошибках
-  Application.*     окно, ввод, режимы selftest/capture, оркестрация
-  Window.*          Win32 HWND, resize/minimize, message pump
-  Renderer.*        device/queue/swapchain/RTV/descriptors/fences/present/resize
-  NoiseVolume.*     Texture3D, compute PSO, периодичность, readback, periodicity probe
-  SliceViewer.*     graphics PSO и fullscreen-срез (не знает о генерации)
-  Validation.*      статистика, seam-метрики, сравнение объёмов
-  ImageIO.*         BMP-вывод
-  Common.*          логирование, HRESULT, transitions, компиляция HLSL
+  CloudTypes.h       камера, параметры облаков, CloudFrameConstants
+  CloudRayMarcher.*  3 cloud texture, UAV/SRV, compute PSO, readback
+  CloudCompositor.*  fullscreen sky/composite PSO
+  CloudProfiler.*    timestamp query heap, readback, средние GPU ms
 shaders/
-  NoiseGenerate.hlsl  GenerateNoise + ProbePeriodicity + ProbeSamplerWrap
-  SliceViewer.hlsl    FullscreenVS + SlicePS
+  CloudRayMarch.hlsl  density, ray/slab intersection, ray marching, lighting
+  CloudComposite.hlsl sky gradient, transmittance composite, tonemap, sRGB
 ```
 
-`NoiseVolume` не зависит от окна и UI; `SliceViewer` получает SRV и рисует
-полноэкранный треугольник. В V1 `Texture3D` можно передать в ray-marching pass
-без переписывания генератора.
+### Ресурсы и синхронизация
 
-## Математика шума
+Используются **три half-res cloud texture**, по одной на каждый back buffer:
 
-Объём — кубическая `Texture3D`, по умолчанию `R16G16B16A16_FLOAT`, fallback
-`R8G8B8A8_UNORM`.
+| Ресурс | Количество | Владение |
+|---|---:|---|
+| `cloudTexture[0..2]` | 3 | `CloudRayMarcher` |
+| UAV + SRV descriptors | 3 + 3 | слоты 3..8 общего heap |
+| upload constants | 3 | `CloudRayMarcher` |
+| timestamp queries | 3 × 3 | `CloudProfiler` |
+| timestamp readback | 3 области | `CloudProfiler` |
 
-- **Perlin fBm.** Классический gradient noise на целочисленной решётке,
-  квинтичная интерполяция, 12 градиентов. Частоты каждой октавы —
-  целые (`baseFrequency * lacunarity^i`), поэтому поле периодично по X/Y/Z.
-  Амплитуды нормируются суммой, затем значение переводится в `[0,1]`.
-- **Worley F1.** Поиск ближайшей feature point в 27 соседних ячейках.
-  Координаты ячеек заворачиваются по модулю `worleyFrequency`; расстояние
-  считается относительно текущей ячейки, поэтому функция корректно
-  продолжается через границу. Результат инвертирован: 1 у feature point,
-  0 у границы ячейки.
-- **Perlin-Worley.** `base = lerp(perlin, worley, blend)`,
-  `combined = saturate(base * (1 - erosion * (1 - worley)))`.
-  `blend` и `erosion` настраиваются с клавиатуры.
+Почему это безопасно:
 
-Выходные каналы: `.r` — Perlin, `.g` — Worley, `.b` — combined, `.a` — 1.
-Seed входит в целочисленный hash, поэтому одинаковые параметры и seed дают
-побитово одинаковый объём.
+1. `Renderer::BeginFrame` ждёт fence именно того back buffer, который
+   переиспользуется.
+2. Cloud texture и upload CB этого back buffer уже не читаются предыдущим
+   кадром.
+3. Descriptor slots стабильны и не перезаписываются во время полёта кадра.
+4. `CloudRayMarcher` ведёт явное состояние каждой texture:
+   `COMMON/ALL_SHADER_RESOURCE → UNORDERED_ACCESS → ALL_SHADER_RESOURCE`.
+5. Composite читает SRV только после UAV barrier и transition.
+6. Resize: `Renderer::Resize` → `WaitForGpu`; затем cloud textures
+   пересоздаются под новый half-res.
+7. Shutdown: `WaitForGpu` до освобождения PSO/root signature/ресурсов.
 
-## Синхронизация и владение
+`ExecuteImmediate` с полным `WaitForGpu` на каждом кадре **не используется**.
+Он остаётся только для редкой генерации/readback шума и для selftest-проверок
+облаков. Descriptor heap расширен с 8 до 16 слотов; V0-слоты 0–2 не менялись.
 
-- 3 back buffer, отдельные command allocator и command list на каждый buffer.
-- Fence на каждый back buffer; allocator переиспользуется только после
-  завершения кадра, который его использовал.
-- `ID3D12Fence::GetCompletedValue() == UINT64_MAX` — это device removal, а не
-  завершение. Sentinel проверяется до сравнения с ожидаемым значением; после
-  `WaitForSingleObject` fence проверяется повторно. Sentinel/timeout не
-  приводят к переиспользованию allocator.
-- Генерация и readback выполняются через `ExecuteImmediate`: перед записью
-  queue дожидается полного GPU idle. Это осознанно консервативно для V0:
-  перегенерация редкая, зато состояние объёма всегда однозначно.
-- Объём создаётся в `UNORDERED_ACCESS`, после dispatch ставится UAV barrier и
-  переход в `ALL_SHADER_RESOURCE`; readback идёт через `COPY_SOURCE`.
-- Resize: `WaitForGpu`, освобождение back buffer references, `ResizeBuffers`,
-  пересоздание RTV. Minimize: рендер приостанавливается, restore возобновляет.
-- Shutdown: сначала `WaitForGpu`, затем освобождение PSO/root signature/
-  ресурсов. Это исправляет реальную ошибку, найденную при resize-тесте:
-  освобождение PSO до GPU idle приводило к падению на shutdown. Нормальное
-  завершение (`GPU idle`) отделено от best-effort cleanup после device removal
-  или неуспешного ожидания.
-- При `--debug` в конце вызывается `ID3D12DebugDevice::ReportLiveDeviceObjects`;
-  сообщения попадают в info queue. В отчёте виден только сам device,
-  non-device live objects = 0.
+### Облачная модель
+
+- горизонтальный слой `bottom..top`; X/Z — бесконечная периодическая плитка
+  NoiseVolume, дальность луча ограничена `maxDistance`.
+- Ветер задаётся в мировых единицах и вычитается **до** умножения на
+  `noiseScale`:
+  `noiseXZ = (worldXZ - windDirectionXZ * windSpeed * time) * noiseScale`.
+  Это одинаково для macro/detail/fine и light shadow samples.
+- Поддерживаются камеры ниже слоя, внутри и выше.
+- Луч, параллельный границе: epsilon; снаружи — нет пересечения, внутри —
+  марш до `maxDistance`.
+- Ранний выход при `T < 0.005`; пустой объём даёт `T = 1`, `rgb = 0`.
+
+Ограничение: нет конечного горизонтального объёма и weather map; повторяемость
+плитки маскируется масштабом, ветром, coverage и вертикальным профилем.
+
+### Плотность
+
+`SampleCloudDensity(worldPosition)` использует:
+
+- вертикальный профиль: плавное появление у нижней границы, полный объём,
+  исчезновение у верхней;
+- coverage как порог, а не линейное смешивание;
+- low-frequency macro sample для крупных масс;
+- full-frequency Perlin-Worley для эрозии;
+- дополнительный fine sample для разрыва краёв;
+- density multiplier, wind offset и масштаб.
+
+Perlin/Worley не переписывались. Повторная генерация 3D-объёма при изменении
+вида облаков не требуется.
+
+### Освещение
+
+- Направленное солнце (азимут/высота/цвет/интенсивность).
+- Single scattering + Beer–Lambert.
+- Henyey–Greenstein phase function.
+- 4 шага к солнцу для приблизительного self-shadowing.
+- Ambient sky contribution.
+- Clear Day и Overcast — два воспроизводимых пресета.
+- Multiple scattering, temporal reprojection и denoiser в V1 отсутствуют.
+
+### SDR composite
+
+Cloud texture хранит линейные `rgb` (in-scattered) и `a` (transmittance).
+Composite: `L = sky * T + cloudRGB`; alpha blending не используется, двойного
+умножения на alpha нет. Exposure и tone mapping выполняются в линейном
+пространстве, затем явное linear → sRGB перед записью в `R8G8B8A8_UNORM`.
+Нижняя полусфера — холодная атмосферная дымка, а не геометрия уровня; это
+известное ограничение standalone V1.
+
+### GPU timestamps
+
+`CloudProfiler` использует `D3D12_QUERY_HEAP_TYPE_TIMESTAMP`, три timestamp
+на кадр: start, после cloud compute, после composite. `ResolveQueryData`
+пишет в readback-область кадра; CPU читает её только после fence завершения
+этого кадра. Логируются cloud ms, composite ms, total ms. WARP используется
+для проверки корректности, не для сравнения производительности.
 
 ## Валидация
 
-`--selftest` проверяет:
+`--selftest` сохраняет V0-проверки:
 
-- все каналы в `[0,1]` и не константны;
-- seam continuity по X/Y/Z: средняя разница через шов / средняя разница внутри
-  объёма < 2.5 (на практике ≈ 0.85–1.12);
-- **direct GPU periodicity probe**: 64 низкодисперсных точки, сравнение
-  `f(p)` и `f(p+axis)` теми же shader-функциями; максимум должен быть < 1e-4
-  (на практике 0). Негативный контроль `f(p)` vs `f(p + 0.37)` должен быть
-  заметно больше нуля (на практике 0.456);
-- **WRAP sampler probe**: 64 пробы у швов X/Y/Z, `SampleLevel` с linear-wrap
-  сравнивается с CPU-трилинейной интерполяцией по readback-объёму; ошибка
-  фильтра < 1e-2 (на практике ≈ 3e-4), `p` vs `p+axis` = 0. Для контроля
-  считается CLAMP-эталон, он заметно отличается (≈ 0.05–0.10);
-- детерминизм: повторная генерация с теми же параметрами даёт max abs diff 0;
-- чувствительность к seed: combined-поле меняется (mean abs diff > 1e-3);
-- отсутствие D3D12 debug errors при включённом debug layer.
+- значения и периодичность шума, direct GPU periodicity probe;
+- WRAP sampler против CPU-трилинейной интерполяции;
+- детерминизм, seed sensitivity;
+- debug layer errors;
+- validation preflight с exit code 3 при недоступной запрошенной validation.
 
-Явный запрос `--debug`/`--gpu-validation` не может дать PASS, если
-инфраструктура не активировалась. Единый preflight перед `--selftest`,
-`--capture`, `--frames` и interactive проверяет отдельно Debug Layer,
-`ID3D12InfoQueue` и GPU-based validation. При недоступности: `INCONCLUSIVE`,
-exit code 3, capture/frames не создают артефактов. Для негативных тестов есть
-служебные `--test-no-validation` и `--test-no-info-queue`; реальный GPU при
-этом не теряется.
+Дополнительно V1 проверяет на GPU readback:
 
-`scripts/run_evidence.ps1` повторяет весь набор: Release 128/64, GPU-based
-validation 128/64, WARP 64, UNORM 64, Debug 64, unit-тесты политики fence и
-validation, полную negative-матрицу (frames/capture/combined/info queue),
-capture и resize.
+- cloud output finite, без NaN/Inf;
+- Clear Day содержит видимый объём;
+- `coverage=0` даёт пустой полностью прозрачный объём;
+- увеличение extinction уменьшает transmittance;
+- фиксированные camera/seed/time дают идентичный результат;
+- движение камеры и солнца меняет изображение;
+- wind translation invariance: t=0 и t=1 с камерой, сдвинутой на
+  `windDirection * windSpeed`, совпадают в пределах half-float;
+- windSpeed=0 не меняет поле; противоположное направление ветра проверяется
+  отдельно;
+- Step Count считает реально выполненные итерации с early exit; Occupancy —
+  отдельный режим;
+- transmittance debug-режим валиден.
 
-`--capture` дополнительно проверяет present/copy/readback path и сохраняет
-BMP. Диагностический кадр `combined_diag_z*.bmp` показывает combined-поле
-плиткой 3×3: если периодичность нарушена, на внутренних границах будут видны
-разрывы. Красная рамка рисуется только по внешнему краю и не перекрывает
-внутренние швы.
+Negative-validation сценарии (`--debug --test-no-validation`, отсутствие
+`ID3D12InfoQueue`, combined `--selftest --capture`) возвращают exit code 3,
+не дают PASS и не создают capture-артефакты.
 
-## Известные ограничения V0
+GPU-based validation проверяется не только на selftest, но и на фактическом
+frame path:
 
-- Нет ray marching, scattering, cloud density profile и temporal reprojection.
-- Нет загрузки/сохранения объёма на диск.
-- Нет автоматического восстановления после device removal; DRED собирается,
-  но полный device-recreation path не реализован.
-- DXGI live-object summary выводится через `OutputDebugString`; device-level
-  live-object report захватывается через info queue, а DXGI summary нужно
-  смотреть в debugger. Это не влияет на корректность shutdown.
-- `--frames`/`--resize-test` — вспомогательные режимы, не benchmark.
-- WARP не отражает производительность GPU.
-- Скриншоты и логи лежат в `artifacts/` (каталог исключён из git).
+```powershell
+OGSRCloudsTest.exe --mode=clouds --size=128 --gpu-validation --frames=120 --no-vsync
+```
+
+Ожидается `gpu requested=1 enabled=1`, строка
+`cloud frame path: CloudRayMarcher compute + CloudCompositor draw active`,
+ненулевые cloud/composite GPU timestamps, `debug message totals: 0 errors,
+0 warnings` и exit code 0. Resize и F2 slices/clouds проверяются отдельно с
+тем же GBV-флагом.
+
+Временные captures:
+
+```powershell
+OGSRCloudsTest.exe --mode=clouds --preset=clear --time=0 --capture=<t0>
+OGSRCloudsTest.exe --mode=clouds --preset=clear --time=1 --capture=<t1>
+```
+
+При `windSpeed=0` поле не меняется; при ненулевом — меняется. Pause/resume
+проверяется клавишей `P`.
+
+## Производительность
+
+Измерения — GPU timestamps, не CPU frame time. Пример на NVIDIA GeForce RTX
+5070 Laptop GPU, 128³ noise, half-resolution cloud output, 120 кадров:
+
+| Разрешение | Пресет | Шаги | Cloud ms | Composite ms | Total ms |
+|---|---|---:|---:|---:|---:|
+| 1280×720 | Clear | 32 | 0.362 | 0.043 | 0.405 |
+| 1280×720 | Clear | 64 | 0.738 | 0.091 | 0.829 |
+| 1280×720 | Overcast | 32 | 0.362 | 0.024 | 0.386 |
+| 1280×720 | Overcast | 64 | 0.831 | 0.025 | 0.856 |
+| 1920×1080 | Clear | 32 | 0.554 | 0.058 | 0.612 |
+| 1920×1080 | Clear | 64 | 1.250 | 0.097 | 1.347 |
+| 1920×1080 | Overcast | 32 | 0.761 | 0.058 | 0.818 |
+| 1920×1080 | Overcast | 64 | 1.554 | 0.054 | 1.608 |
+
+Это измерения конкретной машины и не являются обещанием FPS-бюджета.
 
 ## Evidence
 
-- `artifacts/evidence/` — build logs, selftest-отчёты hardware/WARP/GBV/UNORM,
-  unit/negative-тесты, resize/minimize, git state и GPU/driver info.
-- `artifacts/capture/` — PNG-снимки, `capture_info.txt` и `contact_sheet.png`.
-- `selftest.txt` рядом с EXE — последний отчёт self-test.
+- `artifacts/v1_evidence/` — build/CTest, hardware/WARP/GBV selftests,
+  negative-validation matrix, GPU timestamp matrix, performance.txt.
+- `artifacts/v1_capture/` — 720p Clear/Overcast/debug/camera captures,
+  `contact_sheet.png`.
+- `artifacts/v1_evidence/capture_1080p_overcast/` — 1080p Overcast captures.
+- `artifacts/evidence_v0_regression/` — повторный V0 regression-прогон.
+- `selftest.txt` рядом с EXE — последний отчёт.
 
-## V1 interface
+## Известные ограничения V1
 
-`NoiseVolume` предоставляет `SrvGpuHandle()`, `Resolution()`, `Params()` и
-`Format()`. Этого достаточно, чтобы подключить объём к отдельному
-ray-marching compute/pixel pass, не меняя генерацию и не добавляя зависимости
-от Win32.
+- Нет temporal reprojection/denoiser; при движении возможны мягкие
+  пространственные артефакты half-res upscale.
+- Нет weather map, полноценной атмосферы, cloud shadows на геометрии,
+  multiple scattering, DXR и интеграции в F4.0.
+- Нижняя полусфера — дымка без геометрии; горизонт выглядит условно.
+- Бесконечная горизонтальная плитка NoiseVolume может давать повторяемость
+  на больших дистанциях.
+- WARP не отражает производительность GPU.
+- Device removal не инсценируется; sentinel/DRED унаследованы от V0 и
+  покрыты unit-тестом.
+
+## V0 обратная совместимость
+
+`--mode=slices` — режим по умолчанию. V0 selftest, captures, resize, sampler
+periodicity, negative-validation и unit-тесты сохранены. V1 использует тот же
+`NoiseVolume`, не меняя генератор и не добавляя зависимостей от Win32 в
+cloud-компоненты.

@@ -90,7 +90,7 @@ public:
 
 private:
     static constexpr UINT kBackBufferCount = 3;
-    static constexpr UINT kSrvUavDescriptorCount = 8;
+    static constexpr UINT kSrvUavDescriptorCount = 16;
 
     void EnableDebugLayer(const Options& options);
     void CreateDevice(const Options& options);

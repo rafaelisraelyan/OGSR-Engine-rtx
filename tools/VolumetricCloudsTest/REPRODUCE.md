@@ -1,4 +1,4 @@
-# V0 reproduction
+# V0/V1 reproduction
 
 Все команды выполняются из корня репозитория OGSR. Нужны Windows 10/11 x64,
 Visual Studio 2022 Desktop C++, Windows SDK 10.0.19041+ и CMake 3.21+.
@@ -6,7 +6,8 @@ Visual Studio 2022 Desktop C++, Windows SDK 10.0.19041+ и CMake 3.21+.
 ## 1. Build
 
 ```powershell
-cmake -S tools/VolumetricCloudsTest -B tools/VolumetricCloudsTest/build -G "Visual Studio 17 2022" -A x64
+cmake -S tools/VolumetricCloudsTest -B tools/VolumetricCloudsTest/build `
+  -G "Visual Studio 17 2022" -A x64
 cmake --build tools/VolumetricCloudsTest/build --config Release
 cmake --build tools/VolumetricCloudsTest/build --config Debug
 ctest --test-dir tools/VolumetricCloudsTest/build -C Release --output-on-failure
@@ -15,72 +16,132 @@ ctest --test-dir tools/VolumetricCloudsTest/build -C Release --output-on-failure
 EXE: `tools/VolumetricCloudsTest/build/Release/OGSRCloudsTest.exe`.
 HLSL копируется в `shaders/` рядом с EXE. При наличии `fxc.exe` сборка
 дополнительно проверяет `GenerateNoise`, `ProbePeriodicity`,
-`ProbeSamplerWrap`, `FullscreenVS`, `SlicePS`.
+`ProbeSamplerWrap`, `FullscreenVS`, `SlicePS`, `CloudRayMarch`,
+`CloudCompositePS`.
 
-## 2. Main selftest, 128³, hardware + debug layer
+## 2. V1 cloud selftest, 128³, hardware + debug layer
 
 ```powershell
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --selftest --debug --size=128 --seed=1337
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --selftest --debug --size=128 --seed=1337
 ```
 
 Ожидаемые ключевые строки:
 
 ```text
-periodicity probe max |f(p)-f(p+axis)|: X=0 Y=0 Z=0
-periodicity probe negative control: 0.45625
-sampler WRAP filter error: 0.000340104
-sampler WRAP p vs p+axis difference: 0
-sampler CLAMP reference difference: 0.0500488
-validation verdict: PASS
 V0 SELFTEST: PASS
+V1 CLOUD SELFTEST: PASS
+OVERALL SELFTEST: PASS
 ```
 
-Exit code 0. Отчёт: `selftest.txt` рядом с EXE. При успешном shutdown в логе
-есть `shutdown: GPU idle`; при потере устройства — `best-effort cleanup` и
-ненулевой код.
+Exit code 0. В отчёте `selftest.txt` дополнительно проверяются:
 
-### 128³ GPU-based validation (полный лог)
+- cloud output finite, без NaN/Inf;
+- Clear Day содержит видимый объём;
+- `coverage=0` даёт `T=1`, `rgb=0`;
+- увеличение extinction уменьшает transmittance;
+- фиксированные camera/seed/time детерминированы;
+- движение камеры и солнца меняет изображение;
+- wind translation invariance: t=0 и t=1 с камерой, сдвинутой на
+  `windDirection * windSpeed`, совпадают в пределах half-float;
+- windSpeed=0 и противоположное направление ветра;
+- Step Count считает executed iterations с early exit, Occupancy — отдельно.
+
+### 128³ GPU-based validation
 
 ```powershell
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --selftest --debug --gpu-validation --size=128 --seed=1337
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --selftest --debug --gpu-validation --size=128 --seed=1337
 ```
 
-Ожидается `debug errors: 0`, `debug warnings: 0`, `V0 SELFTEST: PASS`.
-Стартовое сообщение GBV с severity `MESSAGE` — информационное.
+Ожидается `debug errors: 0`, `debug warnings: 0`, `V0 SELFTEST: PASS`,
+`V1 CLOUD SELFTEST: PASS`.
 
-### 64³, WARP и UNORM
+### 128³ GPU-based validation на фактическом frame path
 
 ```powershell
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --selftest --debug --size=64 --seed=1337
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --selftest --debug --warp --size=64 --seed=1337
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --selftest --debug --size=64 --seed=1337 --format=unorm
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --size=128 --gpu-validation --frames=120 --no-vsync
 ```
 
-WARP не является показателем производительности.
+Ожидается `gpu requested=1 enabled=1`, строка
+`cloud frame path: CloudRayMarcher compute + CloudCompositor draw active`,
+`gpu timestamps average`, `debug message totals: 0 errors, 0 warnings`,
+exit code 0.
 
-## 2a. Audit hardening negative tests
-
-Unit-тест политики fence sentinel и validation:
+### 64³, WARP и no-debug
 
 ```powershell
-ctest --test-dir tools/VolumetricCloudsTest/build -C Release --output-on-failure
-# или напрямую:
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsAuditTests.exe
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --selftest --debug --size=64 --seed=1337
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --selftest --debug --warp --size=64 --seed=1337
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --selftest --size=64 --seed=1337
 ```
 
-Ожидается:
+WARP не является показателем производительности. No-debug сценарий должен
+писать `validation verdict: NOT REQUESTED` и завершаться с кодом 0.
 
-```text
-FENCE SENTINEL TESTS: PASS
-VALIDATION POLICY TESTS: PASS
-AUDIT POLICY TESTS: PASS
+## 3. V0 regression
+
+```powershell
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=slices --selftest --debug --size=128 --seed=1337
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=slices --capture="<dir>" --debug --size=128 --seed=1337
 ```
 
-`UINT64_MAX` моделируется как `DeviceRemoved` и не может быть принят за
-завершённый fence.
+V0 selftest должен сохранять `V0 SELFTEST: PASS`, periodicity/sampler probes и
+10 BMP срезов. `--mode=slices` — режим по умолчанию.
 
-Негативная матрица (все команды должны вернуть exit code **3**, без PASS и без
-capture-артефактов):
+## 4. V1 visual captures
+
+```powershell
+$cap = "D:\...\tools\VolumetricCloudsTest\artifacts\v1_capture"
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --window=1280x720 --preset=clear --capture="$cap"
+
+$cap1080 = "D:\...\tools\VolumetricCloudsTest\artifacts\v1_evidence\capture_1080p_overcast"
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --window=1920x1080 --preset=overcast --steps=32 `
+  --capture="$cap1080"
+```
+
+720p набор содержит Clear/Overcast, density/transmittance/step-count,
+occupancy, горизонт, взгляд вверх и тот же объём с другой камеры. BMP можно
+открыть напрямую; evidence-скрипт конвертирует их в PNG и собирает contact
+sheet.
+
+Временные captures для проверки ветра:
+
+```powershell
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --preset=clear --time=0 --capture="<t0>"
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --preset=clear --time=1 --capture="<t1>"
+```
+
+При `windSpeed=0` кадры совпадают; при ненулевом — различаются. Pause/resume
+проверяется клавишей `P` в интерактивном режиме.
+
+## 5. V1 interactive controls and D3D12 paths
+
+```powershell
+# mouse look, WASD/QE, presets, debug modes, F2 slices/clouds, resize
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --mode=clouds --size=64
+
+# automated resize
+.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
+  --mode=clouds --frames=90 --resize-test --size=64
+```
+
+Проверить в логе `cloud output resized`, `window minimized; rendering paused`,
+`window restored; resuming rendering`, `render mode switched`, `GPU idle`.
+
+## 6. Negative validation matrix
+
+Все команды должны вернуть exit code **3**, без PASS и без capture-артефактов:
 
 ```powershell
 # debug недоступен: frames / capture
@@ -98,93 +159,42 @@ capture-артефактов):
 .\...\OGSRCloudsTest.exe --selftest --capture=<test-dir> --debug --test-no-validation
 ```
 
-Для selftest-вариантов в `selftest.txt` должно быть
-`validation verdict: INCONCLUSIVE`, `V0 SELFTEST: INCONCLUSIVE`; каталог
-capture не создаётся. Успешные сценарии без Debug Layer
-(`--selftest`, `--capture`, `--frames`) работают с verdict `NOT REQUESTED`.
+V1-варианты добавляют `--mode=clouds` к тем же командам. В selftest-отчёте
+должно быть `validation verdict: INCONCLUSIVE`; capture-каталог не создаётся.
 
-## 3. Screenshots
+## 7. GPU timestamps
 
 ```powershell
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
-  --capture="D:\Coding Project\OGSR ENGINE fork from rtx\tools\VolumetricCloudsTest\artifacts\capture" `
-  --debug --size=128 --seed=1337
+$exe = ".\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe"
+& $exe --mode=clouds --window=1280x720 --preset=clear --steps=32 `
+  --frames=120 --no-vsync
+& $exe --mode=clouds --window=1920x1080 --preset=overcast --steps=64 `
+  --frames=120 --no-vsync
 ```
 
-Параметры capture:
+В логе: `gpu timestamps average over 120 samples: cloud ... ms,
+composite ... ms, total ... ms`. Это GPU timestamps, не CPU frame time.
+WARP не использовать для сравнения производительности.
+
+## 8. Full evidence script
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tools/VolumetricCloudsTest/scripts/run_v1_evidence.ps1 `
+  -Exe tools/VolumetricCloudsTest/build-clean/Release/OGSRCloudsTest.exe `
+  -DebugExe tools/VolumetricCloudsTest/build-clean/Debug/OGSRCloudsTest.exe `
+  -EvidenceDir tools/VolumetricCloudsTest/artifacts/v1_evidence `
+  -CaptureDir tools/VolumetricCloudsTest/artifacts/v1_capture
+```
+
+Скрипт прогоняет V0 regression, V1 hardware/GBV/WARP/no-debug selftests,
+resize, captures, negative matrix и 8-точечную GPU timestamp-матрицу.
+
+## 9. Evidence layout
 
 ```text
-resolution      128^3
-seed            1337
-octaves         4
-baseFrequency   4
-lacunarity      2
-worleyFrequency 8
-gain            0.5
-blend           0.55
-erosion         0.35
-format          R16G16B16A16_FLOAT (auto; fallback R8G8B8A8_UNORM)
-channel         Perlin / Worley / Combined
-Z slices        16, 64, 112  (N/8, N/2, 7N/8)
-diagnostic      Combined, Z=64, 3x3 tiling
+artifacts/v1_evidence/                 build, CTest, selftests, negative, perf
+artifacts/v1_capture/                  720p PNG + contact_sheet.png
+artifacts/v1_evidence/capture_1080p_overcast/
+artifacts/evidence_v0_regression/      повторный V0 regression
 ```
-
-Файлы capture:
-
-| Файл | Канал | Z | Режим |
-|---|---|---|---|
-| `perlin_z016.png` | Perlin fBm | 16 | обычный |
-| `perlin_z064.png` | Perlin fBm | 64 | обычный |
-| `perlin_z112.png` | Perlin fBm | 112 | обычный |
-| `worley_z016.png` | Worley F1 | 16 | обычный |
-| `worley_z064.png` | Worley F1 | 64 | обычный |
-| `worley_z112.png` | Worley F1 | 112 | обычный |
-| `combined_z016.png` | Perlin-Worley | 16 | обычный |
-| `combined_z064.png` | Perlin-Worley | 64 | обычный |
-| `combined_z112.png` | Perlin-Worley | 112 | обычный |
-| `combined_diag_z064.png` | Perlin-Worley | 64 | 3×3 seam |
-
-Приложение пишет BMP; в пакете лежат PNG-копии с теми же именами. Команда
-выше создаёт BMP; для конвертации можно использовать Paint или:
-
-```powershell
-Add-Type -AssemblyName System.Drawing
-Get-ChildItem <capture-dir> -Filter *.bmp | ForEach-Object {
-  $img = [System.Drawing.Image]::FromFile($_.FullName)
-  $img.Save((Join-Path $_.DirectoryName ($_.BaseName + ".png")), [System.Drawing.Imaging.ImageFormat]::Png)
-  $img.Dispose()
-}
-```
-
-## 4. Resize / minimize
-
-```powershell
-.\tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe --frames=90 --resize-test --debug --size=128
-```
-
-Режим дважды меняет размер окна. В логе должны быть `resize:` и
-`debug errors=0 warnings=0`.
-
-Minimize/restore и смена параметров проверялись через Win32 `ShowWindow` и
-`PostMessage`; лог: `evidence/run_keys_minimize_hw.log`.
-
-## 5. Full evidence script
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File `
-  tools\VolumetricCloudsTest\scripts\run_evidence.ps1 `
-  -Exe tools\VolumetricCloudsTest\build\Release\OGSRCloudsTest.exe `
-  -DebugExe tools\VolumetricCloudsTest\build\Debug\OGSRCloudsTest.exe `
-  -EvidenceDir tools\VolumetricCloudsTest\artifacts\evidence `
-  -CaptureDir tools\VolumetricCloudsTest\artifacts\capture
-```
-
-Скрипт последовательно запускает 128³/64³ hardware, 128³/64³ GPU-based
-validation, WARP 64³, UNORM 64³, Debug 64³, capture и resize, копируя
-`selftest.txt` и логи в `artifacts/evidence`.
-
-## 6. Interactive controls
-
-`1/2/3` — Perlin/Worley/Combined, стрелки/колесо — Z, `Space` — анимация,
-`D` — диагностика швов, `N` — перегенерация, `4` — 64³/128³, `G` — seed,
-`F/O/W/B/E/K` — параметры, `H` — справка, `Esc` — выход.

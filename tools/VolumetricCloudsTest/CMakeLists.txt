@@ -12,6 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(OGSRCloudsTest
     src/main.cpp
     src/Application.cpp
+    src/CloudCompositor.cpp
+    src/CloudProfiler.cpp
+    src/CloudRayMarcher.cpp
     src/Common.cpp
     src/ImageIO.cpp
     src/NoiseVolume.cpp
@@ -101,6 +104,15 @@ if(OGSR_CLOUDS_VALIDATE_SHADERS)
             COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T ps_5_1 /E SlicePS
                     /Fo "${SHADER_CHECK_DIR}/SliceViewer.ps.cso"
                     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/SliceViewer.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarch.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarch.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T vs_5_1 /E FullscreenVS
+                    /Fo "${SHADER_CHECK_DIR}/CloudComposite.vs.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudComposite.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T ps_5_1 /E CloudCompositePS
+                    /Fo "${SHADER_CHECK_DIR}/CloudComposite.ps.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudComposite.hlsl"
             COMMENT "Validating HLSL entry points with fxc"
             VERBATIM
         )

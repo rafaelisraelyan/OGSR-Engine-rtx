@@ -176,6 +176,12 @@ LRESULT Window::WindowProc(
         if (eventFn_)
             eventFn_(message, wparam, lparam);
         return 0;
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+        if (eventFn_)
+            eventFn_(message, wparam, lparam);
+        return 0;
     case WM_KEYDOWN:
         if (eventFn_)
             eventFn_(message, wparam, lparam);
