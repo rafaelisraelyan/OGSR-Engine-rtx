@@ -11,6 +11,9 @@
 #include "MainMenu.h"
 #include "string_table.h"
 #include "UIGameCustom.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "../xr_3da/GameCameraCaptureAdapter.h"
+#endif
 
 int g_cl_save_demo = 0;
 
@@ -171,6 +174,9 @@ bool CLevel::net_start6()
 
     if (net_start_result_total)
     {
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+        B2CameraCapture_OnLevelReady(name().c_str());
+#endif
         if (strstr(Core.Params, "-$"))
         {
             string256 buf, cmd, param;

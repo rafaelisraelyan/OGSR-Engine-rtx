@@ -21,6 +21,12 @@
     <EnableASAN>true</EnableASAN>
   </PropertyGroup-->
 
+  <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
   <ItemDefinitionGroup>
     <ClCompile>
       <EnableEnhancedInstructionSet Condition="'$(Platform)'=='Win32'">StreamingSIMDExtensions2</EnableEnhancedInstructionSet>

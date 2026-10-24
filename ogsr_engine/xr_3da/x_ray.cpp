@@ -18,6 +18,9 @@
 #include "DiscordRPC.hpp"
 #include "Render.h"
 #include "splash.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "GameCameraCaptureAdapter.h"
+#endif
 
 #define CORE_FEATURE_SET(feature, section) Core.Features.set(xrCore::Feature::feature, READ_IF_EXISTS(pSettings, r_bool, section, #feature, false))
 
@@ -533,6 +536,9 @@ void CApplication::OnEvent(EVENT E, u64 P1, u64 P2)
             Console->Execute("main_menu off");
             Console->Hide();
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+            B2CameraCapture_OnLevelTeardownBegin();
+#endif
             g_pGameLevel->net_Stop();
             xr_delete(g_pGameLevel);
 

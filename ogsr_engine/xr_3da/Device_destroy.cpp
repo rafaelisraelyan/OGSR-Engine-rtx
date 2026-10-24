@@ -5,6 +5,9 @@
 #include "IGame_Persistent.h"
 #include "xr_IOConsole.h"
 #include "xr_input.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "GameCameraCaptureAdapter.h"
+#endif
 
 void CRenderDevice::_Destroy(BOOL bKeepTextures)
 {
@@ -60,6 +63,10 @@ extern void unregister_reshade();
 void CRenderDevice::Reset(bool precache)
 {
     ZoneScoped;
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    B2CameraCapture_OnDeviceResetBegin();
+#endif
 
     if (use_reshade) // отключим решейд если он был
         unregister_reshade();

@@ -13,6 +13,9 @@
 #include "XR_IOConsole.h"
 #include "xr_ioc_cmd.h"
 #include "../xrGame/ingame_editors/embedded_editor_main.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "GameCameraCaptureAdapter.h"
+#endif
 
 //#define LOG_SECOND_THREAD_STATS
 
@@ -261,6 +264,9 @@ void CRenderDevice::on_idle()
         }
 
         OnCameraUpdated(false);
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+        B2CameraCapture_OnCameraFrameReady();
+#endif
 
         const auto SecondThreadStartTime = std::chrono::high_resolution_clock::now();
 
@@ -313,6 +319,9 @@ void CRenderDevice::on_idle()
 
             if (Begin())
             {
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+                B2CameraCapture_OnFrameRenderBeginSucceeded();
+#endif
                 {
                     ZoneScopedN("Render process");
                     seqRender.Process(rp_Render);
@@ -328,6 +337,12 @@ void CRenderDevice::on_idle()
                     End();
                 }
             }
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+            else
+            {
+                B2CameraCapture_OnFrameRenderBeginFailed();
+            }
+#endif
         }
 
         if (is_editor_active)
@@ -424,6 +439,9 @@ void CRenderDevice::Run()
     set_current_thread_name("X-RAY Primary thread");
     mainThreadId = std::this_thread::get_id();
     Msg("Main thread id: [%u]", _Thrd_id());
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    B2CameraCapture_Initialize();
+#endif
 
     // Startup timers and calculate timer delta
     dwTimeGlobal = 0;
@@ -458,6 +476,9 @@ void CRenderDevice::Run()
     g_bLoaded = FALSE;
 
     seqAppEnd.Process(rp_AppEnd);
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    B2CameraCapture_OnEngineShutdown();
+#endif
 }
 
 u32 app_inactive_time = 0;

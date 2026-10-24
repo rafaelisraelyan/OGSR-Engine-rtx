@@ -10,6 +10,9 @@
 #include "xrLevel.h"
 #include "CameraManager.h"
 #include "xr_object.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "GameCameraCaptureAdapter.h"
+#endif
 
 ENGINE_API IGame_Level* g_pGameLevel = NULL;
 
@@ -28,6 +31,10 @@ IGame_Level::IGame_Level()
 
 IGame_Level::~IGame_Level()
 {
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    B2CameraCapture_OnLevelTeardownBegin();
+#endif
+
     xr_delete(pLevel);
 
     // Render-level unload
@@ -56,6 +63,9 @@ IGame_Level::~IGame_Level()
     g_pGameLevel = nullptr;
 
     xr_delete(g_hud);
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    B2CameraCapture_OnLevelTeardownComplete();
+#endif
 }
 
 void IGame_Level::net_Stop()

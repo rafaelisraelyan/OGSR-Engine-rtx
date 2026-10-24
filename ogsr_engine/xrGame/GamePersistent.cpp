@@ -34,6 +34,9 @@
 #include "../xr_3da/DiscordRPC.hpp"
 #include "ingame_editors/embedded_editor_main.h"
 #include "../xr_3da/device.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+#include "../xr_3da/GameCameraCaptureAdapter.h"
+#endif
 
 #ifndef MASTER_GOLD
 #include "custommonster.h"
@@ -656,11 +659,18 @@ void CGamePersistent::OnEvent(EVENT E, u64 P1, u64 P2)
 
         LPSTR saved_name = (LPSTR)(P1);
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+        B2CameraCapture_OnLevelTeardownBegin();
+#endif
         Level().remove_objects();
         game_sv_Single* game = smart_cast<game_sv_Single*>(Level().Server->game);
         R_ASSERT(game);
         game->restart_simulator(saved_name);
         xr_free(saved_name);
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+        B2CameraCapture_OnLevelTeardownComplete();
+        B2CameraCapture_OnLevelReady(Level().name().c_str());
+#endif
         return;
     }
     else if (E == eDemoStart)
