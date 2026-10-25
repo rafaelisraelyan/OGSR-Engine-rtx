@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-10-22. Исторические статусы A/B1/F и их
+> **Дата обновления планов:** 2026-10-25. Исторические статусы A/B1/F и их
 > даты оставлены как ранее зафиксированные отчёты, а не результат новой
 > проверки GPU/CI. Изменение roadmap **не означает** реализации или тестирования
 > добавленных этапов.
@@ -47,7 +47,41 @@ Edition* (4A Games) — как исследовательский ориенти
   необязательная интеграция в игровой DX12 с выбором Classic 2D / Volumetric 3D.
   **V0–V2 разрешено разрабатывать параллельно F4.0; V не является гейтом F4/G.**
 
-### Сводка статусов (исторические записи 2026-10-14/15; архитектурный план дополнен 2026-10-16)
+### Актуальная сверка выполнения DX12 и смежных направлений — 2026-10-25
+
+**Основание:** коммиты, доступные в `origin/prypiat` на момент сверки
+(HEAD `4b120ca81`), отчёты этапов и независимого аудита. Ниже отдельно
+различаются **наличие кода в Git**, **PASS по представленным тестам** и
+**полноценная приёмка игрового runtime**. Эта сводка исправляет устаревшие
+`NEXT / NOT STARTED` в исторических таблицах ниже, но не переписывает
+историю прежних решений. Сама правка roadmap не выполняет GPU-тесты.
+
+| Этап | Фактическое состояние на дату сверки | Основание / оставшийся гейт |
+|---|---|---|
+| **F0–F2** — аудит, ADR, bootstrap | ✅ Реализованы и зафиксированы; standalone DX12 bootstrap проверялся ранее | `b396cfb4`, `786e34f8`, `5520318e`; исторические GPU-тесты F2, не игровой renderer |
+| **F3.0–F3.3** — GPU-основа, GR Job System, CPU preparation | ✅ Standalone реализация и тесты по отчётам | `7ae6958d`, `09ca02357`, `5b0e4bbcb`; общий GR pool, Serial/Parallel/Verify, CPU snapshot; не FPS игры |
+| **F3.5.0–F3.5.2B** — ADR, representative snapshot, visibility/compaction, ordering | ✅ Код закоммичен, CPU/ASan и regression PASS по отчётам | `8b1c0525`, `84de634e`, `d6592f97`, `3ac497d3`; порядок opaque/transparent/HUD относится к representative CPU-пути |
+| **F3.5.3A/B** — sequential multi-list и parallel D3D12 command recording | ✅ Реализовано и проверено в standalone Smoke | `b5232622`, `53b82c5`; исторический H1 fence был **FAIL** для старой ревизии и позднее исправлен `d38ea6d8` |
+| **F3.5.4A/B** — scaling/telemetry | ✅ Инструменты и 1–8 draw lists закоммичены; ⚠️ полный performance acceptance не заявлен | `de162d81`, `98a1e0fc`; p99 дополнен в Audit Hardening; синтетические замеры не являются FPS или доказательством ускорения |
+| **F3.5.5A/B/C** — packet-driven GPU recording, batch planning, parallel packets | ✅ Реализовано для standalone | `aeb6a674`, `d02e2a44`, `6daa0b44`; игровой traversal по-прежнему не подключён |
+| **F3.5.6A/B + Audit Hardening** — object CB, indexed geometry registry, fault/timing fixes | ✅ Код и независимый delta-review PASS; **CONDITIONAL PASS** для всего проверенного standalone HEAD | `0659303f`, `5b025aaa`, `738d143c`; M1/L1 закрыты, H1 исправлен; не тестировались все реальные driver failures/TDR, race detector и полный игровой runtime |
+| **F3.5.6C** — material/PSO milestone | ◻ Отдельный PASS не подтверждён в просмотренной истории | Не подменять возможными минимальными ресурсами F3.6A; проверить нужный контракт перед полноценным F4 |
+| **F3.6A — X-Ray Asset Bridge** | ✅ Закоммичен реальный standalone X-Ray OGF/DDS path; **не** игровой CoP renderer | `ccf0d22d`, `docs/dx12-f3-6a-xray-asset-bridge.md`; SoC static mesh, external loose files, textured fallback, без публикации игровых ресурсов |
+| **F4.0-B1** — Jupiter geometry reader | ✅ CPU-only исходники закоммичены | `0ef5aaf2`; это декодирование данных уровня, не GPU игровой кадр |
+| **F4.0-B2 / B2.3** — game camera snapshots и opt-in capture | ✅ CPU-only camera и opt-in интеграционный код закоммичены | `77e71e47`, `60f2030e`; наличие кода не доказывает полноценный runtime DX12 capture |
+| **F4.0-B3A** — offscreen Jupiter validation | 🛠 Код standalone offscreen validation добавлен в Git; независимый GPU PASS этой сверкой не подтверждён | `4b120ca81`; отделять test harness от кадра игрового процесса |
+| **F4.0 целиком** — реальный игровой DX12-кадр | ⬜ **НЕ ПРИНЯТ** | Нужны CoP/OGSR runtime, управляемая камера, видимая реальная геометрия и текстуры через DX12, depth/GBV, визуальный контроль и DX11 fallback |
+| **V — Volumetric Clouds** | 🛠 Отдельная разработка: V0 audit PASS WITH NOTES по roadmap; V2.1 — checkpoint без визуальной приёмки, V2.2 — текущая задача по отчётам | Не считать V1/V2 полноценным PASS без результатов кода, GPU и независимого review; V не блокирует F4/G |
+| **P — PhysX ragdoll** | 🔎 Архитектура и исследование ODE locomotion; **ragdoll P0–P2 не приняты** | Аудит ODE не равен интеграции PhysX; целевой первый NPC ragdoll в OGSR DX11/R4, ODE fallback |
+| **G — Hybrid DXR** | ✅ Архитектурное направление принято, реализация DXR не подтверждена | `22875a0`; Control/Metro — ориентиры, не готовый RT pipeline |
+
+**Границы:** работающий в Smoke DX12 путь, включая параллельную запись и
+поддержку настоящего SoC mesh, **не тождественен** замене R4 в игре.
+В F4.0 пока нельзя ставить PASS из-за наличия CPU readers, capture adapters
+или standalone GPU harness. Не считать тестовые hashes и p50/p95/p99
+доказательством стабильного игрового FPS. Legacy DX11/R4 должен сохраняться.
+
+### Историческая сводка статусов (снимок 2026-10-14/19; актуальная сверка — выше)
 
 | Этап | Статус | Следующее действие |
 |---|---|---|
@@ -57,10 +91,10 @@ Edition* (4A Games) — как исследовательский ориенти
 | C · Тюнинг DLSS | ⬜ Не реализован | Качество и семантика флагов |
 | D · DX11 SSGI / Hi-Z | ⬜ Исследование | D0 → D1 → D2, решение по результатам |
 | E · Техдолг | 🔎 Диагностика | Отдельные согласованные изменения |
-| F · Нативный DX12 | 🛠 В работе (статусы F ниже — исторический снимок) | После F3: F3.5 CPU-side многопоточная архитектура перед F4 |
-| F3.2 · GR Job System (DX12 only) | 🛠 Локальная интеграция Stage 1 по отчёту, не закоммичена | C.1: ownership/lifecycle; затем DX12 Smoke runtime/CPU scene |
-| F3.5 · Multithreaded Renderer Foundation | ✅ ADR принят (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата | F3.5.1 — representative snapshot prototype |
-| F3.5.1 · Representative snapshot prototype | ⏭ NEXT / NOT STARTED | Расширить snapshot представительными полями X-Ray; синтетические `(id, generation)`; не трогать R4 |
+| F · Нативный DX12 | 🛠 Standalone F3.6A и частичные F4.0-B1/B2/B3A в Git; игровой F4.0 ещё не принят | Актуальная сверка 2026-10-25 выше; следующий гейт — реальный игровой DX12-кадр |
+| F3.2 · GR Job System (DX12 only) | ✅ Коммиты и тесты standalone подтверждены по отчётам | Сохранить GR только для DX12; DX11/R4/physics не подключены |
+| F3.5 · Multithreaded Renderer Foundation | ✅ F3.5.1–F3.5.6B в Git; standalone CONDITIONAL PASS по независимому аудиту | Не выдавать за игровой runtime; закрыть непроверенные hardware fault/race/perf гейты |
+| F3.5.1 · Representative snapshot prototype | ✅ Закоммичен `84de634e` | Далее выполнены F3.5.2A/B: culling, compaction, draw ordering |
 | G · DXR | 🆕 План, зависит от F | G0: проверка возможностей GPU/драйвера; архитектурный ориентир Control + Metro закреплён 2026-10-22, реализация не начата |
 | H · Многопоточность | ⬜ План | H0: базовые профили, H1 после RT-теней и отражений |
 | I · World Streaming | ⬜ Концепция | I0: аудит X-Ray ресурсов/уровней и ownership |
@@ -405,7 +439,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 ---
 
-## Этап F — Нативный DX12 (новое направление; пока НЕ реализован)
+## Этап F — Нативный DX12 (standalone реализован; игровой DX12 ещё не принят)
 
 **Цель:** запустить CoP с настоящим D3D12-backend и сохранить рабочий DX11.
 **Приоритет:** стратегический для DXR · **Риск:** высокий · **Оценка срока:**
@@ -438,7 +472,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | F2 — bootstrap | ✅ PASS | F2.0 scaffold и F2.1-B собираются с 0 ошибок. GPU runtime подтверждён: Debug Layer + GBV + DRED активны, 6 036 ресайзов суммарно с 0 validation errors и 0 провалов, shutdown корректен, утечек нет (`ReportLiveObjects` через Microsoft DebugView v5.02, разбор владельцев). Documented limitations: обработка device removal — NOT TESTED (провокация TDR запрещена); полноценный игровой DX12 renderer отсутствует, есть только standalone bootstrap. CI для DX12 добавлен отдельным job `dx12-smoke-build` (build-only, без GPU runtime). Детали — `docs/dx12-f2-first-frame.md`, разделы F2.1-C.1, F2.1-C.2 и F2.1 Finalization |
 | F3 — ресурсы и геометрия | ⬜ NOT STARTED (снимок 2026-10-15) | Предложение по F3.0 — в `docs/dx12-f2-first-frame.md`; текущий прогресс проверять отдельно |
 | F3.5 — multithreaded foundation | ⬜ PLANNED (2026-10-16) | После подтверждения F3.1 / достаточного минимального 3D-пути; архитектурный прототип до F4 |
-| F4 — игровой кадр | ⬜ NOT STARTED | — |
+| F4 — полный игровой renderer | ⬜ Не принят; F4.0-B1/B2/B3A — частичные подготовительные шаги | Реальный кадр в CoP на DX12 и затем полноценные raster-проходы |
 | F5 — temporal | ⬜ NOT STARTED | — |
 | F6 — стабилизация | ⬜ NOT STARTED | — |
 
@@ -535,7 +569,7 @@ Multithreaded Renderer Foundation до F4. Ссылки F3.3/F3.4/F3.5 в таб
 
 **Порядок:** F3 минимальная 3D геометрия/depth/materials → F3.5.0–F3.5.4 → перенос игрового кадра F4 с уже определёнными безопасными границами. При необходимости F4 может стартовать с serial recording поверх подготовленного интерфейса и включать рабочий parallel path постепенно. G0/G1 лабораторные исследования не обязаны ждать полного performance tuning F3.5; полноценная интеграция DXR в игру — после F4.
 
-**Статус на 2026-10-19:** ✅ **F3.5.0 — ADR ПРИНЯТ** (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата. ⏭ **F3.5.1 — NEXT / NOT STARTED**: это **representative snapshot prototype** (раздел 9 ADR), а не интеграция реальных игровых объектов — реальный обход сцены остаётся за F4. Пункт не подтверждает реализацию snapshot или multi-list renderer.
+**Исторический статус на 2026-10-19 (заменён актуальной сверкой 2026-10-25 выше):** ✅ **F3.5.0 — ADR ПРИНЯТ** (`docs/dx12-f3-5-architecture-adr.md`), реализация не начата. ⏭ **F3.5.1 — NEXT / NOT STARTED**: это **representative snapshot prototype** (раздел 9 ADR), а не интеграция реальных игровых объектов — реальный обход сцены остаётся за F4. Пункт не подтверждает реализацию snapshot или multi-list renderer.
 
 **Ограничения, сохраняемые без изменений:** ручной визуальный осмотр окна, интерактивный minimize/restore и специализированный race detector (TSan) **не выполнены**; отсутствие гонок не доказано. Синтетические замеры F3.2C.2 — не FPS и не игровой рендер.
 
