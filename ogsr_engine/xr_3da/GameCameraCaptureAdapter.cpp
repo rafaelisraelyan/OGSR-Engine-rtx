@@ -8,11 +8,16 @@
 #include "igame_level.h"
 
 #include "../Layers/xrRenderDX12/dx12gamecamera.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+#include "../Layers/xrRenderDX12/dx12cameracapturefile.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -50,6 +55,12 @@ struct B2CameraCaptureState
     uint64_t staleTokens = 0;
     gamecamera12::CameraError12 lastError =
         gamecamera12::CameraError12::None;
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+    bool exportRequested = false;
+    bool exportAttempted = false;
+    wchar_t exportPath[1024]{};
+#endif
 };
 
 B2CameraCaptureState& State()
@@ -162,6 +173,149 @@ void DumpMatricesOnce(const gamecamera12::CameraCaptureInput12& input,
             input.fullTransform.m[row][2], input.fullTransform.m[row][3]);
     }
 }
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+constexpr const char* kB3ExportPrefix = "-b3_camera_export=";
+constexpr size_t kB3ExportPrefixLength = 18;
+
+bool IsParameterSpace(char value) noexcept
+{
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n' ||
+           value == '\v' || value == '\f';
+}
+
+// Exact "-b3_camera_export=<path>" lookup (optionally quoted). Substring
+// occurrences and the bare flag are rejected.
+bool ExtractB3ExportPath(const char* params, wchar_t* out,
+                         size_t outCount) noexcept
+{
+    if (params == nullptr || out == nullptr || outCount < 2)
+        return false;
+    const char* cursor = params;
+    while (*cursor)
+    {
+        while (*cursor && IsParameterSpace(*cursor))
+            ++cursor;
+        if (!*cursor)
+            break;
+        const char* token = cursor;
+        if (*cursor == '"')
+        {
+            ++cursor;
+            token = cursor;
+            while (*cursor && *cursor != '"')
+                ++cursor;
+        }
+        else
+        {
+            while (*cursor && !IsParameterSpace(*cursor))
+                ++cursor;
+        }
+        const size_t length = static_cast<size_t>(cursor - token);
+        if (length > kB3ExportPrefixLength &&
+            std::strncmp(token, kB3ExportPrefix, kB3ExportPrefixLength) == 0)
+        {
+            const char* value = token + kB3ExportPrefixLength;
+            const size_t valueLength = length - kB3ExportPrefixLength;
+            if (valueLength >= outCount)
+                return false;
+            const int converted = ::MultiByteToWideChar(
+                CP_UTF8, 0, value, static_cast<int>(valueLength), out,
+                static_cast<int>(outCount) - 1);
+            if (converted <= 0)
+                return false;
+            out[converted] = L'\0';
+            return true;
+        }
+        if (*cursor == '"')
+            ++cursor;
+    }
+    return false;
+}
+
+// One-shot transactional export of the exactly-published B2.3 camera.
+// Called only after PublishPending succeeded for this frame's token.
+void MaybeExportPublishedCamera(B2CameraCaptureState& state,
+                                const gamecamera12::CaptureToken12& token)
+{
+    if (!state.exportRequested || state.exportAttempted)
+        return;
+
+    cameracapture12::ExportGateState gate;
+    gate.exportRequested = state.exportRequested;
+    gate.alreadyExported = state.exportAttempted;
+    gate.ownerThread = OnOwnerThread();
+    gate.shuttingDown = state.shuttingDown;
+    gate.levelActive = state.levelActive;
+    gate.teardownPending = state.teardownPending;
+    gate.levelNameMatches = state.levelName[0] != '\0';
+
+    const auto& published = state.publication.Published();
+    gate.hasPublished = published.has_value();
+    gate.publishedTokenMatches =
+        published.has_value() && published->Token() == token;
+
+    cameracapture12::CameraCaptureFile12 capture{};
+    std::vector<uint8_t> bytes;
+    cameracapture12::FileError fileError = cameracapture12::FileError::None;
+    if (gate.hasPublished && gate.publishedTokenMatches)
+    {
+        const gamecamera12::GameCameraSnapshot12& snapshot = *published;
+        std::snprintf(capture.levelName, sizeof(capture.levelName), "%s",
+                      state.levelName);
+        capture.input.view = snapshot.View();
+        capture.input.projection = snapshot.Projection();
+        capture.input.fullTransform = snapshot.ViewProjection();
+        capture.input.hasFullTransform = true;
+        capture.input.position = snapshot.Position();
+        capture.input.viewportWidth = snapshot.ViewportWidth();
+        capture.input.viewportHeight = snapshot.ViewportHeight();
+        capture.input.levelSession = token.levelSession;
+        capture.input.captureEpoch = token.captureEpoch;
+        capture.input.captureSequence = token.captureSequence;
+        capture.input.sourceGameFrame = token.sourceGameFrame;
+        gate.cameraValid =
+            cameracapture12::Encode(capture, bytes, fileError);
+        if (!gate.cameraValid)
+        {
+            Msg("[B3-B1] camera export rejected: codec=%s",
+                cameracapture12::FileErrorMessage(fileError));
+            return;
+        }
+    }
+
+    const cameracapture12::ExportDecision decision =
+        cameracapture12::EvaluateExportGate(gate);
+    if (decision != cameracapture12::ExportDecision::Write)
+    {
+        Msg("[B3-B1] camera export skipped: %s",
+            cameracapture12::ExportDecisionName(decision));
+        return;
+    }
+
+    state.exportAttempted = true;
+    cameracapture12::WriteError writeError = cameracapture12::WriteError::None;
+    if (!cameracapture12::WriteFileAtomic(state.exportPath, bytes, writeError))
+    {
+        Msg("[B3-B1] camera export failed: %s level='%s' session=%llu "
+            "epoch=%llu sequence=%llu frame=%u",
+            cameracapture12::WriteErrorMessage(writeError), state.levelName,
+            static_cast<unsigned long long>(token.levelSession),
+            static_cast<unsigned long long>(token.captureEpoch),
+            static_cast<unsigned long long>(token.captureSequence),
+            token.sourceGameFrame);
+        return;
+    }
+
+    Msg("[B3-B1] camera export written level='%s' session=%llu epoch=%llu "
+        "sequence=%llu frame=%u bytes=%zu path='%ls'",
+        state.levelName,
+        static_cast<unsigned long long>(token.levelSession),
+        static_cast<unsigned long long>(token.captureEpoch),
+        static_cast<unsigned long long>(token.captureSequence),
+        token.sourceGameFrame, bytes.size(), state.exportPath);
+}
+#endif // OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
 } // namespace
 
 void B2CameraCapture_Initialize()
@@ -180,6 +334,15 @@ void B2CameraCapture_Initialize()
         b2camera_diagnostics::HasExactArgument(params, "-b2_camera_samples");
     state.enabled =
         b2camera_diagnostics::HasExactArgument(params, "-b2_camera_capture");
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+    state.exportRequested = ExtractB3ExportPath(
+        params, state.exportPath, std::size(state.exportPath));
+    if (state.exportRequested)
+        Msg("[B3-B1] one-shot camera export enabled");
+    else if (b2camera_diagnostics::HasExactArgument(params, "-b3_camera_export"))
+        Msg("[B3-B1] camera export ignored: expected -b3_camera_export=<path>");
+#endif
 
     if (state.enabled)
         Msg("[B2.3] CPU camera capture enabled (startup opt-in)");
@@ -411,6 +574,9 @@ void B2CameraCapture_OnFrameRenderBeginSucceeded()
 
     state.lastError = gamecamera12::CameraError12::None;
     ++state.publishedCaptures;
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+    MaybeExportPublishedCamera(state, token);
+#endif
     if (state.dumpGate.OnPublished(token))
         DumpMatricesOnce(state.dumpGate.Input(), token);
     if (!state.publication.Published())

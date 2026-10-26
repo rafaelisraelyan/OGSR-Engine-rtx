@@ -238,6 +238,18 @@
     <ClInclude Include="GameCameraCaptureAdapter.h" />
     <ClInclude Include="GameCameraCaptureDiagnostics.h" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true'">
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12cameracapturefile.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\build_config_defines.h" />
     <ClInclude Include="cf_dynamic_mesh.h" />
@@ -440,6 +452,10 @@
     <Image Include="stalker.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateB3CameraExportDependency" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'!='true'"
+           Text="B3 camera export requires OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE=true" />
+  </Target>
   <Target Name="PostBuildStep1" AfterTargets="Build">
     <Exec Command='copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll"' />
   </Target>

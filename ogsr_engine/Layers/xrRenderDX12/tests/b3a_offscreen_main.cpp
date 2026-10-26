@@ -7,6 +7,9 @@
 // bounded GPU fence wait.
 
 #include "b3a_gpu_state.h"
+#include "b3b1_visibility.h"
+#include "b3b1_sha256.h"
+#include "dx12cameracapturefile.h"
 #include "dx12gamecamera.h"
 #include "dx12xraylevelgeometry.h"
 #include "dx12fencewait.h"
@@ -50,9 +53,14 @@ struct Options
     fs::path level;
     fs::path geom;
     fs::path output;
+    fs::path cameraFile;
+    std::string levelName;
     uint32_t visual = 3;
     uint32_t width = kDefaultWidth;
     uint32_t height = kDefaultHeight;
+    bool widthSpecified = false;
+    bool heightSpecified = false;
+    bool cameraFileSpecified = false;
 };
 
 struct Audit
@@ -264,6 +272,25 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& reason)
             }
             options.output = value;
         }
+        else if (arg == "--camera-file")
+        {
+            if (!next(value))
+            {
+                reason = "missing value for --camera-file";
+                return false;
+            }
+            options.cameraFile = value;
+            options.cameraFileSpecified = true;
+        }
+        else if (arg == "--level-name")
+        {
+            if (!next(value))
+            {
+                reason = "missing value for --level-name";
+                return false;
+            }
+            options.levelName = value;
+        }
         else if (arg == "--visual")
         {
             if (!next(value))
@@ -282,9 +309,15 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& reason)
             }
             const uint32_t parsed = static_cast<uint32_t>(std::stoul(value));
             if (arg == "--width")
+            {
                 options.width = parsed;
+                options.widthSpecified = true;
+            }
             else
+            {
                 options.height = parsed;
+                options.heightSpecified = true;
+            }
         }
         else
         {
@@ -295,6 +328,24 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& reason)
     if (options.level.empty() || options.geom.empty() || options.output.empty())
     {
         reason = "MISSING REAL LEVEL ASSETS: --level, --geom and --output are required";
+        return false;
+    }
+    if (options.cameraFileSpecified)
+    {
+        if (options.cameraFile.empty())
+        {
+            reason = "empty --camera-file path";
+            return false;
+        }
+        if (options.levelName.empty())
+        {
+            reason = "--camera-file requires --level-name for the level match check";
+            return false;
+        }
+    }
+    if (options.widthSpecified != options.heightSpecified)
+    {
+        reason = "--width and --height must be provided together";
         return false;
     }
     if (options.width == 0 || options.height == 0)
@@ -311,6 +362,10 @@ struct PositionElement
     uint32_t offset = 0;
     uint32_t stride = 0;
 };
+
+// Declared POSITION offset of the selected visual. The standalone test is
+// single-threaded and reads one visual per process.
+uint32_t g_positionOffset = 0;
 
 PositionElement ValidateDeclaration(const xraylevel12::Geometry& geometry,
                                     std::string& reason)
@@ -357,8 +412,9 @@ bool ReadPosition(const xraylevel12::Geometry& geometry, uint32_t index,
         reason = "vertex stride cannot contain POSITION";
         return false;
     }
-    const uint64_t offset =
-        static_cast<uint64_t>(index) * geometry.vertex_stride;
+    const uint64_t offset = static_cast<uint64_t>(index) *
+                                geometry.vertex_stride +
+                            g_positionOffset;
     if (offset + 3 * sizeof(float) > geometry.vertex_bytes.size())
     {
         reason = "POSITION read exceeds compact vertex bytes";
@@ -375,20 +431,47 @@ bool ReadPosition(const xraylevel12::Geometry& geometry, uint32_t index,
     position = {raw[0], raw[1], raw[2]};
     return true;
 }
-bool ValidateGeometry(const xraylevel12::Geometry& geometry, std::string& reason)
+bool ValidateGeometry(const xraylevel12::Geometry& geometry,
+                      bool strictJupiterShape, std::string& reason)
 {
-    if (geometry.vertex_stride != 32 || geometry.vertex_count != 120 ||
-        geometry.index_count != 192 || geometry.triangle_count != 64 ||
-        geometry.first_index != 0 || geometry.base_vertex != 0 ||
-        geometry.vertex_bytes.size() != 120ull * 32ull ||
-        geometry.indices.size() != 192)
+    if (strictJupiterShape)
     {
-        reason = "unexpected compact geometry shape for Jupiter visual 3";
-        return false;
+        if (geometry.vertex_stride != 32 || geometry.vertex_count != 120 ||
+            geometry.index_count != 192 || geometry.triangle_count != 64 ||
+            geometry.first_index != 0 || geometry.base_vertex != 0 ||
+            geometry.vertex_bytes.size() != 120ull * 32ull ||
+            geometry.indices.size() != 192)
+        {
+            reason = "unexpected compact geometry shape for Jupiter visual 3";
+            return false;
+        }
+    }
+    else
+    {
+        // Real-camera replay may select any structurally valid real visual.
+        if (geometry.vertex_count == 0 || geometry.index_count < 3 ||
+            (geometry.index_count % 3) != 0 || geometry.vertex_stride == 0 ||
+            geometry.vertex_stride > 4096 ||
+            geometry.vertex_bytes.size() !=
+                static_cast<uint64_t>(geometry.vertex_count) *
+                    geometry.vertex_stride ||
+            geometry.indices.size() != geometry.index_count ||
+            geometry.first_index > 0xFFFF ||
+            geometry.base_vertex > geometry.vertex_count)
+        {
+            reason = "unexpected compact geometry shape";
+            return false;
+        }
     }
     const PositionElement declaration = ValidateDeclaration(geometry, reason);
-    if (!declaration.found || declaration.offset != 0)
+    if (!declaration.found)
         return false;
+    if (strictJupiterShape && declaration.offset != 0)
+    {
+        reason = "Jupiter visual 3 POSITION is not at offset 0";
+        return false;
+    }
+    g_positionOffset = declaration.offset;
     if (geometry.bounds.minimum[0] > geometry.bounds.maximum[0] ||
         geometry.bounds.minimum[1] > geometry.bounds.maximum[1] ||
         geometry.bounds.minimum[2] > geometry.bounds.maximum[2])
@@ -888,7 +971,8 @@ bool CreateRootSignature(ID3D12Device* device, ID3D12RootSignature** signature,
 }
 
 bool CreatePipeline(ID3D12Device* device, ID3D12RootSignature* root,
-                    ID3D12PipelineState** pso, Audit& audit)
+                    uint32_t positionOffset, ID3D12PipelineState** pso,
+                    Audit& audit)
 {
     static const char* shaderSource = R"(
         cbuffer Camera : register(b0)
@@ -940,7 +1024,7 @@ bool CreatePipeline(ID3D12Device* device, ID3D12RootSignature* root,
     inputElement.SemanticIndex = 0;
     inputElement.Format = DXGI_FORMAT_R32G32B32_FLOAT;
     inputElement.InputSlot = 0;
-    inputElement.AlignedByteOffset = 0;
+    inputElement.AlignedByteOffset = positionOffset;
     inputElement.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
     inputElement.InstanceDataStepRate = 0;
 
@@ -1043,11 +1127,129 @@ bool BuildValidationCamera(const xraylevel12::Geometry& geometry,
     return true;
 }
 
+bool LevelNamesEqual(const char* left, const char* right)
+{
+    if (left == nullptr || right == nullptr)
+        return false;
+    while (*left && *right)
+    {
+        unsigned char a = static_cast<unsigned char>(*left);
+        unsigned char b = static_cast<unsigned char>(*right);
+        if (a >= 'A' && a <= 'Z')
+            a = static_cast<unsigned char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = static_cast<unsigned char>(b - 'A' + 'a');
+        if (a != b)
+            return false;
+        ++left;
+        ++right;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+bool BuildRealCameraFromFile(Options& options,
+                             gamecamera12::CameraCaptureInput12& input,
+                             std::optional<gamecamera12::GameCameraSnapshot12>& snapshot,
+                             std::string& captureSha256,
+                             Audit& audit)
+{
+    std::vector<uint8_t> fileBytes;
+    std::string reason;
+    if (!ReadFileBytes(options.cameraFile, fileBytes, reason))
+    {
+        Log(audit.camera, "camera_file_error=%s", reason.c_str());
+        return false;
+    }
+    captureSha256 = b3b1::Sha256Hex(fileBytes);
+
+    cameracapture12::CameraCaptureFile12 file{};
+    cameracapture12::FileError fileError = cameracapture12::FileError::None;
+    if (!cameracapture12::Decode(fileBytes, file, fileError))
+    {
+        Log(audit.camera, "camera_wire_error=%s (%d)",
+            cameracapture12::FileErrorMessage(fileError),
+            static_cast<int>(fileError));
+        return false;
+    }
+
+    if (!LevelNamesEqual(file.levelName, options.levelName.c_str()))
+    {
+        Log(audit.camera, "camera_level_mismatch file='%s' expected='%s'",
+            file.levelName, options.levelName.c_str());
+        return false;
+    }
+
+    input = file.input;
+    gamecamera12::CameraCaptureResult12 result =
+        gamecamera12::ValidateCamera12(input);
+    if (result.error != gamecamera12::CameraError12::None || !result.camera)
+    {
+        Log(audit.camera, "camera_validation_error=%d",
+            static_cast<int>(result.error));
+        return false;
+    }
+    snapshot = std::move(*result.camera);
+
+    const uint32_t captureWidth = snapshot->ViewportWidth();
+    const uint32_t captureHeight = snapshot->ViewportHeight();
+    if (options.widthSpecified)
+    {
+        const double captureAspect = static_cast<double>(captureWidth) /
+                                     static_cast<double>(captureHeight);
+        const double outputAspect = static_cast<double>(options.width) /
+                                    static_cast<double>(options.height);
+        if (std::fabs(captureAspect - outputAspect) > 1.0e-3)
+        {
+            Log(audit.camera,
+                "camera_viewport_aspect_mismatch capture=%ux%u output=%ux%u",
+                captureWidth, captureHeight, options.width, options.height);
+            return false;
+        }
+    }
+    else
+    {
+        options.width = captureWidth;
+        options.height = captureHeight;
+    }
+
+    double maxDelta = 0.0;
+    for (uint32_t row = 0; row < 4; ++row)
+        for (uint32_t column = 0; column < 4; ++column)
+            maxDelta = std::max(
+                maxDelta,
+                std::fabs(static_cast<double>(input.fullTransform.m[row][column]) -
+                          static_cast<double>(
+                              snapshot->ViewProjection().m[row][column])));
+
+    Log(audit.camera, "camera_mode=real_game_capture_replay");
+    Log(audit.camera, "camera_wire_format_version=%u",
+        static_cast<unsigned>(cameracapture12::kFormatVersion));
+    Log(audit.camera, "camera_capture_sha256=%s", captureSha256.c_str());
+    Log(audit.camera, "camera_wire_bytes=%llu",
+        static_cast<unsigned long long>(fileBytes.size()));
+    Log(audit.camera, "camera_level=%s", file.levelName);
+    Log(audit.camera, "level_name_match=1");
+    Log(audit.camera, "level_session=%llu",
+        static_cast<unsigned long long>(input.levelSession));
+    Log(audit.camera, "capture_epoch=%llu",
+        static_cast<unsigned long long>(input.captureEpoch));
+    Log(audit.camera, "capture_sequence=%llu",
+        static_cast<unsigned long long>(input.captureSequence));
+    Log(audit.camera, "source_game_frame=%u", input.sourceGameFrame);
+    Log(audit.camera, "capture_viewport=%ux%u", captureWidth, captureHeight);
+    Log(audit.camera, "output_viewport=%ux%u", options.width, options.height);
+    Log(audit.camera, "capture_aspect_match=1");
+    Log(audit.camera, "full_transform_max_delta=%.9g", maxDelta);
+    Log(audit.camera, "real_camera_input=VERIFIED");
+    return true;
+}
+
 struct CpuProjection
 {
     bool any = false;
+    bool depthInRange = false;
     float clip[4] = {};
-    float ndc[2] = {};
+    float ndc[3] = {};
     float pixel[2] = {};
 };
 
@@ -1069,8 +1271,198 @@ CpuProjection ProjectVertex(const DirectX::XMFLOAT4X4& viewProjection,
         return out;
     out.ndc[0] = out.clip[0] / out.clip[3];
     out.ndc[1] = out.clip[1] / out.clip[3];
-    out.any = std::isfinite(out.ndc[0]) && std::isfinite(out.ndc[1]);
+    out.ndc[2] = out.clip[2] / out.clip[3];
+    out.any = std::isfinite(out.ndc[0]) && std::isfinite(out.ndc[1]) &&
+              std::isfinite(out.ndc[2]);
+    // D3D depth range is [0, 1]; fragments outside are clipped by the GPU.
+    out.depthInRange = out.ndc[2] >= 0.0f && out.ndc[2] <= 1.0f;
     return out;
+}
+
+struct CpuVisibility
+{
+    bool analysisOk = false;
+    bool clippedAny = false;
+    uint32_t triangles = 0;
+    uint32_t clippedTriangles = 0;
+    b3b1::CoverageConfidence confidence =
+        b3b1::CoverageConfidence::AnalysisInvalid;
+    uint64_t coveredPixels = 0;
+    uint64_t interiorPixels = 0;
+    // Conservative screen-space bounds of clipped primitives.
+    double boundMinX = 0.0;
+    double boundMinY = 0.0;
+    double boundMaxX = 0.0;
+    double boundMaxY = 0.0;
+    bool boundsValid = false;
+    // Pixel-center coverage bounds produced by the shared rasterizer.
+    double coveredMinX = 0.0;
+    double coveredMinY = 0.0;
+    double coveredMaxX = 0.0;
+    double coveredMaxY = 0.0;
+    bool coverageBoundsValid = false;
+};
+
+const char* ConfidenceName(b3b1::CoverageConfidence confidence) noexcept
+{
+    switch (confidence)
+    {
+    case b3b1::CoverageConfidence::GuaranteedInterior:
+        return "GUARANTEED_INTERIOR_SAMPLE";
+    case b3b1::CoverageConfidence::BoundaryOnly:
+        return "BOUNDARY_ONLY_OR_UNCERTAIN";
+    case b3b1::CoverageConfidence::NoSampleCoverage:
+        return "NO_SAMPLE_COVERAGE";
+    case b3b1::CoverageConfidence::OutsideFrustum:
+        return "OUTSIDE_FRUSTUM";
+    case b3b1::CoverageConfidence::AnalysisInvalid:
+        return "ANALYSIS_INVALID";
+    }
+    return "ANALYSIS_INVALID";
+}
+
+CpuVisibility AnalyzeVisibility(const xraylevel12::Geometry& geometry,
+                                const DirectX::XMFLOAT4X4& viewProjection,
+                                uint32_t width, uint32_t height,
+                                std::string& reason)
+{
+    CpuVisibility visibility;
+    visibility.analysisOk = true;
+    if (geometry.index_count < 3 || geometry.indices.size() < 3)
+    {
+        visibility.confidence = b3b1::CoverageConfidence::OutsideFrustum;
+        return visibility;
+    }
+
+    std::vector<b3b1::ScreenTriangle> screenTriangles;
+    screenTriangles.reserve(geometry.index_count / 3);
+    const DirectX::XMFLOAT4X4& m = viewProjection;
+    bool invalid = false;
+
+    for (size_t index = 0; index + 2 < geometry.indices.size(); index += 3)
+    {
+        ++visibility.triangles;
+        DirectX::XMFLOAT3 position[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!ReadPosition(geometry, geometry.indices[index + i],
+                              position[i], reason))
+            {
+                visibility.analysisOk = false;
+                return visibility;
+            }
+        }
+
+        b3b1::ClipVertex clip[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            const double x = position[i].x;
+            const double y = position[i].y;
+            const double z = position[i].z;
+            clip[i].x = x * m.m[0][0] + y * m.m[1][0] + z * m.m[2][0] + m.m[3][0];
+            clip[i].y = x * m.m[0][1] + y * m.m[1][1] + z * m.m[2][1] + m.m[3][1];
+            clip[i].z = x * m.m[0][2] + y * m.m[1][2] + z * m.m[2][2] + m.m[3][2];
+            clip[i].w = x * m.m[0][3] + y * m.m[1][3] + z * m.m[2][3] + m.m[3][3];
+        }
+
+        b3b1::ClipVertex polygon[16];
+        int count = 0;
+        bool clipInvalid = false;
+        if (!b3b1::ClipTriangleToFrustum(clip, polygon, count, clipInvalid))
+        {
+            if (clipInvalid)
+                invalid = true;
+            continue;
+        }
+
+        bool valid = true;
+        double screenX[16] = {};
+        double screenY[16] = {};
+        for (int i = 0; i < count; ++i)
+        {
+            if (!(polygon[i].w > 1.0e-9) || !std::isfinite(polygon[i].x) ||
+                !std::isfinite(polygon[i].y) || !std::isfinite(polygon[i].z) ||
+                !std::isfinite(polygon[i].w))
+            {
+                valid = false;
+                break;
+            }
+            const double ndcX = polygon[i].x / polygon[i].w;
+            const double ndcY = polygon[i].y / polygon[i].w;
+            screenX[i] = (ndcX * 0.5 + 0.5) * static_cast<double>(width);
+            screenY[i] = (0.5 - ndcY * 0.5) * static_cast<double>(height);
+            if (!std::isfinite(screenX[i]) || !std::isfinite(screenY[i]))
+            {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+        {
+            invalid = true;
+            continue;
+        }
+
+        visibility.clippedAny = true;
+        ++visibility.clippedTriangles;
+        for (int i = 0; i < count; ++i)
+        {
+            if (!visibility.boundsValid)
+            {
+                visibility.boundsValid = true;
+                visibility.boundMinX = screenX[i];
+                visibility.boundMaxX = screenX[i];
+                visibility.boundMinY = screenY[i];
+                visibility.boundMaxY = screenY[i];
+            }
+            else
+            {
+                visibility.boundMinX = std::min(visibility.boundMinX, screenX[i]);
+                visibility.boundMaxX = std::max(visibility.boundMaxX, screenX[i]);
+                visibility.boundMinY = std::min(visibility.boundMinY, screenY[i]);
+                visibility.boundMaxY = std::max(visibility.boundMaxY, screenY[i]);
+            }
+        }
+        for (int i = 1; i + 1 < count; ++i)
+        {
+            b3b1::ScreenTriangle triangle;
+            triangle.x[0] = screenX[0];
+            triangle.y[0] = screenY[0];
+            triangle.z[0] = polygon[0].z / polygon[0].w;
+            triangle.x[1] = screenX[i];
+            triangle.y[1] = screenY[i];
+            triangle.z[1] = polygon[i].z / polygon[i].w;
+            triangle.x[2] = screenX[i + 1];
+            triangle.y[2] = screenY[i + 1];
+            triangle.z[2] = polygon[i + 1].z / polygon[i + 1].w;
+            screenTriangles.push_back(triangle);
+        }
+    }
+
+    if (invalid)
+    {
+        visibility.confidence = b3b1::CoverageConfidence::AnalysisInvalid;
+        visibility.analysisOk = false;
+        reason = "visibility clipping produced invalid coordinates";
+        return visibility;
+    }
+    if (!visibility.clippedAny)
+    {
+        visibility.confidence = b3b1::CoverageConfidence::OutsideFrustum;
+        return visibility;
+    }
+
+    const b3b1::RasterResult raster = b3b1::RasterizeTriangles(
+        screenTriangles.data(), screenTriangles.size(), width, height);
+    visibility.confidence = raster.confidence;
+    visibility.coveredPixels = raster.coveredPixels;
+    visibility.interiorPixels = raster.interiorPixels;
+    visibility.coverageBoundsValid = raster.boundsValid;
+    visibility.coveredMinX = raster.minX;
+    visibility.coveredMinY = raster.minY;
+    visibility.coveredMaxX = raster.maxX;
+    visibility.coveredMaxY = raster.maxY;
+    return visibility;
 }
 
 bool CreateReadbackBuffer(ID3D12Device* device, uint64_t size,
@@ -1126,7 +1518,7 @@ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &barrier);
 }
 
-int Run(const Options& options)
+int Run(Options options)
 {
     Audit audit;
     if (!audit.Open(options.output))
@@ -1164,7 +1556,8 @@ int Run(const Options& options)
             declarationIndex, element.stream, element.offset, element.type,
             element.method, element.usage, element.usage_index);
     }
-    if (!ValidateGeometry(geometry, reason))
+    const bool realCamera = options.cameraFileSpecified;
+    if (!ValidateGeometry(geometry, !realCamera, reason))
     {
         Log(audit.gpu, "geometry validation failed: %s", reason.c_str());
         std::fprintf(stderr, "geometry validation failed: %s\n", reason.c_str());
@@ -1190,8 +1583,8 @@ int Run(const Options& options)
         geometry.bounds.maximum[2]);
     Log(audit.geometry, "draw=DrawIndexedInstanced(%u,1,%u,%u,0)",
         geometry.index_count, geometry.first_index, geometry.base_vertex);
-    Log(audit.geometry, "declaration_count=%u position_offset=0 position_type=FLOAT3",
-        geometry.declaration_count);
+    Log(audit.geometry, "declaration_count=%u position_offset=%u position_type=FLOAT3",
+        geometry.declaration_count, g_positionOffset);
     for (uint32_t i = 0; i < geometry.vertex_count; ++i)
     {
         DirectX::XMFLOAT3 position{};
@@ -1235,15 +1628,28 @@ int Run(const Options& options)
 
     gamecamera12::CameraCaptureInput12 captured{};
     std::optional<gamecamera12::GameCameraSnapshot12> cameraStorage;
-    if (!BuildValidationCamera(geometry, options.width, options.height,
-                               captured, cameraStorage, audit))
+    std::string captureSha256;
+    if (realCamera)
+    {
+        if (!BuildRealCameraFromFile(options, captured, cameraStorage,
+                                     captureSha256, audit))
+        {
+            std::fprintf(stderr, "real camera capture rejected\n");
+            return 4;
+        }
+    }
+    else if (!BuildValidationCamera(geometry, options.width, options.height,
+                                    captured, cameraStorage, audit))
     {
         std::fprintf(stderr, "B2 validation failed\n");
         return 4;
     }
     const gamecamera12::GameCameraSnapshot12* camera = &*cameraStorage;
-    Log(audit.camera, "camera_mode=deterministic_validation");
-    Log(audit.camera, "real_camera_input=NOT VERIFIED");
+    if (!realCamera)
+    {
+        Log(audit.camera, "camera_mode=deterministic_validation");
+        Log(audit.camera, "real_camera_input=NOT VERIFIED");
+    }
     Log(audit.camera, "position=%.9g %.9g %.9g",
         camera->Position().x, camera->Position().y, camera->Position().z);
     Log(audit.camera, "viewport=%ux%u", options.width, options.height);
@@ -1276,41 +1682,39 @@ int Run(const Options& options)
         first.clip[0], first.clip[1], first.clip[2], first.clip[3]);
     Log(audit.camera, "vertex0_ndc=%.9g %.9g", first.ndc[0], first.ndc[1]);
 
-    uint32_t cpuMinX = options.width, cpuMinY = options.height;
-    uint32_t cpuMaxX = 0, cpuMaxY = 0;
-    uint32_t projected = 0;
-    for (uint32_t i = 0; i < geometry.vertex_count; ++i)
+    const CpuVisibility visibility =
+        AnalyzeVisibility(geometry, camera->ViewProjection(), options.width,
+                          options.height, reason);
+    if (!visibility.analysisOk)
     {
-        DirectX::XMFLOAT3 position{};
-        if (!ReadPosition(geometry, i, position, reason))
-        {
-            Log(audit.gpu, "CPU projection position audit failed: %s",
-                reason.c_str());
-            return 5;
-        }
-        const CpuProjection projectedVertex =
-            ProjectVertex(camera->ViewProjection(), position);
-        if (!projectedVertex.any)
-            continue;
-        const float px = (projectedVertex.ndc[0] * 0.5f + 0.5f) *
-                         static_cast<float>(options.width);
-        const float py = (0.5f - projectedVertex.ndc[1] * 0.5f) *
-                         static_cast<float>(options.height);
-        if (px < 0.0f || py < 0.0f ||
-            px > static_cast<float>(options.width) ||
-            py > static_cast<float>(options.height))
-            continue;
-        ++projected;
-        cpuMinX = std::min(cpuMinX, static_cast<uint32_t>(px));
-        cpuMinY = std::min(cpuMinY, static_cast<uint32_t>(py));
-        cpuMaxX = std::max(cpuMaxX, static_cast<uint32_t>(px));
-        cpuMaxY = std::max(cpuMaxY, static_cast<uint32_t>(py));
+        Log(audit.gpu, "CPU visibility analysis failed: %s", reason.c_str());
+        return 5;
     }
-    Log(audit.camera, "cpu_projected_vertices=%u bbox=%u,%u..%u,%u",
-        projected, cpuMinX, cpuMinY, cpuMaxX, cpuMaxY);
-    if (projected == 0)
+    Log(audit.camera, "cpu_triangles=%u clipped_triangles=%u clipped_any=%d",
+        visibility.triangles, visibility.clippedTriangles,
+        visibility.clippedAny ? 1 : 0);
+    if (visibility.boundsValid)
+        Log(audit.camera, "cpu_clip_bounds=%.2f,%.2f..%.2f,%.2f",
+            visibility.boundMinX, visibility.boundMinY, visibility.boundMaxX,
+            visibility.boundMaxY);
+    Log(audit.camera, "cpu_coverage=%d covered_pixels=%llu interior_pixels=%llu",
+        visibility.coveredPixels != 0 ? 1 : 0,
+        static_cast<unsigned long long>(visibility.coveredPixels),
+        static_cast<unsigned long long>(visibility.interiorPixels));
+    if (visibility.coverageBoundsValid)
+        Log(audit.camera, "cpu_coverage_bounds=%.0f,%.0f..%.0f,%.0f",
+            visibility.coveredMinX, visibility.coveredMinY,
+            visibility.coveredMaxX, visibility.coveredMaxY);
+    const char* confidenceName = ConfidenceName(visibility.confidence);
+    Log(audit.camera, "cpu_coverage_confidence=%s", confidenceName);
+    Log(audit.camera, "cpu_visibility_status=%s", confidenceName);
+    if (!realCamera &&
+        visibility.confidence != b3b1::CoverageConfidence::GuaranteedInterior)
     {
-        Log(audit.gpu, "validation camera does not project any visual vertex");
+        Log(audit.gpu,
+            "validation camera does not produce a guaranteed visible draw "
+            "(confidence=%s)",
+            confidenceName);
         return 5;
     }
 
@@ -1608,7 +2012,8 @@ int Run(const Options& options)
 
     if (!CreateRootSignature(device.Get(), root.GetAddressOf(), audit))
         return 10;
-    if (!CreatePipeline(device.Get(), root.Get(), pso.GetAddressOf(), audit))
+    if (!CreatePipeline(device.Get(), root.Get(), g_positionOffset,
+                        pso.GetAddressOf(), audit))
         return 10;
 
     if (!CreateCommitted(device.Get(), Heap(D3D12_HEAP_TYPE_UPLOAD),
@@ -1799,27 +2204,13 @@ int Run(const Options& options)
             }
         }
     }
-    if (nonClear == 0)
-    {
-        Log(audit.gpu, "color target contains only clear color");
-        return 13;
-    }
-    const bool bboxOk = minX + 3 >= cpuMinX && minY + 3 >= cpuMinY &&
-                        maxX <= cpuMaxX + 3 && maxY <= cpuMaxY + 3;
     Log(audit.readback, "dimensions=%ux%u format=DXGI_FORMAT_R8G8B8A8_UNORM",
         options.width, options.height);
     Log(audit.readback, "row_pitch=%u", colorPitch);
     Log(audit.readback, "resource_state=RENDER_TARGET->COPY_SOURCE");
     Log(audit.readback, "non_clear_pixels=%u", nonClear);
-    Log(audit.readback, "gpu_bbox=%u,%u..%u,%u cpu_bbox=%u,%u..%u,%u bbox_ok=%d",
-        minX, minY, maxX, maxY, cpuMinX, cpuMinY, cpuMaxX, cpuMaxY,
-        bboxOk ? 1 : 0);
-    if (!bboxOk)
-    {
-        Log(audit.gpu, "GPU color bbox is outside CPU projected bounds");
-        return 13;
-    }
 
+    // Depth is always read back and audited, including clear-only frames.
     void* mappedDepth = nullptr;
     if (!Check(depthReadback->Map(0, nullptr, &mappedDepth),
                "Map depth readback", audit))
@@ -1842,11 +2233,6 @@ int Run(const Options& options)
     Log(audit.readback, "depth_format=DXGI_FORMAT_D32_FLOAT depth_row_pitch=%u",
         depthPitch);
     Log(audit.readback, "depth_min=%.9g depth_max=%.9g", depthMin, depthMax);
-    if (!(depthMin < 1.0f && depthMax <= 1.0f && depthMin >= 0.0f))
-    {
-        Log(audit.gpu, "depth test did not produce expected depth values");
-        return 13;
-    }
     if (!WriteDepthPgm(options.output / "offscreen-depth.pgm", options.width,
                        options.height, depthValues, depthPitch))
     {
@@ -1854,19 +2240,130 @@ int Run(const Options& options)
         return 13;
     }
 
+    // InfoQueue is inspected for every frame, including clear-only frames.
     const InfoQueueResult infoQueue = InspectInfoQueue(
         device.Get(), audit, CompletionConfirmed(owner.workState),
         debugLayerAvailable, gpuBasedValidationRequested, deniedAtStart);
-    if (!b3a::ValidationPasses(infoQueue.status))
+    const bool validationPassed = b3a::ValidationPasses(infoQueue.status);
+
+    const b3b1::CoverageConfidence confidence = visibility.confidence;
+    const bool guaranteed =
+        confidence == b3b1::CoverageConfidence::GuaranteedInterior;
+    const bool boundary = confidence == b3b1::CoverageConfidence::BoundaryOnly;
+    const bool noCoverage =
+        confidence == b3b1::CoverageConfidence::NoSampleCoverage;
+    const bool outOfFrustum =
+        confidence == b3b1::CoverageConfidence::OutsideFrustum;
+    const bool analysisInvalid =
+        confidence == b3b1::CoverageConfidence::AnalysisInvalid;
+
+    const bool depthAllClear = depthMin == 1.0f && depthMax == 1.0f;
+    const bool depthWritten =
+        depthMin < 1.0f && depthMax <= 1.0f && depthMin >= 0.0f;
+
+    bool bboxOk = true;
+    if (nonClear != 0 && visibility.coverageBoundsValid)
     {
-        Log(audit.gpu, "frame_status=REJECTED_BY_VALIDATION status=%s",
+        bboxOk = static_cast<double>(minX) + 3.0 >= visibility.coveredMinX &&
+                 static_cast<double>(minY) + 3.0 >= visibility.coveredMinY &&
+                 static_cast<double>(maxX) <= visibility.coveredMaxX + 3.0 &&
+                 static_cast<double>(maxY) <= visibility.coveredMaxY + 3.0;
+    }
+    if (visibility.coverageBoundsValid)
+        Log(audit.readback,
+            "gpu_bbox=%u,%u..%u,%u cpu_coverage_bbox=%.0f,%.0f..%.0f,%.0f bbox_ok=%d",
+            minX, minY, maxX, maxY, visibility.coveredMinX,
+            visibility.coveredMinY, visibility.coveredMaxX,
+            visibility.coveredMaxY, bboxOk ? 1 : 0);
+
+    // GPU pixels are only accepted as a verified draw when the CPU model
+    // predicts a comfortable interior sample, or when the GPU itself supplies
+    // positive evidence inside conservative bounds. Boundary-only predictions
+    // never turn an empty readback into a hard failure.
+    const char* visibilityStatus = "UNVERIFIED";
+    bool visibleDrawVerified = false;
+    if (analysisInvalid)
+    {
+        visibilityStatus = "UNVERIFIED";
+    }
+    else if (guaranteed)
+    {
+        if (nonClear == 0 || !bboxOk || !depthWritten)
+            visibilityStatus = "RENDER_FAILURE";
+        else
+        {
+            visibleDrawVerified = true;
+            visibilityStatus = "VISIBLE_DRAW_VERIFIED";
+        }
+    }
+    else if (boundary)
+    {
+        if (nonClear > 0 && bboxOk && depthWritten)
+        {
+            visibleDrawVerified = true;
+            visibilityStatus = "VISIBLE_DRAW_VERIFIED";
+        }
+        else if (nonClear > 0)
+            visibilityStatus = "RENDER_FAILURE";
+        else
+            visibilityStatus = "UNVERIFIED";
+    }
+    else if (noCoverage)
+    {
+        visibilityStatus = (nonClear == 0 && depthAllClear)
+                               ? "NO_PIXEL_COVERAGE"
+                               : "UNVERIFIED";
+    }
+    else if (outOfFrustum)
+    {
+        visibilityStatus = (nonClear == 0 && depthAllClear)
+                               ? "OUT_OF_FRUSTUM"
+                               : "UNVERIFIED";
+    }
+
+    const bool renderFailure = std::strcmp(visibilityStatus, "RENDER_FAILURE") == 0;
+    const bool visibilityUnverified =
+        std::strcmp(visibilityStatus, "UNVERIFIED") == 0;
+
+    Log(audit.gpu, "draw_command_submitted=1");
+    Log(audit.gpu, "gpu_fence_completed=%d",
+        CompletionConfirmed(owner.workState) ? 1 : 0);
+    Log(audit.gpu, "visible_draw_verified=%d", visibleDrawVerified ? 1 : 0);
+    Log(audit.gpu, "visibility_status=%s", visibilityStatus);
+    Log(audit.gpu, "cpu_coverage_confidence=%s", confidenceName);
+
+    if (!validationPassed)
+    {
+        Log(audit.gpu, "frame_status=RENDER_FAILURE validation_status=%s",
             infoQueue.status);
         return failAfterSubmit(14, "infoqueue validation");
     }
+    if (renderFailure)
+    {
+        Log(audit.gpu,
+            "frame_status=RENDER_FAILURE visibility=%s non_clear=%u "
+            "depth_min=%.9g",
+            visibilityStatus, nonClear, depthMin);
+        return 13;
+    }
+    if (visibilityUnverified)
+    {
+        Log(audit.gpu,
+            "frame_status=VISIBILITY_UNVERIFIED non_clear=%u depth_min=%.9g",
+            nonClear, depthMin);
+        return 15;
+    }
 
-    Log(audit.gpu, "frame_status=PASS");
+    Log(audit.gpu, "frame_status=%s",
+        visibleDrawVerified ? "PASS" : "PASS_NO_VISIBLE_GEOMETRY");
     Log(audit.gpu, "geometry=real_xray_jupiter_visual_%u", geometry.visual_id);
-    Log(audit.gpu, "draw=verified");
+    Log(audit.gpu, "geometry_counts=%u/%u", geometry.vertex_count,
+        geometry.index_count);
+    Log(audit.gpu, "camera_mode=%s",
+        realCamera ? "real_game_capture_replay" : "deterministic_validation");
+    if (realCamera)
+        Log(audit.gpu, "real_camera_draw=%s",
+            visibleDrawVerified ? "VERIFIED" : "NOT VERIFIED");
     Log(audit.gpu, "fence=completed");
     Log(audit.gpu, "readback=verified");
     Log(audit.gpu, "dx12_device=hardware");
@@ -1874,6 +2371,9 @@ int Run(const Options& options)
     Log(audit.validation, "fence_timeout_ms=%u", kFenceTimeoutMs);
     Log(audit.validation, "adapter=hardware");
     Log(audit.validation, "warp_used=no");
+    if (realCamera)
+        Log(audit.validation, "real_camera_capture_sha256=%s",
+            captureSha256.c_str());
 
     return 0;
 }

@@ -38,6 +38,7 @@ set "EXE=%B3A_BUILD_DIR%\b3a_offscreen.exe"
 cl /nologo /std:c++20 /EHsc /MT /O2 /W4 /fp:precise /utf-8 /DNDEBUG /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX ^
     /I"%RENDER%" /I"%JOBS%\include" /I"%JOBS%\thirdparty\enkiTS\src" /I"%DXMATH%" ^
     "%SOURCE%" "%RENDER%\dx12xraylevelgeometry.cpp" "%RENDER%\dx12gamecamera.cpp" ^
+    "%RENDER%\dx12cameracapturefile.cpp" ^
     "%RENDER%\dx12renderprep.cpp" "%RENDER%\dx12packetplan.cpp" "%RENDER%\dx12log.cpp" ^
     "%JOBS%\src\JobSystem.cpp" "%JOBS%\src\JobGroup.cpp" "%JOBS%\src\EnkiBackend.cpp" ^
     "%JOBS%\src\CpuTopology.cpp" "%JOBS%\thirdparty\enkiTS\src\TaskScheduler.cpp" ^
