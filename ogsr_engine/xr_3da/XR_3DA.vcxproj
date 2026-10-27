@@ -250,6 +250,29 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'=='true'">
+    <ClCompile Include="..\Layers\xrRenderDX12\b3b2_camera_stream.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClInclude Include="..\Layers\xrRenderDX12\b3b2_camera_stream.h" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'!='true'">
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12cameracapturefile.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\build_config_defines.h" />
     <ClInclude Include="cf_dynamic_mesh.h" />
@@ -455,6 +478,8 @@
   <Target Name="ValidateB3CameraExportDependency" BeforeTargets="PrepareForBuild">
     <Error Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'!='true'"
            Text="B3 camera export requires OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE=true" />
+    <Error Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'!='true'"
+           Text="B3-B2 camera stream requires OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE=true" />
   </Target>
   <Target Name="PostBuildStep1" AfterTargets="Build">
     <Exec Command='copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll"' />

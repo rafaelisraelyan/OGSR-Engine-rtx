@@ -8,14 +8,19 @@
 #include "igame_level.h"
 
 #include "../Layers/xrRenderDX12/dx12gamecamera.h"
-#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+#if defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT) || defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)
 #include "../Layers/xrRenderDX12/dx12cameracapturefile.h"
+#endif
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+#include "../Layers/xrRenderDX12/b3b2_camera_stream.h"
 #endif
 
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <iterator>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -60,6 +65,15 @@ struct B2CameraCaptureState
     bool exportRequested = false;
     bool exportAttempted = false;
     wchar_t exportPath[1024]{};
+#endif
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    bool streamRequested = false;
+    bool streamStarted = false;
+    wchar_t streamPipeName[256]{};
+    b3b2::CameraStreamProducer streamProducer;
+    uint64_t lastLoggedStreamSequence = 0;
+    uint64_t streamSentLogCount = 0;
 #endif
 };
 
@@ -174,15 +188,17 @@ void DumpMatricesOnce(const gamecamera12::CameraCaptureInput12& input,
     }
 }
 
-#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
-constexpr const char* kB3ExportPrefix = "-b3_camera_export=";
-constexpr size_t kB3ExportPrefixLength = 18;
-
+#if defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT) || defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)
 bool IsParameterSpace(char value) noexcept
 {
     return value == ' ' || value == '\t' || value == '\r' || value == '\n' ||
            value == '\v' || value == '\f';
 }
+#endif
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+constexpr const char* kB3ExportPrefix = "-b3_camera_export=";
+constexpr size_t kB3ExportPrefixLength = 18;
 
 // Exact "-b3_camera_export=<path>" lookup (optionally quoted). Substring
 // occurrences and the bare flag are rejected.
@@ -316,6 +332,160 @@ void MaybeExportPublishedCamera(B2CameraCaptureState& state,
         token.sourceGameFrame, bytes.size(), state.exportPath);
 }
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+constexpr const char* kStreamPipePrefix = "-b3_camera_stream_pipe=";
+constexpr size_t kStreamPipePrefixLength =
+    sizeof("-b3_camera_stream_pipe=") - 1;
+
+bool ExtractStreamPipeName(const char* params, wchar_t* out,
+                           size_t outCount) noexcept
+{
+    if (params == nullptr || out == nullptr || outCount < 2)
+        return false;
+    const char* cursor = params;
+    while (*cursor)
+    {
+        while (*cursor && IsParameterSpace(*cursor))
+            ++cursor;
+        if (!*cursor)
+            break;
+        const char* token = cursor;
+        if (*cursor == '"')
+        {
+            ++cursor;
+            token = cursor;
+            while (*cursor && *cursor != '"')
+                ++cursor;
+        }
+        else
+        {
+            while (*cursor && !IsParameterSpace(*cursor))
+                ++cursor;
+        }
+        const size_t length = static_cast<size_t>(cursor - token);
+        if (length > kStreamPipePrefixLength &&
+            std::strncmp(token, kStreamPipePrefix, kStreamPipePrefixLength) == 0)
+        {
+            const char* value = token + kStreamPipePrefixLength;
+            const size_t valueLength = length - kStreamPipePrefixLength;
+            if (valueLength >= outCount)
+                return false;
+            const int converted = ::MultiByteToWideChar(
+                CP_UTF8, 0, value, static_cast<int>(valueLength), out,
+                static_cast<int>(outCount) - 1);
+            if (converted <= 0)
+                return false;
+            out[converted] = L'\0';
+            return true;
+        }
+        if (*cursor == '"')
+            ++cursor;
+    }
+    return false;
+}
+
+void MaybeStreamPublishedCamera(B2CameraCaptureState& state,
+                                const gamecamera12::CaptureToken12& token)
+{
+    if (!state.streamStarted || !state.streamProducer.Running())
+        return;
+    const auto& published = state.publication.Published();
+    if (!published || published->Token() != token)
+        return;
+
+    const gamecamera12::GameCameraSnapshot12& snapshot = *published;
+    b3b2::CameraPacket packet;
+    std::snprintf(packet.capture.levelName,
+                  sizeof(packet.capture.levelName), "%s", state.levelName);
+    packet.capture.input.view = snapshot.View();
+    packet.capture.input.projection = snapshot.Projection();
+    packet.capture.input.fullTransform = snapshot.ViewProjection();
+    packet.capture.input.hasFullTransform = true;
+    packet.capture.input.position = snapshot.Position();
+    packet.capture.input.viewportWidth = snapshot.ViewportWidth();
+    packet.capture.input.viewportHeight = snapshot.ViewportHeight();
+    packet.capture.input.levelSession = token.levelSession;
+    packet.capture.input.captureEpoch = token.captureEpoch;
+    packet.capture.input.captureSequence = token.captureSequence;
+    packet.capture.input.sourceGameFrame = token.sourceGameFrame;
+    state.streamProducer.Publish(packet);
+
+    b3b2::SentSample sent;
+    if (!state.streamProducer.CopyLastSent(sent))
+        return;
+    if (sent.packet.capture.input.captureSequence ==
+        state.lastLoggedStreamSequence)
+        return;
+    state.lastLoggedStreamSequence =
+        sent.packet.capture.input.captureSequence;
+    ++state.streamSentLogCount;
+    if (state.streamSentLogCount > 3)
+        return;
+
+    const cameracapture12::CameraCaptureFile12& sentCapture =
+        sent.packet.capture;
+    Msg("[B3-B2] stream sent sample=%llu level='%s' session=%llu epoch=%llu "
+        "sequence=%llu frame=%u hash=%016llX position=(%.3f,%.3f,%.3f) "
+        "viewport=%ux%u",
+        static_cast<unsigned long long>(state.streamSentLogCount),
+        sentCapture.levelName,
+        static_cast<unsigned long long>(sentCapture.input.levelSession),
+        static_cast<unsigned long long>(sentCapture.input.captureEpoch),
+        static_cast<unsigned long long>(sentCapture.input.captureSequence),
+        sentCapture.input.sourceGameFrame,
+        static_cast<unsigned long long>(sent.hash),
+        sentCapture.input.position.x,
+        sentCapture.input.position.y,
+        sentCapture.input.position.z,
+        sentCapture.input.viewportWidth,
+        sentCapture.input.viewportHeight);
+    for (uint32_t row = 0; row < 4; ++row)
+    {
+        Msg("[B3-B2] sent view[%u] = %.9g %.9g %.9g %.9g", row,
+            sent.packet.capture.input.view.m[row][0],
+            sent.packet.capture.input.view.m[row][1],
+            sent.packet.capture.input.view.m[row][2],
+            sent.packet.capture.input.view.m[row][3]);
+        Msg("[B3-B2] sent proj[%u] = %.9g %.9g %.9g %.9g", row,
+            sent.packet.capture.input.projection.m[row][0],
+            sent.packet.capture.input.projection.m[row][1],
+            sent.packet.capture.input.projection.m[row][2],
+            sent.packet.capture.input.projection.m[row][3]);
+        Msg("[B3-B2] sent full[%u] = %.9g %.9g %.9g %.9g", row,
+            sent.packet.capture.input.fullTransform.m[row][0],
+            sent.packet.capture.input.fullTransform.m[row][1],
+            sent.packet.capture.input.fullTransform.m[row][2],
+            sent.packet.capture.input.fullTransform.m[row][3]);
+    }
+}
+
+void LogStreamStats(B2CameraCaptureState& state, const char* phase)
+{
+    const b3b2::StreamCountersSnapshot counters =
+        state.streamProducer.Counters();
+    const b3b2::EnqueueStats latency =
+        state.streamProducer.EnqueueLatency();
+    Msg("[B3-B2] stream stats phase=%s published=%llu enqueued=%llu "
+        "overwritten=%llu lock_dropped=%llu encoded=%llu sent=%llu "
+        "rejected=%llu disconnected=%llu reconnected=%llu "
+        "enqueue_ns_median=%llu p95=%llu p99=%llu max=%llu",
+        phase,
+        static_cast<unsigned long long>(counters.published),
+        static_cast<unsigned long long>(counters.enqueued),
+        static_cast<unsigned long long>(counters.overwritten),
+        static_cast<unsigned long long>(counters.lockDropped),
+        static_cast<unsigned long long>(counters.encoded),
+        static_cast<unsigned long long>(counters.sent),
+        static_cast<unsigned long long>(counters.rejected),
+        static_cast<unsigned long long>(counters.disconnected),
+        static_cast<unsigned long long>(counters.reconnected),
+        static_cast<unsigned long long>(latency.medianNs),
+        static_cast<unsigned long long>(latency.p95Ns),
+        static_cast<unsigned long long>(latency.p99Ns),
+        static_cast<unsigned long long>(latency.maxNs));
+}
+#endif // OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
 } // namespace
 
 void B2CameraCapture_Initialize()
@@ -342,6 +512,42 @@ void B2CameraCapture_Initialize()
         Msg("[B3-B1] one-shot camera export enabled");
     else if (b2camera_diagnostics::HasExactArgument(params, "-b3_camera_export"))
         Msg("[B3-B1] camera export ignored: expected -b3_camera_export=<path>");
+#endif
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    state.streamRequested =
+        b2camera_diagnostics::HasExactArgument(params, "-b3_camera_stream");
+    if (state.streamRequested && !state.enabled)
+    {
+        Msg("[B3-B2] camera stream ignored: requires -b2_camera_capture");
+    }
+    else if (state.streamRequested)
+    {
+        std::wstring pipeName;
+        if (!ExtractStreamPipeName(params, state.streamPipeName,
+                                   std::size(state.streamPipeName)))
+        {
+            pipeName = b3b2::CameraStreamProducer::MakePipeName();
+            wcsncpy_s(state.streamPipeName, pipeName.c_str(), _TRUNCATE);
+        }
+        else
+        {
+            pipeName = state.streamPipeName;
+        }
+
+        std::string error;
+        if (state.streamProducer.Start(pipeName, error))
+        {
+            state.streamStarted = true;
+            Msg("[B3-B2] camera stream listening pipe='%ls' local_only=1 "
+                "remote_clients=rejected",
+                state.streamPipeName);
+        }
+        else
+        {
+            Msg("[B3-B2] camera stream disabled: %s", error.c_str());
+        }
+    }
 #endif
 
     if (state.enabled)
@@ -389,6 +595,11 @@ void B2CameraCapture_OnLevelReady(const char* levelName)
     state.dumpGate.Reset(state.dumpRequested);
     CopyLevelName(levelName);
     state.lastError = gamecamera12::CameraError12::None;
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    if (state.streamStarted)
+        state.streamProducer.OnLevelReady(
+            session, state.publication.CurrentEpoch());
+#endif
 
     Msg("[B2.3] level ready level='%s' session=%llu epoch=%llu",
         state.levelName,
@@ -422,6 +633,12 @@ void B2CameraCapture_OnLevelTeardownBegin()
         state.lastError = error;
         LogLastError("BeginTeardown");
     }
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    if (state.streamStarted)
+        state.streamProducer.Invalidate(
+            state.currentLevelSession, state.publication.CurrentEpoch(),
+            b3b2::InvalidateReason::Teardown);
+#endif
     Msg("[B2.3] teardown begin level='%s' session=%llu epoch=%llu",
         state.levelName,
         static_cast<unsigned long long>(state.currentLevelSession),
@@ -574,6 +791,11 @@ void B2CameraCapture_OnFrameRenderBeginSucceeded()
 
     state.lastError = gamecamera12::CameraError12::None;
     ++state.publishedCaptures;
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    MaybeStreamPublishedCamera(state, token);
+    if (state.streamStarted && (state.publishedCaptures % 300) == 0)
+        LogStreamStats(state, "periodic");
+#endif
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
     MaybeExportPublishedCamera(state, token);
 #endif
@@ -644,6 +866,12 @@ void B2CameraCapture_OnDeviceResetBegin()
             state.levelActive = false;
         LogLastError("BeginReset");
     }
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    if (state.streamStarted)
+        state.streamProducer.Invalidate(
+            state.currentLevelSession, state.publication.CurrentEpoch(),
+            b3b2::InvalidateReason::Reset);
+#endif
     Msg("[B2.3] device reset invalidated camera session=%llu epoch=%llu",
         static_cast<unsigned long long>(state.currentLevelSession),
         static_cast<unsigned long long>(state.publication.CurrentEpoch()));
@@ -663,6 +891,14 @@ void B2CameraCapture_OnEngineShutdown()
     state.teardownPending = false;
     state.shuttingDown = true;
     const gamecamera12::CameraError12 error = state.publication.Shutdown();
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
+    if (state.streamStarted)
+    {
+        LogStreamStats(state, "shutdown");
+        state.streamProducer.Stop();
+        state.streamStarted = false;
+    }
+#endif
     Msg("[B2.3] engine shutdown state=%d attempts=%llu validated=%llu "
         "published=%llu rejects=%llu reset=%llu teardown=%llu stale=%llu",
         static_cast<int>(error),
