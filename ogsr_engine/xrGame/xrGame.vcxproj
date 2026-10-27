@@ -39,6 +39,17 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <!-- Diagnostic collector is opt-in. A normal Debug/Release build keeps both flags false. -->
+  <PropertyGroup Label="DiagnosticCapture">
+    <OgsrDiagnosticCapture Condition="'$(OgsrDiagnosticCapture)'==''">false</OgsrDiagnosticCapture>
+    <OgsrDiagnosticRuntimeWorkaround Condition="'$(OgsrDiagnosticRuntimeWorkaround)'==''">false</OgsrDiagnosticRuntimeWorkaround>
+  </PropertyGroup>
+  <PropertyGroup Label="PhysXRuntime">
+    <OgsrPhysXRuntime Condition="'$(OgsrPhysXRuntime)'==''">false</OgsrPhysXRuntime>
+  </PropertyGroup>
+  <PropertyGroup Label="PhysXRagdoll">
+    <OgsrPhysXRagdoll Condition="'$(OgsrPhysXRagdoll)'==''">false</OgsrPhysXRagdoll>
+  </PropertyGroup>
   <PropertyGroup>
     <_ProjectFileVersion>10.0.40219.1</_ProjectFileVersion>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
@@ -166,6 +177,34 @@
       </LinkTimeCodeGeneration>
       <AdditionalDependencies>xrEngine.lib;ode.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64' And '$(OgsrDiagnosticCapture)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_DIAGNOSTIC_CAPTURE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\Layers\PhysicsPortable\include;..\Layers\PhysicsAdapterOGSR\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64' And '$(OgsrDiagnosticCapture)'=='true' And '$(OgsrDiagnosticRuntimeWorkaround)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(OgsrPhysXRuntime)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_PHYSX_RUNTIME;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\Layers\PhysicsPhysX\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(OgsrPhysXRagdoll)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_PHYSX_RUNTIME;OGSR_PHYSX_RAGDOLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\Layers\PhysicsPortable\include;..\Layers\PhysicsAdapterOGSR\include;..\Layers\PhysicsPhysX\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(OgsrDiagnosticRuntimeWorkaround)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\xrServerEntities\ai_sounds.h" />
@@ -2670,6 +2709,39 @@
     <ProjectReference Include="..\..\3rd_party\Src\imgui\imgui.vcxproj">
       <Project>{c8fbc3ce-d6de-4fc3-bc15-7b647614db09}</Project>
     </ProjectReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64' And '$(OgsrDiagnosticCapture)'=='true'">
+    <ClCompile Include="ogsr_ragdoll_capture.cpp" />
+    <ClCompile Include="..\Layers\PhysicsPortable\src\ragdoll.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\PhysicsPortable\src\json.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\PhysicsAdapterOGSR\src\capture.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup Condition="'$(OgsrPhysXRuntime)'=='true' And '$(OgsrPhysXRagdoll)'!='true'">
+    <ClCompile Include="ogsr_physx_runtime.cpp" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(OgsrDiagnosticRuntimeWorkaround)'=='true'">
+    <ClCompile Include="ogsr_ode_smoke.cpp" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(OgsrPhysXRagdoll)'=='true'">
+    <ClCompile Include="ogsr_physx_runtime.cpp" />
+    <ClCompile Include="ogsr_physx_ragdoll.cpp" />
+    <ClCompile Include="..\Layers\PhysicsPortable\src\ragdoll.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\PhysicsAdapterOGSR\src\capture.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

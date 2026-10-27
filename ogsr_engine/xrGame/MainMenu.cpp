@@ -144,10 +144,18 @@ void CMainMenu::Activate(bool bActivate)
         if (b)
             Console->Show();
 
+        // Archive runtime only; normal Debug builds do not define this macro.
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+        if (m_startDialog)
+        {
+#endif
         if (m_startDialog->IsShown())
             m_startDialog->HideDialog();
 
         CleanInternals();
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+        }
+#endif
 
         if (g_pGameLevel)
         {
@@ -215,6 +223,11 @@ void CMainMenu::IR_OnMousePress(int btn)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
+
     IR_OnKeyboardPress(mouse_button_2_key[btn]);
 }
 
@@ -222,6 +235,11 @@ void CMainMenu::IR_OnMouseRelease(int btn)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
+
     IR_OnKeyboardRelease(mouse_button_2_key[btn]);
 }
 
@@ -229,6 +247,11 @@ void CMainMenu::IR_OnMouseHold(int btn)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
+
     IR_OnKeyboardHold(mouse_button_2_key[btn]);
 }
 
@@ -236,6 +259,10 @@ void CMainMenu::IR_OnMouseMove(int x, int y)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
 
     CDialogHolder::IR_UIOnMouseMove(x, y);
 }
@@ -246,6 +273,10 @@ void CMainMenu::IR_OnKeyboardPress(int dik)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
 
     if (is_binded(kCONSOLE, dik))
     {
@@ -265,6 +296,10 @@ void CMainMenu::IR_OnKeyboardRelease(int dik)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
 
     CDialogHolder::IR_UIOnKeyboardRelease(dik);
 }
@@ -273,6 +308,10 @@ void CMainMenu::IR_OnKeyboardHold(int dik)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
 
     CDialogHolder::IR_UIOnKeyboardHold(dik);
 }
@@ -281,6 +320,10 @@ void CMainMenu::IR_OnMouseWheel(int direction)
 {
     if (!IsActive())
         return;
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
 
     CDialogHolder::IR_UIOnMouseWheel(direction);
 }
@@ -347,6 +390,10 @@ void CMainMenu::OnRenderPPUI_PP()
 
 void CMainMenu::OnFrame()
 {
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    if (!m_startDialog)
+        return;
+#endif
     if (m_Flags.test(flNeedChangeCapture))
     {
         m_Flags.set(flNeedChangeCapture, FALSE);

@@ -19,6 +19,9 @@
 #include "ui/UIPdaWnd.h"
 #include "script_vars_storage.h"
 #include "../xrPhysics/PhysicsCommon.h"
+#ifdef OGSR_PHYSX_RUNTIME
+#include "ogsr_physx_runtime.h"
+#endif
 
 const int max_objects_size = 2 * 1024;
 const int max_objects_size_in_save = 8 * 1024;
@@ -139,6 +142,9 @@ extern CUISequencer* g_tutorial2;
 void CLevel::net_Stop()
 {
     Msg("- Disconnect");
+#ifdef OGSR_PHYSX_RUNTIME
+    OgsrPhysXRuntimeOnLevelUnload();
+#endif
 
     if (CurrentGameUI())
     {

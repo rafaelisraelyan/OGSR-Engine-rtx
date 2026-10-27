@@ -3,6 +3,10 @@
 #include "CharacterPhysicsSupport.h"
 #include "alife_space.h"
 #include "Hit.h"
+#ifdef OGSR_PHYSX_RAGDOLL
+#include "ogsr_physx_ragdoll.h"
+#include "ogsr_physx_runtime.h"
+#endif
 #include "PHDestroyable.h"
 #include "PHMovementControl.h"
 #include "CustomMonster.h"
@@ -58,6 +62,9 @@ IC bool is_imotion(interactive_motion* im) { return im && im->is_enabled(); }
 
 CCharacterPhysicsSupport::~CCharacterPhysicsSupport()
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    ReleasePhysXRagdoll();
+#endif
     set_collision_hit_callback(0);
     if (m_flags.test(fl_skeleton_in_shell))
     {
@@ -74,7 +81,8 @@ CCharacterPhysicsSupport::~CCharacterPhysicsSupport()
 
 CCharacterPhysicsSupport::CCharacterPhysicsSupport(EType atype, CEntityAlive* aentity)
     : m_pPhysicsShell(aentity->PPhysicsShell()), m_EntityAlife(*aentity), mXFORM(aentity->XFORM()), m_ph_sound_player(aentity), m_interactive_motion(0),
-      m_PhysicMovementControl(xr_new<CPHMovementControl>(aentity)), m_eType(atype), m_eState(esAlive), m_physics_skeleton(nullptr), m_ik_controller(nullptr),
+      m_PhysicMovementControl(xr_new<CPHMovementControl>(aentity)), m_eType(atype), m_eState(esAlive), m_owner(ownerNone),
+      m_physics_skeleton(nullptr), m_ik_controller(nullptr),
       m_BonceDamageFactor(1.f), m_collision_hit_callback(nullptr), m_interactive_animation(nullptr), m_physics_shell_animated(nullptr),
       m_physics_shell_animated_time_destroy(u32(-1)), m_weapon_attach_bone(0), m_active_item_obj(0), m_hit_valide_time(u32(-1)), m_collision_activating_delay(nullptr)
 {
@@ -83,6 +91,9 @@ CCharacterPhysicsSupport::CCharacterPhysicsSupport(EType atype, CEntityAlive* ae
     m_flags.set(fl_skeleton_in_shell, FALSE);
     m_flags.set(fl_use_hit_anims, TRUE);
     m_pPhysicsShell = nullptr;
+#ifdef OGSR_PHYSX_RAGDOLL
+    m_physx_ragdoll = nullptr;
+#endif
     switch (atype)
     {
     case etActor:
@@ -102,9 +113,32 @@ CCharacterPhysicsSupport::CCharacterPhysicsSupport(EType atype, CEntityAlive* ae
     }
 };
 
+void CCharacterPhysicsSupport::OnBeforeVisualChange()
+{
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        Msg("ph_ragdoll: pre-visual release for [%s]", m_EntityAlife.cName().c_str());
+        ReleasePhysXRagdoll();
+        m_owner = ownerNone;
+        m_flags.set(fl_skeleton_in_shell, FALSE);
+    }
+#endif
+}
+
 void CCharacterPhysicsSupport::SetRemoved()
 {
     m_eState = esRemoved;
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        ReleasePhysXRagdoll();
+        m_owner = ownerNone;
+        m_flags.set(fl_skeleton_in_shell, FALSE);
+        m_EntityAlife.processing_deactivate();
+        return;
+    }
+#endif
     if (m_flags.test(fl_skeleton_in_shell))
     {
         if (m_pPhysicsShell->isEnabled())
@@ -306,6 +340,13 @@ void CCharacterPhysicsSupport::in_NetDestroy()
 {
     destroy(m_interactive_motion);
     m_PhysicMovementControl->DestroyCharacter();
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        ReleasePhysXRagdoll();
+        m_owner = ownerNone;
+    }
+#endif
 
     if (m_physics_skeleton)
     {
@@ -416,29 +457,56 @@ void CCharacterPhysicsSupport::KillHit(SHit& H)
     VERIFY(m_EntityAlife.Visual());
     VERIFY(m_EntityAlife.Visual()->dcast_PKinematics());
 
-    // IKinematicsAnimated * KA = m_EntityAlife.Visual( )->dcast_PKinematicsAnimated	();
-    // VERIFY( KA );
-    // KA->SetUpdateTracksCalback( &tracks_disable_update );
-
     m_character_shell_control.TestForWounded(m_EntityAlife.XFORM(), m_EntityAlife.Visual()->dcast_PKinematics());
     Fmatrix prev_pose;
     prev_pose.set(mXFORM);
 
     Fvector start;
     start.set(m_EntityAlife.Position());
+
+    float hit_angle = 0;
+    MotionID m;
     Fvector velocity;
     Fvector death_position;
-
-    CreateShell(H.who, death_position, velocity);
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (OgsrPhysXRagdollRequested())
+    {
+        // The PhysX branch needs the selected death motion before deciding
+        // whether to take ownership.
+        m = m_death_anims.motion(m_EntityAlife, H, hit_angle);
+        CAI_Stalker* const holder = m_EntityAlife.cast_stalker();
+        if (holder && (holder->wounded() || holder->movement().current_params().cover()))
+            m = MotionID();
+        // Diagnostic override: force the free-ragdoll branch so the PhysX
+        // backend can be exercised without a death animation.
+        if (!m.valid() || OgsrPhysXRagdollForceFree())
+        {
+            if (TryActivatePhysXRagdoll(H.who, &H))
+            {
+                m_flags.set(fl_block_hit, TRUE);
+                return;
+            }
+        }
+        CreateShell(H.who, death_position, velocity);
+    }
+    else
+#endif
+    {
+        // Original ODE order. This is used both by a feature-off build and by
+        // a PhysX-compiled build started without -physx_ragdoll.
+#ifdef OGSR_PHYSX_RAGDOLL
+        if (OgsrPhysXRagdollOdeSmokeRequested())
+            Msg("ph_ragdoll_smoke: ODE KillHit uses original order (CreateShell first)");
+#endif
+        CreateShell(H.who, death_position, velocity);
+        m = m_death_anims.motion(m_EntityAlife, H, hit_angle);
+        CAI_Stalker* const holder = m_EntityAlife.cast_stalker();
+        if (holder && (holder->wounded() || holder->movement().current_params().cover()))
+            m = MotionID();
+    }
     // ActivateShell( H.who );
 
     //	if(Type() == etStalker && xr_strcmp(dbg_stalker_death_anim, "none") != 0)
-    float hit_angle = 0;
-    MotionID m = m_death_anims.motion(m_EntityAlife, H, hit_angle);
-
-    CAI_Stalker* const holder = m_EntityAlife.cast_stalker();
-    if (holder && (holder->wounded() || holder->movement().current_params().cover()))
-        m = MotionID();
 
     if (m.valid()) //&& cmp( prev_pose, mXFORM )
     {
@@ -487,6 +555,13 @@ void CCharacterPhysicsSupport::in_Hit(SHit& H, bool is_killing)
         else
             return;
     }
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        ApplyPhysXRagdollHit(H);
+        return;
+    }
+#endif
 
     // is_killing = is_killing || ( m_eState==esAlive && !m_EntityAlife.g_Alive( ) );
     if (m_EntityAlife.g_Alive() && is_killing && H.type() == ALife::eHitTypeExplosion && H.damage() > 70.f)
@@ -558,6 +633,13 @@ void CCharacterPhysicsSupport::in_UpdateCL()
     {
         return;
     }
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        UpdatePhysXRagdoll();
+        return;
+    }
+#endif
 #ifdef DEBUG
     if (dbg_draw_character_bones)
         dbg_draw_geoms(m_weapon_geoms);
@@ -806,6 +888,10 @@ BOOL dbg_draw_ragdoll_spawn = FALSE;
 #endif
 void CCharacterPhysicsSupport::ActivateShell(CObject* who)
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+        return;
+#endif
     R_ASSERT(_valid(m_EntityAlife.Position()));
     Fvector start;
     start.set(m_EntityAlife.Position());
@@ -993,6 +1079,10 @@ void CCharacterPhysicsSupport::AddActiveWeaponCollision()
 
 void CCharacterPhysicsSupport::CreateShell(CObject* who, Fvector& dp, Fvector& velocity)
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+        return;
+#endif
     xr_delete(m_collision_activating_delay);
     xr_delete(m_interactive_animation);
     destroy_animation_collision();
@@ -1066,6 +1156,7 @@ void CCharacterPhysicsSupport::CreateShell(CObject* who, Fvector& dp, Fvector& v
     R_ASSERT2(m_physics_skeleton, "No skeleton created!!");
     m_pPhysicsShell = m_physics_skeleton;
     m_physics_skeleton = nullptr;
+    m_owner = ownerODE;
     m_pPhysicsShell->set_Kinematics(K);
     m_pPhysicsShell->RunSimulation();
     m_pPhysicsShell->mXFORM.set(mXFORM);
@@ -1175,8 +1266,174 @@ void CCharacterPhysicsSupport::EndActivateFreeShell(CObject* who, const Fvector&
     K->CalculateBones(/*TRUE*/);
 }
 
+#ifdef OGSR_PHYSX_RAGDOLL
+bool CCharacterPhysicsSupport::TryActivatePhysXRagdoll(CObject* who, SHit* hit)
+{
+    if (m_owner != ownerNone || m_pPhysicsShell || m_physics_skeleton || m_eState == esRemoved)
+        return false;
+    if (m_EntityAlife.use_simplified_visual() || !m_EntityAlife.cast_stalker())
+        return false;
+    if (!OgsrPhysXRagdollRuntimeAlive() || OgsrPhysXRagdollRuntimeHasInstance())
+        return false;
+    if (!OgsrPhysXRagdollMatches(m_EntityAlife.cName().c_str(), m_EntityAlife.cNameSect().c_str()))
+        return false;
+
+    IKinematics* K = smart_cast<IKinematics*>(m_EntityAlife.Visual());
+    if (!K)
+        return false;
+
+    Fvector velocity;
+    m_PhysicMovementControl->GetCharacterVelocity(velocity);
+    if (hit)
+        m_character_shell_control.apply_start_velocity_factor(who, velocity);
+
+    K->CalculateBones_Invalidate();
+    K->CalculateBones();
+
+    CPhysicsShell* temporary = nullptr;
+    CreateSkeleton(temporary);
+    if (!temporary)
+    {
+        Msg("! ph_ragdoll: temporary capture skeleton was not built");
+        return false;
+    }
+
+    OgsrPhysXRagdollCapture capture;
+    std::string error;
+    const bool captured = OgsrPhysXRagdollBuildCapture(*K, *temporary, mXFORM, velocity, capture, &error);
+    if (temporary->isActive())
+        temporary->Deactivate();
+    xr_delete(temporary);
+    if (!captured)
+    {
+        Msg("! ph_ragdoll: capture failed, ODE fallback: %s", error.c_str());
+        return false;
+    }
+
+    OgsrPhysXRagdollState* state = nullptr;
+    std::uint32_t bodyCount = 0;
+    std::uint32_t jointCount = 0;
+    if (!OgsrPhysXRagdollActivate(capture, *K, mXFORM, m_EntityAlife.Position(), state, bodyCount, jointCount, &error))
+    {
+        Msg("! ph_ragdoll: activation failed, ODE fallback: %s", error.c_str());
+        return false;
+    }
+
+    // Irreversible commit: stop animation/IK/movement ownership before the
+    // first PhysX pose is published.
+    xr_delete(m_interactive_animation);
+    xr_delete(m_collision_activating_delay);
+    destroy_animation_collision();
+    DestroyIKController();
+    if (m_EntityAlife.animation_movement_controlled())
+        m_EntityAlife.destroy_anim_mov_ctrl();
+    m_PhysicMovementControl->DestroyCharacter();
+
+    m_physx_ragdoll = state;
+    m_owner = ownerPhysX;
+    m_eState = esDead;
+    m_flags.set(fl_block_hit, TRUE);
+    m_flags.set(fl_skeleton_in_shell, FALSE);
+
+    K->CalculateBones_Invalidate();
+    K->CalculateBones(TRUE);
+
+    if (hit)
+    {
+        std::string hitError;
+        if (OgsrPhysXRagdollSmokeRequested())
+        {
+            Fvector direction = hit->direction();
+            if (direction.magnitude() < EPS)
+                direction.set(0.0f, 1.0f, 0.0f);
+            else
+                direction.normalize();
+            const physics_portable::Vec3 impulse{direction.x * hit->phys_impulse(),
+                                                 direction.y * hit->phys_impulse(),
+                                                 direction.z * hit->phys_impulse()};
+            if (!OgsrPhysXRagdollApplyCentralImpulse(*state, impulse, &hitError))
+                Msg("! ph_ragdoll: central impulse failed: %s", hitError.c_str());
+        }
+        else
+        {
+            const Fvector& position = hit->bone_space_position();
+            if (!OgsrPhysXRagdollApplyBoneHit(
+                    *state, *hit,
+                    physics_portable::Vec3{position.x, position.y, position.z}, &hitError))
+                Msg("! ph_ragdoll: bone impulse failed: %s", hitError.c_str());
+        }
+    }
+
+    Msg("ph_ragdoll: owner committed to PhysX name=[%s] section=[%s] bodies=%u joints=%u velocity=(%.2f,%.2f,%.2f)",
+        m_EntityAlife.cName().c_str(), m_EntityAlife.cNameSect().c_str(), bodyCount, jointCount, velocity.x, velocity.y,
+        velocity.z);
+    return true;
+}
+
+void CCharacterPhysicsSupport::UpdatePhysXRagdoll()
+{
+    if (!m_physx_ragdoll || !OgsrPhysXRagdollRuntimeAlive())
+        return;
+    IKinematics* K = smart_cast<IKinematics*>(m_EntityAlife.Visual());
+    if (!K)
+        return;
+    std::string error;
+    if (!OgsrPhysXRagdollPublish(*m_physx_ragdoll, *K, mXFORM, &error))
+    {
+        static bool reported = false;
+        if (!reported)
+        {
+            reported = true;
+            Msg("! ph_ragdoll: pose publication failed: %s", error.c_str());
+        }
+        return;
+    }
+    m_EntityAlife.spatial_move();
+    K->CalculateBones_Invalidate();
+    K->CalculateBones(TRUE);
+}
+
+void CCharacterPhysicsSupport::ReleasePhysXRagdoll()
+{
+    if (!m_physx_ragdoll)
+        return;
+    Msg("ph_ragdoll: releasing PhysX owner state for [%s]", m_EntityAlife.cName().c_str());
+    OgsrPhysXRagdollRelease(m_physx_ragdoll);
+    m_physx_ragdoll = nullptr;
+    m_owner = ownerNone;
+}
+
+void CCharacterPhysicsSupport::ApplyPhysXRagdollHit(SHit& H)
+{
+    if (!m_physx_ragdoll)
+        return;
+    if (OgsrPhysXRagdollSmokeRequested())
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            Msg("ph_ragdoll_smoke: ignoring post-activation external hits");
+        }
+        return;
+    }
+    std::string error;
+    const Fvector& position = H.bone_space_position();
+    if (!OgsrPhysXRagdollApplyBoneHit(
+            *m_physx_ragdoll, H, physics_portable::Vec3{position.x, position.y, position.z}, &error))
+        Msg("! ph_ragdoll: bone impulse application failed: %s", error.c_str());
+}
+#endif
+
 void CCharacterPhysicsSupport::in_ChangeVisual()
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+    {
+        ReleasePhysXRagdoll();
+        m_owner = ownerNone;
+    }
+#endif
     IKinematicsAnimated* KA = smart_cast<IKinematicsAnimated*>(m_EntityAlife.Visual());
     if (m_ik_controller)
     {
@@ -1341,6 +1598,12 @@ void CCharacterPhysicsSupport::in_Die()
     {
         if (m_EntityAlife.use_simplified_visual())
             return;
+#ifdef OGSR_PHYSX_RAGDOLL
+        if (m_owner == ownerPhysX)
+            return;
+        if (TryActivatePhysXRagdoll(nullptr, nullptr))
+            return;
+#endif
         ActivateShell(nullptr);
         m_PhysicMovementControl->DestroyCharacter();
         return;
@@ -1350,6 +1613,10 @@ void CCharacterPhysicsSupport::in_Die()
 
 u16 CCharacterPhysicsSupport::PHGetSyncItemsNumber()
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+        return 0;
+#endif
     if (movement()->CharacterExist())
         return 1;
     else
@@ -1357,10 +1624,21 @@ u16 CCharacterPhysicsSupport::PHGetSyncItemsNumber()
 }
 CPHSynchronize* CCharacterPhysicsSupport::PHGetSyncItem(u16 item)
 {
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+        return nullptr;
+#endif
     if (movement()->CharacterExist())
         return movement()->GetSyncItem();
     else
         return m_EntityAlife.CPhysicsShellHolder::PHGetSyncItem(item);
 }
 
-void CCharacterPhysicsSupport::SyncNetState() { CPHSkeleton::SyncNetState(); }
+void CCharacterPhysicsSupport::SyncNetState()
+{
+#ifdef OGSR_PHYSX_RAGDOLL
+    if (m_owner == ownerPhysX)
+        return;
+#endif
+    CPHSkeleton::SyncNetState();
+}

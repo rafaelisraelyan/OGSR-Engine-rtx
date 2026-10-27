@@ -328,6 +328,14 @@ void CPhysicsShellHolder::OnChangeVisual()
     }
 }
 
+void CPhysicsShellHolder::OnBeforeVisualChange()
+{
+    inherited::OnBeforeVisualChange();
+    CCharacterPhysicsSupport* char_support = character_physics_support();
+    if (char_support)
+        char_support->OnBeforeVisualChange();
+}
+
 void CPhysicsShellHolder::UpdateCL()
 {
     inherited::UpdateCL();

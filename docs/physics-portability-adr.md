@@ -1,7 +1,10 @@
 # ADR — Portable PhysX, OGSR first → IX-Ray next
 
-> **Status: ACCEPTED (architecture decision only)** · 2026-10-22 · branch `prypiat`  
+> **Status: ACCEPTED (architecture decision only)** · 2026-10-22 · branch `prypiat`
+>
 > No PhysX integration, compilation, runtime validation or IX-Ray collaboration is claimed by this document.
+>
+> Implementation status is tracked in [08-roadmap.md](08-roadmap.md), track P: P0–P2.2A are CODE/RUNTIME APPROVED WITH NOTES, FULL PARTIAL; P3 is not started. This ADR remains an architecture decision and does not itself claim PASS.
 
 ## Intent
 

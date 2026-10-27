@@ -11,6 +11,9 @@
 #include "../xrPhysics/PhysicsCommon.h"
 #include "level_sounds.h"
 #include "GamePersistent.h"
+#ifdef OGSR_PHYSX_RUNTIME
+#include "ogsr_physx_runtime.h"
+#endif
 
 BOOL CLevel::Load_GameSpecific_Before()
 {
@@ -138,6 +141,9 @@ BOOL CLevel::Load_GameSpecific_After()
 
     g_pGamePersistent->Environment().Invalidate();
 
+#ifdef OGSR_PHYSX_RUNTIME
+    OgsrPhysXRuntimeOnLevelStart();
+#endif
     return TRUE;
 }
 

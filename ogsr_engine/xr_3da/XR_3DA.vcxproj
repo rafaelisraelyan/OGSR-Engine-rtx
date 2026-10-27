@@ -393,7 +393,7 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="PostBuildStep1" AfterTargets="Build">
-    <Exec Command='copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll"' />
+    <Exec Command='if exist "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" (copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll") else (echo WARNING: optional Debugging Tools dbghelp.dll not found; xrEngine will use the system dbghelp.dll)' />
   </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -134,6 +134,7 @@ public:
     virtual CEntity* cast_entity() { return nullptr; }
     virtual CEntityAlive* cast_entity_alive() { return nullptr; }
 
+    virtual void OnBeforeVisualChange() {}
     virtual void OnChangeVisual() {}
 
     virtual IPhysicsShell* physics_shell() { return nullptr; }

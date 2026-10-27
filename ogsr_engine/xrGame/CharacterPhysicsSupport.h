@@ -19,6 +19,10 @@ class CODEGeom;
 class CPhysicsElement;
 class activating_character_delay;
 
+#ifdef OGSR_PHYSX_RAGDOLL
+struct OgsrPhysXRagdollState;
+#endif
+
 class CCharacterPhysicsSupport : public CPHSkeleton, public CPHDestroyable
 {
 public:
@@ -36,9 +40,17 @@ public:
         esRemoved
     };
 
+    enum EPhysicsOwner
+    {
+        ownerNone,
+        ownerODE,
+        ownerPhysX
+    };
+
 private:
     EType m_eType;
     EState m_eState;
+    EPhysicsOwner m_owner;
     Flags8 m_flags;
     enum Fags
     {
@@ -84,6 +96,9 @@ private:
     SHit m_sv_hit;
     u32 m_hit_valide_time;
     u32 m_physics_shell_animated_time_destroy{u32(-1)};
+#ifdef OGSR_PHYSX_RAGDOLL
+    OgsrPhysXRagdollState* m_physx_ragdoll;
+#endif
 
 public:
     EType Type() { return m_eType; }
@@ -92,7 +107,7 @@ private:
     EState STate() { return m_eState; }
     void SetState(EState astate) { m_eState = astate; }
     IC bool isDead() { return m_eState == esDead; }
-    IC bool isAlive() { return !m_pPhysicsShell; }
+    IC bool isAlive() { return m_owner != ownerPhysX && !m_pPhysicsShell; }
 
 protected:
     virtual void SpawnInitPhysics(CSE_Abstract* D);
@@ -107,6 +122,7 @@ public:
     IC CIKLimbsController* ik_controller() { return m_ik_controller; }
     bool interactive_motion();
     bool can_drop_active_weapon();
+    void OnBeforeVisualChange();
     void SetRemoved();
     bool IsRemoved() { return m_eState == esRemoved; }
     bool IsSpecificDamager() { return !!m_flags.test(fl_specific_bonce_demager); }
@@ -170,6 +186,12 @@ private:
     void bone_fix_clear();
     void EndActivateFreeShell(CObject* who, const Fvector& inital_entity_position, const Fvector& dp, const Fvector& velocity);
     void KillHit(SHit& H);
+#ifdef OGSR_PHYSX_RAGDOLL
+    bool TryActivatePhysXRagdoll(CObject* who, SHit* hit);
+    void UpdatePhysXRagdoll();
+    void ReleasePhysXRagdoll();
+    void ApplyPhysXRagdollHit(SHit& H);
+#endif
     static void DeathAnimCallback(CBlend* B);
     void CreateIKController();
     void DestroyIKController();

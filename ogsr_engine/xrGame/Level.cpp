@@ -28,6 +28,9 @@
 #include "space_restrictor.h"
 #include "client_spawn_manager.h"
 #include "autosave_manager.h"
+#ifdef OGSR_PHYSX_RUNTIME
+#include "ogsr_physx_runtime.h"
+#endif
 #include "ClimableObject.h"
 #include "level_graph.h"
 #include "mt_config.h"
@@ -376,8 +379,29 @@ void CLevel::MakeReconnect()
     }
 }
 
+#ifdef OGSR_DIAGNOSTIC_CAPTURE
+void OgsrRagdollCaptureOnFrame();
+#endif
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+void OgsrOdeSmokeTick();
+#endif
+
 void CLevel::OnFrame()
 {
+#ifdef OGSR_DIAGNOSTIC_CAPTURE
+    // Safe point: the previous seqFrameMT (and CPHWorld::FrameStep) has
+    // completed, while the current physics step has not started yet.
+    OgsrRagdollCaptureOnFrame();
+#endif
+#ifdef OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND
+    OgsrOdeSmokeTick();
+#endif
+#ifdef OGSR_PHYSX_RUNTIME
+    // Main-thread point after seqFrameMT/CPHWorld::FrameStep and before
+    // Objects.Update/CalculateBones. The experimental scene does not write
+    // game transforms; it only advances its isolated CPU test body.
+    OgsrPhysXRuntimeOnFrame();
+#endif
 #ifdef DEBUG
     DBG_RenderUpdate();
 #endif // #ifdef DEBUG
