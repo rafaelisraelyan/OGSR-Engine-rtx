@@ -155,7 +155,8 @@ RagdollSceneContext RagdollRegistry::sceneContext(const SceneSlot& scene, OgsrPh
     return context;
 }
 
-bool RagdollRegistry::createScene(OgsrPhysX2SceneHandle* outScene, std::string* error)
+bool RagdollRegistry::createScene(const OgsrPhysX2SceneConfig& config, OgsrPhysX2SceneHandle* outScene,
+                                  std::string* error)
 {
     if (!outScene)
         return fail(error, "scene output is null");
@@ -175,7 +176,7 @@ bool RagdollRegistry::createScene(OgsrPhysX2SceneHandle* outScene, std::string* 
 
         void* backend = nullptr;
         std::string hookError;
-        if (!hooks_.createScene(&backend, &hookError))
+        if (!hooks_.createScene(config, &backend, &hookError))
         {
             return fail(error, hookError.empty() ? "scene backend create failed"
                                                  : "scene backend create failed: " + hookError);
@@ -225,8 +226,9 @@ bool RagdollRegistry::isSceneAlive(OgsrPhysX2SceneHandle scene) const
     return resolveScene(scene) != nullptr;
 }
 
-bool RagdollRegistry::createInstance(OgsrPhysX2SceneHandle scene, OgsrPhysX2RagdollHandle* outInstance,
-                                     std::string* error)
+bool RagdollRegistry::createInstance(OgsrPhysX2SceneHandle scene, const OgsrPhysXRagdollDefinition& definition,
+                                     const OgsrPhysX2RagdollInstanceConfig& config,
+                                     OgsrPhysX2RagdollHandle* outInstance, std::string* error)
 {
     if (!outInstance)
         return fail(error, "ragdoll output is null");
@@ -256,10 +258,22 @@ bool RagdollRegistry::createInstance(OgsrPhysX2SceneHandle scene, OgsrPhysX2Ragd
         if (generation == 0)
             return fail(error, "instance generation space exhausted");
 
+        RagdollInstanceCreateInfo info;
+        info.handle.sceneSlot = scene.slot;
+        info.handle.sceneGeneration = scene.generation;
+        info.handle.instanceSlot = index;
+        info.handle.instanceGeneration = generation;
+        info.collisionInstanceId = nextCollisionInstanceId_;
+        info.definition = &definition;
+        info.config = &config;
+
         void* backend = nullptr;
         std::string hookError;
-        if (!hooks_.createInstance(context, &backend, &hookError))
+        if (!hooks_.createInstance(context, info, &backend, &hookError))
         {
+            // The generation and collision identity are consumed. No handle is
+            // published and the slot stays free; this is the safe rollback.
+            ++nextCollisionInstanceId_;
             return fail(error, hookError.empty() ? "instance backend create failed"
                                                  : "instance backend create failed: " + hookError);
         }
@@ -298,6 +312,18 @@ bool RagdollRegistry::destroyInstance(OgsrPhysX2RagdollHandle instance, std::str
 bool RagdollRegistry::isInstanceAlive(OgsrPhysX2RagdollHandle instance) const
 {
     return resolveInstance(instance) != nullptr;
+}
+
+void* RagdollRegistry::sceneBackend(OgsrPhysX2SceneHandle scene) const
+{
+    const SceneSlot* slot = resolveScene(scene);
+    return slot ? slot->backend : nullptr;
+}
+
+void* RagdollRegistry::instanceBackend(OgsrPhysX2RagdollHandle instance) const
+{
+    const InstanceSlot* slot = resolveInstance(instance);
+    return slot ? slot->backend : nullptr;
 }
 
 std::uint32_t RagdollRegistry::collisionInstanceId(OgsrPhysX2RagdollHandle instance) const

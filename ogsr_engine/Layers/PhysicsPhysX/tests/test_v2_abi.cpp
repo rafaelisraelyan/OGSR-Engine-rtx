@@ -73,7 +73,8 @@ void testGetApiInfoContract()
     check(info.magic == OGSR_PHYSX2_API_INFO_MAGIC, "GetApiInfo magic");
     check(info.abiMajor == OGSR_PHYSX2_ABI_MAJOR, "GetApiInfo ABI major");
     check(info.abiMinor == OGSR_PHYSX2_ABI_MINOR, "GetApiInfo ABI minor");
-    check(info.capabilityFlags == 0, "P3.1-A advertises no production capabilities");
+    check(info.capabilityFlags == OGSR_PHYSX2_CAP_REQUIRED_P3_1,
+          "P3.1-B advertises the implemented production capabilities");
     check(info.maxScenes == OGSR_PHYSX2_SCENE_CAPACITY, "GetApiInfo scene capacity");
     check(info.maxInstancesPerScene == OGSR_PHYSX2_INSTANCE_CAPACITY, "GetApiInfo instance capacity");
     check(info.reserved0 == 0, "GetApiInfo reserved field is zero");
@@ -125,7 +126,16 @@ void testRealDllExports()
     for (const char* name : v1Names)
         check(GetProcAddress(module, name) != nullptr, name);
 
-    check(GetProcAddress(module, "OgsrPhysX2GetApiInfo") != nullptr, "v2 GetApiInfo export exists");
+    const char* const v2Names[] = {
+        "OgsrPhysX2GetApiInfo",       "OgsrPhysX2SceneCreate",       "OgsrPhysX2SceneDestroy",
+        "OgsrPhysX2SceneIsAlive",     "OgsrPhysX2SceneSetStaticMesh", "OgsrPhysX2SceneAddStaticFragment",
+        "OgsrPhysX2SceneStep",        "OgsrPhysX2RagdollCreate",     "OgsrPhysX2RagdollDestroy",
+        "OgsrPhysX2RagdollIsAlive",   "OgsrPhysX2RagdollGetPose",    "OgsrPhysX2RagdollApplyImpulse",
+        "OgsrPhysX2RagdollApplyCentralImpulse", "OgsrPhysX2RagdollGetBodyMass",
+        "OgsrPhysX2RagdollGetInfo",   "OgsrPhysX2RagdollGetDiagnostics",
+    };
+    for (const char* name : v2Names)
+        check(GetProcAddress(module, name) != nullptr, name);
 
     using GetApiInfoFn = int(OGSR_PHYSX2_CALL*)(OgsrPhysX2ApiInfo*);
     const GetApiInfoFn getApiInfo =
@@ -136,29 +146,23 @@ void testRealDllExports()
         OgsrPhysX2ApiInfo info{};
         info.structSize = OGSR_PHYSX2_API_INFO_V0_SIZE;
         check(getApiInfo(&info) == 1, "resolved v2 GetApiInfo succeeds");
-        check(info.capabilityFlags == 0, "resolved v2 GetApiInfo advertises no production capabilities");
+        check(info.capabilityFlags == OGSR_PHYSX2_CAP_REQUIRED_P3_1,
+              "resolved v2 GetApiInfo advertises production capabilities");
     }
 
     physics_physx::V2Requirements requirements;
     requirements.minimumMinor = 0;
-    requirements.requiredCapabilities = 0;
+    requirements.requiredCapabilities = OGSR_PHYSX2_CAP_REQUIRED_P3_1;
     requirements.minimumScenes = 1;
     requirements.minimumInstances = 2;
-    physics_physx::V2NegotiationResult result = physics_physx::negotiateV2FromModule(module, requirements);
-    check(result.status == physics_physx::V2NegotiationStatus::MissingExport,
-          "actual P3.1-A DLL fails closed on missing SceneCreate");
-    check(result.error.find("OgsrPhysX2SceneCreate") != std::string::npos,
-          "actual DLL negotiation names the missing export");
-    check(result.api.sceneCreate == nullptr && result.api.sceneStep == nullptr &&
-              result.api.ragdollCreate == nullptr,
-          "actual DLL negotiation yields no callable scene/ragdoll pointers");
-
-    requirements.requiredCapabilities = OGSR_PHYSX2_CAP_REQUIRED_P3_1;
-    result = physics_physx::negotiateV2FromModule(module, requirements);
-    check(result.status == physics_physx::V2NegotiationStatus::MissingCapabilities,
-          "actual P3.1-A DLL does not advertise production multi capabilities");
-    check(result.api.getApiInfo == nullptr && result.api.sceneCreate == nullptr,
-          "capability failure yields an empty v2 table");
+    const physics_physx::V2NegotiationResult result =
+        physics_physx::negotiateV2FromModule(module, requirements);
+    check(result.status == physics_physx::V2NegotiationStatus::Ready,
+          "actual P3.1-B DLL negotiates Ready");
+    check(result.api.getApiInfo != nullptr && result.api.sceneCreate != nullptr &&
+              result.api.sceneStep != nullptr && result.api.ragdollCreate != nullptr &&
+              result.api.ragdollGetDiagnostics != nullptr,
+          "actual DLL negotiation yields the complete v2 table");
 
     FreeLibrary(module);
 }

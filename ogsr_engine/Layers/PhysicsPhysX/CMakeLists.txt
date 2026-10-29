@@ -81,9 +81,15 @@ add_library(physics_physx_runtime SHARED
     src/physx_runtime_c.cpp
     src/physx_ragdoll_c.cpp
     src/physx_ragdoll_c_v2.cpp
+    src/physx_ragdoll_scene.cpp
+    src/physx_ragdoll_instance.cpp
+    src/physx_ragdoll_v2_convert.cpp
 )
-target_link_libraries(physics_physx_runtime PRIVATE physics_physx)
-target_include_directories(physics_physx_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(physics_physx_runtime PRIVATE physics_physx physics_physx_abi_v2)
+target_include_directories(physics_physx_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHYSX_ROOT}/include
+)
 target_compile_features(physics_physx_runtime PRIVATE cxx_std_20)
 target_compile_definitions(physics_physx_runtime PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN OGSR_PHYSX_RUNTIME_EXPORTS)
 set_target_properties(physics_physx_runtime PROPERTIES OUTPUT_NAME ogsr_physx_runtime PREFIX "")
@@ -216,6 +222,46 @@ if(PHYSICS_PHYSX_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:mock_physx_runtime_v2_missing>" "$<TARGET_FILE_DIR:physics_physx_v2_loader_tests>"
         COMMENT "Copy mock v1/v2 runtime DLLs beside the v2 loader test"
+    )
+
+    add_executable(physics_physx_v2_multi_tests
+        tests/test_v2_multi.cpp
+        tests/v2_fixture_builder.cpp
+    )
+    target_link_libraries(physics_physx_v2_multi_tests PRIVATE physics_physx_runtime physics_portable)
+    target_include_directories(physics_physx_v2_multi_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PhysicsPortable/include
+    )
+    target_compile_definitions(physics_physx_v2_multi_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(physics_physx_v2_multi_tests physics_physx_runtime)
+    add_custom_command(TARGET physics_physx_v2_multi_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:physics_physx_runtime>" "$<TARGET_FILE_DIR:physics_physx_v2_multi_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PHYSX_RUNTIME_DLLS} "$<TARGET_FILE_DIR:physics_physx_v2_multi_tests>"
+        COMMENT "Copy the ragdoll runtime DLL beside the v2 multi test"
+    )
+    add_test(NAME physics_physx_v2_multi_tests COMMAND physics_physx_v2_multi_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../artifacts/fixtures-p1/ragdoll_sim_default_stalker.json")
+
+    add_executable(physics_physx_v2_benchmark
+        tests/bench_v2_multi.cpp
+        tests/v2_fixture_builder.cpp
+    )
+    target_link_libraries(physics_physx_v2_benchmark PRIVATE physics_physx_runtime physics_portable psapi)
+    target_include_directories(physics_physx_v2_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PhysicsPortable/include
+    )
+    target_compile_definitions(physics_physx_v2_benchmark PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(physics_physx_v2_benchmark physics_physx_runtime)
+    add_custom_command(TARGET physics_physx_v2_benchmark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:physics_physx_runtime>" "$<TARGET_FILE_DIR:physics_physx_v2_benchmark>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PHYSX_RUNTIME_DLLS} "$<TARGET_FILE_DIR:physics_physx_v2_benchmark>"
+        COMMENT "Copy the ragdoll runtime DLL beside the v2 benchmark"
     )
 
     add_executable(physics_physx_v2_abi_tests tests/test_v2_abi.cpp)

@@ -21,6 +21,7 @@ Build PhysX **first for OGSR**, with **character ragdoll as the first in-game fe
 7. **Preserve game semantics.** Actor/NPC movement, stairs, slopes, crouch, AI hybrid movement, contact rules, animation, ragdoll, networking and save/load are not assumed transferable from ODE API to PhysX API. Migrate individual behaviors with measured ODE regression baselines and safe rollback.
 8. **SDK/license/provenance.** Pin a specific PhysX version, verify included components' license requirements and third-party notices, and review redistribution of any X-Ray-derived code separately. No external partnership is assumed until agreed.
 9. **Evidence before PASS.** Agent status is not validation: require reproducible build/runtime logs, diff review, lifecycle tests, collision and movement comparisons, plus DX11/ODE regression checks.
+10. **Single PhysX extension lifetime before P3.1-C.** `PxInitExtensions`/`PxCloseExtensions` are process-global in PhysX. The legacy v1 world and the v2 multi-ragdoll backend currently initialize/close them independently. Activating both paths at the same time (P3.1-C) requires a shared extension lifetime — a process-wide refcount or one shared `PxFoundation`/`PxPhysics` context — with tested create/destroy ordering. Until that exists, v2 must not run alongside v1 in the game, and neither path may close extensions while the other is alive.
 
 ## Architecture
 

@@ -43,9 +43,9 @@ Edition* (4A Games) — как исследовательский ориенти
   (**FULL PASS WITH NOTES**): portable ragdoll, первый игровой NPC в OGSR DX11/R4,
   ODE fallback, multi-NPC и reload. Свежий feature-off gameplay и
   контролируемое 8/40-сравнение закрыты (PASS); **P3.0 architecture audit —
-  PASS WITH NOTES; P3.1-A-R1 C ABI v2 + registry safety corrections —
-  IMPLEMENTED, REVIEW PENDING; P3.1-B/C ещё не начаты**. ODE/движение NPC не заменять;
-  DX12 F4.0 не блокировать.
+  PASS WITH NOTES; P3.1-A/P3.1-A-R1 C ABI v2 + registry safety — приняты;
+  P3.1-B multi-ragdoll backend + P3.1-B-R1 full-rig contact acceptance —
+  IMPLEMENTED, REVIEW PENDING; P3.1-C ещё не начат**. ODE/движение NPC не заменять; DX12 F4.0 не блокировать.
 - **V — Volumetric Clouds (самостоятельный параллельный трек):** изолированный
   DX12/compute-прототип процедурных 3D-облаков с ray marching; позже —
   необязательная интеграция в игровой DX12 с выбором Classic 2D / Volumetric 3D.
@@ -71,7 +71,7 @@ Edition* (4A Games) — как исследовательский ориенти
 | J · Высота / LOD / растения / тени | ⬜ Концепция | J0: инвентаризация LOD/detail/CSM |
 | K · Seamless World | ⬜ Возможность на базе I/J | K0: формат регионов и A-Life/AI constraints |
 | L · DX12/DXR portability / IX-Ray | ⬜ Предложение | L0: лицензии, сравнение API и границ интеграции |
-| P · PhysX ragdoll (OGSR DX11 → IX-Ray) | ✅ P0–P2.2A: FULL PASS WITH NOTES; feature-off PASS, visual PASS; P3 не начат | P3 hardening после отдельной приёмки |
+| P · PhysX ragdoll (OGSR DX11 → IX-Ray) | ✅ P0–P2.2A: FULL PASS WITH NOTES; feature-off PASS, visual PASS; P3.1-B backend + P3.1-B-R1 full-rig contact — IMPLEMENTED, REVIEW PENDING | Независимое review P3.1-B-R1; затем P3.1-C game integration |
 | V · Volumetric Clouds (DX12, параллельно F4.0) | 🆕 Запланировано, реализация не подтверждена | V0–V2: независимый DX12-прототип; V3–V5: интеграция после готовности нужных F4/F5-проходов |
 
 ### Обязательные правила работы
@@ -1062,7 +1062,7 @@ harness с общим интерфейсом cloud pass. Зависимости 
 
 ---
 
-## Этап P — Portable PhysX Ragdoll: OGSR DX11 → IX-Ray (P0–P2.2A PASS WITH NOTES, P3 не начат)
+## Этап P — Portable PhysX Ragdoll: OGSR DX11 → IX-Ray (P0–P2.2A PASS WITH NOTES; P3.1-B-R1 IMPLEMENTED — REVIEW PENDING)
 
 **Первый приоритет направления P (решение 2026-10-22): ragdoll-физика персонажа.** Самый первый игровой результат — **один NPC-сталкер, у которого анимированный скелет переключается на PhysX CPU ragdoll и сталкивается со статической геометрией настоящего игрового уровня на OGSR DX11/R4**. Оригинальное передвижение и AI остаются на ODE. Дополнительные PhysX-ящики — только инструмент тестирования, не самостоятельный игровой milestone. Полная замена character movement и GPU PhysX отложены.
 
@@ -1070,8 +1070,8 @@ harness с общим интерфейсом cloud pass. Зависимости 
 
 **Сохранность:** ODE остаётся стандартным backend и fallback; ни одна физическая оболочка не симулируется одновременно ODE и PhysX. Для первого ragdoll PhysX получает статический collision mesh уровня, без обещания полноценных контактов с динамическими ODE-объектами. Не менять глобальные `CPHWorld`/`CPHIsland`, не ломать DX11 и не блокировать DX12 F4.0. Специальные пути save/load, сеть, анимационные переходы, визуальные кости, удаление объектов и смена уровня требуют тестов до production-включения.
 
-**Статус трека P на 2026-10-26** (ветка `feature/physx-ragdoll-p1`,
-HEAD `7c75614ff`; изменения не закоммичены):
+**Статус трека P на 2026-10-27** (ветка `feature/physx-ragdoll-p1`,
+HEAD `aa6b236d3`; изменения не закоммичены):
 
 | Подэтап | Статус | Подтверждённый результат |
 |---|---|---|
@@ -1080,7 +1080,7 @@ HEAD `7c75614ff`; изменения не закоммичены):
 | **P2.0 — runtime foundation** | ✅ **ЗАВЕРШЁН** | DX11 runtime foundation: feature flags, scene lifecycle, fixed step, archive-runtime workaround, логи `ph_runtime`. |
 | **P2.1 — первый игровой DX11 ragdoll** | ✅ **ЗАВЕРШЁН** | Один NPC-сталкер переключён на PhysX: 11 bodies / 10 joints / 47 bones, pose readback в OGSR, ODE не дублирует shell; reference-кадры в `artifacts/`. |
 | **P2.2A — ODE fallback, multi-NPC, reload, feature-off** | ✅ **FULL PASS WITH NOTES** | Combined runtime: 3 сессии, 2 reload, 6 созданий 11/10, slot reuse, нет double ownership; strict validator PASS, 8/8 повреждённых логов отклонены; feature-off ODE death `shell=1 alive=0` — PASS; HUD lifecycle и capture timing 0/10/50/100/200/400/600 — PASS; controlled visual 8/40 — PASS. |
-| **P3 — стабилизация игрового ragdoll** | 🟡 **P3.0 PASS WITH NOTES; P3.1-A-R1 IMPLEMENTED — REVIEW PENDING; P3.1-B/C NOT STARTED** | P3.1-A-R1: `docs/p3.1a-abi-registry-foundation.md` — F1–F5 исправлены: process-wide generations, scene-aware hooks, deterministic shutdown, per-scene capacity, RAII DLL lease. v1 P2.2A path сохранён; мульти-симуляция и game integration не начаты. |
+| **P3 — стабилизация игрового ragdoll** | 🟡 **P3.0 PASS WITH NOTES; P3.1-A/P3.1-A-R1 приняты; P3.1-B-R1 IMPLEMENTED — REVIEW PENDING; P3.1-C не начат** | P3.1-B-R1: два **полных** 11/10 rig в одной `PxScene` реально сталкиваются (contact impulse 7.8904 на обоих, B сдвинут на 0.22 м, оба ещё в воздухе), устойчивость в порогах v1, удаление A при живом B, per-step `activeContactPairs`, regression потери контакта, запрет конфликтующих material IDs. Отчёт: `docs/p3.1b-multi-ragdoll-backend.md`. v1 P2.2A path сохранён; game integration не начата. |
 
 **Критерии P2.2A (FULL PASS WITH NOTES):**
 
@@ -1112,4 +1112,4 @@ lifecycle и capture timing gates закрыты; остаточная limb-ва
 
 **Первый сквозной критерий успеха:** один физический скелет NPC в OGSR DX11, созданный из исходной модели и игровой позы, симулируется PhysX и правильно отображается в мире; весь остальной gameplay остаётся на ODE. Производственные гарантии P3 не объявлять выполненными после P2.2A.
 
-**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** P0–P2.2A — FULL PASS WITH NOTES; P3.0 — PASS WITH NOTES; P3.1-A-R1 — IMPLEMENTED (REVIEW PENDING); P3.1-B/C — NOT STARTED. PASS — только по коду, тестам, логам, evidence и независимому review.
+**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** P0–P2.2A — FULL PASS WITH NOTES; P3.0 — PASS WITH NOTES; P3.1-A/P3.1-A-R1 — приняты; P3.1-B-R1 — IMPLEMENTED (REVIEW PENDING); P3.1-C — не начат. PASS — только по коду, тестам, логам, evidence и независимому review.

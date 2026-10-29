@@ -27,6 +27,16 @@ struct RagdollSceneContext
     void* backend = nullptr;
 };
 
+struct RagdollInstanceCreateInfo
+{
+    OgsrPhysX2RagdollHandle handle{};
+    std::uint32_t collisionInstanceId = 0;
+    // Valid only for the duration of createInstance(). The backend must copy
+    // everything it needs; it must not retain these caller-owned pointers.
+    const OgsrPhysXRagdollDefinition* definition = nullptr;
+    const OgsrPhysX2RagdollInstanceConfig* config = nullptr;
+};
+
 class RagdollRegistryHooks
 {
 public:
@@ -35,9 +45,10 @@ public:
     // Create/destroy backend resources. Create returns false and sets an
     // optional diagnostic on failure; the backend must not leave partial
     // resources behind. Destroy must be noexcept in practice.
-    virtual bool createScene(void** outScene, std::string* error) = 0;
+    virtual bool createScene(const OgsrPhysX2SceneConfig& config, void** outScene, std::string* error) = 0;
     virtual void destroyScene(void* scene) = 0;
-    virtual bool createInstance(const RagdollSceneContext& scene, void** outInstance, std::string* error) = 0;
+    virtual bool createInstance(const RagdollSceneContext& scene, const RagdollInstanceCreateInfo& info,
+                                void** outInstance, std::string* error) = 0;
     virtual void destroyInstance(const RagdollSceneContext& scene, void* instance) = 0;
 };
 
@@ -58,14 +69,20 @@ public:
     RagdollRegistry(const RagdollRegistry&) = delete;
     RagdollRegistry& operator=(const RagdollRegistry&) = delete;
 
-    bool createScene(OgsrPhysX2SceneHandle* outScene, std::string* error = nullptr);
+    bool createScene(const OgsrPhysX2SceneConfig& config, OgsrPhysX2SceneHandle* outScene,
+                     std::string* error = nullptr);
     bool destroyScene(OgsrPhysX2SceneHandle scene, std::string* error = nullptr);
     bool isSceneAlive(OgsrPhysX2SceneHandle scene) const;
 
-    bool createInstance(OgsrPhysX2SceneHandle scene, OgsrPhysX2RagdollHandle* outInstance,
+    bool createInstance(OgsrPhysX2SceneHandle scene, const OgsrPhysXRagdollDefinition& definition,
+                        const OgsrPhysX2RagdollInstanceConfig& config, OgsrPhysX2RagdollHandle* outInstance,
                         std::string* error = nullptr);
     bool destroyInstance(OgsrPhysX2RagdollHandle instance, std::string* error = nullptr);
     bool isInstanceAlive(OgsrPhysX2RagdollHandle instance) const;
+
+    // Backend pointers for validated handles; nullptr for stale handles.
+    void* sceneBackend(OgsrPhysX2SceneHandle scene) const;
+    void* instanceBackend(OgsrPhysX2RagdollHandle instance) const;
 
     // 0 when the handle is stale/invalid. Nonzero IDs are unique among live
     // instances of one scene and are retired on destroy (never reused).

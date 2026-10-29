@@ -1,3 +1,4 @@
+#include "physics_physx/physx_ragdoll_c.h"
 #include "physics_physx/physx_ragdoll_registry.h"
 
 #include <cstdint>
@@ -34,6 +35,11 @@ struct MockHooks final : physics_physx::RagdollRegistryHooks
     {
         physics_physx::RagdollSceneContext scene;
         void* backend = nullptr;
+        std::uint32_t collisionId = 0;
+        OgsrPhysX2RagdollHandle handle{};
+        bool definitionPresent = false;
+        bool configPresent = false;
+        std::uint32_t configStructSize = 0;
     };
 
     int scenesCreated = 0;
@@ -45,8 +51,9 @@ struct MockHooks final : physics_physx::RagdollRegistryHooks
     std::vector<void*> sceneBackends;
     std::vector<InstanceRecord> instances;
     std::vector<physics_physx::RagdollSceneContext> destroyedInstances;
+    std::uint32_t lastSceneConfigStructSize = 0;
 
-    bool createScene(void** out, std::string* error) override
+    bool createScene(const OgsrPhysX2SceneConfig& config, void** out, std::string* error) override
     {
         if (failScene)
         {
@@ -55,6 +62,7 @@ struct MockHooks final : physics_physx::RagdollRegistryHooks
             return false;
         }
         ++scenesCreated;
+        lastSceneConfigStructSize = config.structSize;
         void* backend = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1000 + scenesCreated));
         sceneBackends.push_back(backend);
         *out = backend;
@@ -67,7 +75,9 @@ struct MockHooks final : physics_physx::RagdollRegistryHooks
         ++scenesDestroyed;
     }
 
-    bool createInstance(const physics_physx::RagdollSceneContext& scene, void** out, std::string* error) override
+    bool createInstance(const physics_physx::RagdollSceneContext& scene,
+                        const physics_physx::RagdollInstanceCreateInfo& info, void** out,
+                        std::string* error) override
     {
         if (failInstance)
         {
@@ -78,7 +88,15 @@ struct MockHooks final : physics_physx::RagdollRegistryHooks
         ++instancesCreated;
         void* backend = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x2000 + instancesCreated));
         *out = backend;
-        instances.push_back(InstanceRecord{scene, backend});
+        InstanceRecord record;
+        record.scene = scene;
+        record.backend = backend;
+        record.collisionId = info.collisionInstanceId;
+        record.handle = info.handle;
+        record.definitionPresent = info.definition != nullptr;
+        record.configPresent = info.config != nullptr;
+        record.configStructSize = info.config ? info.config->structSize : 0;
+        instances.push_back(record);
         return true;
     }
 
@@ -100,6 +118,53 @@ bool containsBackend(const std::vector<void*>& values, void* value)
     return false;
 }
 
+OgsrPhysX2SceneConfig testSceneConfig()
+{
+    OgsrPhysX2SceneConfig config{};
+    config.structSize = sizeof(config);
+    config.fixedTimestep = 0.01f;
+    config.gravityY = -19.62f;
+    config.workerThreads = 2;
+    config.maxSubsteps = 4;
+    config.solverPositionIterations = 16;
+    config.solverVelocityIterations = 4;
+    config.contactOffset = 0.02f;
+    config.restOffset = 0.0f;
+    config.enableStabilization = 1;
+    config.collectContacts = 1;
+    config.maxInstances = OGSR_PHYSX2_INSTANCE_CAPACITY;
+    return config;
+}
+
+OgsrPhysX2RagdollInstanceConfig testInstanceConfig()
+{
+    OgsrPhysX2RagdollInstanceConfig config{};
+    config.structSize = sizeof(config);
+    config.linearDamping = 0.05f;
+    config.angularDamping = 0.2f;
+    config.staticRootDensity = 300.0f;
+    config.promoteStaticRoot = 1;
+    config.disableSelfCollision = 1;
+    config.collisionGroup = OGSR_PHYSX2_GROUP_RAGDOLL;
+    config.collisionMask = OGSR_PHYSX2_GROUP_RAGDOLL | OGSR_PHYSX2_GROUP_STATIC;
+    return config;
+}
+
+bool createTestScene(physics_physx::RagdollRegistry& registry, OgsrPhysX2SceneHandle* out,
+                     std::string* error = nullptr)
+{
+    const OgsrPhysX2SceneConfig config = testSceneConfig();
+    return registry.createScene(config, out, error);
+}
+
+bool createTestInstance(physics_physx::RagdollRegistry& registry, OgsrPhysX2SceneHandle scene,
+                        OgsrPhysX2RagdollHandle* out, std::string* error = nullptr)
+{
+    const OgsrPhysXRagdollDefinition definition{};
+    const OgsrPhysX2RagdollInstanceConfig config = testInstanceConfig();
+    return registry.createInstance(scene, definition, config, out, error);
+}
+
 void testRegistryARejectsHandlesFromRegistryB()
 {
     resetAllocators();
@@ -109,8 +174,8 @@ void testRegistryARejectsHandlesFromRegistryB()
     MockHooks hooksA;
     {
         physics_physx::RagdollRegistry registryA(hooksA);
-        check(registryA.createScene(&sceneA), "registry A scene create");
-        check(registryA.createInstance(sceneA, &instanceA), "registry A instance create");
+        check(createTestScene(registryA, &sceneA), "registry A scene create");
+        check(createTestInstance(registryA, sceneA, &instanceA), "registry A instance create");
     }
     check(hooksA.instancesDestroyed == 1, "registry A destructor destroys its instance");
     check(hooksA.scenesDestroyed == 1, "registry A destructor destroys its scene");
@@ -118,12 +183,12 @@ void testRegistryARejectsHandlesFromRegistryB()
     MockHooks hooksB;
     physics_physx::RagdollRegistry registryB(hooksB);
     OgsrPhysX2SceneHandle sceneB{};
-    check(registryB.createScene(&sceneB), "registry B scene create");
+    check(createTestScene(registryB, &sceneB), "registry B scene create");
     check(sceneB.generation != sceneA.generation, "registry B scene generation differs from A");
     check(!registryB.isSceneAlive(sceneA), "registry B rejects old scene A handle");
 
     OgsrPhysX2RagdollHandle instanceB{};
-    check(registryB.createInstance(sceneB, &instanceB), "registry B instance create");
+    check(createTestInstance(registryB, sceneB, &instanceB), "registry B instance create");
     check(instanceB.instanceGeneration != instanceA.instanceGeneration,
           "registry B instance generation differs from A");
     check(!registryB.isInstanceAlive(instanceA), "registry B rejects old instance A handle");
@@ -146,11 +211,11 @@ void testReuseAndStale()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "scene create");
+    check(createTestScene(registry, &scene), "scene create");
     check(scene.generation != 0, "scene generation is nonzero");
 
     OgsrPhysX2RagdollHandle a{};
-    check(registry.createInstance(scene, &a), "A create");
+    check(createTestInstance(registry, scene, &a), "A create");
     check(a.instanceGeneration != 0, "A generation is nonzero");
     const std::uint32_t aId = registry.collisionInstanceId(a);
     check(aId != 0, "A collision id is nonzero");
@@ -160,7 +225,7 @@ void testReuseAndStale()
     check(registry.collisionInstanceId(a) == 0, "stale A collision id is zero");
 
     OgsrPhysX2RagdollHandle b{};
-    check(registry.createInstance(scene, &b), "B create");
+    check(createTestInstance(registry, scene, &b), "B create");
     check(b.instanceSlot == a.instanceSlot, "B reuses A's per-scene slot");
     check(b.instanceGeneration != a.instanceGeneration, "B has a new generation");
     check(registry.isInstanceAlive(b), "B is alive");
@@ -184,11 +249,11 @@ void testDoubleDestroyAndIndependent()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "double-destroy scene create");
+    check(createTestScene(registry, &scene), "double-destroy scene create");
     OgsrPhysX2RagdollHandle a{};
     OgsrPhysX2RagdollHandle b{};
-    check(registry.createInstance(scene, &a), "double-destroy A create");
-    check(registry.createInstance(scene, &b), "double-destroy B create");
+    check(createTestInstance(registry, scene, &a), "double-destroy A create");
+    check(createTestInstance(registry, scene, &b), "double-destroy B create");
 
     check(registry.destroyInstance(a), "A first destroy succeeds");
     std::string error;
@@ -209,11 +274,11 @@ void testSceneDestroyInvalidatesInstances()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "scene-destroy scene create");
+    check(createTestScene(registry, &scene), "scene-destroy scene create");
     OgsrPhysX2RagdollHandle a{};
     OgsrPhysX2RagdollHandle b{};
-    check(registry.createInstance(scene, &a), "scene-destroy A create");
-    check(registry.createInstance(scene, &b), "scene-destroy B create");
+    check(createTestInstance(registry, scene, &a), "scene-destroy A create");
+    check(createTestInstance(registry, scene, &b), "scene-destroy B create");
 
     check(registry.destroyScene(scene), "scene destroy with two instances");
     check(!registry.isSceneAlive(scene), "scene handle invalid after destroy");
@@ -234,18 +299,18 @@ void testSceneReuse()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle first{};
-    check(registry.createScene(&first), "reuse first scene create");
+    check(createTestScene(registry, &first), "reuse first scene create");
     check(registry.destroyScene(first), "reuse first scene destroy");
 
     OgsrPhysX2SceneHandle second{};
-    check(registry.createScene(&second), "reuse second scene create");
+    check(createTestScene(registry, &second), "reuse second scene create");
     check(second.slot == first.slot, "scene slot is reused");
     check(second.generation != first.generation, "scene generation changes on reuse");
     check(!registry.isSceneAlive(first), "old scene handle is stale");
     check(registry.isSceneAlive(second), "new scene handle is alive");
 
     OgsrPhysX2RagdollHandle instance{};
-    check(!registry.createInstance(first, &instance), "old scene handle cannot create an instance");
+    check(!createTestInstance(registry, first, &instance), "old scene handle cannot create an instance");
     check(instance.instanceGeneration == 0 && instance.sceneGeneration == 0,
           "failed old-scene create returns a zero handle");
 
@@ -264,13 +329,13 @@ void testStaleRagdollAfterSceneReuse()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle first{};
-    check(registry.createScene(&first), "stale-ragdoll first scene create");
+    check(createTestScene(registry, &first), "stale-ragdoll first scene create");
     check(registry.destroyScene(first), "stale-ragdoll first scene destroy");
 
     OgsrPhysX2SceneHandle second{};
-    check(registry.createScene(&second), "stale-ragdoll second scene create");
+    check(createTestScene(registry, &second), "stale-ragdoll second scene create");
     OgsrPhysX2RagdollHandle live{};
-    check(registry.createInstance(second, &live), "stale-ragdoll live instance create");
+    check(createTestInstance(registry, second, &live), "stale-ragdoll live instance create");
 
     OgsrPhysX2RagdollHandle old{first.slot, first.generation, live.instanceSlot, live.instanceGeneration};
     check(!registry.isInstanceAlive(old), "old scene generation cannot address new instance");
@@ -293,18 +358,18 @@ void testSceneAwareHooks()
 
     OgsrPhysX2SceneHandle sceneA{};
     OgsrPhysX2SceneHandle sceneB{};
-    check(registry.createScene(&sceneA), "scene-aware A create");
-    check(registry.createScene(&sceneB), "scene-aware B create");
+    check(createTestScene(registry, &sceneA), "scene-aware A create");
+    check(createTestScene(registry, &sceneB), "scene-aware B create");
     check(sceneA.slot != sceneB.slot, "scene-aware scenes use different slots");
 
     OgsrPhysX2RagdollHandle a1{};
     OgsrPhysX2RagdollHandle a2{};
     OgsrPhysX2RagdollHandle b1{};
     OgsrPhysX2RagdollHandle b2{};
-    check(registry.createInstance(sceneA, &a1), "scene-aware A1 create");
-    check(registry.createInstance(sceneA, &a2), "scene-aware A2 create");
-    check(registry.createInstance(sceneB, &b1), "scene-aware B1 create");
-    check(registry.createInstance(sceneB, &b2), "scene-aware B2 create");
+    check(createTestInstance(registry, sceneA, &a1), "scene-aware A1 create");
+    check(createTestInstance(registry, sceneA, &a2), "scene-aware A2 create");
+    check(createTestInstance(registry, sceneB, &b1), "scene-aware B1 create");
+    check(createTestInstance(registry, sceneB, &b2), "scene-aware B2 create");
 
     check(hooks.instances.size() == 4, "scene-aware hooks recorded four instances");
     check(hooks.instances[0].scene.handle.slot == sceneA.slot, "A1 hook gets scene A handle");
@@ -318,6 +383,16 @@ void testSceneAwareHooks()
     check(containsBackend(hooks.sceneBackends, hooks.instances[2].scene.backend), "B backend is a created scene backend");
     check(a1.sceneSlot == sceneA.slot && a1.sceneGeneration == sceneA.generation, "A1 handle points to scene A");
     check(b1.sceneSlot == sceneB.slot && b1.sceneGeneration == sceneB.generation, "B1 handle points to scene B");
+    check(hooks.lastSceneConfigStructSize == sizeof(OgsrPhysX2SceneConfig),
+          "scene hook receives the validated config");
+    check(hooks.instances[0].collisionId != 0, "instance hook receives a nonzero collision id");
+    check(hooks.instances[0].definitionPresent, "instance hook receives a definition pointer");
+    check(hooks.instances[0].configPresent, "instance hook receives an instance config pointer");
+    check(hooks.instances[0].configStructSize == sizeof(OgsrPhysX2RagdollInstanceConfig),
+          "instance hook receives the expected config size");
+    check(hooks.instances[0].handle.instanceSlot == a1.instanceSlot &&
+              hooks.instances[0].handle.instanceGeneration == a1.instanceGeneration,
+          "instance hook receives the provisional handle");
 
     check(registry.destroyScene(sceneA), "scene-aware A destroy");
     check(!registry.isSceneAlive(sceneA), "scene-aware A invalid");
@@ -336,7 +411,7 @@ void testSceneAwareHooks()
     hooks.failInstance = true;
     OgsrPhysX2RagdollHandle failed{};
     std::string error;
-    check(!registry.createInstance(sceneB, &failed, &error), "scene-aware failed create is rejected");
+    check(!createTestInstance(registry, sceneB, &failed, &error), "scene-aware failed create is rejected");
     check(!error.empty(), "scene-aware failed create reports an error");
     check(failed.instanceGeneration == 0, "scene-aware failed create returns zero handle");
     check(hooks.instancesCreated == createdBeforeFailure, "scene-aware failed create creates no backend");
@@ -344,9 +419,50 @@ void testSceneAwareHooks()
     hooks.failInstance = false;
 
     OgsrPhysX2RagdollHandle recovered{};
-    check(registry.createInstance(sceneB, &recovered), "scene-aware create after failure");
+    check(createTestInstance(registry, sceneB, &recovered), "scene-aware create after failure");
     check(registry.isInstanceAlive(recovered), "scene-aware recovered instance alive");
     check(registry.shutdown(), "scene-aware shutdown");
+}
+
+void testHookCreateInfo()
+{
+    resetAllocators();
+    MockHooks hooks;
+    physics_physx::RagdollRegistry registry(hooks);
+
+    OgsrPhysX2SceneConfig sceneConfig = testSceneConfig();
+    sceneConfig.maxInstances = 7;
+    OgsrPhysX2SceneHandle scene{};
+    check(registry.createScene(sceneConfig, &scene), "hook-info scene create");
+    check(hooks.lastSceneConfigStructSize == sizeof(OgsrPhysX2SceneConfig),
+          "hook-info scene config size is recorded");
+
+    OgsrPhysXRagdollDefinition definition{};
+    definition.rootBody = 0;
+    OgsrPhysX2RagdollInstanceConfig instanceConfig = testInstanceConfig();
+    instanceConfig.collisionGroup = OGSR_PHYSX2_GROUP_RAGDOLL;
+    instanceConfig.collisionMask = OGSR_PHYSX2_GROUP_RAGDOLL | OGSR_PHYSX2_GROUP_STATIC;
+
+    OgsrPhysX2RagdollHandle handle{};
+    check(registry.createInstance(scene, definition, instanceConfig, &handle), "hook-info instance create");
+    check(hooks.instances.size() == 1, "hook-info instance recorded");
+    if (!hooks.instances.empty())
+    {
+        const MockHooks::InstanceRecord& record = hooks.instances.back();
+        check(record.collisionId != 0, "hook-info collision id is nonzero");
+        check(record.collisionId == registry.collisionInstanceId(handle),
+              "hook-info collision id matches the published handle");
+        check(record.definitionPresent, "hook-info definition pointer is present");
+        check(record.configPresent, "hook-info config pointer is present");
+        check(record.configStructSize == sizeof(OgsrPhysX2RagdollInstanceConfig),
+              "hook-info config size is correct");
+        check(record.handle.instanceSlot == handle.instanceSlot &&
+                  record.handle.instanceGeneration == handle.instanceGeneration &&
+                  record.handle.sceneSlot == handle.sceneSlot &&
+                  record.handle.sceneGeneration == handle.sceneGeneration,
+              "hook-info provisional handle matches the published handle");
+    }
+    check(registry.shutdown(), "hook-info shutdown");
 }
 
 void testShutdown()
@@ -356,11 +472,11 @@ void testShutdown()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "shutdown scene create");
+    check(createTestScene(registry, &scene), "shutdown scene create");
     OgsrPhysX2RagdollHandle a{};
     OgsrPhysX2RagdollHandle b{};
-    check(registry.createInstance(scene, &a), "shutdown A create");
-    check(registry.createInstance(scene, &b), "shutdown B create");
+    check(createTestInstance(registry, scene, &a), "shutdown A create");
+    check(createTestInstance(registry, scene, &b), "shutdown B create");
     check(registry.hasActiveResources(), "shutdown registry has active resources");
 
     std::string error;
@@ -381,7 +497,7 @@ void testShutdown()
 
     OgsrPhysX2SceneHandle after{};
     error.clear();
-    check(!registry.createScene(&after, &error), "create after shutdown is rejected");
+    check(!createTestScene(registry, &after, &error), "create after shutdown is rejected");
     check(!error.empty(), "create after shutdown reports an error");
     error.clear();
     check(!registry.destroyScene(scene, &error), "destroy after shutdown is rejected");
@@ -395,11 +511,11 @@ void testDestructorShutdown()
     {
         physics_physx::RagdollRegistry registry(hooks);
         OgsrPhysX2SceneHandle scene{};
-        check(registry.createScene(&scene), "destructor scene create");
+        check(createTestScene(registry, &scene), "destructor scene create");
         OgsrPhysX2RagdollHandle a{};
         OgsrPhysX2RagdollHandle b{};
-        check(registry.createInstance(scene, &a), "destructor A create");
-        check(registry.createInstance(scene, &b), "destructor B create");
+        check(createTestInstance(registry, scene, &a), "destructor A create");
+        check(createTestInstance(registry, scene, &b), "destructor B create");
     }
     check(hooks.instancesDestroyed == 2, "destructor releases two instances");
     check(hooks.scenesDestroyed == 1, "destructor releases one scene");
@@ -416,8 +532,8 @@ void testPerSceneCapacity()
 
     OgsrPhysX2SceneHandle sceneA{};
     OgsrPhysX2SceneHandle sceneB{};
-    check(registry.createScene(&sceneA), "per-scene capacity A create");
-    check(registry.createScene(&sceneB), "per-scene capacity B create");
+    check(createTestScene(registry, &sceneA), "per-scene capacity A create");
+    check(createTestScene(registry, &sceneB), "per-scene capacity B create");
 
     std::vector<OgsrPhysX2RagdollHandle> instancesA;
     std::vector<OgsrPhysX2RagdollHandle> instancesB;
@@ -425,8 +541,8 @@ void testPerSceneCapacity()
     {
         OgsrPhysX2RagdollHandle a{};
         OgsrPhysX2RagdollHandle b{};
-        check(registry.createInstance(sceneA, &a), "per-scene capacity A instance create");
-        check(registry.createInstance(sceneB, &b), "per-scene capacity B instance create");
+        check(createTestInstance(registry, sceneA, &a), "per-scene capacity A instance create");
+        check(createTestInstance(registry, sceneB, &b), "per-scene capacity B instance create");
         instancesA.push_back(a);
         instancesB.push_back(b);
     }
@@ -440,15 +556,15 @@ void testPerSceneCapacity()
     OgsrPhysX2RagdollHandle overflowA{};
     OgsrPhysX2RagdollHandle overflowB{};
     std::string error;
-    check(!registry.createInstance(sceneA, &overflowA, &error), "A per-scene capacity is enforced");
+    check(!createTestInstance(registry, sceneA, &overflowA, &error), "A per-scene capacity is enforced");
     check(!error.empty(), "A capacity error is reported");
     error.clear();
-    check(!registry.createInstance(sceneB, &overflowB, &error), "B per-scene capacity is enforced");
+    check(!createTestInstance(registry, sceneB, &overflowB, &error), "B per-scene capacity is enforced");
     check(!error.empty(), "B capacity error is reported");
 
     check(registry.destroyInstance(instancesA.front()), "A capacity slot release");
     OgsrPhysX2RagdollHandle reusedA{};
-    check(registry.createInstance(sceneA, &reusedA), "A capacity slot reuse");
+    check(createTestInstance(registry, sceneA, &reusedA), "A capacity slot reuse");
     check(reusedA.instanceSlot == instancesA.front().instanceSlot, "A reuses the freed per-scene slot");
 
     check(registry.destroyScene(sceneA), "per-scene capacity A destroy");
@@ -470,24 +586,24 @@ void testSceneGenerationNearOverflow()
     check(physics_physx::RagdollRegistry::setNextSceneGenerationForTest(kMaxGeneration - 1),
           "inject near-max scene generation");
     OgsrPhysX2SceneHandle first{};
-    check(registry.createScene(&first), "scene-overflow first create");
+    check(createTestScene(registry, &first), "scene-overflow first create");
     check(first.generation == kMaxGeneration - 1, "scene generation reaches max-1");
     const std::uint32_t firstSlot = first.slot;
     check(registry.destroyScene(first), "scene-overflow first destroy");
 
     OgsrPhysX2SceneHandle last{};
-    check(registry.createScene(&last), "scene-overflow last create");
+    check(createTestScene(registry, &last), "scene-overflow last create");
     check(last.generation == kMaxGeneration, "scene generation reaches UINT32_MAX");
     check(registry.destroyScene(last), "scene-overflow last destroy");
 
     OgsrPhysX2SceneHandle exhausted{};
     std::string error;
-    check(!registry.createScene(&exhausted, &error), "scene generation exhaustion fails");
+    check(!createTestScene(registry, &exhausted, &error), "scene generation exhaustion fails");
     check(!error.empty(), "scene generation exhaustion reports an error");
 
     check(physics_physx::RagdollRegistry::setNextSceneGenerationForTest(1), "reset scene generation for retirement check");
     OgsrPhysX2SceneHandle next{};
-    check(registry.createScene(&next), "scene-overflow next create after reset");
+    check(createTestScene(registry, &next), "scene-overflow next create after reset");
     check(next.slot != firstSlot, "retired max-generation scene slot is not reused");
     check(registry.shutdown(), "scene-overflow shutdown");
 }
@@ -502,29 +618,29 @@ void testInstanceGenerationNearOverflow()
     physics_physx::RagdollRegistry registry(hooks, config);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "instance-overflow scene create");
+    check(createTestScene(registry, &scene), "instance-overflow scene create");
     check(physics_physx::RagdollRegistry::setNextInstanceGenerationForTest(kMaxGeneration - 1),
           "inject near-max instance generation");
     OgsrPhysX2RagdollHandle first{};
-    check(registry.createInstance(scene, &first), "instance-overflow first create");
+    check(createTestInstance(registry, scene, &first), "instance-overflow first create");
     check(first.instanceGeneration == kMaxGeneration - 1, "instance generation reaches max-1");
     const std::uint32_t firstSlot = first.instanceSlot;
     check(registry.destroyInstance(first), "instance-overflow first destroy");
 
     OgsrPhysX2RagdollHandle last{};
-    check(registry.createInstance(scene, &last), "instance-overflow last create");
+    check(createTestInstance(registry, scene, &last), "instance-overflow last create");
     check(last.instanceGeneration == kMaxGeneration, "instance generation reaches UINT32_MAX");
     check(registry.destroyInstance(last), "instance-overflow last destroy");
 
     OgsrPhysX2RagdollHandle exhausted{};
     std::string error;
-    check(!registry.createInstance(scene, &exhausted, &error), "instance generation exhaustion fails");
+    check(!createTestInstance(registry, scene, &exhausted, &error), "instance generation exhaustion fails");
     check(!error.empty(), "instance generation exhaustion reports an error");
 
     check(physics_physx::RagdollRegistry::setNextInstanceGenerationForTest(1),
           "reset instance generation for retirement check");
     OgsrPhysX2RagdollHandle next{};
-    check(registry.createInstance(scene, &next), "instance-overflow next create after reset");
+    check(createTestInstance(registry, scene, &next), "instance-overflow next create after reset");
     check(next.instanceSlot != firstSlot, "retired max-generation instance slot is not reused");
     check(registry.shutdown(), "instance-overflow shutdown");
 }
@@ -541,26 +657,26 @@ void testGenerationMaxRelease()
     check(physics_physx::RagdollRegistry::setNextSceneGenerationForTest(kMaxGeneration),
           "inject max scene generation");
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "max scene generation create");
+    check(createTestScene(registry, &scene), "max scene generation create");
     check(scene.generation == kMaxGeneration, "max scene generation reached");
     check(registry.destroyScene(scene), "max scene generation destroy");
     check(!registry.isSceneAlive(scene), "max scene generation invalidated");
     OgsrPhysX2SceneHandle nextScene{};
-    check(!registry.createScene(&nextScene), "max scene generation cannot wrap and reuse");
+    check(!createTestScene(registry, &nextScene), "max scene generation cannot wrap and reuse");
 
     resetAllocators();
     MockHooks instanceHooks;
     physics_physx::RagdollRegistry instanceRegistry(instanceHooks, config);
     OgsrPhysX2SceneHandle host{};
-    check(instanceRegistry.createScene(&host), "max instance generation host create");
+    check(createTestScene(instanceRegistry, &host), "max instance generation host create");
     check(physics_physx::RagdollRegistry::setNextInstanceGenerationForTest(kMaxGeneration),
           "inject max instance generation");
     OgsrPhysX2RagdollHandle instance{};
-    check(instanceRegistry.createInstance(host, &instance), "max instance generation create");
+    check(createTestInstance(instanceRegistry, host, &instance), "max instance generation create");
     check(instance.instanceGeneration == kMaxGeneration, "max instance generation reached");
     check(instanceRegistry.destroyInstance(instance), "max instance generation destroy");
     OgsrPhysX2RagdollHandle nextInstance{};
-    check(!instanceRegistry.createInstance(host, &nextInstance), "max instance generation cannot wrap and reuse");
+    check(!createTestInstance(instanceRegistry, host, &nextInstance), "max instance generation cannot wrap and reuse");
     check(instanceRegistry.shutdown(), "max instance generation host cleanup");
 }
 
@@ -571,12 +687,12 @@ void testCollisionIdExhaustion()
     physics_physx::RagdollRegistry registry(hooks);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "collision-exhaustion scene create");
+    check(createTestScene(registry, &scene), "collision-exhaustion scene create");
     registry.setNextCollisionInstanceIdForTest(kMaxGeneration);
 
     OgsrPhysX2RagdollHandle failed{};
     std::string error;
-    check(!registry.createInstance(scene, &failed, &error), "collision id exhaustion rejects create");
+    check(!createTestInstance(registry, scene, &failed, &error), "collision id exhaustion rejects create");
     check(!error.empty(), "collision id exhaustion reports an error");
     check(failed.instanceGeneration == 0, "collision id exhaustion returns a zero handle");
     check(registry.isSceneAlive(scene), "scene survives collision id exhaustion");
@@ -585,7 +701,7 @@ void testCollisionIdExhaustion()
 
     registry.setNextCollisionInstanceIdForTest(1);
     OgsrPhysX2RagdollHandle recovered{};
-    check(registry.createInstance(scene, &recovered), "create after collision id reset");
+    check(createTestInstance(registry, scene, &recovered), "create after collision id reset");
     check(registry.collisionInstanceId(recovered) == 1, "collision id restarts at one");
     check(registry.shutdown(), "collision-exhaustion shutdown");
 }
@@ -624,27 +740,27 @@ void testPartialCreateFailure()
     hooks.failScene = true;
     OgsrPhysX2SceneHandle failedScene{};
     std::string error;
-    check(!registry.createScene(&failedScene, &error), "scene backend failure rejects create");
+    check(!createTestScene(registry, &failedScene, &error), "scene backend failure rejects create");
     check(!error.empty(), "scene backend failure reports an error");
     check(failedScene.generation == 0, "scene backend failure returns a zero handle");
     hooks.failScene = false;
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "scene create after failure");
+    check(createTestScene(registry, &scene), "scene create after failure");
     OgsrPhysX2RagdollHandle b{};
-    check(registry.createInstance(scene, &b), "partial-failure B create");
+    check(createTestInstance(registry, scene, &b), "partial-failure B create");
 
     const int createdBefore = hooks.instancesCreated;
     hooks.failInstance = true;
     OgsrPhysX2RagdollHandle failedInstance{};
-    check(!registry.createInstance(scene, &failedInstance, &error), "instance backend failure rejects create");
+    check(!createTestInstance(registry, scene, &failedInstance, &error), "instance backend failure rejects create");
     check(failedInstance.instanceGeneration == 0, "instance backend failure returns a zero handle");
     check(hooks.instancesCreated == createdBefore, "failed instance create creates no backend");
     check(hooks.instancesDestroyed == 0, "failed instance create destroys no backend");
     hooks.failInstance = false;
 
     OgsrPhysX2RagdollHandle c{};
-    check(registry.createInstance(scene, &c), "instance create after failure");
+    check(createTestInstance(registry, scene, &c), "instance create after failure");
     check(c.instanceSlot != b.instanceSlot, "failed create did not leak its per-scene slot");
     check(registry.isInstanceAlive(b), "B survives failed instance create");
     check(registry.isInstanceAlive(c), "C is alive after recovery");
@@ -662,23 +778,23 @@ void testCapacityExhaustion()
     physics_physx::RagdollRegistry registry(hooks, config);
 
     OgsrPhysX2SceneHandle scene{};
-    check(registry.createScene(&scene), "capacity scene create");
+    check(createTestScene(registry, &scene), "capacity scene create");
     OgsrPhysX2SceneHandle secondScene{};
     std::string error;
-    check(!registry.createScene(&secondScene, &error), "scene capacity is enforced");
+    check(!createTestScene(registry, &secondScene, &error), "scene capacity is enforced");
     check(!error.empty(), "scene capacity error is reported");
 
     OgsrPhysX2RagdollHandle a{};
     OgsrPhysX2RagdollHandle b{};
     OgsrPhysX2RagdollHandle c{};
-    check(registry.createInstance(scene, &a), "capacity A create");
-    check(registry.createInstance(scene, &b), "capacity B create");
+    check(createTestInstance(registry, scene, &a), "capacity A create");
+    check(createTestInstance(registry, scene, &b), "capacity B create");
     error.clear();
-    check(!registry.createInstance(scene, &c, &error), "per-scene instance capacity is enforced");
+    check(!createTestInstance(registry, scene, &c, &error), "per-scene instance capacity is enforced");
     check(!error.empty(), "instance capacity error is reported");
 
     check(registry.destroyInstance(a), "capacity A destroy");
-    check(registry.createInstance(scene, &c), "capacity slot reuse after destroy");
+    check(createTestInstance(registry, scene, &c), "capacity slot reuse after destroy");
     check(c.instanceSlot == a.instanceSlot, "capacity reused per-scene slot is the freed slot");
     check(registry.shutdown(), "capacity shutdown");
 }
@@ -694,6 +810,7 @@ int main()
     testSceneReuse();
     testStaleRagdollAfterSceneReuse();
     testSceneAwareHooks();
+    testHookCreateInfo();
     testShutdown();
     testDestructorShutdown();
     testPerSceneCapacity();
