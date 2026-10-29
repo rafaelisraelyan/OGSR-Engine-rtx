@@ -42,9 +42,9 @@ Edition* (4A Games) — как исследовательский ориенти
 - **P — PhysX Ragdoll (самостоятельный параллельный трек):** P0–P2.2A приняты
   (**FULL PASS WITH NOTES**): portable ragdoll, первый игровой NPC в OGSR DX11/R4,
   ODE fallback, multi-NPC и reload. Свежий feature-off gameplay и
-  контролируемое 8/40-сравнение закрыты (PASS); **P3.0-R1 architecture
-  audit — ARCHITECTURE READY FOR RE-REVIEW; P3.0 REVIEW PENDING; P3.1
-  hardening ещё не начат**. ODE/движение NPC не заменять;
+  контролируемое 8/40-сравнение закрыты (PASS); **P3.0 architecture audit —
+  PASS WITH NOTES; P3.1-A-R1 C ABI v2 + registry safety corrections —
+  IMPLEMENTED, REVIEW PENDING; P3.1-B/C ещё не начаты**. ODE/движение NPC не заменять;
   DX12 F4.0 не блокировать.
 - **V — Volumetric Clouds (самостоятельный параллельный трек):** изолированный
   DX12/compute-прототип процедурных 3D-облаков с ray marching; позже —
@@ -1080,7 +1080,7 @@ HEAD `7c75614ff`; изменения не закоммичены):
 | **P2.0 — runtime foundation** | ✅ **ЗАВЕРШЁН** | DX11 runtime foundation: feature flags, scene lifecycle, fixed step, archive-runtime workaround, логи `ph_runtime`. |
 | **P2.1 — первый игровой DX11 ragdoll** | ✅ **ЗАВЕРШЁН** | Один NPC-сталкер переключён на PhysX: 11 bodies / 10 joints / 47 bones, pose readback в OGSR, ODE не дублирует shell; reference-кадры в `artifacts/`. |
 | **P2.2A — ODE fallback, multi-NPC, reload, feature-off** | ✅ **FULL PASS WITH NOTES** | Combined runtime: 3 сессии, 2 reload, 6 созданий 11/10, slot reuse, нет double ownership; strict validator PASS, 8/8 повреждённых логов отклонены; feature-off ODE death `shell=1 alive=0` — PASS; HUD lifecycle и capture timing 0/10/50/100/200/400/600 — PASS; controlled visual 8/40 — PASS. |
-| **P3 — стабилизация игрового ragdoll** | 🟡 **P3.0-R1 READY FOR RE-REVIEW; P3.0 REVIEW PENDING; P3.1 NOT STARTED** | R1 `docs/p3.0-physx-multi-ragdoll-architecture.md`: F1–F5 исправлены в ADR — v1/v2 ABI negotiation, feature flags, collision filter contract, generation-safe handles, static fragments/teardown. Реализация не начата; нужно независимое повторное ревью. |
+| **P3 — стабилизация игрового ragdoll** | 🟡 **P3.0 PASS WITH NOTES; P3.1-A-R1 IMPLEMENTED — REVIEW PENDING; P3.1-B/C NOT STARTED** | P3.1-A-R1: `docs/p3.1a-abi-registry-foundation.md` — F1–F5 исправлены: process-wide generations, scene-aware hooks, deterministic shutdown, per-scene capacity, RAII DLL lease. v1 P2.2A path сохранён; мульти-симуляция и game integration не начаты. |
 
 **Критерии P2.2A (FULL PASS WITH NOTES):**
 
@@ -1112,4 +1112,4 @@ lifecycle и capture timing gates закрыты; остаточная limb-ва
 
 **Первый сквозной критерий успеха:** один физический скелет NPC в OGSR DX11, созданный из исходной модели и игровой позы, симулируется PhysX и правильно отображается в мире; весь остальной gameplay остаётся на ODE. Производственные гарантии P3 не объявлять выполненными после P2.2A.
 
-**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** P0–P2.2A — FULL PASS WITH NOTES; P3.0-R1 — ARCHITECTURE READY FOR RE-REVIEW (P3.0 REVIEW PENDING); P3.1 — NOT STARTED. PASS — только по коду, тестам, логам, evidence и независимому review.
+**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** P0–P2.2A — FULL PASS WITH NOTES; P3.0 — PASS WITH NOTES; P3.1-A-R1 — IMPLEMENTED (REVIEW PENDING); P3.1-B/C — NOT STARTED. PASS — только по коду, тестам, логам, evidence и независимому review.

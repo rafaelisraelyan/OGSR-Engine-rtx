@@ -58,11 +58,29 @@ if(MSVC)
     target_compile_options(physics_physx PRIVATE /W3 /permissive-)
 endif()
 
+# ABI v2 foundation: registry and fail-closed loader. This target deliberately
+# does not link PhysX so its tests can run without a scene.
+add_library(physics_physx_abi_v2 STATIC
+    src/physx_ragdoll_registry.cpp
+    src/physx_ragdoll_v2_loader.cpp
+)
+target_include_directories(physics_physx_abi_v2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(physics_physx_abi_v2 PUBLIC cxx_std_20)
+target_compile_definitions(physics_physx_abi_v2 PRIVATE
+    OGSR_PHYSX2_STATIC
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+if(MSVC)
+    target_compile_options(physics_physx_abi_v2 PRIVATE /W4 /permissive-)
+endif()
+
 # Optional runtime bridge DLL. It is built with the Release static runtime (/MT)
 # and is loaded dynamically by the Debug game only when -physx_runtime is set.
 add_library(physics_physx_runtime SHARED
     src/physx_runtime_c.cpp
     src/physx_ragdoll_c.cpp
+    src/physx_ragdoll_c_v2.cpp
 )
 target_link_libraries(physics_physx_runtime PRIVATE physics_physx)
 target_include_directories(physics_physx_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -126,4 +144,93 @@ if(PHYSICS_PHYSX_BUILD_TESTS)
     if(DEFINED ENV{OGSR_RAGDOLL_FIXTURE})
         add_test(NAME physics_physx_stability COMMAND physics_physx_stability)
     endif()
+
+    # P3.1-A: C11/C++ header, registry and loader tests.
+    enable_language(C)
+
+    add_library(mock_physx_runtime_v1 SHARED tests/mock_v1_runtime.cpp)
+    set_target_properties(mock_physx_runtime_v1 PROPERTIES OUTPUT_NAME mock_physx_runtime_v1 PREFIX "")
+    target_compile_definitions(mock_physx_runtime_v1 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+    add_library(mock_physx_runtime_v2 SHARED tests/mock_v2_runtime.cpp)
+    set_target_properties(mock_physx_runtime_v2 PROPERTIES OUTPUT_NAME mock_physx_runtime_v2 PREFIX "")
+    target_include_directories(mock_physx_runtime_v2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(mock_physx_runtime_v2 PRIVATE
+        OGSR_PHYSX_RUNTIME_EXPORTS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+
+    add_library(mock_physx_runtime_v2_missing SHARED tests/mock_v2_runtime.cpp)
+    set_target_properties(mock_physx_runtime_v2_missing PROPERTIES OUTPUT_NAME mock_physx_runtime_v2_missing PREFIX "")
+    target_include_directories(mock_physx_runtime_v2_missing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(mock_physx_runtime_v2_missing PRIVATE
+        OGSR_PHYSX_RUNTIME_EXPORTS
+        MOCK_V2_MISSING_SCENE_CREATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+
+    add_executable(physics_physx_v2_header_c11 tests/test_v2_header_c11.c)
+    set_target_properties(physics_physx_v2_header_c11 PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+    )
+    target_include_directories(physics_physx_v2_header_c11 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(physics_physx_v2_header_c11 PRIVATE OGSR_PHYSX2_STATIC)
+    add_test(NAME physics_physx_v2_header_c11 COMMAND physics_physx_v2_header_c11)
+
+    add_executable(physics_physx_v2_header_cpp tests/test_v2_header_cpp.cpp)
+    target_include_directories(physics_physx_v2_header_cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(physics_physx_v2_header_cpp PRIVATE OGSR_PHYSX2_STATIC)
+    add_test(NAME physics_physx_v2_header_cpp COMMAND physics_physx_v2_header_cpp)
+
+    add_executable(physics_physx_v2_registry_tests tests/test_v2_registry.cpp)
+    target_link_libraries(physics_physx_v2_registry_tests PRIVATE physics_physx_abi_v2)
+    target_compile_definitions(physics_physx_v2_registry_tests PRIVATE
+        OGSR_PHYSX2_STATIC
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+    add_test(NAME physics_physx_v2_registry_tests COMMAND physics_physx_v2_registry_tests)
+
+    add_executable(physics_physx_v2_loader_tests tests/test_v2_loader.cpp)
+    target_link_libraries(physics_physx_v2_loader_tests PRIVATE physics_physx_abi_v2)
+    target_compile_definitions(physics_physx_v2_loader_tests PRIVATE
+        OGSR_PHYSX2_STATIC
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+    add_test(NAME physics_physx_v2_loader_tests COMMAND physics_physx_v2_loader_tests)
+    add_dependencies(physics_physx_v2_loader_tests
+        mock_physx_runtime_v1
+        mock_physx_runtime_v2
+        mock_physx_runtime_v2_missing
+    )
+    add_custom_command(TARGET physics_physx_v2_loader_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:mock_physx_runtime_v1>" "$<TARGET_FILE_DIR:physics_physx_v2_loader_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:mock_physx_runtime_v2>" "$<TARGET_FILE_DIR:physics_physx_v2_loader_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:mock_physx_runtime_v2_missing>" "$<TARGET_FILE_DIR:physics_physx_v2_loader_tests>"
+        COMMENT "Copy mock v1/v2 runtime DLLs beside the v2 loader test"
+    )
+
+    add_executable(physics_physx_v2_abi_tests tests/test_v2_abi.cpp)
+    target_link_libraries(physics_physx_v2_abi_tests PRIVATE physics_physx_runtime physics_physx_abi_v2)
+    target_include_directories(physics_physx_v2_abi_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PhysicsPortable/include
+    )
+    target_compile_definitions(physics_physx_v2_abi_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(physics_physx_v2_abi_tests physics_physx_runtime)
+    add_custom_command(TARGET physics_physx_v2_abi_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:physics_physx_runtime>" "$<TARGET_FILE_DIR:physics_physx_v2_abi_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PHYSX_RUNTIME_DLLS} "$<TARGET_FILE_DIR:physics_physx_v2_abi_tests>"
+        COMMENT "Copy the ragdoll runtime DLL beside the v2 ABI test"
+    )
+    add_test(NAME physics_physx_v2_abi_tests COMMAND physics_physx_v2_abi_tests)
 endif()

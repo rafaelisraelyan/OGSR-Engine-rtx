@@ -4,7 +4,7 @@
 >
 > No PhysX integration, compilation, runtime validation or IX-Ray collaboration is claimed by this document.
 >
-> Implementation status is tracked in [08-roadmap.md](08-roadmap.md), track P: P0–P2.2A are FULL PASS WITH NOTES; P3.0 architecture audit is ARCHITECTURE READY (independent review pending); P3.1 is not started. This ADR remains an architecture decision and does not itself claim PASS.
+> Implementation status is tracked in [08-roadmap.md](08-roadmap.md), track P: P0–P2.2A are FULL PASS WITH NOTES; P3.0 is PASS WITH NOTES; P3.1-A-R1 is implemented (review pending); P3.1-B/C are not started. This ADR remains an architecture decision and does not itself claim PASS.
 
 ## Intent
 
