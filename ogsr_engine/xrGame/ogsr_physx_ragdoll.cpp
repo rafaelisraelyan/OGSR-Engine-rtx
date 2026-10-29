@@ -62,6 +62,10 @@ Fvector g_smokeActorStart{};
 Fvector g_smokeActorDir{};
 bool g_smokeActorStartValid = false;
 u16 g_smokeTargetId = u16(-1);
+u16 g_smokeMultiSecondId = u16(-1);
+bool g_smokeDualPostPending = false;
+bool g_smokeDualKeepCamera = false;
+std::uint64_t g_smokeDualPostStep = 0;
 
 Fvector g_smokeCameraTarget{};
 Fvector g_smokeCameraPosition{};
@@ -191,7 +195,10 @@ void hideSmokeHud()
         g_smokeHudRenderableSaved = true;
     }
     if (g_hud)
+    {
         HUD().SetRenderable(false);
+        HUD().ShowCrosshair(false);
+    }
     if (!g_smokeHudFlagsSaved)
     {
         g_smokeHudFlags = psHUD_Flags;
@@ -214,7 +221,10 @@ void restoreSmokeHud()
     if (g_smokeHudRenderableSaved)
     {
         if (g_hud)
+        {
             HUD().SetRenderable(g_smokeHudRenderablePrevious);
+            HUD().ShowCrosshair(true);
+        }
         g_smokeHudRenderableSaved = false;
     }
     if (g_smokeHudFlagsSaved)
@@ -357,16 +367,62 @@ void captureSmokeFrame(const char* tag, std::uint64_t step)
 
 void maybeCaptureSmokeFrames()
 {
+    const bool dual = OgsrPhysXRagdollMultiInstancesRequested();
+    static const std::uint64_t offsets[] = {10, 50, 100, 200, 400, 600};
+
+    // Post-A frame: captured after A is destroyed, while B keeps moving.
+    if (g_smokeDualPostPending && smokeCaptureRequested() &&
+        OgsrPhysXRagdollV2StepIndex() >= g_smokeDualPostStep + 60)
+    {
+        g_smokeDualPostPending = false;
+        g_smokeDualKeepCamera = false;
+        std::vector<float> postBody(OGSR_PHYSX_RAGDOLL_MAX_BODIES * 16);
+        OgsrPhysXRagdollPose postPose{};
+        if (OgsrPhysXRagdollV2GetAnyPose(postPose, postBody.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES))
+        {
+            const std::uint64_t step =
+                (static_cast<std::uint64_t>(postPose.stepIndexHigh) << 32) | postPose.stepIndexLow;
+            captureSmokeFrame("v2_dual_post", step);
+            OgsrPhysXRagdollV2StateInfo b{};
+            if (OgsrPhysXRagdollV2GetStateInfo(g_smokeMultiSecondId, b))
+                Msg("ph_ragdoll_smoke: v2 dual post step=%llu live=%u B id=%u handle=(%u,%u,%u,%u) "
+                    "publish=%u",
+                    static_cast<unsigned long long>(step), OgsrPhysXRagdollV2LiveCount(), b.ownerId,
+                    b.handle.sceneSlot, b.handle.sceneGeneration, b.handle.instanceSlot,
+                    b.handle.instanceGeneration, b.publishFrames);
+        }
+        stopSmokeCamera();
+        return;
+    }
+
     if (!smokeCaptureRequested() || g_smokeCaptureComplete)
         return;
-    static const std::uint64_t offsets[] = {10, 50, 100, 200, 400, 600};
     static std::vector<float> bodyWorld(OGSR_PHYSX_RAGDOLL_MAX_BODIES * 16);
 
     OgsrPhysXRagdollPose pose{};
-    if (!OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES))
+    const bool havePose =
+        dual ? OgsrPhysXRagdollV2GetAnyPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES)
+             : OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES);
+    if (!havePose)
         return;
     const std::uint64_t step =
         (static_cast<std::uint64_t>(pose.stepIndexHigh) << 32) | pose.stepIndexLow;
+
+    auto logDual = [&](const char* tag) {
+        if (!dual)
+            return;
+        OgsrPhysXRagdollV2StateInfo a{};
+        OgsrPhysXRagdollV2StateInfo b{};
+        OgsrPhysXRagdollV2GetStateInfo(g_smokeTargetId, a);
+        OgsrPhysXRagdollV2GetStateInfo(g_smokeMultiSecondId, b);
+        Msg("ph_ragdoll_smoke: v2 dual frame tag=%s step=%llu live=%u "
+            "A id=%u handle=(%u,%u,%u,%u) B id=%u handle=(%u,%u,%u,%u)",
+            tag, static_cast<unsigned long long>(step), OgsrPhysXRagdollV2LiveCount(), a.ownerId,
+            a.handle.sceneSlot, a.handle.sceneGeneration, a.handle.instanceSlot,
+            a.handle.instanceGeneration, b.ownerId, b.handle.sceneSlot, b.handle.sceneGeneration,
+            b.handle.instanceSlot, b.handle.instanceGeneration);
+    };
+
     if (!g_smokeCaptureStarted)
     {
         g_smokeCaptureStarted = true;
@@ -380,9 +436,11 @@ void maybeCaptureSmokeFrames()
         g_smokeCaptureMaxDelta = std::max(g_smokeCaptureMaxDelta, delta);
         if (delta > 5)
             g_smokeCaptureIncomplete = true;
-        captureSmokeFrame("pre", step);
-        Msg("ph_ragdoll_smoke: capture tag=pre target_step=%llu actual_step=%llu delta=%llu time=%.3f",
-            static_cast<unsigned long long>(g_smokeCaptureBase), static_cast<unsigned long long>(step),
+        const char* tag = dual ? "v2_dual_pre" : "pre";
+        captureSmokeFrame(tag, step);
+        logDual(tag);
+        Msg("ph_ragdoll_smoke: capture tag=%s target_step=%llu actual_step=%llu delta=%llu time=%.3f",
+            tag, static_cast<unsigned long long>(g_smokeCaptureBase), static_cast<unsigned long long>(step),
             static_cast<unsigned long long>(delta), static_cast<double>(step) * 0.01);
         return;
     }
@@ -395,9 +453,11 @@ void maybeCaptureSmokeFrames()
             g_smokeCaptureMaxDelta = std::max(g_smokeCaptureMaxDelta, delta);
             if (delta > 5)
                 g_smokeCaptureIncomplete = true;
-            captureSmokeFrame(smokeImpulseTag(), step);
+            const char* tag = dual ? "v2_dual" : smokeImpulseTag();
+            captureSmokeFrame(tag, step);
+            logDual(tag);
             Msg("ph_ragdoll_smoke: capture tag=%s target_step=%llu actual_step=%llu delta=%llu time=%.3f",
-                smokeImpulseTag(), static_cast<unsigned long long>(target), static_cast<unsigned long long>(step),
+                tag, static_cast<unsigned long long>(target), static_cast<unsigned long long>(step),
                 static_cast<unsigned long long>(delta), static_cast<double>(step) * 0.01);
             ++g_smokeCaptureIndex;
             if (g_smokeCaptureIndex == 6)
@@ -406,7 +466,8 @@ void maybeCaptureSmokeFrames()
                 Msg("ph_ragdoll_smoke: CAPTURE_%s max_delta=%llu",
                     g_smokeCaptureIncomplete ? "INCOMPLETE" : "COMPLETE",
                     static_cast<unsigned long long>(g_smokeCaptureMaxDelta));
-                stopSmokeCamera();
+                if (!dual)
+                    stopSmokeCamera();
                 if (smokeDoubleStopRequested())
                 {
                     stopSmokeCamera();
@@ -493,7 +554,49 @@ struct OgsrPhysXRagdollState
     Fmatrix entityWorld;
     bool reportedInitialError = false;
     bool active = false;
+    bool multiV2 = false;
+    // True while CCharacterPhysicsSupport::m_physx_ragdoll still owns this
+    // wrapper. It becomes false when the NPC detaches (visual replacement or
+    // NPC destruction) and the state is quarantined.
+    bool gameOwned = true;
+    std::uint32_t ownerId = 0;
+    OgsrPhysX2RagdollHandle v2Handle{};
 };
+
+namespace
+{
+std::mutex g_v2StatesMutex;
+std::vector<OgsrPhysXRagdollState*> g_v2States;
+std::vector<OgsrPhysXRagdollState*> g_v2Quarantine;
+
+void registerV2State(OgsrPhysXRagdollState* state)
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    g_v2States.push_back(state);
+}
+
+void unregisterV2State(OgsrPhysXRagdollState* state)
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    g_v2States.erase(std::remove(g_v2States.begin(), g_v2States.end(), state), g_v2States.end());
+    g_v2Quarantine.erase(std::remove(g_v2Quarantine.begin(), g_v2Quarantine.end(), state),
+                         g_v2Quarantine.end());
+}
+
+void quarantineV2State(OgsrPhysXRagdollState* state)
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    g_v2States.erase(std::remove(g_v2States.begin(), g_v2States.end(), state), g_v2States.end());
+    if (std::find(g_v2Quarantine.begin(), g_v2Quarantine.end(), state) == g_v2Quarantine.end())
+        g_v2Quarantine.push_back(state);
+}
+
+std::uint32_t v2LiveCount()
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    return static_cast<std::uint32_t>(g_v2States.size() + g_v2Quarantine.size());
+}
+} // namespace
 
 namespace
 {
@@ -567,7 +670,7 @@ bool findTarget(CAI_Stalker*& result, CObject*& object, std::string& description
             continue;
         const char* name = safeName(stalker->cName());
         const char* section = safeName(stalker->cNameSect());
-        if (!OgsrPhysXRagdollMatches(name, section))
+        if (!OgsrPhysXRagdollTargetMatches(name, section))
             continue;
         if (result)
         {
@@ -597,13 +700,32 @@ bool isAliveExtra(CAI_Stalker* stalker, u16 excludeA, u16 excludeB)
 
 CAI_Stalker* findAliveExtra(u16 excludeA, u16 excludeB)
 {
+    Fvector center{};
+    bool haveCenter = false;
+    CAI_Stalker* anchor = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
+    if (!anchor)
+        anchor = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(excludeB));
+    if (anchor)
+    {
+        center = anchor->Position();
+        haveCenter = true;
+    }
+
+    CAI_Stalker* best = nullptr;
+    float bestDistance = 1.0e30f;
     for (u32 index = 0; index < Level().Objects.o_count(); ++index)
     {
         CAI_Stalker* candidate = smart_cast<CAI_Stalker*>(Level().Objects.o_get_by_iterator(index));
-        if (isAliveExtra(candidate, excludeA, excludeB))
-            return candidate;
+        if (!isAliveExtra(candidate, excludeA, excludeB))
+            continue;
+        const float distance = haveCenter ? candidate->Position().distance_to(center) : 0.0f;
+        if (!best || distance < bestDistance)
+        {
+            best = candidate;
+            bestDistance = distance;
+        }
     }
-    return nullptr;
+    return best;
 }
 
 void applyLethalSmokeHit(CAI_Stalker* stalker, const char* label)
@@ -775,6 +897,7 @@ bool OgsrPhysXRagdollActivate(const OgsrPhysXRagdollCapture& capture,
                               IKinematics& kinematics,
                               const Fmatrix& entityWorld,
                               const Fvector& center,
+                              std::uint32_t ownerId,
                               OgsrPhysXRagdollState*& state,
                               std::uint32_t& bodyCount,
                               std::uint32_t& jointCount,
@@ -797,7 +920,7 @@ bool OgsrPhysXRagdollActivate(const OgsrPhysXRagdollCapture& capture,
             *error = "capture exceeds the C ABI caps";
         return false;
     }
-    if (!OgsrPhysXRagdollSetStaticFragment(center, error))
+    if (!OgsrPhysXRagdollMultiInstancesRequested() && !OgsrPhysXRagdollSetStaticFragment(center, error))
         return false;
 
     std::vector<OgsrPhysXRagdollBone> bones;
@@ -949,13 +1072,33 @@ bool OgsrPhysXRagdollActivate(const OgsrPhysXRagdollCapture& capture,
     definition.initialAngularVelocity = angularVelocity.data();
     definition.initialEnabled = enabled.data();
 
-    if (!OgsrPhysXRagdollRuntimeCreateInstance(definition, error, bodyCount, jointCount))
+    OgsrPhysX2RagdollHandle v2Handle{};
+    if (OgsrPhysXRagdollMultiInstancesRequested())
+    {
+        OgsrPhysX2RagdollInstanceConfig v2Config{};
+        v2Config.structSize = sizeof(v2Config);
+        v2Config.linearDamping = 0.05f;
+        v2Config.angularDamping = 0.2f;
+        v2Config.staticRootDensity = 300.0f;
+        v2Config.promoteStaticRoot = 1;
+        v2Config.disableSelfCollision = 1;
+        v2Config.collisionGroup = OGSR_PHYSX2_GROUP_RAGDOLL;
+        v2Config.collisionMask = OGSR_PHYSX2_GROUP_RAGDOLL | OGSR_PHYSX2_GROUP_STATIC;
+        if (!OgsrPhysXRagdollV2Create(center, definition, v2Config, v2Handle, error))
+            return false;
+        bodyCount = definition.bodyCount;
+        jointCount = definition.jointCount;
+    }
+    else if (!OgsrPhysXRagdollRuntimeCreateInstance(definition, error, bodyCount, jointCount))
         return false;
 
     auto* created = new OgsrPhysXRagdollState();
     created->capture = capture;
     created->kinematics = &kinematics;
     created->entityWorld = entityWorld;
+    created->multiV2 = OgsrPhysXRagdollMultiInstancesRequested();
+    created->ownerId = ownerId;
+    created->v2Handle = v2Handle;
     created->lastBodyWorld = capture.initial.bodyWorld;
     created->bodyDynamic.resize(capture.description.bodies.size(), 0);
     for (std::size_t body = 0; body < capture.description.bodies.size(); ++body)
@@ -988,11 +1131,15 @@ bool OgsrPhysXRagdollActivate(const OgsrPhysXRagdollCapture& capture,
             .set_callback(bctCustom, &boneCallback, &created->slots[bone], TRUE);
     }
     created->active = true;
+    if (created->multiV2)
+        registerV2State(created);
     kinematics.CalculateBones_Invalidate();
 
     state = created;
     OgsrPhysXRagdollInfo info{};
-    if (OgsrPhysXRagdollRuntimeGetInfo(info))
+    const bool haveInfo = created->multiV2 ? OgsrPhysXRagdollV2GetInfo(created->v2Handle, info)
+                                           : OgsrPhysXRagdollRuntimeGetInfo(info);
+    if (haveInfo)
     {
         Msg("ph_ragdoll: PhysX ragdoll created bodies=%u joints=%u bones=%zu total_mass=%.2f root_mass=%.2f "
             "root_body=%u root_dynamic=%u",
@@ -1010,6 +1157,11 @@ bool OgsrPhysXRagdollActivate(const OgsrPhysXRagdollCapture& capture,
     return true;
 }
 
+bool OgsrPhysXRagdollIsActive(const OgsrPhysXRagdollState* state)
+{
+    return state && state->active;
+}
+
 void OgsrPhysXRagdollRelease(OgsrPhysXRagdollState* state)
 {
     if (!state)
@@ -1018,11 +1170,13 @@ void OgsrPhysXRagdollRelease(OgsrPhysXRagdollState* state)
         Msg("ph_ragdoll: release HUD before renderable=%d hud_draw=%d hud_draw_rt=%d",
             HUD().IsRenderable() ? 1 : 0, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
             psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
-    stopSmokeCamera();
+    if (!g_smokeDualKeepCamera)
+        stopSmokeCamera();
     if (g_hud)
         Msg("ph_ragdoll: release HUD after renderable=%d hud_draw=%d hud_draw_rt=%d",
             HUD().IsRenderable() ? 1 : 0, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
             psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
+    std::size_t removedCallbacks = 0;
     for (std::size_t bone = 0; bone < state->slots.size(); ++bone)
     {
         if (!state->kinematics)
@@ -1031,25 +1185,68 @@ void OgsrPhysXRagdollRelease(OgsrPhysXRagdollState* state)
         if (instance.callback() == &boneCallback && instance.callback_param() == &state->slots[bone])
         {
             instance.reset_callback();
+            ++removedCallbacks;
         }
     }
     if (state->kinematics)
         state->kinematics->CalculateBones_Invalidate();
-    if (state->active && OgsrPhysXRagdollRuntimeAlive())
+    Msg("ph_ragdoll: release state=%p npc=%u handle=(%u,%u,%u,%u) removed_callbacks=%zu "
+        "active=%d game_owned=%d",
+        static_cast<void*>(state), state->ownerId, state->v2Handle.sceneSlot,
+        state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+        state->v2Handle.instanceGeneration, removedCallbacks, state->active ? 1 : 0,
+        state->gameOwned ? 1 : 0);
+    if (state->multiV2)
+    {
+        if (state->active && OgsrPhysXRagdollV2SceneAlive())
+        {
+            std::string releaseError;
+            if (!OgsrPhysXRagdollV2Destroy(state->v2Handle, &releaseError))
+            {
+                state->gameOwned = false;
+                state->kinematics = nullptr;
+                Msg("! ph_ragdoll: v2 instance release failed npc=%u state=%p "
+                    "handle=(%u,%u,%u,%u): %s; detached quarantine",
+                    state->ownerId, static_cast<void*>(state), state->v2Handle.sceneSlot,
+                    state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+                    state->v2Handle.instanceGeneration, releaseError.c_str());
+                quarantineV2State(state);
+                return;
+            }
+            Msg("ph_ragdoll: v2 ragdoll instance released npc=%u state=%p handle=(%u,%u,%u,%u)",
+                state->ownerId, static_cast<void*>(state), state->v2Handle.sceneSlot,
+                state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+                state->v2Handle.instanceGeneration);
+        }
+        unregisterV2State(state);
+    }
+    else if (state->active && OgsrPhysXRagdollRuntimeAlive())
     {
         OgsrPhysXRagdollRuntimeDestroyInstance();
         Msg("ph_ragdoll: PhysX ragdoll instance released");
     }
+    if (state->multiV2 && !state->active)
+        Msg("ph_ragdoll: released retired game-owned wrapper state=%p npc=%u (backend already destroyed)",
+            static_cast<void*>(state), state->ownerId);
     delete state;
 }
 
 bool OgsrPhysXRagdollPublish(OgsrPhysXRagdollState& state, IKinematics& kinematics, Fmatrix& entityWorld, std::string* error)
 {
     if (!state.active)
+    {
+        if (error)
+            *error = "ragdoll is retired";
         return false;
+    }
     OgsrPhysXRagdollPose pose{};
     std::vector<float> bodyWorld(OGSR_PHYSX_RAGDOLL_MAX_BODIES * 16);
-    if (!OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES))
+    const bool havePose = state.multiV2
+                              ? OgsrPhysXRagdollV2GetPose(state.v2Handle, pose, bodyWorld.data(),
+                                                          OGSR_PHYSX_RAGDOLL_MAX_BODIES)
+                              : OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(),
+                                                               OGSR_PHYSX_RAGDOLL_MAX_BODIES);
+    if (!havePose)
     {
         if (error)
             *error = "cannot read the PhysX ragdoll pose";
@@ -1124,7 +1321,10 @@ bool OgsrPhysXRagdollPublish(OgsrPhysXRagdollState& state, IKinematics& kinemati
             Msg("ph_ragdoll: bone id=%u world=(%.2f,%.2f,%.2f)", bone, world.c.x, world.c.y, world.c.z);
         }
         OgsrPhysXRagdollDiagnostics diagnostics{};
-        if (OgsrPhysXRagdollRuntimeGetDiagnostics(0.0f, diagnostics))
+        const bool haveDiagnostics =
+            state.multiV2 ? OgsrPhysXRagdollV2GetDiagnostics(state.v2Handle, 0.0f, diagnostics)
+                          : OgsrPhysXRagdollRuntimeGetDiagnostics(0.0f, diagnostics);
+        if (haveDiagnostics)
         {
             Msg("ph_ragdoll: energy ke=%.2f pe=%.2f total=%.2f max_w=%.2f anchor=%.4f limit=%.4f contacts=%u "
                 "found=%u persist=%u lost=%u active=%u pen=%.4f awake=%u/%u impulses=%u",
@@ -1146,6 +1346,12 @@ bool OgsrPhysXRagdollApplyBoneHit(OgsrPhysXRagdollState& state,
                                   const pp::Vec3& boneSpacePosition,
                                   std::string* error)
 {
+    if (!state.active)
+    {
+        if (error)
+            *error = "ragdoll is retired";
+        return false;
+    }
     if (hit.phys_impulse() <= 0.0f)
         return true;
     if (state.capture.description.bodies.empty())
@@ -1188,7 +1394,10 @@ bool OgsrPhysXRagdollApplyBoneHit(OgsrPhysXRagdollState& state,
     }
 
     OgsrPhysXRagdollBodyMass mass{};
-    if (!OgsrPhysXRagdollRuntimeGetBodyMass(body, mass, error))
+    const bool haveMass = state.multiV2
+                              ? OgsrPhysXRagdollV2GetBodyMass(state.v2Handle, body, mass, error)
+                              : OgsrPhysXRagdollRuntimeGetBodyMass(body, mass, error);
+    if (!haveMass)
         return false;
     if (mass.body != body)
     {
@@ -1232,7 +1441,9 @@ bool OgsrPhysXRagdollApplyBoneHit(OgsrPhysXRagdollState& state,
 
     const float worldPosition[3] = {hitWorld.x, hitWorld.y, hitWorld.z};
     const float worldImpulse[3] = {impulse.x, impulse.y, impulse.z};
-    const bool applied = OgsrPhysXRagdollRuntimeApplyImpulse(body, worldPosition, worldImpulse, error);
+    const bool applied =
+        state.multiV2 ? OgsrPhysXRagdollV2ApplyImpulse(state.v2Handle, body, worldPosition, worldImpulse, error)
+                      : OgsrPhysXRagdollRuntimeApplyImpulse(body, worldPosition, worldImpulse, error);
     if (applied)
     {
         Msg("ph_ragdoll: bone impulse body=%u bone=%u hit=(%.3f,%.3f,%.3f) com=(%.3f,%.3f,%.3f) "
@@ -1247,6 +1458,12 @@ bool OgsrPhysXRagdollApplyCentralImpulse(OgsrPhysXRagdollState& state,
                                          const pp::Vec3& impulse,
                                          std::string* error)
 {
+    if (!state.active)
+    {
+        if (error)
+            *error = "ragdoll is retired";
+        return false;
+    }
     if (state.capture.description.bodies.empty())
     {
         if (error)
@@ -1275,11 +1492,16 @@ bool OgsrPhysXRagdollApplyCentralImpulse(OgsrPhysXRagdollState& state,
     }
 
     OgsrPhysXRagdollBodyMass mass{};
-    if (!OgsrPhysXRagdollRuntimeGetBodyMass(body, mass, error))
+    const bool haveMass = state.multiV2
+                              ? OgsrPhysXRagdollV2GetBodyMass(state.v2Handle, body, mass, error)
+                              : OgsrPhysXRagdollRuntimeGetBodyMass(body, mass, error);
+    if (!haveMass)
         return false;
     const pp::Vec3 comWorld{mass.worldCenterOfMass[0], mass.worldCenterOfMass[1], mass.worldCenterOfMass[2]};
     const float worldImpulse[3] = {impulse.x, impulse.y, impulse.z};
-    const bool applied = OgsrPhysXRagdollRuntimeApplyCentralImpulse(body, worldImpulse, error);
+    const bool applied =
+        state.multiV2 ? OgsrPhysXRagdollV2ApplyCentralImpulse(state.v2Handle, body, worldImpulse, error)
+                      : OgsrPhysXRagdollRuntimeApplyCentralImpulse(body, worldImpulse, error);
     if (applied)
     {
         const float magnitude =
@@ -1292,11 +1514,199 @@ bool OgsrPhysXRagdollApplyCentralImpulse(OgsrPhysXRagdollState& state,
     return applied;
 }
 
+OgsrPhysXRagdollReleaseAllResult OgsrPhysXRagdollReleaseAllV2()
+{
+    std::vector<OgsrPhysXRagdollState*> active;
+    std::vector<OgsrPhysXRagdollState*> quarantined;
+    {
+        std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+        active.swap(g_v2States);
+        quarantined.swap(g_v2Quarantine);
+    }
+
+    auto removeCallbacks = [](OgsrPhysXRagdollState* state) {
+        if (!state || !state->kinematics)
+            return;
+        std::size_t removed = 0;
+        for (std::size_t bone = 0; bone < state->slots.size(); ++bone)
+        {
+            CBoneInstance& instance = state->kinematics->LL_GetBoneInstance(static_cast<u16>(bone));
+            if (instance.callback() == &boneCallback && instance.callback_param() == &state->slots[bone])
+            {
+                instance.reset_callback();
+                ++removed;
+            }
+        }
+        state->kinematics->CalculateBones_Invalidate();
+        Msg("ph_ragdoll: removed %zu bone callback(s) state=%p npc=%u", removed,
+            static_cast<void*>(state), state->ownerId);
+    };
+
+    auto releaseOne = [&](OgsrPhysXRagdollState* state) {
+        if (!state)
+            return;
+        const bool ownedByNpc = state->gameOwned;
+        removeCallbacks(state);
+        // F1: a quarantined state must never retain a pointer to a visual that
+        // may be destroyed before the backend instance is released.
+        state->kinematics = nullptr;
+        if (state->active && OgsrPhysXRagdollV2SceneAlive())
+        {
+            std::string error;
+            if (!OgsrPhysXRagdollV2Destroy(state->v2Handle, &error))
+            {
+                Msg("! ph_ragdoll: v2 teardown release failed npc=%u state=%p "
+                    "handle=(%u,%u,%u,%u) game_owned=%d: %s; keeping for retry",
+                    state->ownerId, static_cast<void*>(state), state->v2Handle.sceneSlot,
+                    state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+                    state->v2Handle.instanceGeneration, ownedByNpc ? 1 : 0, error.c_str());
+                std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+                if (std::find(g_v2Quarantine.begin(), g_v2Quarantine.end(), state) ==
+                    g_v2Quarantine.end())
+                    g_v2Quarantine.push_back(state);
+                return;
+            }
+            Msg("ph_ragdoll: v2 instance released on level teardown npc=%u state=%p "
+                "handle=(%u,%u,%u,%u)",
+                state->ownerId, static_cast<void*>(state), state->v2Handle.sceneSlot,
+                state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+                state->v2Handle.instanceGeneration);
+        }
+        state->active = false;
+        state->v2Handle = OgsrPhysX2RagdollHandle{};
+        if (!ownedByNpc)
+        {
+            Msg("ph_ragdoll: deleted detached wrapper state=%p npc=%u", static_cast<void*>(state),
+                state->ownerId);
+            delete state;
+        }
+        else
+        {
+            Msg("ph_ragdoll: keeping game-owned wrapper state=%p npc=%u for owner release",
+                static_cast<void*>(state), state->ownerId);
+        }
+    };
+
+    for (OgsrPhysXRagdollState* state : active)
+        releaseOne(state);
+    for (OgsrPhysXRagdollState* state : quarantined)
+        releaseOne(state);
+
+    OgsrPhysXRagdollReleaseAllResult result;
+    {
+        std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+        result.remaining = static_cast<std::uint32_t>(g_v2Quarantine.size());
+        for (OgsrPhysXRagdollState* state : g_v2Quarantine)
+        {
+            if (state)
+                result.handles.push_back(state->v2Handle);
+        }
+    }
+    Msg("ph_ragdoll: ReleaseAllV2 complete=%d remaining=%u live=%u", result.complete() ? 1 : 0,
+        result.remaining, v2LiveCount());
+    return result;
+}
+
+void OgsrPhysXRagdollReconcileSceneDestroyV2()
+{
+    std::vector<OgsrPhysXRagdollState*> states;
+    {
+        std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+        states.swap(g_v2Quarantine);
+    }
+
+    std::size_t deleted = 0;
+    std::size_t kept = 0;
+    for (OgsrPhysXRagdollState* state : states)
+    {
+        if (!state)
+            continue;
+
+        const bool gameOwned = state->gameOwned;
+        Msg("ph_ragdoll: reconcile state=%p npc=%u handle=(%u,%u,%u,%u) game_owned=%d active=%d",
+            static_cast<void*>(state), state->ownerId, state->v2Handle.sceneSlot,
+            state->v2Handle.sceneGeneration, state->v2Handle.instanceSlot,
+            state->v2Handle.instanceGeneration, gameOwned ? 1 : 0, state->active ? 1 : 0);
+
+        // SceneDestroy already destroyed the backend instance. Invalidate the
+        // handle and stop every path that could still touch the scene or the
+        // old visual, but keep the C++ wrapper alive while its NPC owner still
+        // holds CCharacterPhysicsSupport::m_physx_ragdoll.
+        state->active = false;
+        state->v2Handle = OgsrPhysX2RagdollHandle{};
+        state->kinematics = nullptr;
+        OgsrPhysXRagdollV2ReleaseLeaseRef();
+
+        if (gameOwned)
+        {
+            ++kept;
+            Msg("ph_ragdoll: reconcile kept game-owned wrapper state=%p npc=%u; owner release required",
+                static_cast<void*>(state), state->ownerId);
+        }
+        else
+        {
+            ++deleted;
+            Msg("ph_ragdoll: reconcile deleted detached wrapper state=%p npc=%u",
+                static_cast<void*>(state), state->ownerId);
+            delete state;
+        }
+    }
+
+    Msg("ph_ragdoll: reconciled %zu quarantined instance(s) after SceneDestroy: "
+        "deleted=%zu kept_game_owned=%zu live=%u",
+        states.size(), deleted, kept, v2LiveCount());
+}
+
+std::uint32_t OgsrPhysXRagdollV2LiveCount()
+{
+    return v2LiveCount();
+}
+
+bool OgsrPhysXRagdollV2GetStateInfo(std::uint32_t ownerId, OgsrPhysXRagdollV2StateInfo& info)
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    auto fill = [&](OgsrPhysXRagdollState* state) {
+        info.ownerId = ownerId;
+        info.handle = state->v2Handle;
+        info.publishFrames = state->publishFrames;
+        info.callbackCalls = state->callbackCalls.load();
+        info.bodyCount = static_cast<std::uint32_t>(state->capture.description.bodies.size());
+        info.jointCount = static_cast<std::uint32_t>(state->capture.description.joints.size());
+        return true;
+    };
+    for (OgsrPhysXRagdollState* state : g_v2States)
+    {
+        if (state && state->ownerId == ownerId)
+            return fill(state);
+    }
+    for (OgsrPhysXRagdollState* state : g_v2Quarantine)
+    {
+        if (state && state->ownerId == ownerId)
+            return fill(state);
+    }
+    return false;
+}
+
+bool OgsrPhysXRagdollV2GetAnyPose(OgsrPhysXRagdollPose& pose, float* bodyWorld, std::uint32_t maxBodies)
+{
+    std::lock_guard<std::mutex> lock(g_v2StatesMutex);
+    for (OgsrPhysXRagdollState* state : g_v2States)
+    {
+        if (state && state->active)
+            return OgsrPhysXRagdollV2GetPose(state->v2Handle, pose, bodyWorld, maxBodies);
+    }
+    return false;
+}
+
 void OgsrPhysXRagdollSmokeReset()
 {
     stopSmokeCamera();
     g_smokeActorStartValid = false;
     g_smokeTargetId = u16(-1);
+    g_smokeMultiSecondId = u16(-1);
+    g_smokeDualPostPending = false;
+    g_smokeDualKeepCamera = false;
+    g_smokeDualPostStep = 0;
     g_smokeResetRequested = true;
 }
 
@@ -1333,6 +1743,7 @@ void OgsrPhysXRagdollSmokeTick()
     static bool odeVisualReplaced = false;
     static bool multiSpawned = false;
     static bool multiSecondHit = false;
+    static std::uint64_t multiSecondStep = 0;
     static bool multiFirstDestroyed = false;
     static bool multiThirdHit = false;
     static bool multiFinished = false;
@@ -1354,6 +1765,7 @@ void OgsrPhysXRagdollSmokeTick()
         odeVisualReplaced = false;
         multiSpawned = false;
         multiSecondHit = false;
+        multiSecondStep = 0;
         multiFirstDestroyed = false;
         multiThirdHit = false;
         multiFinished = false;
@@ -1371,127 +1783,6 @@ void OgsrPhysXRagdollSmokeTick()
         if (hitFrame == 0)
             hitFrame = frame;
 
-        if (OgsrPhysXRagdollMultiRequested())
-        {
-            if (!multiSpawned && frame - hitFrame >= 30)
-            {
-                multiSpawned = true;
-                CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
-                if (target)
-                {
-                    Fvector base = target->Position();
-                    Fvector first = base;
-                    first.x += 2.0f;
-                    Fvector second = base;
-                    second.z += 2.0f;
-                    Level().g_cl_Spawn("sim_default_stalker_2", 0xff, M_SPAWN_OBJECT_LOCAL, first);
-                    Level().g_cl_Spawn("sim_default_stalker_2", 0xff, M_SPAWN_OBJECT_LOCAL, second);
-                    Msg("ph_ragdoll_smoke: multi spawned two extra stalkers at (%.2f,%.2f,%.2f)",
-                        base.x, base.y, base.z);
-                }
-            }
-            if (!multiSecondHit && frame - hitFrame >= 120)
-            {
-                CAI_Stalker* extra = findAliveExtra(g_smokeTargetId, u16(-1));
-                if (extra)
-                {
-                    multiSecondHit = true;
-                    multiSecondId = extra->ID();
-                    applyLethalSmokeHit(extra, "second/ODE-fallback");
-                    Msg("ph_ragdoll_smoke: multi second hit id=%u physx_instance=%d", extra->ID(),
-                        OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0);
-                }
-                else
-                {
-                    Msg("! ph_ragdoll_smoke: multi second NPC not spawned yet");
-                }
-            }
-            if (!multiFirstDestroyed && frame - hitFrame >= 180)
-            {
-                multiFirstDestroyed = true;
-                CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
-                if (target)
-                {
-                    Msg("ph_ragdoll_smoke: multi destroying first PhysX NPC id=%u", target->ID());
-                    target->DestroyObject();
-                }
-            }
-            if (!multiThirdHit && frame - hitFrame >= 240)
-            {
-                CAI_Stalker* extra = findAliveExtra(g_smokeTargetId, multiSecondId);
-                if (extra)
-                {
-                    multiThirdHit = true;
-                    multiThirdId = extra->ID();
-                    applyLethalSmokeHit(extra, "third/reuse");
-                    Msg("ph_ragdoll_smoke: multi third hit id=%u physx_instance_before=%d", extra->ID(),
-                        OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0);
-                }
-                else
-                {
-                    Msg("! ph_ragdoll_smoke: multi third NPC not found");
-                }
-            }
-            if (!multiFinished && frame - hitFrame >= 300)
-            {
-                multiFinished = true;
-                CAI_Stalker* second = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiSecondId));
-                CAI_Stalker* third = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiThirdId));
-                Msg("ph_ragdoll_smoke: multi result second=%d shell=%d third=%d shell=%d physx_instance=%d",
-                    second ? 1 : 0, second && second->PPhysicsShell() ? 1 : 0, third ? 1 : 0,
-                    third && third->PPhysicsShell() ? 1 : 0,
-                    OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0);
-            }
-            if (OgsrPhysXRagdollReloadRequested() && !reloadRequested && frame - hitFrame >= 300)
-            {
-                reloadRequested = true;
-                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
-                {
-                    g_smokeCaptureIncomplete = true;
-                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
-                }
-                stopSmokeCamera();
-                Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
-                OgsrPhysXRagdollRequestLevelDisconnect();
-            }
-            if (reloadRequested)
-                return;
-            if (frame - hitFrame > 600 && !destroyed)
-            {
-                destroyed = true;
-                CAI_Stalker* third = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiThirdId));
-                if (third)
-                {
-                    Msg("ph_ragdoll_smoke: multi destroying third PhysX NPC id=%u", third->ID());
-                    third->DestroyObject();
-                }
-            }
-            return;
-        }
-        if (OgsrPhysXRagdollReloadRequested())
-        {
-            if (!reloadRequested && frame - hitFrame >= 300)
-            {
-                reloadRequested = true;
-                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
-                {
-                    g_smokeCaptureIncomplete = true;
-                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
-                }
-                stopSmokeCamera();
-                Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
-                OgsrPhysXRagdollRequestLevelDisconnect();
-            }
-            return;
-        }
-
-        if (OgsrPhysXRagdollOdeSmokeRequested() && frame - hitFrame == 60)
-        {
-            CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
-            Msg("ph_ragdoll_smoke: ODE-only death check target=%d shell=%d physx_instance=%d",
-                target ? 1 : 0, target && target->PPhysicsShell() ? 1 : 0,
-                OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0);
-        }
         if (OgsrPhysXRagdollVisualReplaceRequested() && !visualReplaced && frame - hitFrame >= 300)
         {
             visualReplaced = true;
@@ -1539,6 +1830,179 @@ void OgsrPhysXRagdollSmokeTick()
                     Msg("! ph_ragdoll_smoke: no replacement visual available for id=%u", target->ID());
                 }
             }
+        }
+        if (OgsrPhysXRagdollMultiRequested() || OgsrPhysXRagdollMultiInstancesRequested())
+        {
+            // P3.1-C needs at least 600 physics steps with both v2 ragdolls
+            // alive before A is destroyed. The diagnostic v1 sequence keeps
+            // its original timing.
+            const std::uint32_t v2Hold = OgsrPhysXRagdollMultiInstancesRequested() ? 650u : 0u;
+            if (!multiSpawned && frame - hitFrame >= 30)
+            {
+                multiSpawned = true;
+                CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
+                if (target)
+                {
+                    Fvector base = target->Position();
+                    Fvector first = base;
+                    // B is the nearest extra and is offset laterally to the
+                    // diagnostic side camera; C is farther along the view axis.
+                    first.z += 3.5f;
+                    Fvector second = base;
+                    second.z -= 4.5f;
+                    Level().g_cl_Spawn("sim_default_stalker_2", 0xff, M_SPAWN_OBJECT_LOCAL, first);
+                    Level().g_cl_Spawn("sim_default_stalker_2", 0xff, M_SPAWN_OBJECT_LOCAL, second);
+                    Msg("ph_ragdoll_smoke: multi spawned two extra stalkers at (%.2f,%.2f,%.2f)",
+                        base.x, base.y, base.z);
+                }
+            }
+            if (!multiSecondHit && frame - hitFrame >= 120)
+            {
+                CAI_Stalker* extra = findAliveExtra(g_smokeTargetId, u16(-1));
+                if (extra)
+                {
+                    multiSecondHit = true;
+                    multiSecondId = extra->ID();
+                    applyLethalSmokeHit(extra, "second/ODE-fallback");
+                    multiSecondStep = OgsrPhysXRagdollV2StepIndex();
+                    g_smokeMultiSecondId = multiSecondId;
+                    if (OgsrPhysXRagdollMultiInstancesRequested())
+                    {
+                        // Restart the capture series from B activation so the
+                        // frames are counted from the dual-NPC state.
+                        g_smokeCaptureStarted = false;
+                        g_smokeCaptureBase = 0;
+                        g_smokeCaptureIndex = 0;
+                        g_smokeCaptureComplete = false;
+                        g_smokeCaptureIncomplete = false;
+                        g_smokeCaptureMaxDelta = 0;
+                    }
+                    Msg("ph_ragdoll_smoke: multi second hit id=%u physx_instance=%d v2_live=%u step=%llu",
+                        extra->ID(), OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0,
+                        OgsrPhysXRagdollV2LiveCount(),
+                        static_cast<unsigned long long>(multiSecondStep));
+                    OgsrPhysXRagdollV2StateInfo info{};
+                    if (OgsrPhysXRagdollV2GetStateInfo(multiSecondId, info))
+                        Msg("ph_ragdoll_smoke: v2 B id=%u handle=(%u,%u,%u,%u) bodies=%u joints=%u publish=%u "
+                            "callbacks=%u",
+                            multiSecondId, info.handle.sceneSlot, info.handle.sceneGeneration,
+                            info.handle.instanceSlot, info.handle.instanceGeneration, info.bodyCount,
+                            info.jointCount, info.publishFrames, info.callbackCalls);
+                }
+                else
+                {
+                    Msg("! ph_ragdoll_smoke: multi second NPC not spawned yet");
+                }
+            }
+            const bool v2Ready =
+                !OgsrPhysXRagdollMultiInstancesRequested() ||
+                (multiSecondStep != 0 && OgsrPhysXRagdollV2StepIndex() >= multiSecondStep + 600);
+            if (!multiFirstDestroyed && v2Ready && frame - hitFrame >= 180 + v2Hold)
+            {
+                multiFirstDestroyed = true;
+                CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
+                if (target)
+                {
+                    Msg("ph_ragdoll_smoke: multi destroying first PhysX NPC id=%u", target->ID());
+                    target->DestroyObject();
+                    if (OgsrPhysXRagdollMultiInstancesRequested())
+                    {
+                        g_smokeDualPostPending = true;
+                        g_smokeDualPostStep = OgsrPhysXRagdollV2StepIndex();
+                        g_smokeDualKeepCamera = true;
+                    }
+                }
+            }
+            if (!multiThirdHit && multiFirstDestroyed && frame - hitFrame >= 240 + v2Hold)
+            {
+                CAI_Stalker* extra = findAliveExtra(g_smokeTargetId, multiSecondId);
+                if (extra)
+                {
+                    multiThirdHit = true;
+                    multiThirdId = extra->ID();
+                    applyLethalSmokeHit(extra, "third/reuse");
+                    Msg("ph_ragdoll_smoke: multi third hit id=%u physx_instance_before=%d v2_live_before=%u",
+                        extra->ID(), OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0,
+                        OgsrPhysXRagdollV2LiveCount());
+                }
+                else
+                {
+                    Msg("! ph_ragdoll_smoke: multi third NPC not found");
+                }
+            }
+            if (!multiFinished && multiThirdHit && frame - hitFrame >= 300 + v2Hold)
+            {
+                multiFinished = true;
+                CAI_Stalker* second = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiSecondId));
+                CAI_Stalker* third = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiThirdId));
+                Msg("ph_ragdoll_smoke: multi result second=%d shell=%d third=%d shell=%d physx_instance=%d "
+                    "v2_live=%u step=%llu",
+                    second ? 1 : 0, second && second->PPhysicsShell() ? 1 : 0, third ? 1 : 0,
+                    third && third->PPhysicsShell() ? 1 : 0,
+                    OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0, OgsrPhysXRagdollV2LiveCount(),
+                    static_cast<unsigned long long>(OgsrPhysXRagdollV2StepIndex()));
+                OgsrPhysXRagdollV2StateInfo secondInfo{};
+                OgsrPhysXRagdollV2StateInfo thirdInfo{};
+                if (OgsrPhysXRagdollV2GetStateInfo(multiSecondId, secondInfo))
+                    Msg("ph_ragdoll_smoke: v2 B result handle=(%u,%u,%u,%u) publish=%u callbacks=%u",
+                        secondInfo.handle.sceneSlot, secondInfo.handle.sceneGeneration,
+                        secondInfo.handle.instanceSlot, secondInfo.handle.instanceGeneration,
+                        secondInfo.publishFrames, secondInfo.callbackCalls);
+                if (OgsrPhysXRagdollV2GetStateInfo(multiThirdId, thirdInfo))
+                    Msg("ph_ragdoll_smoke: v2 C result handle=(%u,%u,%u,%u) publish=%u callbacks=%u",
+                        thirdInfo.handle.sceneSlot, thirdInfo.handle.sceneGeneration,
+                        thirdInfo.handle.instanceSlot, thirdInfo.handle.instanceGeneration,
+                        thirdInfo.publishFrames, thirdInfo.callbackCalls);
+            }
+            if (OgsrPhysXRagdollReloadRequested() && !reloadRequested && frame - hitFrame >= 300 + v2Hold)
+            {
+                reloadRequested = true;
+                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
+                {
+                    g_smokeCaptureIncomplete = true;
+                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
+                }
+                stopSmokeCamera();
+                Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
+                OgsrPhysXRagdollRequestLevelDisconnect();
+            }
+            if (reloadRequested)
+                return;
+            if (frame - hitFrame > 600 + v2Hold && !destroyed)
+            {
+                destroyed = true;
+                CAI_Stalker* third = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(multiThirdId));
+                if (third)
+                {
+                    Msg("ph_ragdoll_smoke: multi destroying third PhysX NPC id=%u", third->ID());
+                    third->DestroyObject();
+                }
+            }
+            return;
+        }
+        if (OgsrPhysXRagdollReloadRequested())
+        {
+            if (!reloadRequested && frame - hitFrame >= 300)
+            {
+                reloadRequested = true;
+                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
+                {
+                    g_smokeCaptureIncomplete = true;
+                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
+                }
+                stopSmokeCamera();
+                Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
+                OgsrPhysXRagdollRequestLevelDisconnect();
+            }
+            return;
+        }
+
+        if (OgsrPhysXRagdollOdeSmokeRequested() && frame - hitFrame == 60)
+        {
+            CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
+            Msg("ph_ragdoll_smoke: ODE-only death check target=%d shell=%d physx_instance=%d",
+                target ? 1 : 0, target && target->PPhysicsShell() ? 1 : 0,
+                OgsrPhysXRagdollRuntimeHasInstance() ? 1 : 0);
         }
         if (OgsrPhysXRagdollVisualReplaceOdeRequested() && !odeVisualReplaced && frame - hitFrame == 360)
         {
@@ -1727,11 +2191,11 @@ void OgsrPhysXRagdollSmokeTick()
                     Fvector(0.7071f, 0.0f, -0.7071f), Fvector(-0.7071f, 0.0f, -0.7071f),
                 };
                 Fvector chosen(1.0f, 0.0f, 0.0f);
-                float chosenHeight = 0.3f;
+                float chosenHeight = 2.5f;
                 bool found = false;
                 for (int pass = 0; pass < 2 && !found; ++pass)
                 {
-                    const float height = pass == 0 ? 0.3f : 2.5f;
+                    const float height = pass == 0 ? 2.5f : 3.5f;
                     for (const Fvector& candidate : candidates)
                     {
                         Fvector side = candidate;
@@ -1739,7 +2203,7 @@ void OgsrPhysXRagdollSmokeTick()
                             side.invert();
                         Fvector camPos = target;
                         Fvector offset = side;
-                        offset.mul(5.5f);
+                        offset.mul(8.0f);
                         camPos.add(offset);
                         camPos.y = target.y + height;
                         Fvector ray = camPos;
@@ -1763,7 +2227,7 @@ void OgsrPhysXRagdollSmokeTick()
                     }
                 }
                 Fvector offset = chosen;
-                offset.mul(5.5f);
+                offset.mul(8.0f);
                 g_smokeCameraPosition.set(target);
                 g_smokeCameraPosition.add(offset);
                 g_smokeCameraPosition.y = target.y + chosenHeight;

@@ -6,6 +6,8 @@
 #include "physics_portable/json.h"
 #include "physics_portable/ragdoll.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -60,6 +62,11 @@ void check(bool condition, const char* message)
         ++g_failures;
         std::printf("FAIL: %s\n", message);
     }
+}
+
+bool contains(const char* text, const char* needle)
+{
+    return text && needle && std::strstr(text, needle) != nullptr;
 }
 
 OgsrPhysX2SceneConfig sceneConfig(float gravityY = -19.62f, bool collectContacts = true)
@@ -915,6 +922,28 @@ void testPartialFailure()
     check(OgsrPhysX2SceneDestroy(scene, nullptr, 0) == 1, "partial-failure scene destroy");
 }
 
+void testFaultInjection()
+{
+    OgsrPhysX2SceneHandle scene{};
+    check(createScene(sceneConfig(), scene), "fault-injection scene create");
+    OgsrPhysX2RagdollHandle body{};
+    check(createSingleBody(scene, Vec3{0.0f, 1.0f, 0.0f}, 0.25f, body), "fault-injection body create");
+
+    SetEnvironmentVariableA("OGSR_PHYSX2_FAULT_RAGDOLL_DESTROY", "1");
+    char error[512] = {};
+    check(OgsrPhysX2RagdollDestroy(body, error, sizeof(error)) == 0,
+          "faulted RagdollDestroy is rejected");
+    check(contains(error, "fault injection"), "faulted RagdollDestroy names the injection");
+    check(OgsrPhysX2RagdollIsAlive(body) == 1, "instance stays alive after a failed destroy");
+    OgsrPhysX2StepResult result{};
+    check(step(scene, 0.01f, 1, result), "scene still steps after a failed instance destroy");
+    SetEnvironmentVariableA("OGSR_PHYSX2_FAULT_RAGDOLL_DESTROY", nullptr);
+    check(OgsrPhysX2RagdollDestroy(body, nullptr, 0) == 1,
+          "RagdollDestroy succeeds after the fault is cleared");
+    check(OgsrPhysX2RagdollIsAlive(body) == 0, "instance is invalid after fault recovery");
+    check(OgsrPhysX2SceneDestroy(scene, nullptr, 0) == 1, "fault-injection scene destroy");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -928,6 +957,7 @@ int main(int argc, char** argv)
     testTwoFullRagdollsContact();
     testContactLossOnDestroy();
     testMaterialConflictRejected();
+    testFaultInjection();
     testStaticFragments();
     testFrameRates();
     testInvalidInputs();

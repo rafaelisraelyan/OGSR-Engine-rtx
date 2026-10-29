@@ -127,9 +127,18 @@ public:
     const V2ApiTable& api() const;
     V2NegotiationResult negotiate(const V2Requirements& requirements);
 
+    // Client-side resource guard. The game runtime registers every live v2
+    // scene/instance here; unload() refuses to FreeLibrary while any resource
+    // is registered. The lease cannot prevent a hostile caller from calling
+    // FreeLibrary directly, so all game calls must go through this object.
+    void addResourceRef();
+    bool releaseResourceRef();
+    std::uint32_t resourceRefs() const;
+
 private:
     void* module_ = nullptr;
     V2ApiTable api_{};
+    std::uint32_t resourceRefs_ = 0;
 };
 #endif
 

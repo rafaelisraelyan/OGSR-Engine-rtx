@@ -32,6 +32,7 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../PhysicsPortable" "${CMAKE_BINAR
 add_library(physics_physx STATIC
     src/physx_ragdoll_world.cpp
     src/physx_runtime.cpp
+    src/physx_extension_lifetime.cpp
 )
 
 target_include_directories(physics_physx
@@ -118,6 +119,18 @@ if(PHYSICS_PHYSX_BUILD_TESTS)
     )
 
     add_test(NAME physics_physx_tests COMMAND physics_physx_tests)
+
+    add_executable(physics_physx_extension_lifetime_tests
+        tests/test_extension_lifetime.cpp
+    )
+    target_link_libraries(physics_physx_extension_lifetime_tests PRIVATE physics_physx)
+    target_include_directories(physics_physx_extension_lifetime_tests PRIVATE ${PHYSX_ROOT}/include)
+    target_compile_definitions(physics_physx_extension_lifetime_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_custom_command(TARGET physics_physx_extension_lifetime_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PHYSX_RUNTIME_DLLS} "$<TARGET_FILE_DIR:physics_physx_extension_lifetime_tests>"
+        COMMENT "Copy PhysX runtime DLLs beside the extension lifetime test"
+    )
+    add_test(NAME physics_physx_extension_lifetime_tests COMMAND physics_physx_extension_lifetime_tests)
 
     add_executable(physics_physx_ragdoll_abi_tests
         tests/test_ragdoll_c.cpp
@@ -244,6 +257,21 @@ if(PHYSICS_PHYSX_BUILD_TESTS)
     )
     add_test(NAME physics_physx_v2_multi_tests COMMAND physics_physx_v2_multi_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/../../../artifacts/fixtures-p1/ragdoll_sim_default_stalker.json")
+
+    add_executable(physics_physx_v2_lifetime_tests tests/test_v2_lifetime.cpp)
+    target_link_libraries(physics_physx_v2_lifetime_tests PRIVATE physics_physx_runtime physics_physx_abi_v2)
+    target_include_directories(physics_physx_v2_lifetime_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(physics_physx_v2_lifetime_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(physics_physx_v2_lifetime_tests physics_physx_runtime)
+    add_custom_command(TARGET physics_physx_v2_lifetime_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:physics_physx_runtime>" "$<TARGET_FILE_DIR:physics_physx_v2_lifetime_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PHYSX_RUNTIME_DLLS} "$<TARGET_FILE_DIR:physics_physx_v2_lifetime_tests>"
+        COMMENT "Copy the ragdoll runtime DLL beside the v2 lifetime test"
+    )
+    add_test(NAME physics_physx_v2_lifetime_tests COMMAND physics_physx_v2_lifetime_tests)
 
     add_executable(physics_physx_v2_benchmark
         tests/bench_v2_multi.cpp

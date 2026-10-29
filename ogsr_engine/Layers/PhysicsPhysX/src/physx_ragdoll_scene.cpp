@@ -1,5 +1,7 @@
 #include "physx_ragdoll_v2_internal.h"
 
+#include "physics_physx/physx_extension_lifetime.h"
+
 #include "PxPhysicsAPI.h"
 #include "cooking/PxCooking.h"
 #include "extensions/PxDefaultCpuDispatcher.h"
@@ -78,7 +80,8 @@ private:
     {
         foundation_ = PxCreateFoundation(PX_PHYSICS_VERSION, allocator_, errorCallback_);
         if (!foundation_)
-            return fail(error, "PxCreateFoundation failed");
+            return fail(error, "PxCreateFoundation failed (PhysX allows one foundation per process; "
+                               "v1/v2 coexistence is not supported)");
         physics_ = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation_, PxTolerancesScale(), false, nullptr);
         if (!physics_)
         {
@@ -86,13 +89,13 @@ private:
             foundation_ = nullptr;
             return fail(error, "PxCreatePhysics failed");
         }
-        if (!PxInitExtensions(*physics_, nullptr))
+        if (!acquirePhysXExtensions(PhysXExtensionOwner::MultiV2, *physics_, error))
         {
             physics_->release();
             physics_ = nullptr;
             foundation_->release();
             foundation_ = nullptr;
-            return fail(error, "PxInitExtensions failed");
+            return false;
         }
         return true;
     }
@@ -101,7 +104,7 @@ private:
     {
         if (physics_)
         {
-            PxCloseExtensions();
+            releasePhysXExtensions(PhysXExtensionOwner::MultiV2);
             physics_->release();
             physics_ = nullptr;
         }

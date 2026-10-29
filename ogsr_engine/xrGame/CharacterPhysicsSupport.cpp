@@ -1273,7 +1273,11 @@ bool CCharacterPhysicsSupport::TryActivatePhysXRagdoll(CObject* who, SHit* hit)
         return false;
     if (m_EntityAlife.use_simplified_visual() || !m_EntityAlife.cast_stalker())
         return false;
-    if (!OgsrPhysXRagdollRuntimeAlive() || OgsrPhysXRagdollRuntimeHasInstance())
+    if (!OgsrPhysXRagdollRuntimeAlive())
+        return false;
+    if (!OgsrPhysXRagdollMultiInstancesRequested() && OgsrPhysXRagdollRuntimeHasInstance())
+        return false;
+    if (OgsrPhysXRagdollMultiInstancesRequested() && OgsrPhysXRagdollV2LiveCount() >= 2)
         return false;
     if (!OgsrPhysXRagdollMatches(m_EntityAlife.cName().c_str(), m_EntityAlife.cNameSect().c_str()))
         return false;
@@ -1313,7 +1317,8 @@ bool CCharacterPhysicsSupport::TryActivatePhysXRagdoll(CObject* who, SHit* hit)
     OgsrPhysXRagdollState* state = nullptr;
     std::uint32_t bodyCount = 0;
     std::uint32_t jointCount = 0;
-    if (!OgsrPhysXRagdollActivate(capture, *K, mXFORM, m_EntityAlife.Position(), state, bodyCount, jointCount, &error))
+    if (!OgsrPhysXRagdollActivate(capture, *K, mXFORM, m_EntityAlife.Position(), m_EntityAlife.ID(), state,
+                                  bodyCount, jointCount, &error))
     {
         Msg("! ph_ragdoll: activation failed, ODE fallback: %s", error.c_str());
         return false;
@@ -1372,7 +1377,8 @@ bool CCharacterPhysicsSupport::TryActivatePhysXRagdoll(CObject* who, SHit* hit)
 
 void CCharacterPhysicsSupport::UpdatePhysXRagdoll()
 {
-    if (!m_physx_ragdoll || !OgsrPhysXRagdollRuntimeAlive())
+    if (!m_physx_ragdoll || !OgsrPhysXRagdollRuntimeAlive() ||
+        !OgsrPhysXRagdollIsActive(m_physx_ragdoll))
         return;
     IKinematics* K = smart_cast<IKinematics*>(m_EntityAlife.Visual());
     if (!K)

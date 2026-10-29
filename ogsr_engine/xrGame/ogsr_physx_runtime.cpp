@@ -12,6 +12,8 @@
 #ifdef OGSR_PHYSX_RAGDOLL
 #include "ogsr_physx_ragdoll.h"
 #include "../Layers/PhysicsPhysX/include/physics_physx/physx_ragdoll_c.h"
+#include "../Layers/PhysicsPhysX/include/physics_physx/physx_ragdoll_c_v2.h"
+#include "../Layers/PhysicsPhysX/include/physics_physx/physx_ragdoll_v2_loader.h"
 #endif
 
 #include <algorithm>
@@ -117,6 +119,17 @@ bool g_ragdoll_smoke_time_scaled = false;
 double g_ragdoll_ms_total = 0.0;
 double g_ragdoll_ms_max = 0.0;
 std::uint32_t g_ragdoll_steps = 0;
+bool g_ragdoll_multi_instances = false;
+
+physics_physx::V2ModuleLease g_v2_lease;
+physics_physx::V2ApiTable g_v2_api{};
+OgsrPhysX2SceneHandle g_v2_scene{};
+bool g_v2_scene_alive = false;
+bool g_v2_scene_destroy_failed = false;
+std::uint64_t g_v2_frame_id = 0;
+std::uint64_t g_v2_step_index = 0;
+std::uint32_t g_v2_live_instances = 0;
+std::uint32_t g_v2_scene_triangles = 0;
 
 void parseRagdollFlags()
 {
@@ -195,6 +208,10 @@ void parseRagdollFlags()
         {
             g_ragdoll_multi = true;
         }
+        else if (tokens[index] == "-physx_multi_instances")
+        {
+            g_ragdoll_multi_instances = true;
+        }
         else if (tokens[index] == "-physx_ragdoll_reload")
         {
             g_ragdoll_reload = true;
@@ -210,6 +227,15 @@ void parseRagdollFlags()
     }
     if (g_ragdoll_smoke)
         g_ragdoll_force_free = true;
+    if (g_ragdoll_multi && g_ragdoll_multi_instances)
+    {
+        Msg("! ph_runtime: -physx_multi_instances conflicts with diagnostic -physx_ragdoll_multi; "
+            "v2 path disabled");
+        g_ragdoll_multi_instances = false;
+        g_ragdoll_requested = false;
+    }
+    if (g_ragdoll_multi_instances)
+        Msg("ph_runtime: multi-instance v2 mode requested (max 2 live ragdolls)");
     if (g_ragdoll_requested)
         Msg("ph_runtime: NPC ragdoll requested target=[%s] smoke=%d force_free=%d", g_ragdoll_target.c_str(),
             g_ragdoll_smoke ? 1 : 0, g_ragdoll_force_free ? 1 : 0);
@@ -241,6 +267,12 @@ bool OgsrPhysXRagdollMultiRequested()
     return g_ragdoll_multi;
 }
 
+bool OgsrPhysXRagdollMultiInstancesRequested()
+{
+    parseRagdollFlags();
+    return g_ragdoll_multi_instances;
+}
+
 bool OgsrPhysXRagdollReloadRequested()
 {
     parseRagdollFlags();
@@ -252,8 +284,28 @@ void OgsrPhysXRagdollRequestLevelDisconnect() { Engine.Event.Defer("KERNEL:disco
 bool OgsrPhysXRagdollMatches(const char* name, const char* section)
 {
     parseRagdollFlags();
-    if (!g_ragdoll_requested || g_ragdoll_target.empty())
+    if (!g_ragdoll_requested)
         return false;
+    // The production multi-instance mode accepts any stalker; the target name
+    // only seeds the smoke scenario.
+    if (g_ragdoll_multi_instances)
+        return true;
+    if (g_ragdoll_target.empty())
+        return false;
+    if (name && _stricmp(name, g_ragdoll_target.c_str()) == 0)
+        return true;
+    if (section && _stricmp(section, g_ragdoll_target.c_str()) == 0)
+        return true;
+    return false;
+}
+
+bool OgsrPhysXRagdollTargetMatches(const char* name, const char* section)
+{
+    parseRagdollFlags();
+    if (!g_ragdoll_requested)
+        return false;
+    if (g_ragdoll_target.empty())
+        return true;
     if (name && _stricmp(name, g_ragdoll_target.c_str()) == 0)
         return true;
     if (section && _stricmp(section, g_ragdoll_target.c_str()) == 0)
@@ -277,8 +329,19 @@ bool OgsrPhysXRagdollVisualReplaceOdeRequested()
     parseRagdollFlags();
     return g_ragdoll_visual_replace_ode;
 }
-bool OgsrPhysXRagdollRuntimeAlive() { return g_ragdoll_alive && g_ragdoll_handle != nullptr; }
-bool OgsrPhysXRagdollRuntimeHasInstance() { return g_ragdoll_active; }
+bool OgsrPhysXRagdollRuntimeAlive()
+{
+    parseRagdollFlags();
+    if (g_ragdoll_multi_instances)
+        return true; // the v2 scene is created lazily on the first activation
+    return g_ragdoll_alive && g_ragdoll_handle != nullptr;
+}
+bool OgsrPhysXRagdollRuntimeHasInstance()
+{
+    if (g_ragdoll_multi_instances)
+        return false; // capacity is enforced by the v2 scene and live counter
+    return g_ragdoll_active;
+}
 #endif
 
 namespace
@@ -453,6 +516,58 @@ bool loadApi()
 void shutdown()
 {
 #ifdef OGSR_PHYSX_RAGDOLL
+    if (g_v2_scene_alive)
+    {
+        OgsrPhysXRagdollReleaseAllResult release = OgsrPhysXRagdollReleaseAllV2();
+        if (!release.complete())
+        {
+            Msg("ph_runtime: v2 instance teardown incomplete: remaining=%u; retrying", release.remaining);
+            release = OgsrPhysXRagdollReleaseAllV2();
+        }
+        for (const OgsrPhysX2RagdollHandle& handle : release.handles)
+            Msg("! ph_runtime: quarantined instance scene=(%u,%u) instance=(%u,%u)", handle.sceneSlot,
+                handle.sceneGeneration, handle.instanceSlot, handle.instanceGeneration);
+        Msg("ph_runtime: v2 teardown state: remaining=%u live=%u lease_refs=%u", release.remaining,
+            OgsrPhysXRagdollV2LiveCount(), g_v2_lease.resourceRefs());
+
+        char destroyError[kErrorSize] = {};
+        bool destroyed = false;
+        for (int attempt = 0; attempt < 2 && !destroyed; ++attempt)
+        {
+            destroyed = g_v2_api.sceneDestroy &&
+                        g_v2_api.sceneDestroy(g_v2_scene, destroyError, sizeof(destroyError));
+            if (!destroyed)
+                Msg("! ph_runtime: v2 SceneDestroy attempt %d failed: %s", attempt + 1,
+                    destroyError[0] ? destroyError : "no error");
+        }
+        if (!destroyed)
+        {
+            Msg("! ph_runtime: v2 SceneDestroy failed (%s); keeping scene and DLL loaded",
+                destroyError[0] ? destroyError : "no error");
+            g_v2_scene_destroy_failed = true;
+        }
+        else
+        {
+            // SceneDestroy is authoritative: every backend instance in the
+            // scene is gone, including any quarantined ones. Reconcile the game
+            // states and their per-instance lease references.
+            if (!release.complete())
+                OgsrPhysXRagdollReconcileSceneDestroyV2();
+            g_v2_scene_alive = false;
+            g_v2_scene_destroy_failed = false;
+            g_v2_scene = OgsrPhysX2SceneHandle{};
+            g_v2_live_instances = 0;
+            g_v2_api = physics_physx::V2ApiTable{};
+            g_v2_lease.releaseResourceRef();
+            Msg("ph_runtime: v2 scene destroyed; lease_refs=%u", g_v2_lease.resourceRefs());
+        }
+    }
+    if (!g_v2_scene_alive && g_v2_lease.isLoaded())
+    {
+        std::string unloadError;
+        if (!g_v2_lease.unload(&unloadError))
+            Msg("! ph_runtime: v2 DLL unload deferred: %s", unloadError.c_str());
+    }
     if (g_ragdoll_handle)
     {
         if (g_api.ragdollRuntimeDestroy)
@@ -472,14 +587,17 @@ void shutdown()
         Msg("ph_runtime: level context destroyed");
 }
 
-bool readStaticFragment(const Fvector& center,
-                        std::vector<float>& vertices,
-                        std::vector<std::uint32_t>& indices,
-                        std::uint32_t& triangleCount)
+bool readStaticFragmentSized(const Fvector& center,
+                             float halfXZ,
+                             float halfY,
+                             std::uint32_t maxTriangles,
+                             std::vector<float>& vertices,
+                             std::vector<std::uint32_t>& indices,
+                             std::uint32_t& triangleCount)
 {
     Fvector zAxis(0.0f, 0.0f, 1.0f);
     Fvector yAxis(0.0f, 1.0f, 0.0f);
-    Fvector sizes(kStaticHalfExtentXZ * 2.0f, kStaticHalfExtentY * 2.0f, kStaticHalfExtentXZ * 2.0f);
+    Fvector sizes(halfXZ * 2.0f, halfY * 2.0f, halfXZ * 2.0f);
     std::vector<Fvector> triangleVertices;
     const bool found = Level().ObjectSpace.BoxQuery(center, zAxis, yAxis, sizes, &triangleVertices);
     if (!found || triangleVertices.empty())
@@ -489,7 +607,7 @@ bool readStaticFragment(const Fvector& center,
     }
 
     const std::size_t sourceTriangles = triangleVertices.size() / 3;
-    triangleCount = static_cast<std::uint32_t>(std::min<std::size_t>(sourceTriangles, kMaxStaticTriangles));
+    triangleCount = static_cast<std::uint32_t>(std::min<std::size_t>(sourceTriangles, maxTriangles));
     vertices.reserve(triangleCount * 9);
     indices.reserve(triangleCount * 3);
     for (std::size_t triangle = 0; triangle < triangleCount; ++triangle)
@@ -504,6 +622,15 @@ bool readStaticFragment(const Fvector& center,
         }
     }
     return true;
+}
+
+bool readStaticFragment(const Fvector& center,
+                        std::vector<float>& vertices,
+                        std::vector<std::uint32_t>& indices,
+                        std::uint32_t& triangleCount)
+{
+    return readStaticFragmentSized(center, kStaticHalfExtentXZ, kStaticHalfExtentY, kMaxStaticTriangles, vertices,
+                                   indices, triangleCount);
 }
 
 void prepareArchiveRuntime()
@@ -618,6 +745,110 @@ void initializeRagdoll()
     g_ragdoll_steps = 0;
     Msg("ph_runtime: NPC ragdoll runtime initialized");
 }
+bool initializeMultiRagdoll(const Fvector& center)
+{
+    if (g_v2_scene_alive)
+        return true;
+    if (g_init_failed)
+        return false;
+
+    shutdown();
+    if (g_v2_scene_alive || g_v2_scene_destroy_failed)
+    {
+        Msg("! ph_runtime: previous v2 scene teardown is incomplete; refusing a new scene");
+        g_init_failed = true;
+        return false;
+    }
+    std::string error;
+    if (!g_v2_lease.load("ogsr_physx_runtime.dll", &error))
+    {
+        Msg("! ph_runtime: cannot load the v2 DLL: %s", error.c_str());
+        g_init_failed = true;
+        return false;
+    }
+
+    physics_physx::V2Requirements requirements;
+    requirements.requiredCapabilities = OGSR_PHYSX2_CAP_REQUIRED_P3_1;
+    requirements.minimumScenes = 1;
+    requirements.minimumInstances = 2;
+    const physics_physx::V2NegotiationResult negotiation = g_v2_lease.negotiate(requirements);
+    if (negotiation.status != physics_physx::V2NegotiationStatus::Ready)
+    {
+        Msg("! ph_runtime: v2 ABI negotiation failed: %s (%s)",
+            physics_physx::v2NegotiationStatusName(negotiation.status), negotiation.error.c_str());
+        g_v2_lease.unload();
+        g_init_failed = true;
+        return false;
+    }
+    g_v2_api = g_v2_lease.api();
+
+    OgsrPhysX2SceneConfig config{};
+    config.structSize = sizeof(config);
+    config.fixedTimestep = kFixedStep;
+    config.gravityY = -19.62f;
+    config.workerThreads = 2;
+    config.maxSubsteps = kMaxSubsteps;
+    config.solverPositionIterations = 16;
+    config.solverVelocityIterations = 4;
+    config.contactOffset = 0.02f;
+    config.restOffset = 0.0f;
+    config.enableStabilization = 1;
+    config.collectContacts = 1;
+    config.maxInstances = 2;
+
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.sceneCreate(&config, &g_v2_scene, buffer, sizeof(buffer)))
+    {
+        Msg("! ph_runtime: v2 SceneCreate failed: %s", buffer);
+        g_v2_lease.unload();
+        g_init_failed = true;
+        return false;
+    }
+    // The scene owns a DLL resource from this point. If any later rollback
+    // fails, the lease must keep the module loaded.
+    g_v2_lease.addResourceRef();
+
+    std::vector<float> vertices;
+    std::vector<std::uint32_t> indices;
+    std::uint32_t sourceTriangles = 0;
+    const bool staticReady = readStaticFragmentSized(center, 48.0f, 24.0f, 8192, vertices, indices, sourceTriangles);
+    if (!staticReady ||
+        !g_v2_api.sceneSetStaticMesh(g_v2_scene, vertices.data(),
+                                     static_cast<std::uint32_t>(vertices.size() / 3), indices.data(),
+                                     static_cast<std::uint32_t>(indices.size()), buffer, sizeof(buffer)))
+    {
+        Msg("! ph_runtime: v2 static mesh upload failed: %s", buffer);
+        char destroyError[kErrorSize] = {};
+        const bool destroyed =
+            g_v2_api.sceneDestroy && g_v2_api.sceneDestroy(g_v2_scene, destroyError, sizeof(destroyError));
+        if (!destroyed)
+        {
+            Msg("! ph_runtime: v2 rollback SceneDestroy failed (%s); keeping scene handle and DLL lease",
+                destroyError[0] ? destroyError : "no error");
+            g_v2_scene_alive = true;
+            g_v2_scene_destroy_failed = true;
+            g_init_failed = true;
+            return false;
+        }
+        g_v2_scene = OgsrPhysX2SceneHandle{};
+        g_v2_lease.releaseResourceRef();
+        g_v2_lease.unload();
+        g_init_failed = true;
+        return false;
+    }
+
+    g_v2_scene_alive = true;
+    g_v2_scene_destroy_failed = false;
+    g_v2_frame_id = 0;
+    g_v2_step_index = 0;
+    g_v2_live_instances = 0;
+    g_v2_scene_triangles = sourceTriangles;
+    Msg("ph_runtime: v2 scene created scene=(%u,%u) caps=0x%08x max_instances=2 static_tris=%u "
+        "center=(%.2f,%.2f,%.2f)",
+        g_v2_scene.slot, g_v2_scene.generation, negotiation.info.capabilityFlags, sourceTriangles, center.x,
+        center.y, center.z);
+    return true;
+}
 #endif
 
 void initialize()
@@ -628,6 +859,13 @@ void initialize()
         prepareArchiveRuntime();
         if (!g_pGameLevel)
             return;
+        if (OgsrPhysXRagdollMultiInstancesRequested())
+        {
+            // The v2 scene is created lazily on the first activation so the
+            // static fragment is centered on the action area. One scene per
+            // level; never per NPC.
+            return;
+        }
         initializeRagdoll();
         return;
     }
@@ -705,6 +943,31 @@ void update()
     if (OgsrPhysXRagdollTargetRequested())
     {
         OgsrPhysXRagdollSmokeTick();
+        if (OgsrPhysXRagdollMultiInstancesRequested())
+        {
+            if (!OgsrPhysXRagdollV2SceneAlive())
+                return;
+            if (Device.Paused() || Device.fTimeDelta <= 0.0f)
+                return;
+            OgsrPhysX2StepResult stepResult{};
+            stepResult.structSize = sizeof(stepResult);
+            char stepError[kErrorSize] = {};
+            const std::uint64_t frameId = ++g_v2_frame_id;
+            if (!g_v2_api.sceneStep(g_v2_scene, Device.fTimeDelta, frameId, &stepResult, stepError,
+                                    sizeof(stepError)))
+            {
+                Msg("! ph_runtime: v2 SceneStep failed: %s", stepError);
+                return;
+            }
+            g_v2_step_index = stepResult.stepIndex;
+            if (g_v2_frame_id % 120 == 0)
+                Msg("ph_runtime: v2 frame=%llu step=%llu live=%u scene=(%u,%u)", g_v2_frame_id,
+                    g_v2_step_index, OgsrPhysXRagdollV2LiveCount(), g_v2_scene.slot, g_v2_scene.generation);
+            if (stepResult.droppedSteps > 0)
+                Msg("ph_runtime: v2 dropped steps=%u time=%.4f frame=%llu", stepResult.droppedSteps,
+                    stepResult.droppedSeconds, static_cast<unsigned long long>(frameId));
+            return;
+        }
         if (!OgsrPhysXRagdollRequested())
             return;
         if (!g_ragdoll_alive)
@@ -988,6 +1251,171 @@ bool OgsrPhysXRagdollRuntimeGetBodyMass(uint16_t body, OgsrPhysXRagdollBodyMass&
     }
     char buffer[kErrorSize] = {};
     if (!g_api.ragdollGetBodyMass(g_ragdoll_handle, body, &mass, buffer, sizeof(buffer)))
+    {
+        if (error)
+            *error = buffer;
+        return false;
+    }
+    return true;
+}
+
+bool OgsrPhysXRagdollV2SceneAlive()
+{
+    return g_v2_scene_alive;
+}
+
+std::uint64_t OgsrPhysXRagdollV2StepIndex()
+{
+    return g_v2_step_index;
+}
+
+bool OgsrPhysXRagdollV2Create(const Fvector& center,
+                              const OgsrPhysXRagdollDefinition& definition,
+                              const OgsrPhysX2RagdollInstanceConfig& config,
+                              OgsrPhysX2RagdollHandle& handle,
+                              std::string* error)
+{
+    handle = OgsrPhysX2RagdollHandle{};
+    if (!initializeMultiRagdoll(center))
+    {
+        if (error)
+            *error = "v2 scene is not available";
+        return false;
+    }
+    if (!g_v2_api.ragdollCreate)
+    {
+        if (error)
+            *error = "v2 ragdollCreate export is missing";
+        return false;
+    }
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.ragdollCreate(g_v2_scene, &definition, &config, &handle, buffer, sizeof(buffer)))
+    {
+        if (error)
+            *error = buffer;
+        return false;
+    }
+    ++g_v2_live_instances;
+    g_v2_lease.addResourceRef();
+    Msg("ph_ragdoll_v2: instance created scene=(%u,%u) instance=(%u,%u) live=%u", g_v2_scene.slot,
+        g_v2_scene.generation, handle.instanceSlot, handle.instanceGeneration, g_v2_live_instances);
+    return true;
+}
+
+bool OgsrPhysXRagdollV2Destroy(OgsrPhysX2RagdollHandle handle, std::string* error)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollDestroy)
+    {
+        if (error)
+            *error = "v2 scene is not available";
+        return false;
+    }
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.ragdollDestroy(handle, buffer, sizeof(buffer)))
+    {
+        if (error)
+            *error = buffer;
+        return false;
+    }
+    if (g_v2_live_instances > 0)
+        --g_v2_live_instances;
+    g_v2_lease.releaseResourceRef();
+    Msg("ph_ragdoll_v2: instance destroyed instance=(%u,%u) live=%u", handle.instanceSlot,
+        handle.instanceGeneration, g_v2_live_instances);
+    return true;
+}
+
+void OgsrPhysXRagdollV2ReleaseLeaseRef()
+{
+    if (g_v2_live_instances > 0)
+        --g_v2_live_instances;
+    g_v2_lease.releaseResourceRef();
+    Msg("ph_ragdoll_v2: lease ref released on reconciliation; live=%u refs=%u", g_v2_live_instances,
+        g_v2_lease.resourceRefs());
+}
+
+bool OgsrPhysXRagdollV2GetPose(OgsrPhysX2RagdollHandle handle,
+                               OgsrPhysXRagdollPose& pose,
+                               float* bodyWorld,
+                               std::uint32_t maxBodies)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollGetPose)
+        return false;
+    return g_v2_api.ragdollGetPose(handle, &pose, bodyWorld, maxBodies) != 0;
+}
+
+bool OgsrPhysXRagdollV2GetInfo(OgsrPhysX2RagdollHandle handle, OgsrPhysXRagdollInfo& info)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollGetInfo)
+        return false;
+    return g_v2_api.ragdollGetInfo(handle, &info) != 0;
+}
+
+bool OgsrPhysXRagdollV2GetBodyMass(OgsrPhysX2RagdollHandle handle,
+                                   std::uint16_t body,
+                                   OgsrPhysXRagdollBodyMass& mass,
+                                   std::string* error)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollGetBodyMass)
+    {
+        if (error)
+            *error = "v2 scene is not available";
+        return false;
+    }
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.ragdollGetBodyMass(handle, body, &mass, buffer, sizeof(buffer)))
+    {
+        if (error)
+            *error = buffer;
+        return false;
+    }
+    return true;
+}
+
+bool OgsrPhysXRagdollV2GetDiagnostics(OgsrPhysX2RagdollHandle handle,
+                                      float referenceHeight,
+                                      OgsrPhysXRagdollDiagnostics& diagnostics)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollGetDiagnostics)
+        return false;
+    return g_v2_api.ragdollGetDiagnostics(handle, referenceHeight, &diagnostics) != 0;
+}
+
+bool OgsrPhysXRagdollV2ApplyImpulse(OgsrPhysX2RagdollHandle handle,
+                                    std::uint16_t body,
+                                    const float worldPosition[3],
+                                    const float impulse[3],
+                                    std::string* error)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollApplyImpulse)
+    {
+        if (error)
+            *error = "v2 scene is not available";
+        return false;
+    }
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.ragdollApplyImpulse(handle, body, worldPosition, impulse, buffer, sizeof(buffer)))
+    {
+        if (error)
+            *error = buffer;
+        return false;
+    }
+    return true;
+}
+
+bool OgsrPhysXRagdollV2ApplyCentralImpulse(OgsrPhysX2RagdollHandle handle,
+                                           std::uint16_t body,
+                                           const float impulse[3],
+                                           std::string* error)
+{
+    if (!g_v2_scene_alive || !g_v2_api.ragdollApplyCentralImpulse)
+    {
+        if (error)
+            *error = "v2 scene is not available";
+        return false;
+    }
+    char buffer[kErrorSize] = {};
+    if (!g_v2_api.ragdollApplyCentralImpulse(handle, body, impulse, buffer, sizeof(buffer)))
     {
         if (error)
             *error = buffer;

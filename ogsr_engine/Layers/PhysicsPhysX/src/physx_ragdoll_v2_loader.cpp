@@ -186,13 +186,19 @@ bool V2ModuleLease::load(const char* path, std::string* error)
 
 bool V2ModuleLease::unload(std::string* error)
 {
+    if (!module_)
+        return true;
+    if (resourceRefs_ != 0)
+    {
+        if (error)
+            *error = "v2 module still has " + std::to_string(resourceRefs_) + " active resource(s)";
+        return false;
+    }
+
     // Invalidate the table before dropping the module reference. A copied
     // function pointer remains a caller contract violation, but no lease-owned
     // table can be used after this point.
     api_ = V2ApiTable{};
-    if (!module_)
-        return true;
-
     if (!FreeLibrary(static_cast<HMODULE>(module_)))
     {
         if (error)
@@ -204,6 +210,24 @@ bool V2ModuleLease::unload(std::string* error)
     if (error)
         error->clear();
     return true;
+}
+
+void V2ModuleLease::addResourceRef()
+{
+    ++resourceRefs_;
+}
+
+bool V2ModuleLease::releaseResourceRef()
+{
+    if (resourceRefs_ == 0)
+        return false;
+    --resourceRefs_;
+    return true;
+}
+
+std::uint32_t V2ModuleLease::resourceRefs() const
+{
+    return resourceRefs_;
 }
 
 bool V2ModuleLease::isLoaded() const

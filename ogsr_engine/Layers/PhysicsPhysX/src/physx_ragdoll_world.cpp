@@ -1,5 +1,7 @@
 ﻿#include "physics_physx/physx_ragdoll_world.h"
 
+#include "physics_physx/physx_extension_lifetime.h"
+
 #include "PxPhysicsAPI.h"
 #include "cooking/PxCooking.h"
 #include "geometry/PxConvexCoreGeometry.h"
@@ -208,32 +210,6 @@ bool fail(std::string* error, const std::string& message)
     return false;
 }
 
-std::mutex g_extensionsMutex;
-int g_extensionsRefCount = 0;
-
-bool acquireExtensions(PxPhysics& physics, std::string* error)
-{
-    std::lock_guard<std::mutex> lock(g_extensionsMutex);
-    if (g_extensionsRefCount == 0)
-    {
-        if (!PxInitExtensions(physics, nullptr))
-            return fail(error, "PxInitExtensions failed");
-    }
-    ++g_extensionsRefCount;
-    return true;
-}
-
-void releaseExtensions()
-{
-    std::lock_guard<std::mutex> lock(g_extensionsMutex);
-    if (g_extensionsRefCount > 0)
-    {
-        --g_extensionsRefCount;
-        if (g_extensionsRefCount == 0)
-            PxCloseExtensions();
-    }
-}
-
 bool isFiniteTransform(const physics_portable::Transform& value)
 {
     return physics_portable::isFinite(value);
@@ -361,7 +337,7 @@ struct PhysXRagdollWorld::Impl
 
         if (extensionsInitialized)
         {
-            releaseExtensions();
+            releasePhysXExtensions(PhysXExtensionOwner::LegacyV1);
             extensionsInitialized = false;
         }
         if (physics)
@@ -388,13 +364,15 @@ struct PhysXRagdollWorld::Impl
     {
         foundation = PxCreateFoundation(PX_PHYSICS_VERSION, allocator, errors);
         if (!foundation)
-            return fail(&lastError, "PxCreateFoundation failed: " + errors.lastError());
+            return fail(&lastError, "PxCreateFoundation failed (PhysX allows one foundation per process; "
+                                    "v1/v2 coexistence is not supported): " +
+                                        errors.lastError());
 
         physics = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation, PxTolerancesScale(), false, nullptr);
         if (!physics)
             return fail(&lastError, "PxCreatePhysics failed: " + errors.lastError());
 
-        if (!acquireExtensions(*physics, &lastError))
+        if (!acquirePhysXExtensions(PhysXExtensionOwner::LegacyV1, *physics, &lastError))
             return false;
         extensionsInitialized = true;
 

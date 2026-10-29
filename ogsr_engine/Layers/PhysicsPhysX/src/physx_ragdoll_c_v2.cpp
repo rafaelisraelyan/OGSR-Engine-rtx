@@ -4,8 +4,11 @@
 #include "physx_ragdoll_v2_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <windows.h>
 #include <limits>
 #include <memory>
 #include <string>
@@ -28,6 +31,28 @@ void clearError(char* error, std::size_t errorSize)
 {
     if (error && errorSize)
         error[0] = 0;
+}
+
+// Test-only fault injection. It is gated by process environment variables and
+// never changes the ABI or production behavior when the variables are absent.
+// GetEnvironmentVariableA is used instead of getenv so the /MT DLL and the test
+// executable (separate CRT copies) observe the same value.
+bool faultInjectionEnabled(const char* name)
+{
+    char value[8] = {};
+    const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
+    return length > 0 && value[0] != 0 && value[0] != '0';
+}
+
+std::atomic<bool> g_ragdollFaultOnceConsumed{false};
+std::atomic<bool> g_sceneFaultOnceConsumed{false};
+
+bool faultInjectionOnce(std::atomic<bool>& consumed, const char* name)
+{
+    if (!faultInjectionEnabled(name))
+        return false;
+    bool expected = false;
+    return consumed.compare_exchange_strong(expected, true);
 }
 
 bool validateSceneConfig(const OgsrPhysX2SceneConfig& config, std::string* error)
@@ -240,6 +265,12 @@ extern "C" OGSR_PHYSX2_API int OGSR_PHYSX2_CALL OgsrPhysX2SceneDestroy(OgsrPhysX
         writeError(error, errorSize, "scene cannot be destroyed during simulate/fetch");
         return 0;
     }
+    if (faultInjectionOnce(g_sceneFaultOnceConsumed, "OGSR_PHYSX2_FAULT_SCENE_DESTROY_ONCE") ||
+        faultInjectionEnabled("OGSR_PHYSX2_FAULT_SCENE_DESTROY"))
+    {
+        writeError(error, errorSize, "fault injection: SceneDestroy failed");
+        return 0;
+    }
     std::string message;
     if (!runtime().registry.destroyScene(scene, &message))
     {
@@ -428,6 +459,12 @@ extern "C" OGSR_PHYSX2_API int OGSR_PHYSX2_CALL OgsrPhysX2RagdollDestroy(OgsrPhy
     if (instance->isSceneStepping())
     {
         writeError(error, errorSize, "ragdoll cannot be destroyed during simulate/fetch");
+        return 0;
+    }
+    if (faultInjectionOnce(g_ragdollFaultOnceConsumed, "OGSR_PHYSX2_FAULT_RAGDOLL_DESTROY_ONCE") ||
+        faultInjectionEnabled("OGSR_PHYSX2_FAULT_RAGDOLL_DESTROY"))
+    {
+        writeError(error, errorSize, "fault injection: RagdollDestroy failed");
         return 0;
     }
     std::string message;
