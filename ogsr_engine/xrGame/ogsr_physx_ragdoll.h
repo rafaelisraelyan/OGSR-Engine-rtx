@@ -64,4 +64,7 @@ bool OgsrPhysXRagdollApplyCentralImpulse(OgsrPhysXRagdollState& state,
 
 void OgsrPhysXRagdollSmokeTick();
 
+void OgsrPhysXRagdollSmokeCameraStop();
+bool OgsrPhysXRagdollSmokeCameraActive();
+
 #endif // OGSR_PHYSX_RAGDOLL

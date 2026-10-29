@@ -8,23 +8,35 @@
 #include "Level.h"
 #include "Hit.h"
 #include "Actor.h"
+#include "ActorEffector.h"
+#include "GamePersistent.h"
+#include "HUDManager.h"
+#include "../xr_3da/CustomHUD.h"
+#include "../Include/xrRender/KinematicsAnimated.h"
 #include "xrMessages.h"
 #include "CameraFirstEye.h"
 #include "CharacterPhysicsSupport.h"
 #include "ai/stalker/ai_stalker.h"
 #include "PHMovementControl.h"
 #include "../xr_3da/pure.h"
+#include "../xr_3da/Effector.h"
+#include "../xr_3da/CameraManager.h"
 #include "../xr_3da/xr_area.h"
 #include "../xr_3da/xr_object.h"
+#include "../xr_3da/Render.h"
 #include "../Layers/PhysicsAdapterOGSR/ogsr/ogsr_capture.h"
 #include "../Layers/PhysicsPortable/include/physics_portable/row_matrix.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -40,32 +52,422 @@ constexpr float kStaticSizeY = 24.0f;
 constexpr float kStaticSizeZ = 48.0f;
 constexpr std::uint32_t kSmokeGiveUpFrame = 1800;
 
+struct CCollectBlends final : public IterateBlendsCallback
+{
+    std::vector<CBlend*> blends;
+    void operator()(CBlend& blend) override { blends.push_back(&blend); }
+};
+
 Fvector g_smokeActorStart{};
 Fvector g_smokeActorDir{};
 bool g_smokeActorStartValid = false;
 u16 g_smokeTargetId = u16(-1);
 
 Fvector g_smokeCameraTarget{};
+Fvector g_smokeCameraPosition{};
+Fvector g_smokeCameraDirection{};
+Fvector g_smokeCameraTop{};
+Fvector g_smokeCameraRight{};
+float g_smokeCameraFov = 60.0f;
 bool g_smokeCameraActive = false;
+bool g_smokeCameraReady = false;
+bool g_smokeCameraRenderRegistered = false;
+bool g_smokeCameraPreRenderRegistered = false;
+Flags32 g_smokeHudFlags{};
+bool g_smokeHudFlagsSaved = false;
+bool g_smokeHudRenderableSaved = false;
+bool g_smokeHudRenderablePrevious = true;
+bool g_smokeHudPreHidden = false;
+bool g_smokeCaptureStarted = false;
+std::uint64_t g_smokeCaptureBase = 0;
+int g_smokeCaptureIndex = 0;
+bool g_smokeCaptureComplete = false;
+bool g_smokeCaptureIncomplete = false;
+std::uint64_t g_smokeCaptureMaxDelta = 0;
+int g_smokePostCheckFrames = 0;
 bool g_smokeResetRequested = false;
 
-class SmokeCamera final : public pureFrame
+float g_smokeImpulse = 8.0f;
+bool g_smokeImpulseParsed = false;
+int g_smokeCameraMode = 0; // 0 = top, 1 = side, 2 = side_left
+bool g_smokeCameraParsed = false;
+bool g_smokeCapture = false;
+bool g_smokeCaptureParsed = false;
+bool g_smokeHudHiddenRequested = false;
+bool g_smokeHudHiddenParsed = false;
+bool g_smokeDoubleStop = false;
+bool g_smokeDoubleStopParsed = false;
+
+float smokeImpulse()
+{
+    if (g_smokeImpulseParsed)
+        return g_smokeImpulse;
+    g_smokeImpulseParsed = true;
+    const char* params = Core.Params;
+    const char* flag = params ? strstr(params, "-physx_ragdoll_smoke_impulse") : nullptr;
+    if (flag)
+    {
+        const char* value = flag + std::strlen("-physx_ragdoll_smoke_impulse");
+        while (*value == ' ')
+            ++value;
+        if (*value && *value != '-')
+        {
+            const float parsed = static_cast<float>(std::atof(value));
+            if (parsed > 0.0f && parsed <= 200.0f)
+                g_smokeImpulse = parsed;
+        }
+    }
+    Msg("ph_ragdoll_smoke: impulse=%.2f N*s (default=8.00)", g_smokeImpulse);
+    return g_smokeImpulse;
+}
+
+const char* smokeImpulseTag()
+{
+    static char tag[16];
+    xr_sprintf(tag, sizeof(tag), "%.0f", smokeImpulse());
+    return tag;
+}
+
+int smokeCameraMode()
+{
+    if (g_smokeCameraParsed)
+        return g_smokeCameraMode;
+    g_smokeCameraParsed = true;
+    const char* params = Core.Params;
+    const char* flag = params ? strstr(params, "-physx_ragdoll_smoke_camera") : nullptr;
+    if (flag)
+    {
+        const char* value = flag + std::strlen("-physx_ragdoll_smoke_camera");
+        while (*value == ' ')
+            ++value;
+        if (strncmp(value, "side_left", 9) == 0)
+            g_smokeCameraMode = 2;
+        else if (strncmp(value, "side", 4) == 0)
+            g_smokeCameraMode = 1;
+    }
+    Msg("ph_ragdoll_smoke: camera=%s", g_smokeCameraMode == 2 ? "side_left" : g_smokeCameraMode == 1 ? "side" : "top");
+    return g_smokeCameraMode;
+}
+
+bool smokeCaptureRequested()
+{
+    if (g_smokeCaptureParsed)
+        return g_smokeCapture;
+    g_smokeCaptureParsed = true;
+    g_smokeCapture = Core.Params && strstr(Core.Params, "-physx_ragdoll_smoke_capture") != nullptr;
+    if (g_smokeCapture)
+        Msg("ph_ragdoll_smoke: frame capture enabled");
+    return g_smokeCapture;
+}
+
+bool smokeHudHiddenRequested()
+{
+    if (g_smokeHudHiddenParsed)
+        return g_smokeHudHiddenRequested;
+    g_smokeHudHiddenParsed = true;
+    g_smokeHudHiddenRequested =
+        Core.Params && strstr(Core.Params, "-physx_ragdoll_smoke_hud_hidden") != nullptr;
+    if (g_smokeHudHiddenRequested)
+        Msg("ph_ragdoll_smoke: HUD pre-hidden regression enabled");
+    return g_smokeHudHiddenRequested;
+}
+
+bool smokeDoubleStopRequested()
+{
+    if (g_smokeDoubleStopParsed)
+        return g_smokeDoubleStop;
+    g_smokeDoubleStopParsed = true;
+    g_smokeDoubleStop = Core.Params && strstr(Core.Params, "-physx_ragdoll_smoke_double_stop") != nullptr;
+    if (g_smokeDoubleStop)
+        Msg("ph_ragdoll_smoke: double-stop regression enabled");
+    return g_smokeDoubleStop;
+}
+
+void hideSmokeHud()
+{
+    if (!g_smokeHudRenderableSaved)
+    {
+        g_smokeHudRenderablePrevious = g_hud ? HUD().IsRenderable() : true;
+        g_smokeHudRenderableSaved = true;
+    }
+    if (g_hud)
+        HUD().SetRenderable(false);
+    if (!g_smokeHudFlagsSaved)
+    {
+        g_smokeHudFlags = psHUD_Flags;
+        g_smokeHudFlagsSaved = true;
+    }
+    psHUD_Flags.set(HUD_DRAW, FALSE);
+    psHUD_Flags.set(HUD_DRAW_RT, FALSE);
+    Msg("ph_ragdoll_smoke: HUD hide previous_renderable=%d hud_draw=%d hud_draw_rt=%d",
+        g_smokeHudRenderablePrevious ? 1 : 0, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
+        psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
+}
+
+void restoreSmokeHud()
+{
+    if (!g_smokeHudRenderableSaved && !g_smokeHudFlagsSaved)
+    {
+        Msg("ph_ragdoll_smoke: HUD restore skipped (no ownership)");
+        return;
+    }
+    if (g_smokeHudRenderableSaved)
+    {
+        if (g_hud)
+            HUD().SetRenderable(g_smokeHudRenderablePrevious);
+        g_smokeHudRenderableSaved = false;
+    }
+    if (g_smokeHudFlagsSaved)
+    {
+        psHUD_Flags = g_smokeHudFlags;
+        g_smokeHudFlagsSaved = false;
+    }
+    Msg("ph_ragdoll_smoke: HUD restore renderable=%d hud_draw=%d hud_draw_rt=%d",
+        g_hud ? (HUD().IsRenderable() ? 1 : 0) : -1, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
+        psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
+}
+
+class CSmokeCameraEffector final : public CEffectorCam
 {
 public:
-    void OnFrame() override
+    CSmokeCameraEffector() : CEffectorCam((ECamEffectorType)0, 1.0e9f) { bHudAffect = false; }
+
+    BOOL ProcessCam(SCamEffectorInfo& info) override
     {
-        if (!g_smokeCameraActive)
-            return;
-        Fvector position = g_smokeCameraTarget;
-        position.y += 6.0f;
-        Device.vCameraPosition.set(position);
-        Device.vCameraDirection.set(0.0f, -1.0f, 0.0f);
-        Device.vCameraTop.set(0.0f, 0.0f, 1.0f);
-        Device.vCameraRight.set(1.0f, 0.0f, 0.0f);
+        if (m_stop)
+            return FALSE;
+        info.p.set(g_smokeCameraPosition);
+        info.d.set(g_smokeCameraDirection);
+        info.n.set(g_smokeCameraTop);
+        info.r.set(g_smokeCameraRight);
+        info.fFov = g_smokeCameraFov;
+        info.dont_apply = false;
+        info.affected_on_hud = false;
+        fLifeTime = 1.0e9f;
+        static int logCounter = 0;
+        if (++logCounter % 60 == 0)
+            Msg("ph_ragdoll_smoke: camera effector frame=%u p=(%.3f,%.3f,%.3f) d=(%.3f,%.3f,%.3f) fov=%.2f",
+                Device.dwFrame, info.p.x, info.p.y, info.p.z, info.d.x, info.d.y, info.d.z, info.fFov);
+        return TRUE;
     }
+
+    bool m_stop = false;
 };
 
-SmokeCamera g_smokeCamera;
+CEffectorCam* g_smokeCameraEffector = nullptr;
+CEffectorCam* g_smokeCameraActorEffector = nullptr;
+
+void maybeCaptureSmokeFrames();
+
+class CSmokeCameraRender final : public pureRender
+{
+public:
+    void OnRender() override;
+};
+
+CSmokeCameraRender g_smokeCameraRender;
+
+class CSmokeCameraPreRender final : public pureRender
+{
+public:
+    void OnRender() override;
+};
+
+CSmokeCameraPreRender g_smokeCameraPreRender;
+
+void stopSmokeCamera()
+{
+    const bool wasActive = g_smokeCameraActive;
+    if (g_smokeCameraEffector)
+        static_cast<CSmokeCameraEffector*>(g_smokeCameraEffector)->m_stop = true;
+    if (g_smokeCameraActorEffector)
+        static_cast<CSmokeCameraEffector*>(g_smokeCameraActorEffector)->m_stop = true;
+    g_smokeCameraEffector = nullptr;
+    g_smokeCameraActorEffector = nullptr;
+    g_smokeCameraActive = false;
+    g_smokeCameraReady = false;
+    restoreSmokeHud();
+    if (wasActive)
+        g_smokePostCheckFrames = 5;
+    if (g_smokeCameraRenderRegistered)
+    {
+        Device.seqRender.Remove(&g_smokeCameraRender);
+        g_smokeCameraRenderRegistered = false;
+    }
+    if (g_smokeCameraPreRenderRegistered)
+    {
+        Device.seqRender.Remove(&g_smokeCameraPreRender);
+        g_smokeCameraPreRenderRegistered = false;
+    }
+}
+
+void captureSmokeFrame(const char* tag, std::uint64_t step)
+{
+    if (!Render)
+        return;
+    Render->Screenshot(IRender_interface::SM_NORMAL, nullptr);
+
+    string_path folder;
+    FS.update_path(folder, "$screenshots$", "");
+    const std::filesystem::path dir(folder);
+    std::filesystem::path newest;
+    std::filesystem::file_time_type newestTime{};
+    try
+    {
+        for (const auto& entry : std::filesystem::directory_iterator(dir))
+        {
+            if (!entry.is_regular_file())
+                continue;
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("ss_", 0) != 0)
+                continue;
+            const std::string extension = entry.path().extension().string();
+            if (extension != ".png" && extension != ".jpg" && extension != ".bmp")
+                continue;
+            const auto time = entry.last_write_time();
+            if (newest.empty() || time > newestTime)
+            {
+                newest = entry.path();
+                newestTime = time;
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        Msg("! ph_ragdoll_smoke: capture scan failed: %s", error.what());
+        return;
+    }
+    if (newest.empty())
+    {
+        Msg("! ph_ragdoll_smoke: capture file not found");
+        return;
+    }
+
+    char name[256];
+    xr_sprintf(name, sizeof(name), "p22a_%s_step%llu.png", tag, static_cast<unsigned long long>(step));
+    const std::filesystem::path target = dir / name;
+    std::error_code error;
+    std::filesystem::rename(newest, target, error);
+    if (error)
+        Msg("! ph_ragdoll_smoke: capture rename failed: %s", error.message().c_str());
+    else
+        Msg("ph_ragdoll_smoke: capture tag=%s step=%llu file=%s", tag,
+            static_cast<unsigned long long>(step), name);
+}
+
+void maybeCaptureSmokeFrames()
+{
+    if (!smokeCaptureRequested() || g_smokeCaptureComplete)
+        return;
+    static const std::uint64_t offsets[] = {10, 50, 100, 200, 400, 600};
+    static std::vector<float> bodyWorld(OGSR_PHYSX_RAGDOLL_MAX_BODIES * 16);
+
+    OgsrPhysXRagdollPose pose{};
+    if (!OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES))
+        return;
+    const std::uint64_t step =
+        (static_cast<std::uint64_t>(pose.stepIndexHigh) << 32) | pose.stepIndexLow;
+    if (!g_smokeCaptureStarted)
+    {
+        g_smokeCaptureStarted = true;
+        g_smokeCaptureBase = step;
+        for (std::uint32_t index = 0; index < pose.bodyCount; ++index)
+        {
+            const float* body = bodyWorld.data() + static_cast<std::size_t>(index) * 16;
+            Msg("ph_ragdoll_smoke: initial body=%u pos=(%.4f,%.4f,%.4f)", index, body[12], body[13], body[14]);
+        }
+        const std::uint64_t delta = step - g_smokeCaptureBase;
+        g_smokeCaptureMaxDelta = std::max(g_smokeCaptureMaxDelta, delta);
+        if (delta > 5)
+            g_smokeCaptureIncomplete = true;
+        captureSmokeFrame("pre", step);
+        Msg("ph_ragdoll_smoke: capture tag=pre target_step=%llu actual_step=%llu delta=%llu time=%.3f",
+            static_cast<unsigned long long>(g_smokeCaptureBase), static_cast<unsigned long long>(step),
+            static_cast<unsigned long long>(delta), static_cast<double>(step) * 0.01);
+        return;
+    }
+    if (g_smokeCaptureIndex < 6)
+    {
+        const std::uint64_t target = g_smokeCaptureBase + offsets[g_smokeCaptureIndex];
+        if (step >= target)
+        {
+            const std::uint64_t delta = step - target;
+            g_smokeCaptureMaxDelta = std::max(g_smokeCaptureMaxDelta, delta);
+            if (delta > 5)
+                g_smokeCaptureIncomplete = true;
+            captureSmokeFrame(smokeImpulseTag(), step);
+            Msg("ph_ragdoll_smoke: capture tag=%s target_step=%llu actual_step=%llu delta=%llu time=%.3f",
+                smokeImpulseTag(), static_cast<unsigned long long>(target), static_cast<unsigned long long>(step),
+                static_cast<unsigned long long>(delta), static_cast<double>(step) * 0.01);
+            ++g_smokeCaptureIndex;
+            if (g_smokeCaptureIndex == 6)
+            {
+                g_smokeCaptureComplete = true;
+                Msg("ph_ragdoll_smoke: CAPTURE_%s max_delta=%llu",
+                    g_smokeCaptureIncomplete ? "INCOMPLETE" : "COMPLETE",
+                    static_cast<unsigned long long>(g_smokeCaptureMaxDelta));
+                stopSmokeCamera();
+                if (smokeDoubleStopRequested())
+                {
+                    stopSmokeCamera();
+                    Msg("ph_ragdoll_smoke: double stop HUD renderable=%d hud_draw=%d",
+                        g_hud ? (HUD().IsRenderable() ? 1 : 0) : -1,
+                        psHUD_Flags.test(HUD_DRAW) ? 1 : 0);
+                }
+            }
+        }
+    }
+}
+
+void CSmokeCameraPreRender::OnRender()
+{
+    if (!g_smokeCameraActive)
+        return;
+    const bool mismatch = Device.vCameraPosition.distance_to(g_smokeCameraPosition) > 0.05f ||
+                          Device.vCameraDirection.dotproduct(g_smokeCameraDirection) < 0.999f;
+    if (mismatch)
+    {
+        static int logCounter = 0;
+        if (++logCounter % 30 == 0)
+            Msg("! ph_ragdoll_smoke: pre-render camera overwritten pos=(%.3f,%.3f,%.3f) "
+                "dir=(%.3f,%.3f,%.3f) fov=%.2f; applying effector values",
+                Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
+                Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z, Device.fFOV);
+    }
+    Device.vCameraPosition.set(g_smokeCameraPosition);
+    Device.vCameraDirection.set(g_smokeCameraDirection);
+    Device.vCameraTop.set(g_smokeCameraTop);
+    Device.vCameraRight.set(g_smokeCameraRight);
+    Device.fFOV = g_smokeCameraFov;
+    Device.mView.build_camera_dir(g_smokeCameraPosition, g_smokeCameraDirection, g_smokeCameraTop);
+    Device.mProject.build_projection(deg2rad(Device.fFOV), Device.fASPECT, VIEWPORT_NEAR,
+                                     g_pGamePersistent->Environment().CurrentEnv->far_plane);
+    Device.mFullTransform.mul(Device.mProject, Device.mView);
+    if (Render)
+        Render->SetCacheXform(Device.mView, Device.mProject);
+}
+
+void CSmokeCameraRender::OnRender()
+{
+    if (!g_smokeCameraActive)
+        return;
+    OgsrPhysXRagdollPose pose{};
+    static std::vector<float> bodyWorld(OGSR_PHYSX_RAGDOLL_MAX_BODIES * 16);
+    std::uint64_t step = 0;
+    if (OgsrPhysXRagdollRuntimeGetPose(pose, bodyWorld.data(), OGSR_PHYSX_RAGDOLL_MAX_BODIES))
+        step = (static_cast<std::uint64_t>(pose.stepIndexHigh) << 32) | pose.stepIndexLow;
+    static int logCounter = 0;
+    if (++logCounter % 30 == 0)
+        Msg("ph_ragdoll_smoke: render camera frame=%u step=%llu pos=(%.3f,%.3f,%.3f) "
+            "dir=(%.3f,%.3f,%.3f) view=(%.3f,%.3f,%.3f) fov=%.2f",
+            Device.dwFrame, static_cast<unsigned long long>(step), Device.vCameraPosition.x,
+            Device.vCameraPosition.y, Device.vCameraPosition.z, Device.vCameraDirection.x,
+            Device.vCameraDirection.y, Device.vCameraDirection.z, Device.mView.c.x, Device.mView.c.y,
+            Device.mView.c.z, Device.fFOV);
+    if (Level().Cameras().Position().distance_to(g_smokeCameraPosition) < 0.05f)
+        g_smokeCameraReady = true;
+    maybeCaptureSmokeFrames();
+}
 
 } // namespace
 
@@ -612,11 +1014,15 @@ void OgsrPhysXRagdollRelease(OgsrPhysXRagdollState* state)
 {
     if (!state)
         return;
-    if (g_smokeCameraActive)
-    {
-        Device.seqFrame.Remove(&g_smokeCamera);
-        g_smokeCameraActive = false;
-    }
+    if (g_hud)
+        Msg("ph_ragdoll: release HUD before renderable=%d hud_draw=%d hud_draw_rt=%d",
+            HUD().IsRenderable() ? 1 : 0, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
+            psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
+    stopSmokeCamera();
+    if (g_hud)
+        Msg("ph_ragdoll: release HUD after renderable=%d hud_draw=%d hud_draw_rt=%d",
+            HUD().IsRenderable() ? 1 : 0, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
+            psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
     for (std::size_t bone = 0; bone < state->slots.size(); ++bone)
     {
         if (!state->kinematics)
@@ -659,8 +1065,6 @@ bool OgsrPhysXRagdollPublish(OgsrPhysXRagdollState& state, IKinematics& kinemati
     const pp::Transform entity = rowTransform(pose.entityWorld);
     entityWorld = engineMatrix(entity);
     state.entityWorld = entityWorld;
-    if (g_smokeCameraActive)
-        g_smokeCameraTarget.set(entityWorld.c.x, entityWorld.c.y, entityWorld.c.z);
     state.lastBodyWorld.resize(pose.bodyCount);
     for (std::uint32_t body = 0; body < pose.bodyCount; ++body)
         state.lastBodyWorld[body] = rowTransform(bodyWorld.data() + static_cast<std::size_t>(body) * 16);
@@ -878,20 +1282,27 @@ bool OgsrPhysXRagdollApplyCentralImpulse(OgsrPhysXRagdollState& state,
     const bool applied = OgsrPhysXRagdollRuntimeApplyCentralImpulse(body, worldImpulse, error);
     if (applied)
     {
+        const float magnitude =
+            std::sqrt(impulse.x * impulse.x + impulse.y * impulse.y + impulse.z * impulse.z);
         Msg("ph_ragdoll: central impulse body=%u com=(%.3f,%.3f,%.3f) impulse=(%.2f,%.2f,%.2f) "
-            "lever=(0.000,0.000,0.000) angular=(0.00,0.00,0.00)",
-            body, comWorld.x, comWorld.y, comWorld.z, impulse.x, impulse.y, impulse.z);
+            "magnitude=%.2f time=%.3f lever=(0.000,0.000,0.000) angular=(0.00,0.00,0.00)",
+            body, comWorld.x, comWorld.y, comWorld.z, impulse.x, impulse.y, impulse.z, magnitude,
+            Device.fTimeGlobal);
     }
     return applied;
 }
 
 void OgsrPhysXRagdollSmokeReset()
 {
+    stopSmokeCamera();
     g_smokeActorStartValid = false;
     g_smokeTargetId = u16(-1);
-    g_smokeCameraActive = false;
     g_smokeResetRequested = true;
 }
+
+void OgsrPhysXRagdollSmokeCameraStop() { stopSmokeCamera(); }
+
+bool OgsrPhysXRagdollSmokeCameraActive() { return g_smokeCameraActive; }
 
 void OgsrPhysXRagdollSmokeTick()
 {
@@ -899,6 +1310,19 @@ void OgsrPhysXRagdollSmokeTick()
         return;
     if (!OgsrPhysXRagdollRuntimeAlive() && !OgsrPhysXRagdollOdeSmokeRequested())
         return;
+
+    if (g_smokePostCheckFrames > 0)
+    {
+        --g_smokePostCheckFrames;
+        Msg("ph_ragdoll_smoke: post-check frames=%d camera=(%.3f,%.3f,%.3f) hud_renderable=%d "
+            "hud_draw=%d hud_draw_rt=%d",
+            g_smokePostCheckFrames, Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
+            g_hud ? (HUD().IsRenderable() ? 1 : 0) : -1, psHUD_Flags.test(HUD_DRAW) ? 1 : 0,
+            psHUD_Flags.test(HUD_DRAW_RT) ? 1 : 0);
+        if (g_smokePostCheckFrames == 0)
+            Msg("ph_ragdoll_smoke: camera/HUD restored");
+    }
+
     static std::uint32_t frame = 0;
     static bool fired = false;
     static bool listed = false;
@@ -914,6 +1338,7 @@ void OgsrPhysXRagdollSmokeTick()
     static bool multiFinished = false;
     static bool staged = false;
     static std::uint32_t stagedFrame = 0;
+    static std::chrono::steady_clock::time_point stagedTime{};
     static u16 multiSecondId = u16(-1);
     static u16 multiThirdId = u16(-1);
     if (g_smokeResetRequested)
@@ -934,6 +1359,7 @@ void OgsrPhysXRagdollSmokeTick()
         multiFinished = false;
         staged = false;
         stagedFrame = 0;
+        stagedTime = {};
         multiSecondId = u16(-1);
         multiThirdId = u16(-1);
     }
@@ -1019,6 +1445,12 @@ void OgsrPhysXRagdollSmokeTick()
             if (OgsrPhysXRagdollReloadRequested() && !reloadRequested && frame - hitFrame >= 300)
             {
                 reloadRequested = true;
+                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
+                {
+                    g_smokeCaptureIncomplete = true;
+                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
+                }
+                stopSmokeCamera();
                 Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
                 OgsrPhysXRagdollRequestLevelDisconnect();
             }
@@ -1041,6 +1473,12 @@ void OgsrPhysXRagdollSmokeTick()
             if (!reloadRequested && frame - hitFrame >= 300)
             {
                 reloadRequested = true;
+                if (smokeCaptureRequested() && !g_smokeCaptureComplete)
+                {
+                    g_smokeCaptureIncomplete = true;
+                    Msg("ph_ragdoll_smoke: CAPTURE_INCOMPLETE (reload before step 600)");
+                }
+                stopSmokeCamera();
                 Msg("ph_ragdoll_smoke: reload gate requesting level disconnect with active ragdoll");
                 OgsrPhysXRagdollRequestLevelDisconnect();
             }
@@ -1150,9 +1588,11 @@ void OgsrPhysXRagdollSmokeTick()
                 Msg("! ph_ragdoll_smoke: no ODE corpse with a visual found");
             }
         }
-        if (!destroyed && frame - hitFrame > 600)
+        if (!destroyed && frame - hitFrame > 600 &&
+            (!smokeCaptureRequested() || g_smokeCaptureComplete))
         {
             destroyed = true;
+            stopSmokeCamera();
             CAI_Stalker* target = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(g_smokeTargetId));
             if (target)
             {
@@ -1227,12 +1667,24 @@ void OgsrPhysXRagdollSmokeTick()
     {
         staged = true;
         stagedFrame = frame;
+        stagedTime = std::chrono::steady_clock::now();
         Msg("ph_ragdoll_smoke: staging at actor_start=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f,%.2f)", g_smokeActorStart.x,
             g_smokeActorStart.y, g_smokeActorStart.z, g_smokeActorDir.x, g_smokeActorDir.y, g_smokeActorDir.z);
         return;
     }
     if (frame - stagedFrame < 180)
         return;
+    if (stagedTime.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stagedTime)
+                .count() < 3000)
+        return;
+
+    if (g_smokeCameraActive && smokeCameraMode() != 0 && !g_smokeCameraReady)
+    {
+        if (frame % 60 == 0)
+            Msg("ph_ragdoll_smoke: waiting for render camera ready");
+        return;
+    }
 
     IKinematics* kinematics = smart_cast<IKinematics*>(stalker->Visual());
     if (!kinematics)
@@ -1246,18 +1698,13 @@ void OgsrPhysXRagdollSmokeTick()
     {
         if (CCameraFirstEye* camera = static_cast<CCameraFirstEye*>(actor->cam_FirstEye()))
         {
-            Fvector forward = camera->Direction();
-            if (forward.magnitude() > EPS)
-                forward.normalize();
-            Fvector right = camera->Right();
-            if (right.magnitude() > EPS)
-                right.normalize();
+            // Fixed world axes keep the staged NPC position identical across
+            // runs; the live actor/camera direction drifts during the intro.
+            Fvector forward(0.0f, 0.0f, -1.0f);
             forward.mul(3.0f);
-            right.mul(2.0f);
-            Fvector npcPosition = actor->Position();
+            Fvector npcPosition = g_smokeActorStart;
             npcPosition.add(forward);
-            npcPosition.add(right);
-            npcPosition.y = actor->Position().y;
+            npcPosition.y = g_smokeActorStart.y;
             stalker->XFORM().c.set(npcPosition);
             if (CCharacterPhysicsSupport* support = stalker->character_physics_support())
             {
@@ -1265,30 +1712,198 @@ void OgsrPhysXRagdollSmokeTick()
                     support->movement()->SetPosition(npcPosition);
             }
             stalker->spatial_move();
-            Fvector look = npcPosition;
-            look.y += 1.0f;
-            camera->LookAtPoint(look);
 
             g_smokeCameraTarget = npcPosition;
-            if (!g_smokeCameraActive)
+            const int cameraMode = smokeCameraMode();
+            if (cameraMode != 0)
             {
-                g_smokeCameraActive = true;
-                Device.seqFrame.Add(&g_smokeCamera, REG_PRIORITY_LOW);
+                Fvector target = npcPosition;
+                target.y += 1.0f;
+
+                static const Fvector candidates[] = {
+                    Fvector(1.0f, 0.0f, 0.0f), Fvector(-1.0f, 0.0f, 0.0f),
+                    Fvector(0.0f, 0.0f, 1.0f), Fvector(0.0f, 0.0f, -1.0f),
+                    Fvector(0.7071f, 0.0f, 0.7071f), Fvector(-0.7071f, 0.0f, 0.7071f),
+                    Fvector(0.7071f, 0.0f, -0.7071f), Fvector(-0.7071f, 0.0f, -0.7071f),
+                };
+                Fvector chosen(1.0f, 0.0f, 0.0f);
+                float chosenHeight = 0.3f;
+                bool found = false;
+                for (int pass = 0; pass < 2 && !found; ++pass)
+                {
+                    const float height = pass == 0 ? 0.3f : 2.5f;
+                    for (const Fvector& candidate : candidates)
+                    {
+                        Fvector side = candidate;
+                        if (cameraMode == 2)
+                            side.invert();
+                        Fvector camPos = target;
+                        Fvector offset = side;
+                        offset.mul(5.5f);
+                        camPos.add(offset);
+                        camPos.y = target.y + height;
+                        Fvector ray = camPos;
+                        ray.sub(target);
+                        const float range = ray.magnitude();
+                        if (range < EPS)
+                            continue;
+                        ray.mul(1.0f / range);
+                        collide::rq_result result;
+                        const bool clear = !Level().ObjectSpace.RayPick(
+                            target, ray, range, collide::rqtStatic, result, stalker);
+                        Msg("ph_ragdoll_smoke: camera candidate side=(%.2f,%.2f,%.2f) height=%.2f clear=%d",
+                            side.x, side.y, side.z, height, clear ? 1 : 0);
+                        if (clear)
+                        {
+                            chosen = side;
+                            chosenHeight = height;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                Fvector offset = chosen;
+                offset.mul(5.5f);
+                g_smokeCameraPosition.set(target);
+                g_smokeCameraPosition.add(offset);
+                g_smokeCameraPosition.y = target.y + chosenHeight;
+                g_smokeCameraDirection.sub(target, g_smokeCameraPosition);
+                if (g_smokeCameraDirection.magnitude() > EPS)
+                    g_smokeCameraDirection.normalize();
+                g_smokeCameraTop.set(0.0f, 1.0f, 0.0f);
+                g_smokeCameraRight.crossproduct(g_smokeCameraTop, g_smokeCameraDirection);
+                if (g_smokeCameraRight.magnitude() > EPS)
+                    g_smokeCameraRight.normalize();
+                g_smokeCameraTop.crossproduct(g_smokeCameraDirection, g_smokeCameraRight);
+                if (g_smokeCameraTop.magnitude() > EPS)
+                    g_smokeCameraTop.normalize();
+                g_smokeCameraFov = 60.0f;
             }
-            Msg("ph_ragdoll_smoke: camera staged actor=(%.2f,%.2f,%.2f) npc=(%.2f,%.2f,%.2f)", actor->Position().x,
-                actor->Position().y, actor->Position().z, npcPosition.x, npcPosition.y, npcPosition.z);
+            if (cameraMode != 0 && !g_smokeCameraActive)
+            {
+                auto* effector = new CSmokeCameraEffector();
+                effector->SetType(Level().Cameras().RequestCamEffectorId());
+                Level().Cameras().AddCamEffector(effector);
+                g_smokeCameraEffector = effector;
+                if (actor)
+                {
+                    auto* actorEffector = new CSmokeCameraEffector();
+                    actorEffector->SetType(actor->Cameras().RequestCamEffectorId());
+                    actor->Cameras().AddCamEffector(actorEffector);
+                    g_smokeCameraActorEffector = actorEffector;
+                }
+                g_smokeCameraActive = true;
+                g_smokeCaptureStarted = false;
+                g_smokeCaptureBase = 0;
+                g_smokeCaptureIndex = 0;
+                g_smokeCaptureComplete = false;
+                g_smokeCaptureIncomplete = false;
+                g_smokeCaptureMaxDelta = 0;
+                g_smokePostCheckFrames = 0;
+                if (smokeHudHiddenRequested() && !g_smokeHudPreHidden)
+                {
+                    g_smokeHudPreHidden = true;
+                    if (g_hud)
+                        HUD().SetRenderable(false);
+                    psHUD_Flags.set(HUD_DRAW, FALSE);
+                    psHUD_Flags.set(HUD_DRAW_RT, FALSE);
+                    Msg("ph_ragdoll_smoke: HUD pre-hidden for regression");
+                }
+                hideSmokeHud();
+                if (!g_smokeCameraRenderRegistered)
+                {
+                    Device.seqRender.Add(&g_smokeCameraRender, REG_PRIORITY_LOW - 10000);
+                    g_smokeCameraRenderRegistered = true;
+                }
+                if (!g_smokeCameraPreRenderRegistered)
+                {
+                    Device.seqRender.Add(&g_smokeCameraPreRender, REG_PRIORITY_HIGH + 1000);
+                    g_smokeCameraPreRenderRegistered = true;
+                }
+                Msg("ph_ragdoll_smoke: camera effector added type=%d", static_cast<int>(effector->GetType()));
+            }
+            Msg("ph_ragdoll_smoke: camera staged mode=%s actor=(%.2f,%.2f,%.2f) npc=(%.2f,%.2f,%.2f) "
+                "pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f)",
+                cameraMode == 2 ? "side_left" : cameraMode == 1 ? "side" : "top", actor->Position().x,
+                actor->Position().y, actor->Position().z, npcPosition.x, npcPosition.y, npcPosition.z,
+                g_smokeCameraPosition.x, g_smokeCameraPosition.y, g_smokeCameraPosition.z,
+                g_smokeCameraDirection.x, g_smokeCameraDirection.y, g_smokeCameraDirection.z,
+                g_smokeCameraTarget.x, g_smokeCameraTarget.y + 1.0f, g_smokeCameraTarget.z);
         }
     }
 
+    if (g_smokeCameraActive && smokeCameraMode() != 0)
+    {
+        const Fvector& camera = Level().Cameras().Position();
+        if (camera.distance_to(g_smokeCameraPosition) > 0.05f)
+        {
+            if (frame % 60 == 0)
+                Msg("ph_ragdoll_smoke: hit gate waiting for camera pos=(%.3f,%.3f,%.3f) "
+                    "target=(%.3f,%.3f,%.3f)",
+                    camera.x, camera.y, camera.z, g_smokeCameraPosition.x, g_smokeCameraPosition.y,
+                    g_smokeCameraPosition.z);
+            return;
+        }
+    }
+
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - stagedTime)
+                                 .count();
+        const Fvector& camera = Level().Cameras().Position();
+        Msg("ph_ragdoll_smoke: hit gate frame=%u stagedFrame=%u elapsed_ms=%lld active=%d mode=%d "
+            "camera=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f)",
+            frame, stagedFrame, static_cast<long long>(elapsed), g_smokeCameraActive ? 1 : 0,
+            smokeCameraMode(), camera.x, camera.y, camera.z, g_smokeCameraPosition.x,
+            g_smokeCameraPosition.y, g_smokeCameraPosition.z);
+    }
+
+    if (IKinematicsAnimated* animated = smart_cast<IKinematicsAnimated*>(stalker->Visual()))
+    {
+        CCollectBlends collect;
+        animated->LL_IterateBlends(collect);
+        CBlend* dominant = nullptr;
+        float maxAmount = -1.0f;
+        for (CBlend* blend : collect.blends)
+        {
+            if (blend->blendAmount > maxAmount)
+            {
+                maxAmount = blend->blendAmount;
+                dominant = blend;
+            }
+        }
+        for (CBlend* blend : collect.blends)
+        {
+            blend->timeCurrent = 0.0f;
+            blend->speed = 0.0f;
+            blend->blendAmount = (blend == dominant) ? 1.0f : 0.0f;
+        }
+        kinematics->CalculateBones(TRUE);
+        Msg("ph_ragdoll_smoke: animation locked blends=%zu dominant_amount=%.3f",
+            collect.blends.size(), maxAmount);
+    }
+
     const std::uint16_t bone = rootBoneId(*kinematics);
+    Fmatrix rootWorld;
+    rootWorld.mul_43(stalker->XFORM(), kinematics->LL_GetTransform(bone));
+    const Fmatrix& npcXform = stalker->XFORM();
+    Msg("ph_ragdoll_smoke: pre-impulse npc pos=(%.3f,%.3f,%.3f) i=(%.3f,%.3f,%.3f) j=(%.3f,%.3f,%.3f) "
+        "k=(%.3f,%.3f,%.3f) root_bone=%u root_world=(%.3f,%.3f,%.3f) impulse=%.2f time=%.3f",
+        npcXform.c.x, npcXform.c.y, npcXform.c.z, npcXform.i.x, npcXform.i.y, npcXform.i.z, npcXform.j.x,
+        npcXform.j.y, npcXform.j.z, npcXform.k.x, npcXform.k.y, npcXform.k.z, bone, rootWorld.c.x,
+        rootWorld.c.y, rootWorld.c.z, smokeImpulse(), Device.fTimeGlobal);
+    if (smokeCaptureRequested())
+        captureSmokeFrame("pre_alive", 0);
+
     Fvector direction(0.0f, 0.0f, 1.0f);
     Fvector position(0.0f, 0.0f, 0.0f);
-    SHit hit(1000.0f, direction, Level().CurrentEntity(), bone, position, 8.0f, ALife::eHitTypeFireWound, 0.0f, false);
+    SHit hit(1000.0f, direction, Level().CurrentEntity(), bone, position, smokeImpulse(), ALife::eHitTypeFireWound,
+             0.0f, false);
     fired = true;
     g_smokeTargetId = stalker->ID();
-    Msg("ph_ragdoll_smoke: lethal hit target=[%s] id=%u bone=%u pos=(%.2f,%.2f,%.2f) ode_only=%d",
+    Msg("ph_ragdoll_smoke: lethal hit target=[%s] id=%u bone=%u pos=(%.2f,%.2f,%.2f) impulse=%.2f ode_only=%d",
         description.c_str(), stalker->ID(), bone, stalker->Position().x, stalker->Position().y,
-        stalker->Position().z, OgsrPhysXRagdollOdeSmokeRequested() ? 1 : 0);
+        stalker->Position().z, smokeImpulse(), OgsrPhysXRagdollOdeSmokeRequested() ? 1 : 0);
     stalker->Hit(&hit);
 }
 

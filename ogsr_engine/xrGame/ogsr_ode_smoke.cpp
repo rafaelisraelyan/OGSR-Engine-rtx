@@ -4,6 +4,7 @@
 
 #include "Level.h"
 #include "Hit.h"
+#include "MainMenu.h"
 #include "ai/stalker/ai_stalker.h"
 #include "../Include/xrRender/Kinematics.h"
 
@@ -70,6 +71,34 @@ void OgsrOdeSmokeTick()
     parse();
     if (!g_enabled)
         return;
+
+    // The archive test runtime has no usable main-menu UI factory, so the
+    // normal -start path leaves the level paused. This is a test-only,
+    // flag-gated archive workaround: it does not change production MainMenu
+    // behavior and is compiled only with OGSR_DIAGNOSTIC_RUNTIME_WORKAROUND.
+    static bool runtimePrepared = false;
+    if (!runtimePrepared)
+    {
+        runtimePrepared = true;
+        CMainMenu* menu = MainMenu();
+        Msg("ode_death_smoke: runtime state paused=%d menu_active=%d level_ready=%d entity=%u objects=%u",
+            Device.Paused() ? 1 : 0, menu && menu->IsActive() ? 1 : 0,
+            g_pGameLevel ? (g_pGameLevel->bReady ? 1 : 0) : 0,
+            Level().CurrentEntity() ? Level().CurrentEntity()->ID() : 0, Level().Objects.o_count());
+        if (menu)
+        {
+            Device.seqFrame.Remove(menu);
+            if (menu->IsActive())
+                menu->Activate(false);
+            Device.seqRender.Remove(menu);
+        }
+        if (Device.Paused())
+            Device.Pause(FALSE, TRUE, TRUE, "ode_death_smoke");
+        Msg("ode_death_smoke: archive runtime workaround applied");
+    }
+    if (Device.Paused())
+        Device.Pause(FALSE, TRUE, TRUE, "ode_death_smoke");
+
     ++g_frame;
     if (g_frame < 300)
         return;

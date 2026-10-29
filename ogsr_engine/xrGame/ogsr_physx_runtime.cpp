@@ -1027,6 +1027,7 @@ void OgsrPhysXRuntimeOnLevelUnload()
 #ifdef OGSR_PHYSX_RAGDOLL
     if (g_ragdoll_handle)
         Msg("ph_runtime: unloading NPC ragdoll level");
+    OgsrPhysXRagdollSmokeCameraStop();
     if (g_ragdoll_smoke_time_scaled)
     {
         Device.time_factor(1.0f);
