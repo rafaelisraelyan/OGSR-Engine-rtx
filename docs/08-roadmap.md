@@ -53,7 +53,78 @@ DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. 
   необязательная интеграция в игровой DX12 с выбором Classic 2D / Volumetric 3D.
   **V0–V2 разрешено разрабатывать параллельно F4.0; V не является гейтом F4/G.**
 
-### Актуальная сверка выполнения DX12 и смежных направлений — 2026-10-25
+### Актуальная сверка статусов проекта — 2026-10-30
+
+**Источник истины и уровни доказательств:** ветка `prypiat` после
+документального коммита `3e9fe8b7`; последний коммит **с исходным кодом
+F4.0** — `920a3f168d8820ffbb065c1027b739eaaac27788` (B3-B2A).
+Ниже **«в Git»** означает наличие кода в ветке, **«отчёт DeepSeek»** —
+тесты Windows/GPU, заявленные и документированные исполнителем, а
+**«ревью Codex»** — независимая проверка в указанном объёме. Эти уровни
+не взаимозаменяемы. Необъединённые патчи, локальные worktree и отчёты
+не повышают статус кода в `prypiat` автоматически.
+
+| Направление | Состояние на 2026-10-30 | Доказательства / оставшийся гейт |
+|---|---|---|
+| **DX11/R4: A–C** | ✅ Исторически подтверждён рабочий baseline; нового полного ретеста нет | Старые результаты DLSS/NIS не считать свежей проверкой всех режимов |
+| **D — DX11 SSGI/Hi-Z** | 🔎 Исследование, без подтверждённого игрового PASS | D0–D2, отдельное решение о продолжении; не гейт DX12 |
+| **F0–F3.5.6A/B** | ✅ Standalone DX12 foundation и геометрия в Git | Исторические smoke/CPU/GPU результаты; **не игровой DX12 renderer**, не заявлять полного runtime/perf PASS |
+| **F3.5.6C — material/PSO** | ◻ Отдельный независимый PASS не подтверждён | Проверить перед полным F4 либо формально принять документированный минимальный эквивалент |
+| **F3.6A — X-Ray Asset Bridge** | ✅ Закоммичен `ccf0d22d` | Настоящий SoC OGF/DDS в standalone; не полноценная игровая сцена |
+| **F4.0-B1 / B2 / B2.3** | ✅ Код в Git | Jupiter geometry reader `0ef5aaf2`; game camera snapshots `77e71e47`; opt-in capture `60f2030e` |
+| **F4.0-B3A** | ✅ Код в Git | `4b120ca8`: standalone Jupiter DX12 offscreen validation, не игровой DX12 кадр |
+| **F4.0-B3-B1** | ✅ Код в Git | `61a75650`: real-game camera capture → standalone DX12 offscreen replay/validation; не подмена R4 |
+| **F4.0-B3-B2A** | ✅ Код в Git; Codex CONDITIONAL PASS в истории этапа | `920a3f16`: camera mailbox и Named Pipe → **standalone CPU receiver**; producer/consumer, не GPU renderer в игре; runE не закрыт |
+| **F4.0-B3-B2B — persistent GPU consumer / evidence** | 🟡 **Изолированный patch, НЕ в Git; DeepSeek: `READY FOR CODEX RE-REVIEW`** | После исходного Codex `REQUEST CHANGES` исправлены P1–P4; Windows по отчёту: CPU 97/0, evidence CPU 38/0, fault 33/33, два P4 harness 10/10 и 11/11, offline DX12 3/3 с Debug Layer/GBV и 0 InfoQueue errors/corruption; **повторное независимое Codex review не получено** |
+| **Claude B1–B5 Hardening (отдельный patch)** | 🔴 **Codex: `REQUEST CHANGES`; НЕ в Git** | B1 fence-ordering, B3 pipe, B4 logging, B5 duplicate teardown в основном подтверждены; B2 реальный Unicode CLI/quoted-tail не исправлен, B1 fault hooks не изолированы, full feature-on `xrGame` lifecycle не доказан, post-build `dbghelp.dll` завершался ошибкой |
+| **Claude B1–B5 Round 2** | 📝 Задание DeepSeek подготовлено, выполнение НЕ подтверждено | Исправить B2/guards B1, пересобрать feature-on `xrGame`, проверить lifecycle, успешный post-build; затем Codex re-review |
+| **runE / shutdown** | 🔴 `0xC0000005`, UNRESOLVED | Codex подтвердил null read после unload и опасный доступ к `Level().name()` до null-check в `GamePersistent.cpp:515`; **точный root cause и «pre-existing» не доказаны baseline A/B**. Отдельный worktree/fix |
+| **F4.0 — полноценный игровой DX12 frame** | ⬜ **НЕ ПРИНЯТ** | Нужны draw/submit в CoP runtime, реальный уровень/материалы, управляемая камера, validation, resize/reload/shutdown и DX11 fallback; standalone GPU PASS недостаточно |
+| **F4-PBR.0–4** | 📝 Архитектурный план в Git (`3e9fe8b7`), **код не реализован** | IX-Ray PBR проанализирован как референс; ещё нужны аудит OGSR THM/DDS, Material/PSO, G-buffer, GGX/IBL, игровой A/B и общий material lookup для DXR. Не гейт F4.0 или G3 |
+| **F5/F6 и G0–G5 (DXR)** | ◻ Запланированы; рабочего игрового DXR PASS нет | F5 temporal/F6 perf после игровой базы; G0–G2 можно исследовать отдельно, G3 — RT-тени, G5 — отражения после принятого PBR raster/material path |
+| **V — Volumetric Clouds** | 🛠 Независимый V0 audit PASS WITH NOTES; V1/V2 без подтверждённой полной приёмки | Отдельный трек, визуальная/GPU приёмка и Codex review обязательны; не блокирует F4/G |
+| **P — PhysX ragdoll** | 🔎 ODE/скелетная архитектура исследованы; P0–P2 НЕ ПРИНЯТЫ | Один NPC ragdoll сначала в OGSR DX11/R4; ODE fallback; не блокировать F4 |
+| **H, I–L, VFX, AUDIO** | 📝 Запланировано или исследуется; новые runtime PASS не предъявлены | Гейты и зависимости указаны ниже; не считать roadmap-решения реализованными возможностями |
+
+**Проверяемые артефакты, не опубликованные в `prypiat`:**
+
+- **B3-B2B P1–P4:** DeepSeek Windows report
+  `F4.0-B3B2B-P1P4-Verify`, patch `B3B2B-P1-P4-final.patch`,
+  SHA-256 `C0F1982E854E6650117B75605D9AA4C9137ACD89A0A99F1C25315200CC8A4E6D`;
+  fresh apply / 11 из 11 файлов заявлены и зафиксированы в evidence.
+  **Недостаточно для ACCEPTED без повторного Codex review.**
+- **Claude B1–B5:** `B1-B5-full.patch`,
+  SHA-256 `A1C01996A1247AAF61A1BE9435A2C0D7BD5FA550CC422F8E2408F649003C10F9`,
+  14 файлов; DeepSeek первоначально заявил `CONDITIONAL PASS`, но
+  **последний независимый Codex verdict — `REQUEST CHANGES`**.
+  Production-only patch тоже не принят целиком из-за B2.
+- Факты тестирования всегда разделять на **independently executed**,
+  **log/evidence-verified**, **author-reported** и **NOT TESTED**.
+  Нет подтверждённых аппаратного TDR, полного current-format live
+  Jupiter с финальным `last` sample и штатного feature-on lifecycle.
+
+**Ближайший порядок (не означает разрешение на слияние патчей):**
+
+1. **Codex re-review B3-B2B P1–P4:** независимо повторить исходные
+   false-PASS мутации, проверить оба harness и валидный GPU run.
+   Только после положительного вердикта планировать интеграцию.
+2. **DeepSeek Claude B1–B5 Round 2:** исправить B2 Unicode/CLI, изолировать
+   B1 fault hooks, доказать штатный B4/B5 feature-on lifecycle и post-build,
+   затем отправить в Codex. Не смешивать с B3-B2B.
+3. **runE:** отдельно воспроизвести baseline vs patched, подтвердить root
+   cause и провести regression disconnect/reload/quit; не маркировать
+   pre-existing без A/B.
+4. Продолжить **F4.0** до реального игрового DX12 кадра; после этого
+   реализовать **F4-PBR** для полноценного raster/material lighting.
+   Сохранять DX11/R4 fallback. B3-B2C/DXR не объявлять начатыми
+   лишь из-за наличия планов или подготовленных тестовых патчей.
+
+**Фиксация статуса:** изменения roadmap не выполняют сборку, тесты,
+интеграцию, перенос патчей или независимую приёмку сами по себе.
+Всё ниже, датированное 2026-10-25 и раньше, — исторический срез,
+который следует читать вместе с этой таблицей.
+
+### Историческая сверка выполнения DX12 и смежных направлений — 2026-10-25
 
 **Основание:** коммиты, доступные в `origin/prypiat` на момент сверки
 (HEAD `4b120ca81`), отчёты этапов и независимого аудита. Ниже отдельно
@@ -87,7 +158,7 @@ DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. 
 или standalone GPU harness. Не считать тестовые hashes и p50/p95/p99
 доказательством стабильного игрового FPS. Legacy DX11/R4 должен сохраняться.
 
-### Историческая сводка статусов (снимок 2026-10-14/19; актуальная сверка — выше)
+### Историческая сводка статусов (снимок 2026-10-14/19; актуальная сверка — 2026-10-30 выше)
 
 | Этап | Статус | Следующее действие |
 |---|---|---|
@@ -632,6 +703,12 @@ particles, сложный postprocess, temporal upscalers, RT-тени/отра�
 streaming, оптимизация FPS. Их перенос остаётся в полном F4/F5/F6/G.
 До прохождения полноценных гейтов F4–F5 DX12 не выдавать пользователям
 как штатный завершённый игровой режим.
+
+**Состояние на 2026-10-30:** в `prypiat` после B3A закоммичены также
+`F4.0-B3-B1` (offscreen replay игровой камеры) и `F4.0-B3-B2A`
+(IPC/CPU receiver). Изолированный B3-B2B GPU consumer ожидает повторного
+Codex review после P1–P4; отдельный Claude B1–B5 patch получил
+`REQUEST CHANGES`. Ничего из этого не подтверждает завершение F4.0.
 
 ### F4-PBR — Physically Based Materials & Lighting (решение 2026-10-30; PLANNED)
 
