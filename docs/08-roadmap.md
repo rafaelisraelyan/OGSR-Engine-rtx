@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-10-27. Исторические статусы A/B1/F и их
+> **Дата обновления планов:** 2026-10-30. Исторические статусы A/B1/F и их
 > даты оставлены как ранее зафиксированные отчёты, а не результат новой
 > проверки GPU/CI. Изменение roadmap **не означает** реализации или тестирования
 > добавленных этапов.
@@ -24,6 +24,12 @@ Edition* (4A Games) — как исследовательский ориенти
 полного переноса освещения, прозрачности, HUD, постобработки и DXR.
 Это **план**, а не утверждение о готовом игровом DX12-рендерере; точные
 зависимости реальных ассетов и игрового frame loop сначала проверить аудитом.
+
+**F4-PBR — принятое направление (решение 2026-10-30):** после раннего
+F4.0 развивать самостоятельный physically based material/lighting path
+для DX12 raster: Legacy/Enhanced, THM/DDS и совместимая модель для будущего
+DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. F4-PBR ниже),
+но не готовый DX12 renderer; PBR не блокирует F4.0 и первые G3-тени.
 
 **Основные направления:**
 
@@ -627,6 +633,65 @@ streaming, оптимизация FPS. Их перенос остаётся в �
 До прохождения полноценных гейтов F4–F5 DX12 не выдавать пользователям
 как штатный завершённый игровой режим.
 
+### F4-PBR — Physically Based Materials & Lighting (решение 2026-10-30; PLANNED)
+
+**Статус:** архитектурное направление закреплено; **реализация и GPU PASS не
+подтверждены**. Это обязательный рубеж качества для полноценного игрового
+**DX12 raster lighting**, но **не гейт раннего F4.0** и не требование перед
+исследовательскими G0–G2 или первыми G3 RT-тенями. До интеграции игровых
+RT-отражений и RTGI (G5) должна быть принята согласованная модель материалов,
+общая для raster и ray-hit shading. Само добавление этого раздела не означает
+перенос PBR из DX11 или готовность DXR.
+
+**Ориентир:** открытая реализация **IX-Ray 1.6 STCoP**, ветка `default`,
+исследованный commit `fb73ad7f3de241bd3e3576f9af9fcd263cd26561`.
+Она реализует THM-выбор PBS-материалов, packed `BUMP/BUMP#`, отдельные
+legacy/PBS lighting paths, metallic/roughness/AO в G-buffer, GGX/Smith/Fresnel,
+IBL и привязку к погоде/небу. Это *референс для анализа*, **не готовый DX12
+backend и не основание копировать исходники без анализа лицензии**.
+
+**Контракт совместимости (Asset Compatibility First):**
+
+- `Legacy Materials` используют существующие OGSR/X-Ray OGF, DDS и THM с
+  документированными значениями albedo/normal/gloss, roughness, F0, metallic,
+  AO, alpha-test и fallback. Массовая переконвертация ассетов **не требуется**;
+  режим DX11/R4 остаётся независимым baseline/откатом.
+- `Enhanced Materials` по мере появления могут задавать base color,
+  normal, metallic, perceptual roughness, AO, emissive и, где необходимо,
+  SSS/translucency. Нельзя считать отсутствие карты ошибкой загрузки.
+- Для совместимости допускается изучить IX-Ray packing:
+  `BUMP` — нормаль в G/A, optional height в R;
+  `BUMP#` — metallic/R, roughness/G, vegetation SSS/B, AO/A. Формат,
+  соглашения каналов, normal Y, alpha и gamma **сначала проверяются** на
+  существующих CoP/OGSR ресурсах; не вводить несовместимое переименование DDS.
+- Один типизированный `MaterialID`/material record и проверяемые GPU
+  texture handles должны обслуживать deferred raster и будущий DXR
+  `ray-hit material lookup` вне экранного G-buffer; не использовать
+  временные CPU pointers без lifetime/generation-гарантий.
+
+| Подэтап | Содержание | Гейт / доказательства |
+|---|---|---|
+| **F4-PBR.0 — Asset/Shader Audit** | Инвентаризировать OGSR THM/DDS, gloss/specular, normals, alpha test, detail/terrain, солнце/sky/hemi, старые HLSL; сопоставить с IX-Ray `tmPBR_Material`, `UsePBRTexures`, `USE_PBR`, `USE_LEGACY_LIGHT` и `BUMP#`. Проверить лицензионные условия перед переносом кода. | ADR: матрица Legacy → Enhanced, карта полей и sRGB/linear, перечень несовместимостей; никакого изменения игрового DX11. |
+| **F4-PBR.1 — Material Contract & G-buffer** | Разработать DX12 material/texture binding и explicit layout: albedo, normal, metallic, roughness, specular/F0, AO, material ID, depth, motion vectors; documented alpha/foliage/SSS. Отдельно выбрать RT formats, точность и packed/unpacked политику; реализовать deterministic legacy fallback. | CPU/Shader unit tests, debug views каждого поля, стабильные ID/lifetime при reload, визуально правильный RGB/sRGB и нормали; тесты текстур с отсутствующими каналами. |
+| **F4-PBR.2 — PBR Lighting & IBL** | Реализовать и проверить физически обоснованный Cook–Torrance/ GGX BRDF с Fresnel и visibility/Smith, energy handling, диапазонами roughness/F0; direct sun/local lights и атмосферно согласованное IBL от погодного неба. Учесть exposure, linear HDR и смену суток, не копировать эвристические коэффициенты IX-Ray без оценки. | Референсные BRDF/sphere tests (dielectric/metal, rough/smooth), day/night/weather A/B, стабильно работающие raster lighting, GPU Debug Layer/GBV без ошибок. |
+| **F4-PBR.3 — Game Integration & Validation** | Применить материал ко всем необходимым игровым классам: статика, terrain/detail, foliage alpha cutout, dynamic/skinned, прозрачность/HUD по отдельному обоснованному контракту. Интегрировать через настоящий CoP/OGSR DX12 runtime, сохраняя DX11 fallback. | Сопоставимые кадры DX11 и DX12: помещение, улица/мокрые поверхности, лес/ветер, ночь/день; G-buffer captures, PSO/SRV validation, resize/reload/shutdown, GPU ms, VRAM, CPU p95/p99. Список unsupported материалов без ложного PASS. |
+| **F4-PBR.4 — DXR Material Readiness** | Описать общий material record и доступ к albedo/normal/roughness/metallic/alpha/emissive по ID+UV в ray hit, включая объекты за пределами кадра; проверить descriptor ownership, residency, alpha-tested vegetation и fallback. **Без обязательной реализации DXR в этом подэтапе.** | Контракт и тестовая проверка material lookup готовы для G4/G5; RT-отражения и RTGI не начинают production-интеграцию без этого гейта. |
+
+**Зависимости:** F4.0-C обеспечивает лишь минимальный textured preview.
+F4-PBR.0 можно проводить параллельно F4.0, но F4-PBR.1–3 подключаются к
+полному F4 по мере готовности игрового geometry/texture path. F5 temporal
+опирается на документированные normal/depth/material/motion контракты;
+переход F4 → G0–G3 возможен без обязательных PBR-карт. Для игровых G4/G5
+материальный контракт F4-PBR.4 обязателен; для RT-отражений/RTGI необходима
+принятая базовая PBR-модель. Никаких заявлений о FPS без GPU измерений.
+
+**IX-Ray reference (точные исходники):**
+
+- [IX-Ray PBS/texture packing](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/docs/docs/main/ru/graphics/pbr.md).
+- [THM material detection](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/src/Layers/xrRender/TextureDescrManager.cpp) и [shader option binding](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/src/Layers/xrRender/uber_deffer.cpp).
+- [Material/G-buffer](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/gamedata/shaders/d3d11/metalic_roughness_base.hlsli), [GGX direct light](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/gamedata/shaders/d3d11/metalic_roughness_light.hlsli), [IBL](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/gamedata/shaders/d3d11/metalic_roughness_ambient.hlsli).
+- [IX-Ray license](https://github.com/ixray-team/ixray-1.6-stcop/blob/fb73ad7f3de241bd3e3576f9af9fcd263cd26561/LICENSE.md): проверить совместимость до любого дословного переноса; в этом milestone закреплены только архитектурные решения.
+
 ### Принципы F
 
 - Не заменять существующий `CHW` на D3D12 в одном большом коммите и не
@@ -871,13 +936,19 @@ H1–H3 — после указанных RT-рубежей. Реализова�
          ↓
     F4.0: первый реальный DX12 кадр уровня → текстурированный preview
           ↓
-    F4: полный перенос игрового кадра → F5: temporal/DLSS/FSR3
+    F4: полный перенос игрового кадра; F4-PBR.0–3 — параллельный PBR-трек
+         ↓
+    F5: temporal/DLSS/FSR3 + согласованные G-buffer/motion data
          ↓
     F6: стабильность и измеренное расширение parallel path
          ↓
     G0: DXR tier → G1: BLAS/TLAS → G2: DispatchRays
          ↓
-    G3: RT-тени → G4: динамика → G5: RT-отражения (отдельный гейт)
+    G3: RT-тени (без гейта новых PBR-карт)
+         ↓
+    G4: динамика + F4-PBR.4: material lookup readiness
+         ↓
+    G5: RT-отражения (PBR PASS); RTGI позднее по отдельному ADR
           ↓
     H1: аудит многопоточности ВСЕГО X-Ray → H2: точечные оптимизации
           ↓
