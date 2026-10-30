@@ -53,6 +53,50 @@ DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. 
   необязательная интеграция в игровой DX12 с выбором Classic 2D / Volumetric 3D.
   **V0–V2 разрешено разрабатывать параллельно F4.0; V не является гейтом F4/G.**
 
+### Актуальная сверка — 2026-10-31: B1–B5 Round 2 в `prypiat`
+
+**Состояние Git после финальной независимой приёмки:** production-only изменения
+Claude B1–B5 Round 2 опубликованы поверх `9b46385540e19c4655c6c8637a0a8c6043faaadd`
+двумя последовательными коммитами:
+
+- `54c5ea039be2ccf20a9aa252681804c6667d4a28` —
+  `fix(dx12): harden B1-B5 production camera and GPU lifecycle`;
+- `c67a04cbed38c72ecb6f1b43482dfb88486361bf` —
+  сохранение исходных CRLF в `GameCameraCaptureAdapter.cpp/.h`.
+  Второй коммит только восстанавливает побайтовую идентичность принятого
+  патча; итоговые **7/7 Git blob SHA совпадают** с независимым production-only
+  Round 2 review (включая новый `GameCameraCaptureExportPath.h`).
+
+**Основания приёмки:** Codex `Round2-independent-review.md`:
+`CONDITIONAL PASS`; Windows `B1-B5-Round2-Integration-Report.md`:
+`CONDITIONAL PASS`; Codex `Final-integration-review.md`
+(2026-10-31): **`CONDITIONAL PASS — READY TO COMMIT WITH TRACKED RISKS`**.
+Это разрешение на узкий production-коммит, **не** полное принятие игрового
+DX12 renderer/F4.0 и **не** закрытие двух crashes.
+
+| Направление | Состояние на 2026-10-31 | Доказательства / условия |
+|---|---|---|
+| **Claude B1–B5 Round 2 (production-only)** | ✅ **В Git (`prypiat`), Codex CONDITIONAL PASS** | 7 разрешённых файлов, включая новый header; B1 порядок `Execute → Signal → Present`, B2 `GetCommandLineW` и Unicode export, B3 first-instance, B4 throttling, B5 lifecycle; test hooks находятся за compile-time guards и **не включены** в проверенных shipping defines |
+| **Build и обычный runtime** | ✅ **Feature-on сборка и игровые тесты по Windows evidence**, независимое delta-review | Ручные `Release|x64` и `ReleaseDX12|x64` MSVC exit 0, post-build 0; новый `xrEngine.exe`: две реальные Jupiter-сессии, epoch `1→2→3→4`, teardown=2, exit 0; game IPC 1201 кадров/0 protocol/CRC errors; Unicode export. Codex проверил compilation logs/артефакты, самостоятельно повторил standalone DX12 и Unicode export, **не** полный Jupiter/IPC runtime |
+| **Standalone DX12 smoke** | ✅ **Независимый аппаратный повтор Codex** | Fence 49/0, geometry 245/0, visibility 1519476/0, GPU resize/GBV/InfoQueue/Shutdown; **не** игровой DX12 frame |
+| **F4.0-B3-B2B persistent GPU evidence (P1–P4)** | 🔴 **Отдельный патч, НЕ в Git; Codex REQUEST CHANGES** | Исходные single repro и hardware GPU replay проверены, но extended audit нашёл 8 нарушений integrity (включая sampled-set false PASS, false FAIL hash, fence sentinel и Unicode relocation); Round 3 исправления требуют отдельной независимой приёмки |
+| **Shutdown: `GamePersistent::OnFrame`** | 🔴 **P2, UNRESOLVED** | Возможный `Level().name()` при `g_pGameLevel==nullptr`; старый crash `0xC0000005` после teardown. Причина и статус pre-existing/regression не доказаны. Отдельный guard fix, baseline A/B и регрессия перед следующим F4.0 acceptance |
+| **Shutdown: `CMainMenu::Activate`** | 🔴 **P2, UNRESOLVED** | Direct-start `-start ...` + `quit`: null `m_startDialog`, `MainMenu.cpp:147`, `0xC0000005`; PDB/minidump сопоставлены. Связь с B1–B5 **не подтверждена**, baseline A/B не выполнен; отдельный issue/fix/review |
+| **B3 IPC reconnect / handles** | ◻ **NOT TESTED на новом integration binary** | Проверены single connection/1201 кадров и отдельные B3 Win32/transport тесты. Перед последующим transport acceptance: потеря receiver во время overlapped write, reconnect, порядок/CRC, handle counting и teardown |
+| **Build bootstrap/automation** | 🟡 **P3, не закрыт** | `prepare-b1b5-integration.ps1 -BuildRelease` завершился exit 1 (нет gitignored vendored dependencies, нехватка места `D:`, ошибка создания корня `D:`); последующая ручная feature-on сборка exit 0. Исправить зависимости и явные feature properties в отдельной задаче, не объявлять script PASS |
+| **F4.0 — игровой DX12 frame** | ⬜ **НЕ ПРИНЯТ** | Ещё нет принятой отрисовки реальной геометрии Jupiter внутри OGSR DX12 runtime; standalone consumer и корректная камера не заменяют in-game frame/renderer, DX12→DX11 fallback и full lifecycle acceptance |
+
+**До следующего F4.0 milestone acceptance:** отдельно закрыть либо доказательно
+классифицировать оба shutdown crashes (с сохранением GamePersistent cleanup),
+протестировать нужные reconnect/handle и интеграционные lifecycle gates и
+проверить итоговую игровую DX12-сборку. Реальный TDR, Engine ASan и полный
+игровой DX12→DX11 fallback не были проверены в рамках данного B1–B5 review;
+не записывать их как PASS. Исправления B3-B2B Round 3, PhysX и PBR **не**
+входят в эти два производственных коммита.
+
+Ниже сохранена **историческая сверка на 2026-10-30**: её предыдущие статусы
+`B1–B5 Round 2 не в Git` больше не являются актуальными после данной записи.
+
 ### Актуальная сверка статусов проекта — 2026-10-30
 
 **Источник истины и уровни доказательств:** ветка `prypiat` после
