@@ -18,4 +18,13 @@ void B2CameraCapture_OnFrameRenderBeginFailed();
 void B2CameraCapture_OnDeviceResetBegin();
 void B2CameraCapture_OnEngineShutdown();
 
+#ifdef OGSR_B2_CAMERA_TEST_HOOKS
+// Test-only fault injection for the B4 diagnostic-throttling checks. These
+// entry points are compiled only into dedicated verification builds.
+void B2CameraCapture_TestArmPublishRejects(unsigned count);
+unsigned B2CameraCapture_TestPublishRejectsRemaining();
+void B2CameraCapture_TestExhaustCaptureSequence();
+void B2CameraCapture_TestLogState(const char* phase);
+#endif
+
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE

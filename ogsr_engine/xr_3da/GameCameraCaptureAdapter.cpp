@@ -4,6 +4,7 @@
 
 #include "GameCameraCaptureAdapter.h"
 #include "GameCameraCaptureDiagnostics.h"
+#include "GameCameraCaptureExportPath.h"
 #include "device.h"
 #include "igame_level.h"
 
@@ -55,6 +56,11 @@ struct B2CameraCaptureState
     uint64_t validatedCaptures = 0;
     uint64_t publishedCaptures = 0;
     uint64_t validationRejects = 0;
+    uint64_t publishRejectLogAttempts = 0;
+    bool captureSequenceExhaustionLogged = false;
+#ifdef OGSR_B2_CAMERA_TEST_HOOKS
+    unsigned testPublishRejectsRemaining = 0;
+#endif
     uint64_t resetInvalidations = 0;
     uint64_t teardownInvalidations = 0;
     uint64_t staleTokens = 0;
@@ -189,65 +195,14 @@ void DumpMatricesOnce(const gamecamera12::CameraCaptureInput12& input,
 }
 
 #if defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT) || defined(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM)
-bool IsParameterSpace(char value) noexcept
-{
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n' ||
-           value == '\v' || value == '\f';
-}
+using b2camera_export::IsParameterSpace;
 #endif
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
-constexpr const char* kB3ExportPrefix = "-b3_camera_export=";
-constexpr size_t kB3ExportPrefixLength = 18;
-
-// Exact "-b3_camera_export=<path>" lookup (optionally quoted). Substring
-// occurrences and the bare flag are rejected.
-bool ExtractB3ExportPath(const char* params, wchar_t* out,
-                         size_t outCount) noexcept
-{
-    if (params == nullptr || out == nullptr || outCount < 2)
-        return false;
-    const char* cursor = params;
-    while (*cursor)
-    {
-        while (*cursor && IsParameterSpace(*cursor))
-            ++cursor;
-        if (!*cursor)
-            break;
-        const char* token = cursor;
-        if (*cursor == '"')
-        {
-            ++cursor;
-            token = cursor;
-            while (*cursor && *cursor != '"')
-                ++cursor;
-        }
-        else
-        {
-            while (*cursor && !IsParameterSpace(*cursor))
-                ++cursor;
-        }
-        const size_t length = static_cast<size_t>(cursor - token);
-        if (length > kB3ExportPrefixLength &&
-            std::strncmp(token, kB3ExportPrefix, kB3ExportPrefixLength) == 0)
-        {
-            const char* value = token + kB3ExportPrefixLength;
-            const size_t valueLength = length - kB3ExportPrefixLength;
-            if (valueLength >= outCount)
-                return false;
-            const int converted = ::MultiByteToWideChar(
-                CP_UTF8, 0, value, static_cast<int>(valueLength), out,
-                static_cast<int>(outCount) - 1);
-            if (converted <= 0)
-                return false;
-            out[converted] = L'\0';
-            return true;
-        }
-        if (*cursor == '"')
-            ++cursor;
-    }
-    return false;
-}
+// Production path: use the native wide command line. Core.Params is built from
+// GetCommandLineA in this MultiByte build and therefore depends on the process
+// ANSI code page; it cannot carry Unicode export paths reliably.
+using b2camera_export::ExtractB3ExportPathW;
 
 // One-shot transactional export of the exactly-published B2.3 camera.
 // Called only after PublishPending succeeded for this frame's token.
@@ -506,12 +461,18 @@ void B2CameraCapture_Initialize()
         b2camera_diagnostics::HasExactArgument(params, "-b2_camera_capture");
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT
-    state.exportRequested = ExtractB3ExportPath(
-        params, state.exportPath, std::size(state.exportPath));
-    if (state.exportRequested)
-        Msg("[B3-B1] one-shot camera export enabled");
-    else if (b2camera_diagnostics::HasExactArgument(params, "-b3_camera_export"))
-        Msg("[B3-B1] camera export ignored: expected -b3_camera_export=<path>");
+    {
+        const wchar_t* const commandLine = ::GetCommandLineW();
+        state.exportRequested = ExtractB3ExportPathW(
+            commandLine, state.exportPath, std::size(state.exportPath));
+        if (state.exportRequested)
+            Msg("[B3-B1] one-shot camera export enabled: %ls",
+                state.exportPath);
+        else if (commandLine &&
+                 std::wcsstr(commandLine, L"-b3_camera_export") != nullptr)
+            Msg("[B3-B1] camera export ignored: malformed, ambiguous or "
+                "duplicate -b3_camera_export argument");
+    }
 #endif
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_B3_B2_CAMERA_STREAM
@@ -591,6 +552,7 @@ void B2CameraCapture_OnLevelReady(const char* levelName)
     state.currentLevelSession = session;
     state.levelActive = true;
     state.teardownPending = false;
+    state.captureSequenceExhaustionLogged = false;
     state.hasPendingToken = false;
     state.dumpGate.Reset(state.dumpRequested);
     CopyLevelName(levelName);
@@ -617,6 +579,10 @@ void B2CameraCapture_OnLevelTeardownBegin()
         Msg("[B2.3] OnLevelTeardownBegin ignored: not owner thread");
         return;
     }
+    // OnEvent(eDisconnect) and ~IGame_Level both invoke this hook.
+    // Never advance the epoch or emit an additional Invalidate twice.
+    if (state.teardownPending || !state.levelActive)
+        return;
 
     state.hasPendingToken = false;
     state.dumpGate.ClearPending();
@@ -691,8 +657,11 @@ void B2CameraCapture_OnCameraFrameReady()
         return;
     if (state.nextCaptureSequence == 0)
     {
-        if ((state.captureAttempts % 120) == 0)
+        if (!state.captureSequenceExhaustionLogged)
+        {
+            state.captureSequenceExhaustionLogged = true;
             Msg("[B2.3] capture sequence exhausted");
+        }
         return;
     }
 
@@ -775,8 +744,18 @@ void B2CameraCapture_OnFrameRenderBeginSucceeded()
 
     const gamecamera12::CaptureToken12 token = state.pendingToken;
     state.hasPendingToken = false;
-    const gamecamera12::CameraError12 error =
-        state.publication.PublishPending(token);
+    gamecamera12::CameraError12 error = gamecamera12::CameraError12::None;
+#ifdef OGSR_B2_CAMERA_TEST_HOOKS
+    if (state.testPublishRejectsRemaining > 0)
+    {
+        --state.testPublishRejectsRemaining;
+        error = gamecamera12::CameraError12::StaleCaptureEpoch;
+    }
+    else
+#endif
+    {
+        error = state.publication.PublishPending(token);
+    }
     if (error != gamecamera12::CameraError12::None)
     {
         state.dumpGate.ClearPending();
@@ -784,7 +763,10 @@ void B2CameraCapture_OnFrameRenderBeginSucceeded()
         if (error == gamecamera12::CameraError12::StaleCaptureEpoch ||
             error == gamecamera12::CameraError12::StaleLevelSession)
             ++state.staleTokens;
-        if ((state.validationRejects + state.staleTokens) % 60 == 0)
+        // Every PublishPending failure advances this throttle counter,
+        // including error kinds that leave validationRejects unchanged.
+        ++state.publishRejectLogAttempts;
+        if ((state.publishRejectLogAttempts % 60) == 1)
             LogLastError("PublishPending");
         return;
     }
@@ -876,6 +858,45 @@ void B2CameraCapture_OnDeviceResetBegin()
         static_cast<unsigned long long>(state.currentLevelSession),
         static_cast<unsigned long long>(state.publication.CurrentEpoch()));
 }
+
+#ifdef OGSR_B2_CAMERA_TEST_HOOKS
+void B2CameraCapture_TestArmPublishRejects(unsigned count)
+{
+    State().testPublishRejectsRemaining = count;
+}
+
+unsigned B2CameraCapture_TestPublishRejectsRemaining()
+{
+    return State().testPublishRejectsRemaining;
+}
+
+void B2CameraCapture_TestExhaustCaptureSequence()
+{
+    State().nextCaptureSequence = 0;
+}
+
+void B2CameraCapture_TestLogState(const char* phase)
+{
+    B2CameraCaptureState& state = State();
+    Msg("[B2.3][test] phase=%s attempts=%llu validated=%llu published=%llu "
+        "validationRejects=%llu publishRejectLogAttempts=%llu "
+        "sequenceExhaustionLogged=%d reset=%llu teardown=%llu stale=%llu "
+        "levelActive=%d teardownPending=%d pendingToken=%d",
+        phase ? phase : "?",
+        static_cast<unsigned long long>(state.captureAttempts),
+        static_cast<unsigned long long>(state.validatedCaptures),
+        static_cast<unsigned long long>(state.publishedCaptures),
+        static_cast<unsigned long long>(state.validationRejects),
+        static_cast<unsigned long long>(state.publishRejectLogAttempts),
+        state.captureSequenceExhaustionLogged ? 1 : 0,
+        static_cast<unsigned long long>(state.resetInvalidations),
+        static_cast<unsigned long long>(state.teardownInvalidations),
+        static_cast<unsigned long long>(state.staleTokens),
+        state.levelActive ? 1 : 0,
+        state.teardownPending ? 1 : 0,
+        state.hasPendingToken ? 1 : 0);
+}
+#endif
 
 void B2CameraCapture_OnEngineShutdown()
 {

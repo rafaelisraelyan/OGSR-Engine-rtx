@@ -287,6 +287,13 @@ bool CHW12::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     // Shutdown уже приводил объект к исходному состоянию): идемпотентность
     // Shutdown снимается, иначе cleanup после повторной попыки стал бы no-op.
     m_shutdownComplete = false;
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    // A fault armed by a previous test session must never leak into a new
+    // initialization.
+    m_presentFaultHr = S_OK;
+    m_signalFaultHr = S_OK;
+    m_allocatorResetCount = 0;
+#endif
     // F3.5.3B: m_prepFailed обязан сбрасываться вместе с m_recordFailed.
     // Иначе один сбой подготовки кадра навсегда блокирует RenderFrame(),
     // и последовательность Shutdown → Initialize не восстанавливает рендер.
@@ -2967,6 +2974,9 @@ bool CHW12::RenderFrame()
         // owner не трогает их allocator до Wait.
         if (parallelDraw && i >= 1 && i <= drawLists) continue;
         if (InjectRecordingFailure(0,i)) return false;
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+        ++m_allocatorResetCount;
+#endif
         hr=allocators[i]->Reset();
         if (FAILED(hr)) { m_recordFailed=true; ReportGpuFailure(L"allocator Reset",hr); return false; }
         if (InjectRecordingFailure(1,i)) return false;
@@ -3519,9 +3529,36 @@ bool CHW12::RenderFrame()
     }
     m_gpuWorkSubmitted = true;
 
-    // Present — единственный источник DEVICE_REMOVED/DEVICE_RESET и единственное
-    // место, откуда приходит DXGI_STATUS_OCCLUDED для свёрнутого окна.
-    hr = m_swapChain->Present(1, 0);
+    // Track submitted GPU work before Present: a failed Present does not
+    // cancel already queued command lists. The frame allocator must remain
+    // tied to this submission even if Present fails.
+    const uint64_t submittedFence = m_fenceValue + 1;
+    HRESULT sigHr = S_OK;
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    sigHr = m_signalFaultHr;
+    m_signalFaultHr = S_OK;
+#endif
+    if (sigHr == S_OK)
+        sigHr = m_commandQueue->Signal(m_fence.Get(), submittedFence);
+    if (FAILED(sigHr))
+    {
+        // Signal failure makes completion unknown: never reset this allocator.
+        dx12log::Write("[DX12] Signal failed after Execute, hr=0x%08X", static_cast<unsigned>(sigHr));
+        ReportGpuFailure(L"Signal", sigHr);
+        return false;
+    }
+    m_fenceValue = submittedFence;
+    frame.fenceValue = submittedFence;
+
+    // Present reports occlusion/device errors but cannot invalidate the
+    // submission fence already queued on the same command queue.
+    hr = S_OK;
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    hr = m_presentFaultHr;
+    m_presentFaultHr = S_OK;
+#endif
+    if (hr == S_OK)
+        hr = m_swapChain->Present(1, 0);
 
     // F3.5.4A: интервал между Present. Present(1,0) ограничен vsync,
     // поэтому это wall-clock диагностика, а не FPS игры.
@@ -3556,18 +3593,7 @@ bool CHW12::RenderFrame()
         return false;
     }
 
-    // Сигналим fence и при occlusion: слот должен разблокироваться после
-    // восстановления окна, иначе он зависнет навсегда. При провале Signal
-    // аллокатор НЕ сбрасывается в следующем кадре — мы остановимся здесь.
-    frame.fenceValue = ++m_fenceValue;
-    const HRESULT sigHr = m_commandQueue->Signal(m_fence.Get(), frame.fenceValue);
-    if (FAILED(sigHr))
-    {
-        dx12log::Write("[DX12] Signal failed after Present, hr=0x%08X", static_cast<unsigned>(sigHr));
-        ReportGpuFailure(L"Signal", sigHr);
-        return false;
-    }
-
+    // Fence was submitted before Present, including the occluded path.
     if (occluded)
     {
         m_occluded = true;
@@ -3772,6 +3798,11 @@ void CHW12::Shutdown()
         return;
 
     m_shutdownComplete = true;
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    // Armed but unconsumed injections are session state, not renderer state.
+    m_presentFaultHr = S_OK;
+    m_signalFaultHr = S_OK;
+#endif
     dx12log::Write("[renderprep] %s mode=%u frames=%llu samples=%llu packets=%u snapshot=%.6f serial=%.6f parallel=%.6f submit=%.6f wait=%.6f merge=%.6f gpuFence=%.6f ms",
         m_prepFailed ? "FAIL" : "PASS",static_cast<unsigned>(m_prepMode),
         (unsigned long long)m_prepFrames,(unsigned long long)m_prepSamples,

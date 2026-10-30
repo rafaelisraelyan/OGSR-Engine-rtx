@@ -137,6 +137,36 @@ public:
     void ArmTimerRenderFailure() { m_timerFaultArmed = true; }
     bool RenderFrameFromTimer();
 
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    // B1 TEST ONLY: one-shot Present/Signal failure injection. These entry
+    // points are compiled only into dedicated fault-injection builds. Success
+    // codes are never accepted for Signal: forwarding S_FALSE would skip the
+    // real Signal while FAILED(S_FALSE) is false, falsely confirming a fence.
+    bool ArmPresentFailure(HRESULT hr)
+    {
+        // Only a real failure or the real occlusion status may be injected.
+        // Any other success code (S_OK, S_FALSE, ...) is invalid test
+        // configuration, not a failure.
+        if (SUCCEEDED(hr) && hr != DXGI_STATUS_OCCLUDED)
+            return false;
+        m_presentFaultHr = hr;
+        return true;
+    }
+    bool ArmSignalFailure(HRESULT hr)
+    {
+        if (SUCCEEDED(hr))
+            return false;
+        m_signalFaultHr = hr;
+        return true;
+    }
+    uint64_t CurrentSlotFenceValue() const
+    {
+        return m_frameResources[m_frameIndex].fenceValue;
+    }
+    uint64_t SubmittedFenceValue() const { return m_fenceValue; }
+    uint64_t AllocatorResetCount() const { return m_allocatorResetCount; }
+#endif
+
     // Заимствование: JobSystem должен пережить CHW12.
     void ConfigurePreparation(renderprep12::Mode mode, gr::jobs::JobSystem* jobs) { m_prepMode=mode; m_jobs=jobs; }
     bool PreparationFailed() const { return m_prepFailed; }
@@ -331,6 +361,11 @@ private:
     bool m_preparing=false, m_prepFailed=false;
     bool m_timerFaultArmed=false; // F3.3.0a TEST ONLY, см. ArmTimerRenderFailure()
     bool m_prepFaultArmed=false;  // F3.5.3B TEST ONLY, см. ArmPreparationFailure()
+#ifdef OGSR_B1_FENCE_TEST_HOOKS
+    HRESULT m_presentFaultHr=S_OK; // B1 TEST ONLY, см. ArmPresentFailure()
+    HRESULT m_signalFaultHr=S_OK;  // B1 TEST ONLY, см. ArmSignalFailure()
+    uint64_t m_allocatorResetCount=0; // B1 TEST ONLY: proves Reset was not run
+#endif
     uint64_t m_sceneGeneration=1, m_prepFrames=0, m_prepSamples=0;
     double m_snapshotMs=0, m_serialMs=0, m_parallelMs=0, m_submitMs=0, m_waitMs=0;
     // F3.3.0a: merge (финальная сборка PreparedFrame) и ожидание GPU fence

@@ -147,7 +147,10 @@ HANDLE CreateLocalPipeInstance(const std::wstring& pipeName) noexcept
 
     HANDLE pipe = ::CreateNamedPipeW(
         pipeName.c_str(),
-        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+        // Fail closed if any local process already owns this pipe name.
+        // The producer uses one instance at a time, including reconnects.
+        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED |
+            FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
             PIPE_REJECT_REMOTE_CLIENTS,
         1, kPipeBufferBytes, kPipeBufferBytes, 0, &attributes);

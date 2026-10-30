@@ -237,6 +237,7 @@
     </ClCompile>
     <ClInclude Include="GameCameraCaptureAdapter.h" />
     <ClInclude Include="GameCameraCaptureDiagnostics.h" />
+    <ClInclude Include="GameCameraCaptureExportPath.h" />
   </ItemGroup>
   <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true'">
     <ClCompile>
@@ -482,7 +483,16 @@
            Text="B3-B2 camera stream requires OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE=true" />
   </Target>
   <Target Name="PostBuildStep1" AfterTargets="Build">
-    <Exec Command='copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll"' />
+    <!-- Debugging Tools for Windows is an optional Windows SDK component. The
+         engine links the dbghelp import library and Windows loads the system
+         copy when no local one is deployed. Prefer the SDK Debuggers build
+         when it is installed, but do not turn a missing optional component
+         into a build failure. -->
+    <PropertyGroup>
+      <_OgsrDbgHelpSource>$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll</_OgsrDbgHelpSource>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_OgsrDbgHelpSource)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(_OgsrDbgHelpSource)')" />
+    <Message Importance="high" Condition="!Exists('$(_OgsrDbgHelpSource)')" Text="dbghelp.dll not found in Windows SDK Debugging Tools at '$(_OgsrDbgHelpSource)'; using the system dbghelp.dll (optional component)." />
   </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
