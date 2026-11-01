@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-11-01 (добавлен независимый V/R02 audit status).
+> **Дата обновления планов:** 2026-11-01 (V/R02 audit; независимая приёмка и Git-интеграция B3-B2B Round 6).
 > Исторические статусы A/B1/F/V и их даты оставлены как ранее зафиксированные
 > отчёты, а не результат новой проверки GPU/CI. Изменение roadmap **не означает**
 > реализации или тестирования добавленных этапов.
@@ -52,6 +52,63 @@ DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. 
   DX12/compute-прототип процедурных 3D-облаков с ray marching; позже —
   необязательная интеграция в игровой DX12 с выбором Classic 2D / Volumetric 3D.
   **V0–V2 разрешено разрабатывать параллельно F4.0; V не является гейтом F4/G.**
+
+### Актуальная сверка — 2026-11-01: F4.0-B3-B2B Round 6 в `prypiat`
+
+**Статус: ✅ `INTEGRATED — INDEPENDENT CODEX PASS` в пределах standalone
+GPU consumer и evidence/verifier/harness.** Код опубликован отдельным коммитом
+[`fc3b0617e2a38664c8f8670476eab8a96bfe9029`](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/commit/fc3b0617e2a38664c8f8670476eab8a96bfe9029)
+поверх `8bbc9f0e0b7602ca5fb7610b7b08bfba79ad050c`. Это актуальный
+кодовый HEAD перед данным документационным обновлением. Коммит добавляет
+**ровно 14 test/evidence-файлов** исключительно в
+`ogsr_engine/Layers/xrRenderDX12/tests/` (**7779 insertions, 0 deletions**).
+Он не меняет shipping renderer, `xrGame`, `xr_3da`, DX11/R4,
+production B1–B5, named-pipe protocol, PhysX, DXR, PBR и roadmap.
+После публикации отдельно сверены remote HEAD, единственный commit,
+parent, полный whitelist и 14 Git blobs; различия LF/CRLF между
+отдельным ZIP-снимком и Windows worktrees были явно учтены.
+
+**Основание независимой приёмки:** Codex `Round6-independent-review.md`
+(2026-11-01), вердикт **`PASS — READY TO COMMIT`**, после чего DeepSeek
+выполнил commit/push с post-push проверкой; локальный основной checkout
+не менялся. Проверенный full patch:
+`B3B2B-Round6-full.patch`, SHA-256
+`9EBA72FFF288D3CE642D859AA2955356419F255DED581142204CB099EE0ED7E0`.
+Codex независимо проверил **1248/1248** записей evidence manifest,
+четыре цепочки применения на историческом `920a3f16`, прежнем `6e2d82dc`
+и актуальном на момент review `8bbc9f0e`; **14/14 postimages**
+совпали. Manifest и GPU-логи остаются внешними evidence-артефактами, а не
+добавленными в Git файлами.
+
+| Проверка / направление | Зафиксированное подтверждение | Граница результата |
+|---|---|---|
+| **R5-N1, real D3D12 InfoQueue** | Независимый before/after: Round 5 отвергал `INFO: No ERROR occurred`, Round 6 принимает; `ParseInfoQueue` использует structured severity, `ValidInfoQueue` применяет zero-policy к WARNING/ERROR/CORRUPTION | `pDescription` — произвольный текст; совпадения слов больше не подменяют severity; полный coherent rewrite всех mutable evidence без внешнего trust root не обнаруживается |
+| **Evidence source/build/CPU** | Codex: четыре MSVC x64 targets exit 0; portable evidence CPU `128/0` (`/W4 /WX`), persistent CPU `97/0`; fault `33/33` | Это test targets и standalone consumer, **не** combined `Engine.sln` / игровой DX12 renderer |
+| **Verifier и negative matrices** | Codex: full verifier 24 cases; runners `10/10` и `12/12`, self-tests `7/7` и `26/26`; R4 `21/21`, independent probes 20 negatives + control, extended 40 negatives + 6 controls | Проверены фактические baseline PASS, mutation/reject и fail-closed cases; не утверждать абсолютную защищённость evidence |
+| **Jupiter offline GPU** | Codex самостоятельно: RTX 5070 Laptop, D3D12 Debug Layer + GBV `ID1016`, frames `3/3/3`, sampled 3, fences `4/4`, InfoQueue `81/81`, warning/error/corruption `0/0/0`, verifier `0/PASS/PASS`; `format=v2` | Это **standalone DX12**, не кадр внутри игрового CoP/OGSR runtime |
+| **Named-pipe → GPU live** | Codex независимо: sample-every=1 `2/2/2/2`; sample-every=10 last `2/3/3/2` (третий `kind=last`); forced-final `2/2/2/2`; producer/consumer/verifier exit 0, protocol/CRC errors 0 | Источник — отдельный standalone producer, **не** реальный `xrGame` producer |
+| **B1–B5 Round 2** | Ранее опубликованы и имеют отдельный Codex `CONDITIONAL PASS`; Round 6 их не изменял | Два игровых shutdown crash и незавершённые transport/build gates остаются отслеживаемыми |
+
+**Открытые гейты F4.0:** `CMainMenu::Activate` (`MainMenu.cpp:147`)
+и `CGamePersistent::OnFrame` / `Level().name()` до проверки
+`g_pGameLevel` — оба **P2 / UNRESOLVED**, baseline A/B ещё нужен;
+B3 reconnect/handle stress на финальном игровом binary **NOT TESTED**;
+автоматический `-BuildRelease` bootstrap **не принят**.
+Не проверены combined current-prypiat game build,
+in-game `xrGame` producer, реальный игровой DX12 кадр и
+DX12→DX11 fallback, другие GPU/драйверы, ASan, long stress и реальный TDR.
+Ни аппаратный standalone PASS, ни принятый test harness не закрывают
+**F4.0 native in-game renderer acceptance**.
+
+**Следующие независимые задачи:** (1) отдельное baseline A/B и lifecycle
+regression обоих shutdown crashes; (2) read-only аудит игрового frame loop,
+встраивание реальной геометрии Jupiter в opt-in DX12 runtime при сохранении
+R4 fallback; (3) отдельные reconnect/handles и build/bootstrap проверки.
+Любые production исправления требуют собственного patch, тестов и Codex review.
+
+Ниже сохранены **исторические** сверки на 2026-10-31 и 2026-10-30.
+Указания в этих старых таблицах, что B3-B2B «не в Git» или ожидает re-review,
+не являются текущим статусом после `fc3b0617`.
 
 ### Актуальная сверка — 2026-10-31: B1–B5 Round 2 в `prypiat`
 
