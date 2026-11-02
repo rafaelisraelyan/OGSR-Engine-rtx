@@ -811,6 +811,54 @@ streaming, оптимизация FPS. Их перенос остаётся в �
 Codex review после P1–P4; отдельный Claude B1–B5 patch получил
 `REQUEST CHANGES`. Ничего из этого не подтверждает завершение F4.0.
 
+### F4.0-JOBS — GR Job System в игровом DX12 renderer (решение 2026-11-02; PLANNED)
+
+**Решение:** повторно использовать **существующий GR Job System** (`ogsr_engine/Layers/JobSystem/`,
+адаптированный enkiTS) как **обязательную архитектурную основу** для CPU-подготовки
+игрового DX12-кадра и параллельной записи D3D12 command lists **до масштабирования
+полноценного игрового renderer на множество объектов**. Не внедрять второй
+scheduler / второй несвязанный worker pool и не переписывать GR/enkiTS с нуля.
+Это требование к будущему игровому renderer, а **не утверждение, что текущий
+F4.0-G1B уже работает через GR**.
+
+**Фактическая база:** в standalone `xrDX12Smoke` уже имеются GR-driven CPU
+preparation и реальная параллельная запись через `CHW12` (`JobGroup`,
+`Submit`/`Wait`, индивидуальные D3D12 allocator/list, owner
+`ExecuteCommandLists`; F3.5.3B и F3.5.5C). В проекте
+`xrRender_R5_DX12.vcxproj` есть `ProjectReference` на `gr_job_system`,
+но наличие build-зависимости **не доказывает игровое runtime-использование**.
+Изолированный in-process `GameDx12Bridge` G1B пока выполняет только
+служебный single-list submit без игрового draw и без GR workers. G1B Round 2.3
+ожидает независимой source-приёмки; игровой Jupiter runtime заблокирован
+недостающим совместимым level payload. **Ни G1B, ни игровой parallel recording
+не объявлены принятыми.**
+
+| Гейт | Содержание и порядок | Доказательство |
+|---|---|---|
+| **F4.0-J0 — source/runtime integration audit** | Сопоставить `CHW12`, `FrameBatchPlan12`, API GR и реальные точки G1B / игрового render lifecycle; выбрать единственного владельца GR pool, безопасную инициализацию/остановку и границы модулей. | Схема ownership/threading, минимальный diff-план; отсутствие второй системы задач и зависимости DX11/R4 от GR. |
+| **F4.0-J1 — первый игровой Draw (serial fallback)** | Сначала вывести один настоящий static visual Jupiter внутри игрового процесса с игровой камерой, depth и DX12 readback. Одна command list на owner thread; GR не является блокером первого геометрического кадра. | Реальные игровые VB/IB и GPU draw, подтверждённый fence, кадр/изображение, работающий R4 fallback; не выдавать standalone draw за игровой. |
+| **F4.0-J2 — GR game-frame preparation** | После J1 передавать в GR только immutable frame snapshots, проверенные geometry/material handles и готовые packet plans; worker'ы не читают mutable X-Ray level/game state. Встроить serial/parallel/verify. | Побайтовое/смысловое равенство packet order и camera/object data, тесты level teardown/reset и lifetime. |
+| **F4.0-J3 — parallel game command recording** | До массового переноса статической/динамической сцены подключить GR `JobGroup` для 2+ непустых draw lists; у каждого worker собственные per-frame allocator/list и результат. Owner делает Begin/End, `Wait`/drain, barriers/queue submission/fence; никакого конкурентного Reset общего allocator/list. | GPU capture реальной геометрии, одинаковые draw order/image oracle с serial, отказ одного worker запрещает частичный `ExecuteCommandLists`, все задачи завершены до reset/reload/shutdown. |
+| **F4.0-J4 — correctness, fallback, scaling gate** | Прогнать serial vs GR parallel на реальных сценах/объектах, с 1/2/4 workers и разным числом списков; измерить CPU recording/scheduling/Wait, GPU time, VRAM, p50/p95/p99 и validation. Выбирать parallel default только при воспроизводимом выигрыше. | Одинаковые кадры и ресурсный lifetime, нет новых D3D12 WARNING/ERROR/CORRUPTION, корректный serial fallback; результат по FPS не выводить из synthetic Smoke. |
+
+**Инварианты:** одна согласованная GR lifetime/ownership политика на время работы
+DX12, без создания пула на каждый кадр/level; исключения и отказ `Submit`
+дренируются до любого GPU Execute; GPU resource creation/residency и изменение
+общего состояния остаются под контролем owner. Настоящая GPU работа может
+начинаться только после подтверждённого CPU job completion и в рамках
+существующих fence/quarantine правил. `JobGroup::Wait` не заменяет GPU fence.
+При малом числе packets использовать owner-only последовательный путь, без
+фиктивных задач. DX11/R4, physics, AI и audio не подключать к GR в этих
+милестоунах.
+
+**Связь с общим планом:** J1 относится к F4.0-B (первый игровой geometry
+frame), J2/J3 — к последующему росту F4.0/F4 renderer, J4 — к гейтам
+приёмки/оптимизации F4/F6. F4.0-C текстуры и F4-PBR могут исследоваться
+параллельно, но их игровая запись команд должна наследовать этот же
+GR/packet/allocator/lifetime контракт. Обозначения **F4.0-J0–J4** не
+переименовывают **DXR-G0–G5** (где G3 — RT-тени). Не принимать native
+DX12 Presentation, PBR и DXR на основании одного GR теста.
+
 ### F4-PBR — Physically Based Materials & Lighting (решение 2026-10-30; PLANNED)
 
 **Статус:** архитектурное направление закреплено; **реализация и GPU PASS не
