@@ -643,21 +643,30 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F5 — temporal и совместимость** | DX12-обёртки для выбранных DLSS/FSR, jitter, history reset, upscale input/output, прицел 3DSS, ImGui, Tracy/PIX/RenderDoc, HDR/ReShade там, где поддерживается. | DLSS/FSR fallback без device loss, нет ошибок resize/async lifetime и серьёзного ghosting. |
 | **F6 — стабилизация** | Измеренная настройка/расширение прототипа parallel command recording из F3.5, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
-**Статус подэтапов F на 2026-10-15** (ветка `prypiat`, HEAD `2f6ca66da`):
+**Актуальный статус подэтапов F — 2026-11-03** (ветка `prypiat`; сверка по
+исходникам, отдельным независимым review и Git-коммитам до `34952e711`):
 
-| Подэтап | Статус | Комментарий |
+| Подэтап | Актуальный статус | Подтверждение и оставшиеся ограничения |
 |---|---|---|
-| F0 — аудит | ✅ PASS | `docs/dx12-port-audit.md` |
-| F1 — проектирование | ✅ PASS | `docs/dx12-architecture-adr.md` |
-| F2 — bootstrap | ✅ PASS | F2.0 scaffold и F2.1-B собираются с 0 ошибок. GPU runtime подтверждён: Debug Layer + GBV + DRED активны, 6 036 ресайзов суммарно с 0 validation errors и 0 провалов, shutdown корректен, утечек нет (`ReportLiveObjects` через Microsoft DebugView v5.02, разбор владельцев). Documented limitations: обработка device removal — NOT TESTED (провокация TDR запрещена); полноценный игровой DX12 renderer отсутствует, есть только standalone bootstrap. CI для DX12 добавлен отдельным job `dx12-smoke-build` (build-only, без GPU runtime). Детали — `docs/dx12-f2-first-frame.md`, разделы F2.1-C.1, F2.1-C.2 и F2.1 Finalization |
-| F3 — ресурсы и геометрия | ⬜ NOT STARTED (снимок 2026-10-15) | Предложение по F3.0 — в `docs/dx12-f2-first-frame.md`; текущий прогресс проверять отдельно |
-| F3.5 — multithreaded foundation | ⬜ PLANNED (2026-10-16) | После подтверждения F3.1 / достаточного минимального 3D-пути; архитектурный прототип до F4 |
-| F4 — полный игровой renderer | ⬜ Не принят; F4.0-B1/B2/B3A — частичные подготовительные шаги | Реальный кадр в CoP на DX12 и затем полноценные raster-проходы |
-| F5 — temporal | ⬜ NOT STARTED | — |
-| F6 — стабилизация | ⬜ NOT STARTED | — |
+| **F0 — аудит** | ✅ PASS | `docs/dx12-port-audit.md`; исходный этап завершён. |
+| **F1 — проектирование** | ✅ PASS | `docs/dx12-architecture-adr.md`; DX12 architecture ADR принят. |
+| **F2 — bootstrap** | ✅ PASS для standalone | DX12 device/queue/fence, Debug Layer, GBV/DRED, resize/shutdown и smoke CI; исторические аппаратные результаты приведены в `docs/dx12-f2-first-frame.md`. Это **не** игровой renderer; реальный TDR NOT TESTED. |
+| **F3 — GPU-ресурсы и геометрия** | ✅ Реализовано в standalone; **не** игровой renderer | DX12 GPU geometry/registry, CB, indexed draw, F3.6A OGF/DDS asset bridge и реальные X-Ray ресурсы; результаты standalone Smoke и J1.1. Массовый игровой traversal и текстурный кадр ещё не приняты. |
+| **F3.5 — многопоточная основа** | ✅ Standalone foundation реализована | GR Job System на enkiTS, CPU preparation, immutable snapshots/packets, parallel D3D12 command-list recording и serial fallback. **В игровом GameDx12Bridge GR workers ещё не используются**; подключение запланировано на F4.0-J2/J3. Standalone perf ≠ игровой FPS. |
+| **F3.5.6C — material/PSO** | ◻ Отдельный PASS не подтверждён | Перед полным F4 проверить исходный material/PSO contract либо формально принять достаточный минимальный эквивалент. |
+| **F4.0-G1B — in-process bridge** | ✅ Source-only PASS, в Git | `bb62c00ac`: opt-in DX12 bridge, служебный single-list submit, без игрового Draw; full device lifetime diagnostics остаётся UNVERIFIED. |
+| **F4.0-J1.1 — real-asset GPU Draw** | ✅ Независимый standalone GPU PASS, в Git | `a1c751274`: Visual 9 и 315 из настоящих `level` + `level.geom`, fence/readback/PNG и GBV; используется изолированный GPU adapter и тестовая камера, **не** игровой Draw. |
+| **F4.0-J1.2A — игровой geometry adapter** | ✅ Source-only + owner-side lifetime PASS, в Git | `c4a95c39`: VFS/geometry, world constants, lifecycle/epoch и quarantine, feature-off/on Release x64 PASS. Использованы cached sibling libraries: clean `Engine.sln`/Debug x64 NOT TESTED; полноценный игровой runtime не запускался. |
+| **F4.0-J1.2B — первый in-game Draw** | 🟡 **BLOCKED / NOT ACCEPTED** | Ещё нет принятого игрового DX12 RTV/depth/submit/readback и полного совместимого Jupiter payload/visual placement. R4 Present, G1-M parity, игровой level lifecycle NOT TESTED. **Следующий графический рубеж.** |
+| **F4 — полный игровой renderer** | ⬜ **НЕ ПРИНЯТ** | F4.0 не завершён: нужны настоящий игровой DX12 кадр, управляемая камера, depth/текстуры, затем основные raster-проходы и обязательные runtime/rollback проверки. |
+| **F5 — temporal / upscaling DX12** | ◻ Не принят / впереди | Игровой DX12 temporal history, jitter, DLSS/FSR integration и history reset не подтверждены. |
+| **F6 — стабилизация** | ◻ Не принят / впереди | Измерение реального игрового CPU/GPU frametime, memory residency и FPS; standalone profiling не является F6 PASS. |
 
-**Ближайшая работа по историческому снимку:** F3.0 — минимальный рендер 3D-геометрии. Если с тех пор выполнены F3.x GPU-гейты, свериться с актуальными коммитами/логами перед планированием F3.5. Новая запись не переоценивает уже выполненное.
-
+**Ближайшая работа:** F4.0-J1.2B — реальный DX12 render target/depth,
+`DrawIndexedInstanced`, owner submit/fence/readback в OGSR после восстановления
+совместимого level payload. Затем F4.0-J2/J3 — подключить существующий GR
+Job System к игровой CPU-подготовке и параллельной записи command lists.
+R4/DX11 сохраняется; ни F4.0, ни полный F4 пока не приняты.
 
 ### F3.2 — GR Job System: сначала только DX12 (решение 2026-10-18)
 
