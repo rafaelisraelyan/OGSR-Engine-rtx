@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-11-01 (V/R02 audit; независимая приёмка и Git-интеграция B3-B2B Round 6).
+> **Дата обновления планов:** 2026-11-03 (F4.0-J1.2A Round 2: независимый source-only PASS и Git-интеграция; J1.2B in-game Draw BLOCKED).
 > Исторические статусы A/B1/F/V и их даты оставлены как ранее зафиксированные
 > отчёты, а не результат новой проверки GPU/CI. Изменение roadmap **не означает**
 > реализации или тестирования добавленных этапов.
@@ -30,6 +30,8 @@ F4.0 развивать самостоятельный physically based material
 для DX12 raster: Legacy/Enhanced, THM/DDS и совместимая модель для будущего
 DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. F4-PBR ниже),
 но не готовый DX12 renderer; PBR не блокирует F4.0 и первые G3-тени.
+
+**Актуальный графический статус (2026-11-03):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — independently accepted standalone real-asset GPU Draw, source в Git (`a1c751274`); J1.2A Round 2 — independently accepted owner-side source/lifetime, код в Git (`c4a95c39`). **J1.2B: настоящий in-game DX12 Draw BLOCKED** из-за неполного совместимого игрового payload и отсутствующего игрового RTV/depth/submit/readback. F4.0 и GR game parallel recording **не приняты**. Подробности и ограничения — ниже.
 
 **Основные направления:**
 
@@ -811,7 +813,7 @@ streaming, оптимизация FPS. Их перенос остаётся в �
 Codex review после P1–P4; отдельный Claude B1–B5 patch получил
 `REQUEST CHANGES`. Ничего из этого не подтверждает завершение F4.0.
 
-### F4.0-G1B / J1 / J1.1 — статус 2026-11-02
+### F4.0-G1B / J1.1 — принятые промежуточные результаты
 
 - **F4.0-G1B Round 2.4 (source-only): принят.** Коммит
   `bb62c00ac3109464ff1304d3cfa46c014b10bf63`,
@@ -826,11 +828,12 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
   Debug Layer/GBV без ERROR/CORRUPTION и
   `GetDeviceRemovedReason() == S_OK`. Это isolated adapter с тестовой
   камерой, **не** игровой кадр.
-- **F4.0-J1.2 (in-game Draw): BLOCKED.** Полный совместимый Jupiter payload
+- **F4.0-J1.2B (in-game Draw): BLOCKED.** Полный совместимый Jupiter payload
   отсутствует: нет `level.ltx`, `level.cform`, `level.graph`/`level.ai`,
   `level.hom`, `level.spawn`/`level.game`/`level.gct` и подтверждённого
-  размещения visual. J1.2A source integration может продолжаться, но
-  in-game `DrawIndexedInstanced` не выполнен и не принят.
+  размещения visual. J1.2A уже принят как source-only milestone и внесён
+  в Git (подробности ниже); реальный игровой `DrawIndexedInstanced` ещё
+  не выполнен.
 - **R4 Present / G1-M parity: NOT TESTED.** F4.0 renderer не завершён;
   standalone GPU evidence не заменяет игровой runtime.
 
@@ -841,9 +844,14 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
   `feat(dx12): integrate Jupiter geometry with game bridge`: 6
   production/build-файлов. Закрыты P1 unknown completion/quarantine,
   visual ID 0, небезопасное Draw confirmation и epoch/generation reset.
-  Feature-off и feature-on project builds — PASS; CPU/adapter 17/17,
-  strict reader 114/114, lifecycle 26/26. Это source-only milestone,
-  **не** игровой DX12 renderer.
+  Независимый owner-side GPU lifetime/quarantine — PASS в проверенных
+  сценариях, без аппаратного TDR. Feature-off / feature-on Release x64
+  project builds — PASS (без / с импортом `d3d12.dll`); CPU adapter 17/17,
+  strict reader 114/114, visual ID 0 — 14/14, lifecycle 27/27, bridge
+  failure modes — 6/6. Использованы cached sibling libraries с
+  неподтверждённой полной ABI/commit-совместимостью: clean `Engine.sln`
+  и Debug x64 — NOT TESTED. Это source-only milestone, **не** игровой
+  DX12 renderer.
 - **F4.0-J1.2B (in-process DX12 render target/Draw): не принят,
   BLOCKED.** Реальный RTV/depth/Draw submission/readback внутри OGSR ещё
   не реализованы и не проверены. Полный совместимый Jupiter payload и
