@@ -834,6 +834,22 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
 - **R4 Present / G1-M parity: NOT TESTED.** F4.0 renderer не завершён;
   standalone GPU evidence не заменяет игровой runtime.
 
+### F4.0-J1.2A Round 2 — статус 2026-11-03
+
+- **F4.0-J1.2A Round 2 (source-only): принят.** Коммит
+  `c4a95c39e3e994e21b6768985b1005612ae5ec71`,
+  `feat(dx12): integrate Jupiter geometry with game bridge`: 6
+  production/build-файлов. Закрыты P1 unknown completion/quarantine,
+  visual ID 0, небезопасное Draw confirmation и epoch/generation reset.
+  Feature-off и feature-on project builds — PASS; CPU/adapter 17/17,
+  strict reader 114/114, lifecycle 26/26. Это source-only milestone,
+  **не** игровой DX12 renderer.
+- **F4.0-J1.2B (in-process DX12 render target/Draw): не принят,
+  BLOCKED.** Реальный RTV/depth/Draw submission/readback внутри OGSR ещё
+  не реализованы и не проверены. Полный совместимый Jupiter payload и
+  подтверждённый visual placement отсутствуют; R4 Present, G1-M parity и
+  игровой level lifecycle — NOT TESTED. F4.0 renderer не завершён.
+
 ### F4.0-JOBS — GR Job System в игровом DX12 renderer (решение 2026-11-02; PLANNED)
 
 **Решение:** повторно использовать **существующий GR Job System** (`ogsr_engine/Layers/JobSystem/`,
