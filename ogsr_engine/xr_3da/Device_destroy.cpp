@@ -5,6 +5,7 @@
 #include "IGame_Persistent.h"
 #include "xr_IOConsole.h"
 #include "xr_input.h"
+#include "GameDx12Bridge.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
 #include "GameCameraCaptureAdapter.h"
 #endif
@@ -24,6 +25,8 @@ void CRenderDevice::_Destroy(BOOL bKeepTextures)
 
 void CRenderDevice::Destroy(void)
 {
+    GameDx12Bridge_Shutdown();
+
     if (!b_is_Ready)
         return;
 
@@ -100,6 +103,8 @@ void CRenderDevice::Reset(bool precache)
     pInput->clip_cursor(true);
 
     seqDeviceReset.Process(rp_DeviceReset);
+
+    GameDx12Bridge_OnDeviceReset(dwWidth, dwHeight);
 
     if (dwWidth_before != dwWidth || dwHeight_before != dwHeight)
     {

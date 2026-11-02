@@ -10,6 +10,7 @@
 #include "xrLevel.h"
 #include "CameraManager.h"
 #include "xr_object.h"
+#include "GameDx12Bridge.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
 #include "GameCameraCaptureAdapter.h"
 #endif
@@ -31,6 +32,7 @@ IGame_Level::IGame_Level()
 
 IGame_Level::~IGame_Level()
 {
+    GameDx12Bridge_OnLevelTeardown();
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
     B2CameraCapture_OnLevelTeardownBegin();
 #endif
@@ -119,6 +121,7 @@ BOOL IGame_Level::Load(u32 dwNum)
     // Done
     FS.r_close(LL_Stream);
     bReady = true;
+    GameDx12Bridge_OnLevelReady(name().c_str());
     IR_Capture();
     Device.seqRender.Add(this);
     Device.seqFrame.Add(this);

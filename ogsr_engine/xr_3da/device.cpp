@@ -13,6 +13,7 @@
 #include "XR_IOConsole.h"
 #include "xr_ioc_cmd.h"
 #include "../xrGame/ingame_editors/embedded_editor_main.h"
+#include "GameDx12Bridge.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
 #include "GameCameraCaptureAdapter.h"
 #endif
@@ -267,6 +268,7 @@ void CRenderDevice::on_idle()
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
         B2CameraCapture_OnCameraFrameReady();
 #endif
+        GameDx12Bridge_OnFrame();
 
         const auto SecondThreadStartTime = std::chrono::high_resolution_clock::now();
 

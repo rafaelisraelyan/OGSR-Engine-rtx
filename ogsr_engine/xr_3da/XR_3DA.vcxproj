@@ -239,6 +239,18 @@
     <ClInclude Include="GameCameraCaptureDiagnostics.h" />
     <ClInclude Include="GameCameraCaptureExportPath.h" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
+    <Link>
+      <AdditionalDependencies>d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
+    <ClCompile Include="GameDx12Bridge.cpp" />
+    <ClInclude Include="GameDx12Bridge.h" />
+    <ClInclude Include="GameDx12BridgeCommandLine.h" />
+    <ClInclude Include="GameDx12BridgeDiagnostics.h" />
+    <ClInclude Include="GameDx12BridgeQuarantine.h" />
+  </ItemGroup>
   <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT)'=='true'">
     <ClCompile>
       <PreprocessorDefinitions>OGSR_ENABLE_EXPERIMENTAL_DX12_B3_CAMERA_EXPORT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
