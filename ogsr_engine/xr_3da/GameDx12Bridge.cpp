@@ -4,6 +4,7 @@
 #include "GameDx12BridgeDiagnostics.h"
 #include "GameDx12BridgeQuarantine.h"
 #include "GameDx12LevelGeometry.h"
+#include "GameDx12OffscreenPass.h"
 
 #include "igame_level.h"
 
@@ -87,6 +88,7 @@ struct BridgeStateData
     // frame preparation stay inactive until a full Jupiter payload provides a
     // validated visual placement.
     GameDx12LevelGeometry12 geometry;
+    GameDx12OffscreenPass12 offscreen;
 
     uint64_t fenceValue = 0;
     uint64_t levelSession = 0;
@@ -198,6 +200,7 @@ void QuarantineObjects()
     g_bridgeQuarantine.device = BridgeDetachToQuarantine(state.device);
     g_bridgeQuarantine.fenceEvent = state.fenceEvent;
     state.fenceEvent = nullptr;
+    state.offscreen.Quarantine(g_bridgeQuarantine);
 
     state.quarantined = true;
     state.gpuUnknown = true;
@@ -215,6 +218,7 @@ void QuarantineForGeometryUnknown(const char* stage)
         "bridge ownership must be retained", stage != nullptr ? stage : "?");
     if (!state.objectsReleased)
         QuarantineObjects();
+    state.offscreen.Quarantine(g_bridgeQuarantine);
     // Monotonic owner-visible state. Even if the bridge quarantine was
     // already populated, nothing may be released or resubmitted.
     state.quarantined = true;
@@ -236,6 +240,7 @@ void ReleaseObjects()
     }
 
     state.objectsReleased = true;
+    state.offscreen.Release();
     state.infoQueue.Reset();
     state.list.Reset();
     state.allocator.Reset();
@@ -248,6 +253,41 @@ void ReleaseObjects()
     state.queue.Reset();
     state.device.Reset();
     state.infoQueueAvailable = false;
+}
+
+// A command list that was Reset successfully belongs to the current
+// diagnostic invocation. If recording fails before ExecuteCommandLists, the
+// only legal recovery is to close that list and discard its commands. A list
+// that cannot be closed is poisoned; the bridge must not return to Ready.
+void AbortUnsubmittedDiagnosticState(BridgeStateData& state) noexcept
+{
+    std::string ignored;
+    state.geometry.AbortRecordedDraw(ignored);
+    state.offscreen.AbortUnsubmittedFrame();
+}
+
+bool RecoverUnsubmittedDiagnosticList(BridgeStateData& state,
+                                      const char* stage,
+                                      std::string& reason)
+{
+    AbortUnsubmittedDiagnosticState(state);
+    if (state.list == nullptr)
+    {
+        DisableTerminal("diagnostic command list is missing");
+        reason = "diagnostic command list is missing";
+        return false;
+    }
+    const HRESULT hr = state.list->Close();
+    if (FAILED(hr))
+    {
+        Msg("ph_dx12_bridge: diagnostic list recovery failed stage='%s' "
+            "hr=0x%08X",
+            stage != nullptr ? stage : "?", static_cast<unsigned>(hr));
+        DisableTerminal("diagnostic command list recovery");
+        reason = "diagnostic command list recovery failed";
+        return false;
+    }
+    return true;
 }
 
 class D3D12InfoQueueAdapter final : public IBridgeInfoQueue
@@ -1204,6 +1244,165 @@ void GameDx12Bridge_OnFrame()
         LogCamera(view, projection, fullTransform, hash);
 }
 
+bool GameDx12Bridge_RenderOffscreenDiagnostic(
+    const DirectX::XMFLOAT4X4& logicalViewProjection,
+    const DirectX::XMFLOAT4X4& logicalWorld,
+    const wchar_t* pngPath,
+    std::string& reason)
+{
+    if (!EnsureOwnerThread("offscreen_diagnostic"))
+        return false;
+    BridgeStateData& state = State();
+    if (state.state != BridgeState::Ready || !state.levelActive ||
+        state.device == nullptr || state.queue == nullptr ||
+        state.fence == nullptr || state.fenceEvent == nullptr ||
+        state.allocator == nullptr || state.list == nullptr)
+    {
+        reason = "bridge is not ready for offscreen diagnostic";
+        return false;
+    }
+    if (!state.geometry.IsLoaded() ||
+        state.geometry.GpuCompletionUnknown() ||
+        state.geometry.IsDrawRecorded())
+    {
+        reason = "geometry is not reusable for offscreen diagnostic";
+        return false;
+    }
+    if (state.width == 0 || state.height == 0)
+    {
+        reason = "game viewport is unavailable";
+        return false;
+    }
+    if (state.fenceValue == std::numeric_limits<uint64_t>::max())
+    {
+        reason = "fence value overflow before diagnostic draw";
+        return false;
+    }
+
+    if (state.offscreen.IsCreated() &&
+        (state.offscreen.Width() != state.width ||
+         state.offscreen.Height() != state.height))
+    {
+        if (state.geometry.GpuCompletionUnknown() ||
+            state.geometry.IsDrawRecorded())
+        {
+            reason = "cannot resize offscreen target with pending GPU work";
+            return false;
+        }
+        state.offscreen.Release();
+    }
+    if (!state.offscreen.IsCreated() &&
+        !state.offscreen.Create(state.device.Get(), state.width, state.height,
+                                reason))
+        return false;
+
+    if (!state.geometry.PrepareFrame(logicalViewProjection, logicalWorld,
+                                     reason))
+        return false;
+
+    HRESULT hr = state.allocator->Reset();
+    if (FAILED(hr))
+    {
+        reason = "diagnostic allocator reset failed";
+        return false;
+    }
+    hr = state.list->Reset(state.allocator.Get(), nullptr);
+    if (FAILED(hr))
+    {
+        reason = "diagnostic command list reset failed";
+        return false;
+    }
+
+    const float clearColor[4] = {0.03f, 0.05f, 0.09f, 1.0f};
+    if (!state.offscreen.RecordBegin(state.list.Get(), clearColor, reason))
+    {
+        RecoverUnsubmittedDiagnosticList(state, "record-begin", reason);
+        return false;
+    }
+    if (!state.geometry.RecordDraw(state.list.Get(), reason))
+    {
+        RecoverUnsubmittedDiagnosticList(state, "record-draw", reason);
+        return false;
+    }
+    if (!state.offscreen.RecordEnd(state.list.Get(), reason))
+    {
+        RecoverUnsubmittedDiagnosticList(state, "record-end", reason);
+        return false;
+    }
+    hr = state.list->Close();
+    if (FAILED(hr))
+    {
+        AbortUnsubmittedDiagnosticState(state);
+        DisableTerminal("diagnostic command list close failed");
+        reason = "diagnostic command list close failed";
+        return false;
+    }
+
+    const uint64_t expected = state.fenceValue + 1;
+    ID3D12CommandList* lists[] = {state.list.Get()};
+    state.queue->ExecuteCommandLists(1, lists);
+    state.gpuWorkSubmitted = true;
+
+    // Mark is intentionally after ExecuteCommandLists: from here on the work
+    // may be in flight, so a failure must quarantine rather than abort.
+    if (!state.geometry.MarkDrawSubmitted(expected, state.fence.Get(),
+                                          state.device.Get(), reason))
+    {
+        QuarantineForGeometryUnknown("diagnostic-mark-submitted");
+        return false;
+    }
+    state.fenceValue = expected;
+    hr = state.queue->Signal(state.fence.Get(), expected);
+    if (FAILED(hr))
+    {
+        QuarantineForGeometryUnknown("diagnostic-signal");
+        reason = "diagnostic fence signal failed";
+        return false;
+    }
+    if (state.fence->GetCompletedValue() < expected)
+    {
+        hr = state.fence->SetEventOnCompletion(expected, state.fenceEvent);
+        if (FAILED(hr))
+        {
+            QuarantineForGeometryUnknown("diagnostic-fence-event");
+            reason = "diagnostic fence event failed";
+            return false;
+        }
+        if (WaitForSingleObject(state.fenceEvent, kServiceFenceTimeoutMs) !=
+            WAIT_OBJECT_0)
+        {
+            QuarantineForGeometryUnknown("diagnostic-fence-wait");
+            reason = "diagnostic fence wait failed";
+            return false;
+        }
+    }
+    if (state.fence->GetCompletedValue() < expected ||
+        state.device->GetDeviceRemovedReason() != S_OK)
+    {
+        QuarantineForGeometryUnknown("diagnostic-completion");
+        reason = "diagnostic GPU completion unconfirmed";
+        return false;
+    }
+    if (!state.geometry.OnDrawCompleted(expected, state.fence.Get(),
+                                        state.device.Get(), reason))
+    {
+        QuarantineForGeometryUnknown("diagnostic-draw-completion");
+        return false;
+    }
+    // Exact Draw fence and device status are confirmed here. Only now may the
+    // offscreen pass forget its submitted frame before CPU readback.
+    state.offscreen.CommitSubmittedFrame();
+    if (!state.offscreen.Readback(reason))
+        return false;
+    if (pngPath != nullptr && !state.offscreen.SavePng(pngPath, reason))
+        return false;
+
+    Msg("ph_dx12_geometry: offscreen diagnostic submitted fence=%llu "
+        "size=%ux%u",
+        static_cast<unsigned long long>(expected), state.width, state.height);
+    return true;
+}
+
 void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
 {
     if (!EnsureOwnerThread("device_reset"))
@@ -1229,7 +1428,7 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
             QuarantineForGeometryUnknown("device_reset");
     }
     Msg("ph_dx12_bridge: device reset width=%u height=%u epoch=%llu "
-        "(no offscreen resources in G1)",
+        "(offscreen target resized on next diagnostic)",
         width, height,
         static_cast<unsigned long long>(state.captureEpoch));
 }

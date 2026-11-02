@@ -30,6 +30,13 @@ struct BridgeQuarantineStorage
     IUnknown* list = nullptr;
     IUnknown* infoQueue = nullptr;
     HANDLE fenceEvent = nullptr;
+
+    // J1.2B owner-side offscreen pass resources.
+    IUnknown* offscreenColor = nullptr;
+    IUnknown* offscreenDepth = nullptr;
+    IUnknown* offscreenReadback = nullptr;
+    IUnknown* offscreenRtvHeap = nullptr;
+    IUnknown* offscreenDsvHeap = nullptr;
 };
 
 extern BridgeQuarantineStorage g_bridgeQuarantine;

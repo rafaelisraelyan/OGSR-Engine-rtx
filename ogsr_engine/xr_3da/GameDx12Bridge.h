@@ -18,6 +18,9 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include <DirectXMath.h>
+#include <string>
+
 void GameDx12Bridge_OnLevelReady(const char* levelName);
 void GameDx12Bridge_OnLevelTeardown();
 void GameDx12Bridge_OnFrame();
@@ -25,6 +28,15 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height);
 void GameDx12Bridge_Shutdown();
 
 bool GameDx12Bridge_IsEnabled();
+
+// J1.2B owner-only diagnostic render. logicalViewProjection and logicalWorld
+// must come from the real game camera/placement; this function does not
+// synthesize either. pngPath may be null to skip the PNG save.
+bool GameDx12Bridge_RenderOffscreenDiagnostic(
+    const DirectX::XMFLOAT4X4& logicalViewProjection,
+    const DirectX::XMFLOAT4X4& logicalWorld,
+    const wchar_t* pngPath,
+    std::string& reason);
 
 #else // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 

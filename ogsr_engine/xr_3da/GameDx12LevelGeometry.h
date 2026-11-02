@@ -74,18 +74,25 @@ public:
                       const DirectX::XMFLOAT4X4& logicalWorld,
                       std::string& reason);
 
-    // Records the single indexed draw on a caller-owned list. J1.2A has no
-    // public submission-confirmation API: a recorded draw keeps the registry
-    // and constants held until a future J1.2B token/fence contract is added.
+    // Records the single indexed draw on a caller-owned list. Submission is a
+    // separate owner step: MarkDrawSubmitted captures the exact owner fence and
+    // device together with the positive fence value. OnDrawCompleted accepts
+    // only that captured COM identity and verifies it before releasing the
+    // draw lifetime.
     bool RecordDraw(ID3D12GraphicsCommandList* list,
                     std::string& reason);
+    bool MarkDrawSubmitted(uint64_t fenceValue, ID3D12Fence* fence,
+                           ID3D12Device* device, std::string& reason);
+    bool OnDrawCompleted(uint64_t fenceValue, ID3D12Fence* fence,
+                         ID3D12Device* device, std::string& reason);
+    // Safe only before submission. Clears a recorded-but-never-submitted draw.
+    bool AbortRecordedDraw(std::string& reason);
 
     void OnLevelTeardown(uint64_t nextEpoch);
     void OnDeviceReset(uint64_t nextEpoch);
 
     // Owner-visible monotonic lifetime state. True after an unknown upload/
     // draw completion or when a recorded draw has no verified completion.
-    // Once true it never returns to false on this object.
     bool GpuCompletionUnknown() const noexcept
     {
         return m_gpuUnknown || m_drawRecorded ||
@@ -94,13 +101,16 @@ public:
 
     // Returns true only when the owner confirms that no GPU work remains.
     // Otherwise the registry and constants are moved to process-lifetime
-    // quarantine and are never released. A recorded draw always quarantines:
-    // J1.2A deliberately has no way to assert Draw completion.
+    // quarantine and are never released. A recorded draw always quarantines
+    // unless OnDrawCompleted() already verified its exact fence.
     void Shutdown(bool gpuCompletionConfirmed);
 
     bool IsLoaded() const { return m_loaded; }
     bool HasPreparedFrame() const { return m_prepared; }
     bool IsDrawRecorded() const { return m_drawRecorded; }
+    bool IsDrawSubmitted() const { return m_drawSubmitted; }
+    bool IsDrawCompleted() const { return m_drawCompleted; }
+    uint64_t DrawFenceValue() const { return m_drawFenceValue; }
     uint32_t VisualId() const { return m_visualId; }
     uint32_t IndexCount() const { return m_assetIndexCount; }
     uint64_t LevelSession() const { return m_levelSession; }
@@ -141,6 +151,14 @@ private:
     bool m_loaded = false;
     bool m_prepared = false;
     bool m_drawRecorded = false;
+    bool m_drawSubmitted = false;
+    bool m_drawCompleted = false;
+    uint64_t m_drawFenceValue = 0;
+    // Captured only for the active submission. These references are released
+    // on confirmed completion or pre-submit abort; they are deliberately kept
+    // while completion is unknown so geometry cannot outlive its owner objects.
+    ComPtr<ID3D12Fence> m_drawFence;
+    ComPtr<ID3D12Device> m_drawDevice;
     bool m_uploadSubmitted = false;
     bool m_uploadConfirmed = false;
     bool m_gpuUnknown = false;

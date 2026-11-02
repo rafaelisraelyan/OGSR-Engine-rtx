@@ -447,7 +447,78 @@ bool GameDx12LevelGeometry12::RecordDraw(ID3D12GraphicsCommandList* list,
     if (!m_registry.RecordDraw(list, m_resolved.draws[0], m_frameCBVA,
                                m_objectCBVA))
         return Fail(reason, "level geometry RecordDraw failed");
+    m_drawFence.Reset();
+    m_drawDevice.Reset();
     m_drawRecorded = true;
+    m_drawSubmitted = false;
+    m_drawCompleted = false;
+    m_drawFenceValue = 0;
+    return true;
+}
+
+bool GameDx12LevelGeometry12::MarkDrawSubmitted(
+    uint64_t fenceValue, ID3D12Fence* fence, ID3D12Device* device,
+    std::string& reason)
+{
+    m_lastError.clear();
+    if (!m_drawRecorded || m_drawSubmitted || m_drawCompleted)
+        return Fail(reason, "no recorded draw awaiting submission");
+    if (fence == nullptr || device == nullptr)
+        return Fail(reason, "missing owner fence or device");
+    if (m_drawFence != nullptr || m_drawDevice != nullptr)
+        return Fail(reason, "draw already owns submission objects");
+    if (!m_uploadConfirmed || fenceValue == 0 ||
+        fenceValue <= m_uploadFenceValue)
+        return Fail(reason, "invalid Draw fence value");
+
+    m_drawFence = fence;
+    m_drawDevice = device;
+    m_drawSubmitted = true;
+    m_drawFenceValue = fenceValue;
+    return true;
+}
+
+bool GameDx12LevelGeometry12::OnDrawCompleted(
+    uint64_t fenceValue, ID3D12Fence* fence, ID3D12Device* device,
+    std::string& reason)
+{
+    m_lastError.clear();
+    if (!m_drawRecorded || !m_drawSubmitted || m_drawCompleted)
+        return Fail(reason, "no submitted draw awaiting completion");
+    if (fence == nullptr || device == nullptr)
+        return Fail(reason, "missing owner fence or device");
+    if (fence != m_drawFence.Get() || device != m_drawDevice.Get())
+        return Fail(reason, "Draw fence/device identity does not match submission");
+    if (fenceValue == 0 || fenceValue != m_drawFenceValue ||
+        fenceValue <= m_uploadFenceValue)
+        return Fail(reason, "Draw fence value does not match submission");
+    if (fence->GetCompletedValue() < fenceValue)
+        return Fail(reason, "Draw fence is not complete");
+    if (device->GetDeviceRemovedReason() != S_OK)
+        return Fail(reason, "device removed before Draw completion");
+
+    m_drawFence.Reset();
+    m_drawDevice.Reset();
+    m_drawRecorded = false;
+    m_drawSubmitted = false;
+    m_drawCompleted = true;
+    m_drawFenceValue = 0;
+    return true;
+}
+
+bool GameDx12LevelGeometry12::AbortRecordedDraw(std::string& reason)
+{
+    m_lastError.clear();
+    if (!m_drawRecorded || m_drawCompleted)
+        return Fail(reason, "no recorded draw to abort");
+    if (m_drawSubmitted)
+        return Fail(reason, "draw already submitted; abort is unsafe");
+    m_drawFence.Reset();
+    m_drawDevice.Reset();
+    m_drawRecorded = false;
+    m_drawSubmitted = false;
+    m_drawCompleted = false;
+    m_drawFenceValue = 0;
     return true;
 }
 
@@ -458,8 +529,9 @@ void GameDx12LevelGeometry12::OnLevelTeardown(uint64_t nextEpoch)
     m_loaded = false;
     if (m_drawRecorded)
     {
-        // No public submission-confirmation API exists in J1.2A. Keep the
-        // registry/constants held; Shutdown() must quarantine them.
+        // A recorded or submitted draw has no verified completion on this
+        // teardown path. Keep the registry/constants held; Shutdown() must
+        // quarantine them.
         m_generation = 0;
         return;
     }
@@ -510,7 +582,12 @@ void GameDx12LevelGeometry12::ReleaseGpu()
     m_asset = {};
     m_resolved = {};
     m_prepared = false;
+    m_drawFence.Reset();
+    m_drawDevice.Reset();
     m_drawRecorded = false;
+    m_drawSubmitted = false;
+    m_drawCompleted = false;
+    m_drawFenceValue = 0;
     m_uploadSubmitted = false;
     m_uploadConfirmed = false;
     m_loaded = false;
@@ -535,10 +612,16 @@ void GameDx12LevelGeometry12::QuarantineGpu()
     m_registry.Quarantine(g_geometryQuarantine);
     g_geometryQuarantine.occupied = true;
 
+    // Captured fence/device ComPtrs stay alive intentionally. If completion is
+    // unknown they must not be released here; the bridge quarantine retains the
+    // owner references until process exit.
     m_asset = {};
     m_resolved = {};
     m_prepared = false;
     m_drawRecorded = false;
+    m_drawSubmitted = false;
+    m_drawCompleted = false;
+    m_drawFenceValue = 0;
     m_uploadSubmitted = false;
     m_uploadConfirmed = false;
     m_loaded = false;

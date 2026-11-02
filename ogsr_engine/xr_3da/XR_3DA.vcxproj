@@ -244,7 +244,7 @@
       <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
@@ -253,11 +253,16 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
+    <ClCompile Include="GameDx12OffscreenPass.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
     <ClInclude Include="GameDx12Bridge.h" />
     <ClInclude Include="GameDx12BridgeCommandLine.h" />
     <ClInclude Include="GameDx12BridgeDiagnostics.h" />
     <ClInclude Include="GameDx12BridgeQuarantine.h" />
     <ClInclude Include="GameDx12LevelGeometry.h" />
+    <ClInclude Include="GameDx12OffscreenPass.h" />
     <ClCompile Include="..\Layers\xrRenderDX12\dx12xraylevelgeometry.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
