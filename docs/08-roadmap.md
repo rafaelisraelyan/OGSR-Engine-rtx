@@ -811,6 +811,29 @@ streaming, оптимизация FPS. Их перенос остаётся в �
 Codex review после P1–P4; отдельный Claude B1–B5 patch получил
 `REQUEST CHANGES`. Ничего из этого не подтверждает завершение F4.0.
 
+### F4.0-G1B / J1 / J1.1 — статус 2026-11-02
+
+- **F4.0-G1B Round 2.4 (source-only): принят.** Коммит
+  `bb62c00ac3109464ff1304d3cfa46c014b10bf63`,
+  `feat(dx12): add experimental in-process game bridge`: 10
+  production/build-файлов, 2254 insertions. Это source-only milestone:
+  in-process bridge не является игровым DX12 renderer.
+- **F4.0-J1.1 (standalone real-asset GPU Draw): принят независимым review.**
+  Source-only коммит `a1c75127427bc05597adba0711f8092cad5de256` добавляет
+  `dx12xraylevelasset.h/.cpp`. Visual 9 (545/1314/438) и Visual 315
+  (90/333/111) отрисованы из strict `level` + `level.geom` через
+  существующий GPU registry. Подтверждены fence 2, readback/PNG SHA-256,
+  Debug Layer/GBV без ERROR/CORRUPTION и
+  `GetDeviceRemovedReason() == S_OK`. Это isolated adapter с тестовой
+  камерой, **не** игровой кадр.
+- **F4.0-J1.2 (in-game Draw): BLOCKED.** Полный совместимый Jupiter payload
+  отсутствует: нет `level.ltx`, `level.cform`, `level.graph`/`level.ai`,
+  `level.hom`, `level.spawn`/`level.game`/`level.gct` и подтверждённого
+  размещения visual. J1.2A source integration может продолжаться, но
+  in-game `DrawIndexedInstanced` не выполнен и не принят.
+- **R4 Present / G1-M parity: NOT TESTED.** F4.0 renderer не завершён;
+  standalone GPU evidence не заменяет игровой runtime.
+
 ### F4.0-JOBS — GR Job System в игровом DX12 renderer (решение 2026-11-02; PLANNED)
 
 **Решение:** повторно использовать **существующий GR Job System** (`ogsr_engine/Layers/JobSystem/`,
@@ -827,11 +850,12 @@ preparation и реальная параллельная запись через
 `ExecuteCommandLists`; F3.5.3B и F3.5.5C). В проекте
 `xrRender_R5_DX12.vcxproj` есть `ProjectReference` на `gr_job_system`,
 но наличие build-зависимости **не доказывает игровое runtime-использование**.
-Изолированный in-process `GameDx12Bridge` G1B пока выполняет только
-служебный single-list submit без игрового draw и без GR workers. G1B Round 2.3
-ожидает независимой source-приёмки; игровой Jupiter runtime заблокирован
-недостающим совместимым level payload. **Ни G1B, ни игровой parallel recording
-не объявлены принятыми.**
+Изолированный in-process `GameDx12Bridge` G1B выполняет только
+служебный single-list submit без игрового draw и без GR workers. G1B
+Round 2.4 source-only принят (`bb62c00ac`), J1.1 standalone GPU принят
+отдельно (`a1c751274`); игровой Jupiter runtime по-прежнему заблокирован
+недостающим совместимым level payload. **GR parallel recording не объявлен
+принятым; принятые G1B/J1.1 не являются in-game renderer.**
 
 | Гейт | Содержание и порядок | Доказательство |
 |---|---|---|
