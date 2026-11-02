@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-11-03 (F4.0-J1.2A Round 2: независимый source-only PASS и Git-интеграция; J1.2B in-game Draw BLOCKED).
+> **Дата обновления планов:** 2026-11-03 (G-CLAS/PTLAS — экспериментальное направление DXR; J1.2B source-only PASS в Git, игровой DX12 Draw BLOCKED).
 > Исторические статусы A/B1/F/V и их даты оставлены как ранее зафиксированные
 > отчёты, а не результат новой проверки GPU/CI. Изменение roadmap **не означает**
 > реализации или тестирования добавленных этапов.
@@ -24,6 +24,13 @@ Edition* (4A Games) — как исследовательский ориенти
 полного переноса освещения, прозрачности, HUD, постобработки и DXR.
 Это **план**, а не утверждение о готовом игровом DX12-рендерере; точные
 зависимости реальных ассетов и игрового frame loop сначала проверить аудитом.
+
+**G-CLAS / PTLAS — принятое направление исследований (решение 2026-11-03):**
+в будущей DXR-геометрии исследовать **CLAS → Cluster BLAS** и **Partitioned TLAS**
+для больших уровней, LOD, растительности и изменяющихся инстансов. Обычные
+**BLAS/TLAS остаются обязательным базовым и fallback-путём**; CLAS/PTLAS
+не реализованы, их экономия VRAM и ускорение в OGSR не доказаны. Исследование
+**не блокирует F4.0-J1.2B, первый игровой Draw и G1–G3**.
 
 **F4-PBR — принятое направление (решение 2026-10-30):** после раннего
 F4.0 развивать самостоятельный physically based material/lighting path
@@ -1033,12 +1040,58 @@ F4-PBR.0 можно проводить параллельно F4.0, но F4-PBR.
 | Подэтап | Работа | Гейт / результат |
 |---|---|---|
 | **G0 — capabilities** | На DX12-устройстве запросить `D3D12_FEATURE_D3D12_OPTIONS5` / `RaytracingTier`; проверить `ID3D12Device5` / `ID3D12GraphicsCommandList4` и fallback на GPU без DXR. | Диагностика точного tier и понятное отключение RT при отсутствии поддержки. |
-| **G1 — геометрия для RT** | Сопоставить реальный поток vertex/index с RT geometry. Построить BLAS для **небольшого статического** набора, TLAS для инстансов. Проверить ресурсы, lifetime, scratch buffers, transforms. | Видимая тестовая сцена с валидными BLAS/TLAS; RenderDoc/PIX & validation. |
+| **G1 — геометрия для RT** | Сопоставить реальный поток vertex/index с RT geometry. Построить обычный BLAS для **небольшого статического** набора, TLAS для инстансов. Проверить ресурсы, lifetime, scratch buffers, transforms; этот путь сохраняется базой и fallback для G-CLAS. | Видимая тестовая сцена с валидными BLAS/TLAS; RenderDoc/PIX & validation. |
 | **G2 — минимальный трассировочный проход** | DXC/SM6, raygen/miss/closest-hit, shader tables/RTPSO, `DispatchRays` в простую UAV-маску. | Предсказуемые hits/misses и стабильная работа без серьёзных ошибок. |
 | **G3 — RT-тени** | Начать с одного света/ограниченной геометрии, интеграция с существующим deferred lighting. Временная/пространственная фильтрация при необходимости. | Включаемые RT-тени рядом с текущим CSM, сопоставимые кадры и GPU ms. |
 | **G4 — динамика и материалы** | Skinned/dynamic objects, обновление/rebuild BLAS/TLAS, alpha-tested foliage, invalidation, emissive и material lookup. | Нет существенных артефактов при анимации NPC/растительности и движении камеры. |
 | **G5 — дополнительные эффекты (опц.)** | Только после G3/G4: **RT-отражения как отдельный проверяемый рубеж**, затем по отдельному решению diffuse GI и denoise; DLSS Ray Reconstruction — отдельная интеграция при проверенной поддержке SDK/API. | Для RT-отражений отдельно зафиксированы качество, GPU ms, CPU ms и frametime. После работающих RT-теней и отражений — переход к H1 (аудит многопоточности всего движка). Каждый дополнительный эффект имеет собственный performance budget. |
 
+### G-CLAS — Clustered Geometry & Partitioned TLAS (решение 2026-11-03; PLANNED)
+
+**Статус:** архитектурное исследование / будущий эксперимент, **NOT IMPLEMENTED /
+NOT TESTED**. Нельзя подменять принятый обычный DXR BLAS/TLAS экспериментальным
+путём. Приоритеты остаются: реальный игровой DX12-кадр F4.0, обычные G0–G2,
+затем RT-тени G3; G-CLAS не является условием принятия G1/G3 или запуска игры.
+
+**Две независимые оптимизации:**
+
+- **CLAS (Cluster Level Acceleration Structure)** хранит компактные кластеры
+  треугольников. Из нескольких CLAS строится **Cluster BLAS**; отдельный CLAS
+  **нельзя помещать прямо в TLAS**. По спецификации DXR2 один CLAS ограничен
+  256 треугольниками и 256 уникальными индексами вершин. Обычные BLAS и
+  Cluster BLAS могут сосуществовать в одном наборе RT-инстансов.
+- **PTLAS (Partitioned TLAS)** — альтернативная верхнеуровневая структура:
+  частичное обновление пространственных групп инстансов вместо перестроения
+  обычного TLAS целиком. PTLAS не является обязательной частью CLAS и
+  исследуется отдельно, в том числе на обычных BLAS.
+- **Ожидаемый эффект — гипотеза:** сокращение AS build/rebuild, повторное
+  использование кластеров и экономия части памяти. Требуются реальные
+  профили: scratch и дополнительные метаданные могут вырасти, ray traversal
+  может замедлиться; нельзя обещать проценты экономии VRAM/FPS без замеров.
+
+| Подэтап | Содержание | Acceptance gate |
+|---|---|---|
+| **G-CLAS.0 — Capability/SDK Audit** | Проверить текущую официальную DXR2 спецификацию и статус preview, Agility SDK/драйвер/DXC, `ClustersAndPTLASSupported`, tier/SM, поддерживаемые DXR pipeline/RayQuery flags. Выделить отдельный opt-in эксперимент: не обновлять основной shipping SDK ради preview. | Матрица GPU/драйвер/API и feature guards; unsupported устройства и обычный BLAS/TLAS гарантированно работают; никаких новых зависимостей DX11/R4. |
+| **G-CLAS.1 — Реальная геометрия OGSR** | После работающего обычного G1 BLAS/TLAS сравнить на доступных совместимых реальных static/terrain мешах: classic BLAS+TLAS против CLAS→Cluster BLAS+TLAS; сохранить geometry/material IDs и hit-результат. | Сопоставимые ray hits, изображения, GPU Debug Layer/GBV; build/update GPU ms, trace GPU ms, VRAM/AS size, peak scratch и CPU submission; без допущения об ускорении. |
+| **G-CLAS.2 — LOD, foliage и dynamic** | Отдельно исследовать крупные outdoor-секции, vegetation LOD, wind/animation, streaming и reuse кластеров. Skinned NPC сравнивать с классическим BLAS update/rebuild; не считать CLAS автоматически оптимальным для всех объектов. | Одни сцены, камеры и бюджет: cold/warm build, rebuild frequency, VRAM/residency, GPU time, визуальная и hit-корректность, teardown/reset/epoch. |
+| **G-CLAS.3 — PTLAS partitions** | Отдельно сравнить TLAS rebuild/update с PTLAS на статичных секторах и меняющихся инстансах (NPC, foliage, LOD, streaming); оценить гранулярность partitions и lifetime. | Количество перестроенных partitions, build/update/trace GPU ms, память/scratch, корректность spatial transforms, partial updates, level reload; fallback на TLAS. |
+| **G-CLAS.4 — Hybrid decision / optional integration** | В RT Geometry Manager выбирать Classic BLAS/TLAS или Cluster BLAS и/или PTLAS по capability, типу геометрии и профилю. Сохранить единые material/geometry IDs, owner fence/quarantine и GR Job System для CPU preparation без второго scheduler. | ADR с порогами на основании измерений и независимым review; стабильные RT-тени G3 и DX12 raster, отсутствие новых DX11/R4 регрессий. Если преимущества нет — оставить classic. |
+
+**Риски и инварианты:** lifetime каждого CLAS должен переживать все Cluster BLAS,
+которые на него ссылаются, и незавершённую GPU-работу; соблюдать AS barriers,
+scratch allocation, epoch/generation, residency и owner fence/quarantine.
+Разделить CPU-планирование существующим GR Job System и GPU-driven indirect
+RTAS operations; **не** создавать второй scheduler. Не требовать массовой
+переконвертации оригинальных OGF/DDS/THM. Отладка и perf должны охватывать
+включение/отключение RT, game level teardown/reload и unsupported GPU.
+
+**Официальные источники (документация, а не результат реализации):**
+
+- [Microsoft: DXR Functional Spec, Part 2 — Clustered Geometry / PTLAS](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing2.html).
+- [Microsoft: DXR Functional Spec — tiers, capabilities, BLAS/TLAS](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html).
+- [NVIDIA RTX Mega Geometry SDK — исследовательский референс](https://github.com/NVIDIA-RTX/RTXMG).
+
+---
 ### X-Ray DX12/DXR — Hybrid Rendering Architecture (решение 2026-10-22)
 
 **Статус:** ✅ **принято как направление проектирования; НЕ реализовано и НЕ
