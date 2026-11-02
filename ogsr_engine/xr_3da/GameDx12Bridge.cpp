@@ -3,6 +3,7 @@
 #include "GameDx12BridgeCommandLine.h"
 #include "GameDx12BridgeDiagnostics.h"
 #include "GameDx12BridgeQuarantine.h"
+#include "GameDx12LevelGeometry.h"
 
 #include "igame_level.h"
 
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -79,6 +81,12 @@ struct BridgeStateData
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12InfoQueue> infoQueue;
+
+    // J1.2A owner-side geometry state. The bridge owns the device/queue/fence
+    // and the adapter owns only the level registry/constants. Loading and
+    // frame preparation stay inactive until a full Jupiter payload provides a
+    // validated visual placement.
+    GameDx12LevelGeometry12 geometry;
 
     uint64_t fenceValue = 0;
     uint64_t levelSession = 0;
@@ -172,7 +180,13 @@ void QuarantineObjects()
     BridgeStateData& state = State();
     if (!BridgeQuarantineBegin(g_bridgeQuarantine))
     {
-        Msg("ph_dx12_bridge: duplicate quarantine attempt ignored");
+        Msg("ph_dx12_bridge: duplicate quarantine attempt ignored; "
+            "objects remain owned by the first quarantine");
+        state.quarantined = true;
+        state.gpuUnknown = true;
+        state.objectsReleased = true;
+        state.state = BridgeState::Disabled;
+        state.levelActive = false;
         return;
     }
 
@@ -189,8 +203,25 @@ void QuarantineObjects()
     state.gpuUnknown = true;
     state.objectsReleased = true;
     state.state = BridgeState::Disabled;
+    state.levelActive = false;
     Msg("ph_dx12_bridge: GPU completion unknown; DX12 ownership is "
         "quarantined until process exit (no Release, no CloseHandle)");
+}
+
+void QuarantineForGeometryUnknown(const char* stage)
+{
+    BridgeStateData& state = State();
+    Msg("ph_dx12_bridge: geometry GPU completion unknown at stage='%s'; "
+        "bridge ownership must be retained", stage != nullptr ? stage : "?");
+    if (!state.objectsReleased)
+        QuarantineObjects();
+    // Monotonic owner-visible state. Even if the bridge quarantine was
+    // already populated, nothing may be released or resubmitted.
+    state.quarantined = true;
+    state.gpuUnknown = true;
+    state.objectsReleased = true;
+    state.state = BridgeState::Disabled;
+    state.levelActive = false;
 }
 
 void ReleaseObjects()
@@ -508,6 +539,16 @@ BridgeWaitResult BridgeWaitForSingleObject(
 bool ServiceSubmit()
 {
     BridgeStateData& state = State();
+    if (state.state == BridgeState::Disabled ||
+        state.state == BridgeState::ShuttingDown ||
+        state.state == BridgeState::Shutdown ||
+        state.gpuUnknown || state.quarantined || state.objectsReleased ||
+        state.geometry.GpuCompletionUnknown())
+    {
+        Msg("ph_dx12_bridge: service submit refused: completion unknown "
+            "or owner state is terminal");
+        return false;
+    }
     const char* injected =
         std::getenv("OGSR_DX12_GAME_BRIDGE_FAIL_SUBMIT");
 
@@ -1035,6 +1076,46 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
         static_cast<unsigned long long>(state.captureEpoch));
+
+    // J1.2A diagnostic load path. It is opt-in and never synthesizes a world
+    // transform or draws. A full runtime can exercise the real VFS ->
+    // ReadVisual -> BuildXrayLevelAsset12 -> GpuMeshRegistry12 upload path
+    // before J1.2B supplies the validated visual placement.
+    const char* geometryVisual =
+        std::getenv("OGSR_DX12_GAME_GEOMETRY_VISUAL");
+    if (geometryVisual != nullptr && geometryVisual[0] != '\0')
+    {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(geometryVisual, &end, 10);
+        if (end == geometryVisual || *end != '\0' ||
+            parsed > 0xFFFFul)
+        {
+            Msg("ph_dx12_geometry: invalid OGSR_DX12_GAME_GEOMETRY_VISUAL");
+        }
+        else
+        {
+            GameDx12LevelGeometryOwner12 owner;
+            owner.device = state.device.Get();
+            owner.queue = state.queue.Get();
+            owner.fence = state.fence.Get();
+            owner.fenceEvent = state.fenceEvent;
+            owner.allocator = state.allocator.Get();
+            owner.list = state.list.Get();
+            owner.fenceValue = &state.fenceValue;
+            std::string reason;
+            const bool loaded = state.geometry.LoadFromVfs(
+                owner, state.levelName, static_cast<uint32_t>(parsed),
+                state.levelSession, state.captureEpoch, reason);
+            if (!loaded)
+            {
+                Msg("ph_dx12_geometry: load failed reason='%s'",
+                    reason.empty() ? "allocation or unknown failure"
+                                   : reason.c_str());
+            }
+            if (state.geometry.GpuCompletionUnknown())
+                QuarantineForGeometryUnknown("level_ready");
+        }
+    }
 }
 
 void GameDx12Bridge_OnLevelTeardown()
@@ -1053,6 +1134,9 @@ void GameDx12Bridge_OnLevelTeardown()
         return;
     }
     ++state.captureEpoch;
+    state.geometry.OnLevelTeardown(state.captureEpoch);
+    if (state.geometry.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("level_teardown");
     Msg("ph_dx12_bridge: level teardown level='%s' session=%llu epoch=%llu",
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
@@ -1140,6 +1224,9 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         }
         ++state.captureEpoch;
         state.captureSequence = 0;
+        state.geometry.OnDeviceReset(state.captureEpoch);
+        if (state.geometry.GpuCompletionUnknown())
+            QuarantineForGeometryUnknown("device_reset");
     }
     Msg("ph_dx12_bridge: device reset width=%u height=%u epoch=%llu "
         "(no offscreen resources in G1)",
@@ -1165,6 +1252,10 @@ void GameDx12Bridge_Shutdown()
     }
 
     state.state = BridgeState::ShuttingDown;
+    const bool ownerCompletionKnown = !state.gpuUnknown && !state.quarantined;
+    state.geometry.Shutdown(ownerCompletionKnown);
+    if (state.geometry.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("shutdown");
     if (state.gpuUnknown || state.quarantined)
     {
         Msg("ph_dx12_bridge: shutdown with unknown GPU completion; "

@@ -2,7 +2,13 @@
 
 #include <cmath>
 #include <cstring>
-#include <limits>
+#include <new>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+
+static_assert(std::is_nothrow_move_assignable_v<XrayAssetData12>,
+              "transactional asset publish must not throw");
 
 namespace
 {
@@ -96,28 +102,49 @@ bool BuildXrayLevelAsset12(const xraylevel12::Geometry& geometry,
             return Fail(reason, "level visual position is outside sphere");
     }
 
-    asset.vertices.resize(geometry.vertex_count);
-    for (uint32_t i = 0; i < geometry.vertex_count; ++i)
+    // Transactional publish: all allocations happen in a local candidate.
+    // A std::bad_alloc/std::length_error leaves the caller's asset empty and
+    // never exposes a partially filled GPU asset description.
+    XrayAssetData12 candidate;
+    try
     {
-        XrayVertex12& vertex = asset.vertices[i];
-        vertex.position = {ReadPosition(geometry, i, 0),
-                           ReadPosition(geometry, i, 1),
-                           ReadPosition(geometry, i, 2)};
-        // Flat-fallback material: the existing X-Ray PS samples only the
-        // texture, so normal/UV are placeholders, not decoded source data.
-        vertex.normal = {0.0f, 0.0f, 1.0f};
-        vertex.uv = {0.0f, 0.0f};
+        candidate.vertices.resize(geometry.vertex_count);
+        for (uint32_t i = 0; i < geometry.vertex_count; ++i)
+        {
+            XrayVertex12& vertex = candidate.vertices[i];
+            vertex.position = {ReadPosition(geometry, i, 0),
+                               ReadPosition(geometry, i, 1),
+                               ReadPosition(geometry, i, 2)};
+            // Flat-fallback material: the existing X-Ray PS samples only the
+            // texture, so normal/UV are placeholders, not decoded source data.
+            vertex.normal = {0.0f, 0.0f, 1.0f};
+            vertex.uv = {0.0f, 0.0f};
+        }
+        candidate.indices = geometry.indices;
+        candidate.minimum = {geometry.bounds.minimum[0],
+                             geometry.bounds.minimum[1],
+                             geometry.bounds.minimum[2]};
+        candidate.maximum = {geometry.bounds.maximum[0],
+                             geometry.bounds.maximum[1],
+                             geometry.bounds.maximum[2]};
+        candidate.sphere.center = {geometry.sphere.center[0],
+                                   geometry.sphere.center[1],
+                                   geometry.sphere.center[2]};
+        candidate.sphere.radius = geometry.sphere.radius;
+        candidate.textureName = "jupiter_level_visual";
+        candidate.shaderName = "flat_color";
     }
-    asset.indices = geometry.indices;
-    asset.minimum = {geometry.bounds.minimum[0], geometry.bounds.minimum[1],
-                     geometry.bounds.minimum[2]};
-    asset.maximum = {geometry.bounds.maximum[0], geometry.bounds.maximum[1],
-                     geometry.bounds.maximum[2]};
-    asset.sphere.center = {geometry.sphere.center[0],
-                           geometry.sphere.center[1],
-                           geometry.sphere.center[2]};
-    asset.sphere.radius = geometry.sphere.radius;
-    asset.textureName = "jupiter_level_visual";
-    asset.shaderName = "flat_color";
+    catch (const std::bad_alloc&)
+    {
+        asset = {};
+        return Fail(reason, "level visual allocation failed");
+    }
+    catch (const std::length_error&)
+    {
+        asset = {};
+        return Fail(reason, "level visual allocation failed");
+    }
+
+    asset = std::move(candidate);
     return true;
 }

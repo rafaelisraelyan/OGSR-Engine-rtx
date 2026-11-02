@@ -86,4 +86,24 @@ inline bool IsValidTransformWorld(const DirectX::XMFLOAT4X4& world)
         c * (d * h - e * g);
     return std::isfinite(determinant) && determinant != 0.0;
 }
+
+// Build the GPU-side object constant. HLSL cbuffers are column-major by
+// default; the CPU stores the transpose of the logical row-vector world,
+// matching CHW12::WriteObjectConstants. The helper rejects non-finite tints
+// and invalid transforms so a malformed object cannot reach a command list.
+inline bool BuildObjectConstants12(const DirectX::XMFLOAT4X4& world,
+                                   const DirectX::XMFLOAT4& tint,
+                                   ObjectConstants12& out) noexcept
+{
+    if (!IsValidTransformWorld(world) ||
+        !std::isfinite(tint.x) || !std::isfinite(tint.y) ||
+        !std::isfinite(tint.z) || !std::isfinite(tint.w))
+        return false;
+
+    DirectX::XMStoreFloat4x4(
+        &out.world,
+        DirectX::XMMatrixTranspose(DirectX::XMLoadFloat4x4(&world)));
+    out.tint = tint;
+    return true;
+}
 } // namespace dx12object12
