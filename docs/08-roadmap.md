@@ -31,7 +31,7 @@ F4.0 развивать самостоятельный physically based material
 DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. F4-PBR ниже),
 но не готовый DX12 renderer; PBR не блокирует F4.0 и первые G3-тени.
 
-**Актуальный графический статус (2026-11-03):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — independently accepted standalone real-asset GPU Draw, source в Git (`a1c751274`); J1.2A Round 2 — independently accepted owner-side source/lifetime, код в Git (`c4a95c39`). **J1.2B: настоящий in-game DX12 Draw BLOCKED** из-за неполного совместимого игрового payload и отсутствующего игрового RTV/depth/submit/readback. F4.0 и GR game parallel recording **не приняты**. Подробности и ограничения — ниже.
+**Актуальный графический статус (2026-11-03):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — independently accepted standalone real-asset GPU Draw, source в Git (`a1c751274`); J1.2A Round 2 — independently accepted owner-side source/lifetime, код в Git (`c4a95c39`); J1.2B Round 2 — independently accepted source-only RTV/depth/submit/readback integration, код в Git (`3a9b7c926`). **J1.2B: настоящий in-game DX12 Draw BLOCKED** из-за неполного совместимого игрового payload и отсутствующего подтверждённого visual placement/caller. F4.0 и GR game parallel recording **не приняты**. Подробности и ограничения — ниже.
 
 **Основные направления:**
 
@@ -644,7 +644,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F6 — стабилизация** | Измеренная настройка/расширение прототипа parallel command recording из F3.5, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
 **Актуальный статус подэтапов F — 2026-11-03** (ветка `prypiat`; сверка по
-исходникам, отдельным независимым review и Git-коммитам до `34952e711`):
+исходникам, отдельным независимым review и Git-коммитам до `3a9b7c926`):
 
 | Подэтап | Актуальный статус | Подтверждение и оставшиеся ограничения |
 |---|---|---|
@@ -657,14 +657,15 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F4.0-G1B — in-process bridge** | ✅ Source-only PASS, в Git | `bb62c00ac`: opt-in DX12 bridge, служебный single-list submit, без игрового Draw; full device lifetime diagnostics остаётся UNVERIFIED. |
 | **F4.0-J1.1 — real-asset GPU Draw** | ✅ Независимый standalone GPU PASS, в Git | `a1c751274`: Visual 9 и 315 из настоящих `level` + `level.geom`, fence/readback/PNG и GBV; используется изолированный GPU adapter и тестовая камера, **не** игровой Draw. |
 | **F4.0-J1.2A — игровой geometry adapter** | ✅ Source-only + owner-side lifetime PASS, в Git | `c4a95c39`: VFS/geometry, world constants, lifecycle/epoch и quarantine, feature-off/on Release x64 PASS. Использованы cached sibling libraries: clean `Engine.sln`/Debug x64 NOT TESTED; полноценный игровой runtime не запускался. |
-| **F4.0-J1.2B — первый in-game Draw** | 🟡 **BLOCKED / NOT ACCEPTED** | Ещё нет принятого игрового DX12 RTV/depth/submit/readback и полного совместимого Jupiter payload/visual placement. R4 Present, G1-M parity, игровой level lifecycle NOT TESTED. **Следующий графический рубеж.** |
+| **F4.0-J1.2B — первый in-game Draw** | ✅ **Source-only PASS, в Git; in-game Draw BLOCKED** | `3a9b7c926`: реальный DX12 RTV RGBA8, D32 depth/DSV, barriers, clear, viewport, owner submit/fence/readback, WIC PNG; fence/device identity, COM lifetime и command-list recovery независимо приняты. IN-GAME DRAW всё ещё BLOCKED: нет полного совместимого Jupiter payload и подтверждённого visual placement/caller. R4 Present, G1-M parity и игровой level lifecycle NOT TESTED. |
 | **F4 — полный игровой renderer** | ⬜ **НЕ ПРИНЯТ** | F4.0 не завершён: нужны настоящий игровой DX12 кадр, управляемая камера, depth/текстуры, затем основные raster-проходы и обязательные runtime/rollback проверки. |
 | **F5 — temporal / upscaling DX12** | ◻ Не принят / впереди | Игровой DX12 temporal history, jitter, DLSS/FSR integration и history reset не подтверждены. |
 | **F6 — стабилизация** | ◻ Не принят / впереди | Измерение реального игрового CPU/GPU frametime, memory residency и FPS; standalone profiling не является F6 PASS. |
 
-**Ближайшая работа:** F4.0-J1.2B — реальный DX12 render target/depth,
-`DrawIndexedInstanced`, owner submit/fence/readback в OGSR после восстановления
-совместимого level payload. Затем F4.0-J2/J3 — подключить существующий GR
+**Ближайшая работа:** F4.0-J1.2B — восстановить полный совместимый игровой
+payload, подключить реальный visual/sector ownership и игровую камеру, затем
+выполнить первый настоящий `DrawIndexedInstanced` с owner submit/fence/readback
+в OGSR. Затем F4.0-J2/J3 — подключить существующий GR
 Job System к игровой CPU-подготовке и параллельной записи command lists.
 R4/DX11 сохраняется; ни F4.0, ни полный F4 пока не приняты.
 
@@ -861,11 +862,33 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
   неподтверждённой полной ABI/commit-совместимостью: clean `Engine.sln`
   и Debug x64 — NOT TESTED. Это source-only milestone, **не** игровой
   DX12 renderer.
-- **F4.0-J1.2B (in-process DX12 render target/Draw): не принят,
-  BLOCKED.** Реальный RTV/depth/Draw submission/readback внутри OGSR ещё
-  не реализованы и не проверены. Полный совместимый Jupiter payload и
-  подтверждённый visual placement отсутствуют; R4 Present, G1-M parity и
-  игровой level lifecycle — NOT TESTED. F4.0 renderer не завершён.
+- **F4.0-J1.2B Round 2 (source-only): принят.** Коммит
+  `3a9b7c926be4a19e0a3ec579488e1a2d19ed7439`,
+  `feat(dx12): add experimental in-game offscreen render pass`: 8
+  production/build-файлов. Реализованы offscreen RTV `R8G8B8A8_UNORM`,
+  D32 depth/DSV, barriers, clear, viewport, owner command submission,
+  fence, readback и WIC PNG под feature guard. Независимо приняты fence/device
+  identity, COM lifetime `SavePng`, command-list recovery и owner-side
+  GPU quarantine; offscreen GPU clear/readback — PASS, feature-off/on
+  Release x64 project builds — PASS. **IN-GAME DRAW остаётся BLOCKED:**
+  полный совместимый Jupiter payload и подтверждённый visual placement/caller
+  отсутствуют, реальный игровой readback не выполнялся. R4 Present, G1-M parity
+  и полный game level lifecycle — NOT TESTED. Это source-only milestone,
+  **не** игровой DX12 renderer. Использованы cached sibling libraries:
+  clean `Engine.sln` и Debug x64 — NOT TESTED.
+- **J1.2B P3 ownership boundary.** При неизвестном GPU completion текущий
+  Bridge обязан удерживать owner fence/device через process-lifetime
+  quarantine. Захваченные внутри `GameDx12LevelGeometry` `ComPtr` сами по
+  себе не гарантируют сохранение ресурсов после уничтожения geometry; для
+  текущего Bridge это не production use-after-free, поскольку geometry
+  находится в function-static `BridgeStateData`, а `QuarantineObjects()`
+  отдельно удерживает fence/device. Любой новый caller обязан сохранять
+  fence/device до подтверждённого completion либо до process exit; его
+  ownership contract проверяется отдельно.
+- **F4.0-J1.2B runtime — BLOCKED.** Следующий рубеж — полный совместимый
+  игровой payload, реальный visual/sector ownership, игровая камера и первый
+  настоящий indexed Draw с readback. Без этих компонентов in-game GPU PASS
+  не заявляется.
 
 ### F4.0-JOBS — GR Job System в игровом DX12 renderer (решение 2026-11-02; PLANNED)
 
