@@ -1,7 +1,7 @@
 # 08 — План работ
 
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
-> **Дата обновления планов:** 2026-11-03 (G-CLAS/PTLAS — экспериментальное направление DXR; J1.2B source-only PASS в Git, игровой DX12 Draw BLOCKED).
+> **Дата обновления планов:** 2026-11-06 (J1.2B VFS Readiness R2 — evidence-only PASS; G-CLAS/PTLAS остаётся экспериментальным DXR; реальный in-game DX12 Draw BLOCKED).
 > Исторические статусы A/B1/F/V и их даты оставлены как ранее зафиксированные
 > отчёты, а не результат новой проверки GPU/CI. Изменение roadmap **не означает**
 > реализации или тестирования добавленных этапов.
@@ -38,7 +38,7 @@ F4.0 развивать самостоятельный physically based material
 DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. F4-PBR ниже),
 но не готовый DX12 renderer; PBR не блокирует F4.0 и первые G3-тени.
 
-**Актуальный графический статус (2026-11-03):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — independently accepted standalone real-asset GPU Draw, source в Git (`a1c751274`); J1.2A Round 2 — independently accepted owner-side source/lifetime, код в Git (`c4a95c39`); J1.2B Round 2 — independently accepted source-only RTV/depth/submit/readback integration, код в Git (`3a9b7c926`). **J1.2B: настоящий in-game DX12 Draw BLOCKED** из-за неполного совместимого игрового payload и отсутствующего подтверждённого visual placement/caller. F4.0 и GR game parallel recording **не приняты**. Подробности и ограничения — ниже.
+**Актуальный графический статус (2026-11-06):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — independently accepted standalone real-asset GPU Draw, source в Git (`a1c751274`); J1.2A Round 2 — independently accepted owner-side source/lifetime, код в Git (`c4a95c39`); J1.2B Round 2 — independently accepted source-only RTV/depth/submit/readback integration, код в Git (`3a9b7c926`). **J1.2B: настоящий in-game DX12 Draw BLOCKED** из-за неполного совместимого игрового payload и отсутствующего подтверждённого visual placement/caller. VFS Readiness R2 (2026-11-06) **evidence-only PASS**: исправленный probe проверен, в тестируемой установке Jupiter/Zaton/Pripyat содержат в VFS лишь `level.puddles`; восстановление CoP assets ещё не выполнено. F4.0 и GR game parallel recording **не приняты**. Подробности и ограничения — ниже.
 
 **Основные направления:**
 
@@ -650,8 +650,9 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F5 — temporal и совместимость** | DX12-обёртки для выбранных DLSS/FSR, jitter, history reset, upscale input/output, прицел 3DSS, ImGui, Tracy/PIX/RenderDoc, HDR/ReShade там, где поддерживается. | DLSS/FSR fallback без device loss, нет ошибок resize/async lifetime и серьёзного ghosting. |
 | **F6 — стабилизация** | Измеренная настройка/расширение прототипа parallel command recording из F3.5, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
-**Актуальный статус подэтапов F — 2026-11-03** (ветка `prypiat`; сверка по
-исходникам, отдельным независимым review и Git-коммитам до `3a9b7c926`):
+**Актуальный статус подэтапов F — 2026-11-06** (ветка `prypiat`; сверка по
+исходникам, отдельным независимым review и Git-коммитам до `1c2b5752`;
+VFS Readiness R2 — внешний evidence-пакет, а не production-изменение):
 
 | Подэтап | Актуальный статус | Подтверждение и оставшиеся ограничения |
 |---|---|---|
@@ -665,6 +666,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F4.0-J1.1 — real-asset GPU Draw** | ✅ Независимый standalone GPU PASS, в Git | `a1c751274`: Visual 9 и 315 из настоящих `level` + `level.geom`, fence/readback/PNG и GBV; используется изолированный GPU adapter и тестовая камера, **не** игровой Draw. |
 | **F4.0-J1.2A — игровой geometry adapter** | ✅ Source-only + owner-side lifetime PASS, в Git | `c4a95c39`: VFS/geometry, world constants, lifecycle/epoch и quarantine, feature-off/on Release x64 PASS. Использованы cached sibling libraries: clean `Engine.sln`/Debug x64 NOT TESTED; полноценный игровой runtime не запускался. |
 | **F4.0-J1.2B — первый in-game Draw** | ✅ **Source-only PASS, в Git; in-game Draw BLOCKED** | `3a9b7c926`: реальный DX12 RTV RGBA8, D32 depth/DSV, barriers, clear, viewport, owner submit/fence/readback, WIC PNG; fence/device identity, COM lifetime и command-list recovery независимо приняты. IN-GAME DRAW всё ещё BLOCKED: нет полного совместимого Jupiter payload и подтверждённого visual placement/caller. R4 Present, G1-M parity и игровой level lifecycle NOT TESTED. |
+| **F4.0-J1.2B — VFS Readiness R2** | ✅ **Evidence-only PASS (2026-11-06)** | Исправлен вызов `CLocatorAPI::exist` через alias/resolved path; в проверенной CoP-конфигурации положительный/отрицательный контроли и `file_list` согласуются, но полноценный игровой payload отсутствует. Нового in-game GPU Draw, production diff и тестов на других установках нет; см. детальный gate ниже. |
 | **F4 — полный игровой renderer** | ⬜ **НЕ ПРИНЯТ** | F4.0 не завершён: нужны настоящий игровой DX12 кадр, управляемая камера, depth/текстуры, затем основные raster-проходы и обязательные runtime/rollback проверки. |
 | **F5 — temporal / upscaling DX12** | ◻ Не принят / впереди | Игровой DX12 temporal history, jitter, DLSS/FSR integration и history reset не подтверждены. |
 | **F6 — стабилизация** | ◻ Не принят / впереди | Измерение реального игрового CPU/GPU frametime, memory residency и FPS; standalone profiling не является F6 PASS. |
@@ -896,6 +898,17 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
   игровой payload, реальный visual/sector ownership, игровая камера и первый
   настоящий indexed Draw с readback. Без этих компонентов in-game GPU PASS
   не заявляется.
+
+### F4.0-J1.2B VFS Readiness R2 — evidence gate (2026-11-06; ACCEPTED)
+
+- **Причина R2:** первоначальный диагностический probe ошибочно вызывал одноаргументный `CLocatorAPI::exist("$level$/level")`, не разрешая алиас. Старые результаты `MISS` были **TEST INVALID**. R2 применяет `FS.update_path(resolved, "$level$", name)`, `FS.exist("$level$", name)` и `FS.exist(resolved)` с проверкой согласованности.
+- **Проверенный runtime:** production `CLocatorAPI` и реальный `fsgame.ltx` проверенной установки CoP, уровни `jupiter`, `zaton`, `pripyat`. Положительный контроль `level.puddles`: **HIT** (4038 / 3591 / 6680 байт соответственно, loose file); отрицательный контроль: **MISS**; `FS.file_list($level$)` — **ровно один файл на уровень**. Обязательные `level`, `level.ltx`, `level.geom[x]`, `level.cform`, graph/AI/HOM и игровые spawn/game/gct — **FILE NOT FOUND IN VFS**.
+- **Архивы:** `ARCHIVE_COUNT 0` для проверенного корня установки (`gamedata.db*`/`.xdb`); проверка **не рекурсивная**. Другие установки, внешние архивы и восстановленный полный level payload — **NOT TESTED**; нельзя обобщать отсутствие архивов за пределы проверенной конфигурации. SoC `gamedata.db0..dbd` не использовать как замену CoP.
+- **Независимая приёмка evidence:** `F4.0-First-InGame-Draw-Readiness-R2-All-Files.zip`: ZIP CRC 14 файлов PASS; `MANIFEST.sha256` 13/13 PASS; `SHA256SUMS.txt` 10/10 PASS; JSON-manifest 9/9 PASS. SHA-256 R2-отчёта `4C5D7A42057FA8C7A2CFAD7672AEA65E6AC872B2A8C18CF25EB2E6BFE0DF8039`, объединённого VFS-лога `81E74377ABD771F32492568F4D5242ED914B4613C1E4EDBBE420CBA1183B742C`. Отчёты — **evidence-only**; независимый повторный запуск Windows probe и игровой GPU test этим milestone не подтверждаются.
+- **Подтверждено только исходниками:** `sector.root_id` может ссылаться на hierarchy, `FHierrarhyVisual::Load` поддерживает `OGF_CHILDREN_L` и `OGF_CHILDREN`, а `xraylevel12::ReadVisual` принимает только `MT_NORMAL`; static sector geometry использует authored world-space placement и identity world. `Device.mFullTransform` — игровой row-vector View × Projection с transpose на границе HLSL. Реальные root/leaf ID, положение во фрустуме и визуальная корректность **NOT TESTED** без уровня.
+- **Следующий блокирующий gate (asset recovery):** восстановить/проверить официальные данные **Call of Pripyat** в используемой установке, повторить R2 VFS probe до **HIT** для всех обязательных level components; проверить совместимость `XRLC_version` и штатную загрузку уровня OGSR. Не создавать фиктивные файлы, не подмешивать SoC, не считать обнаружение файла успешным декодированием/загрузкой.
+- **После asset gate — J1 serial-first:** взять **реальный** `fsL_SECTORS → root_id → drawable MT_NORMAL leaf` (с проверкой формата children, границ, geometry container и provenance), игровую камеру и identity world, сделать **один opt-in owner-thread** `GameDx12Bridge_RenderOffscreenDiagnostic` с подтверждённым fence, depth, readback PNG, ненулевым покрытием пикселей и сохранённым R4 Present; отдельно проверить P3 quarantine/lifetime, Debug Layer/GBV и негативные сценарии. Только фактический in-game GPU readback допускает J1 PASS.
+- **Текущий вердикт:** **VFS R2 PASS, F4.0-J1 IN-GAME DRAW BLOCKED.** Никаких новых production runtime изменений и доказанного игрового кадра. J2/J3 (GR game parallel prep/recording) остаются после J1, CLAS/PTLAS/PBR/DXR не задерживают J1.
 
 ### F4.0-JOBS — GR Job System в игровом DX12 renderer (решение 2026-11-02; PLANNED)
 
