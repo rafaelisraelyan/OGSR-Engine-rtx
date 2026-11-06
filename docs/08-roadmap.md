@@ -1865,13 +1865,15 @@ CoP/модовых материалах, **не подтверждены в на
 
 **G5.0 remote-source audit (2026-11-06):** в текущем `prypiat` каталоги `ogsr_engine/Layers/PhysicsPortable`, `PhysicsPhysX`, `PhysicsAdapterOGSR` **не обнаружены**. Проверена резервная ветка [`backup/physx-p31c-20261029`](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/tree/backup/physx-p31c-20261029) (`2253acd743725d1799b2759a8ed6462a099d694f`): код и документация соответствуют историческому **P3.1-C-R3**, не принятому **G4.2-R1**. Ветки разошлись (backup относительно `prypiat`: +6/−48 commits); перенос backup целиком запрещён без отдельного source/ABI review. **G5.0 = BLOCKED — R1 source provenance**, clean Windows build/CTest в рамках текущей сверки NOT RUN; G5.1 NOT ACCEPTED. Подробное read-only задание: [PhysX G5.0 provenance audit](physx-p3-3-g5-0-provenance.md). GitHub Issues в этом репозитории отключены; задача отслеживается документацией/roadmap.
 
+**G5.0 независимая проверка evidence (2026-11-06): `READY FOR INTEGRATION REVIEW — CONDITIONAL`, не `G5.0 PASS`.** Принят архив `G5.0-Provenance-Review.zip`: внешний ZIP 10 записей, CRC PASS; `ARCHIVE-MANIFEST` 9/9; вложенный R1 ZIP 22 записи, CRC PASS; `G5.0-Evidence-Manifest` 19/19 предоставленных файлов совпали, один внешний game-derived fixture **не предоставлен**; R1 patch 29 450 bytes, diff 5 файлов (+489/−79); восстановлены 3/3/3 collider registration/unregistration/draw и исторические CTest 10/10 по логам. Командный отчёт подтверждает **локальное** наличие коммита `a02eca5`, parent `7778170d`, tree `bd235c15`, но напрямую проверить локальные Git objects по данному ZIP невозможно: предоставлен R1 delta patch, а не полный R1 source tree. Legacy callback остаётся отдельным fix; внешний fixture — обязательный clean-CTest gate; no-vis crash — UNRESOLVED; fresh build вместе с DX12 — NOT RUN. **Следующее действие:** review branch от актуального `origin/prypiat`, только whitelist интеграции и отдельная независимая проверка, **не** push старого PhysX целиком в `prypiat`. [Независимый G5.0 review](physx-p3-3-g5-0-independent-review.md); [G5.0 audit plan](physx-p3-3-g5-0-provenance.md).
+
 **Открытые наблюдения:** (1) для legacy/targeted diagnostic activation зарегистрирован callback, но индивидуальный unregister подтверждён только для v2, поэтому legacy lifecycle **NOT VERIFIED**; (2) один no-vis `0xC0000005` в `CLevel::IR_OnMouseMove` до ragdoll остаётся **UNRESOLVED**. Не маркировать crash автоматически как PhysX regression или как pre-existing: необходимы stack trace, baseline A/B и воспроизводимый сценарий.
 
 **P3.3-G5 — Real Gameplay Readiness.** Scope freeze: не добавлять новые физические возможности. Цель — доказать пригодность существующего PhysX ragdoll для обычной игры OGSR DX11/R4 при ODE movement/AI, ODE fallback и отсутствии регрессий.
 
 | Гейт | Требуемые доказательства | Статус |
 |---|---|---|
-| G5.0 — provenance/build | Remote commit + branch ancestry + исходники, clean feature-on/off Release x64 `XR_3DA`, CTest, SHA binary/logs | **BLOCKED — source not verified; clean build NOT RUN** |
+| G5.0 — provenance/build | Локальный исходник по command evidence, независимая проверка ZIP/patch; review branch + clean feature-on/off Release x64 `XR_3DA`, CTest, SHA binary/logs ещё нужны | **READY FOR INTEGRATION REVIEW — CONDITIONAL; full G5.0 NOT PASSED** |
 | G5.1 — normal gameplay | Одновременно 4–8 PhysX v2 ragdolls, несколько разных игровых территорий/сцен; реальный AI/actor loop, непрерывная gameplay-сессия; видео+run-id+логи | NOT RUN |
 | G5.2 — save/load/lifecycle | Повторные сохранения/загрузки и level reload с ragdolls, выход из игры; до/после counts registry/callbacks/scene leases; нет stale snapshots, двойной симуляции, UAF | NOT RUN |
 | G5.3 — stability | Overlay on/off, повторные запуски и длительная игровая сессия, раздельная диагностика legacy callback и `IR_OnMouseMove` no-vis crash; fail-closed при ошибках | NOT RUN |
@@ -1915,7 +1917,7 @@ CoP/модовых материалах, **не подтверждены в на
 
 **Первый сквозной критерий успеха:** один физический скелет NPC в OGSR DX11, созданный из исходной модели и игровой позы, симулируется PhysX и правильно отображается в мире; весь остальной gameplay остаётся на ODE. Производственные гарантии P3 не объявлять выполненными после P2.
 
-**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** ранее принятый G4.2-R1 EXPERIMENTAL PASS WITH NOTES по внешнему evidence; R1 Git provenance UNVERIFIED; G5 NOT ACCEPTED. Остальные независимые треки P-C/P-M/P4–P6 — PLANNED. PASS — только по коду, тестам, логам, evidence и независимому review.
+**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** G4.2-R1 — ранее принятый EXPERIMENTAL PASS WITH NOTES; G5.0 **READY FOR INTEGRATION REVIEW — CONDITIONAL** по проверенному evidence и report-backed локальному provenance, remote source integration / fresh build NOT DONE; G5.1 NOT ACCEPTED. Независимые P-C/P-M/P4–P6 — PLANNED. PASS — только по коду, тестам, логам, evidence и независимому review.
 
 ### P-M — Индивидуальная масса NPC и подвижность экипировки (решение 2026-10-25; PLANNED)
 
