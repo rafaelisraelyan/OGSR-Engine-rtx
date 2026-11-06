@@ -665,7 +665,7 @@ VFS Readiness R2 — внешний evidence-пакет, а не production-из
 | **F4.0-G1B — in-process bridge** | ✅ Source-only PASS, в Git | `bb62c00ac`: opt-in DX12 bridge, служебный single-list submit, без игрового Draw; full device lifetime diagnostics остаётся UNVERIFIED. |
 | **F4.0-J1.1 — real-asset GPU Draw** | ✅ Независимый standalone GPU PASS, в Git | `a1c751274`: Visual 9 и 315 из настоящих `level` + `level.geom`, fence/readback/PNG и GBV; используется изолированный GPU adapter и тестовая камера, **не** игровой Draw. |
 | **F4.0-J1.2A — игровой geometry adapter** | ✅ Source-only + owner-side lifetime PASS, в Git | `c4a95c39`: VFS/geometry, world constants, lifecycle/epoch и quarantine, feature-off/on Release x64 PASS. Использованы cached sibling libraries: clean `Engine.sln`/Debug x64 NOT TESTED; полноценный игровой runtime не запускался. |
-| **F4.0-J1.2B — первый in-game Draw** | ✅ **Source-only PASS, в Git; in-game Draw BLOCKED** | `3a9b7c926`: реальный DX12 RTV RGBA8, D32 depth/DSV, barriers, clear, viewport, owner submit/fence/readback, WIC PNG; fence/device identity, COM lifetime и command-list recovery независимо приняты. IN-GAME DRAW всё ещё BLOCKED: нет полного совместимого Jupiter payload и подтверждённого visual placement/caller. R4 Present, G1-M parity и игровой level lifecycle NOT TESTED. |
+| **F4.0-J1.2B — первый in-game Draw** | ✅ **Source-only PASS, в Git; in-game Draw BLOCKED** | `3a9b7c926`: реальный DX12 RTV RGBA8, D32 depth/DSV, barriers, clear, viewport, owner submit/fence/readback, WIC PNG; fence/device identity, COM lifetime и command-list recovery независимо приняты. На момент source-only milestone отсутствовал полный payload; Asset Recovery R3 (2026-11-06) подтвердил его VFS/CPU-совместимость. **IN-GAME DRAW всё ещё BLOCKED:** не проверены OGSR game-level boot, подтверждённый runtime caller/visual placement и GPU readback. R4 Present, G1-M parity и игровой level lifecycle NOT TESTED. |
 | **F4.0-J1.2B — VFS Readiness R2** | ✅ **Evidence-only PASS (2026-11-06)** | Исправлен вызов `CLocatorAPI::exist` через alias/resolved path; в проверенной CoP-конфигурации положительный/отрицательный контроли и `file_list` согласуются, но полноценный игровой payload отсутствует. Нового in-game GPU Draw, production diff и тестов на других установках нет; см. детальный gate ниже. |
 | **F4.0-J1 — Asset Recovery R3** | ✅ **PASS (VFS + CPU-only compatibility); runtime gate PENDING** | Новая проверка оригинальной CoP: 41 архив, `level`/`level.geom[x]`/`level.ltx`/`level.cform`/`level.ai`/`level.game`/`level.spawn`/`level.hom` доступны из VFS; `XRLC_version=14`, `CFORM=4`, sector-root linked hierarchy и `ReadVisual` прошли на Jupiter leaf 275, Zaton 405, Pripyat 1002. Настоящий OGSR level boot и GPU readback **NOT TESTED**; J1 Draw не принят. |
 | **F4 — полный игровой renderer** | ⬜ **НЕ ПРИНЯТ** | F4.0 не завершён: нужны настоящий игровой DX12 кадр, управляемая камера, depth/текстуры, затем основные raster-проходы и обязательные runtime/rollback проверки. |
@@ -871,8 +871,7 @@ Codex review после P1–P4; отдельный Claude B1–B5 patch пол�
   identity, COM lifetime `SavePng`, command-list recovery и owner-side
   GPU quarantine; offscreen GPU clear/readback — PASS, feature-off/on
   Release x64 project builds — PASS. **IN-GAME DRAW остаётся BLOCKED:**
-  полный совместимый Jupiter payload и подтверждённый visual placement/caller
-  отсутствуют, реальный игровой readback не выполнялся. R4 Present, G1-M parity
+  на момент J1.2B source-only проверки отсутствовали полный Jupiter payload и подтверждённый visual placement/caller; R3 (2026-11-06) доказал доступность payload и CPU drawable leaf, но runtime caller/placement и реальный игровой readback ещё не проверены. R4 Present, G1-M parity
   и полный game level lifecycle — NOT TESTED. Это source-only milestone,
   **не** игровой DX12 renderer. Использованы cached sibling libraries:
   clean `Engine.sln` и Debug x64 — NOT TESTED.
@@ -931,8 +930,9 @@ preparation и реальная параллельная запись через
 Изолированный in-process `GameDx12Bridge` G1B выполняет только
 служебный single-list submit без игрового draw и без GR workers. G1B
 Round 2.4 source-only принят (`bb62c00ac`), J1.1 standalone GPU принят
-отдельно (`a1c751274`); игровой Jupiter runtime по-прежнему заблокирован
-недостающим совместимым level payload. **GR parallel recording не объявлен
+отдельно (`a1c751274`); на момент принятия G1B/J1.1 игровой Jupiter runtime был заблокирован
+недостающим совместимым level payload; Asset Recovery R3 (2026-11-06) закрыл
+VFS/CPU gate, но J1 in-game Draw и GPU readback ещё не проверены. **GR parallel recording не объявлен
 принятым; принятые G1B/J1.1 не являются in-game renderer.**
 
 | Гейт | Содержание и порядок | Доказательство |
