@@ -40,6 +40,8 @@ DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. 
 
 **Актуальный графический статус (2026-11-06):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — независимо принят standalone real-asset GPU Draw (`a1c751274`); J1.2A Round 2 — source/owner-lifetime (`c4a95c39`); J1.2B Round 2 — source-only RTV/depth/submit/readback (`3a9b7c926`). **F4.0-J1 Asset Recovery R3 — ACCEPTED как VFS/CPU compatibility gate:** после установки оригинальной CoP в новой проверке обнаружено 41 архивное хранилище, core files Jupiter/Zaton/Pripyat читаются через production VFS, `XRLC_version=14`, `CFORM=4`, реальные `fsL_VISUALS`/`fsL_SECTORS` и `ReadVisual` на drawable `MT_NORMAL` leaf проходят CPU-only checks. Оригинальный runtime не запускался; in-game OGSR DX12 Draw, GPU readback и R4 Present **NOT TESTED / BLOCKED до J1 runtime**. R2 фиксирует прежнее состояние неполного payload и не отменяется; R3 его supersedes. GR game parallel recording F4.0-J2/J3 впереди.
 
+**Сверка PhysX на 2026-11-06 (параллельный трек P):** предыдущий независимый аудит **P3.3-G4.2-R1 — EXPERIMENTAL PASS WITH NOTES** по переданному review-пакету; **G5 Real Gameplay Readiness — PLANNED / NOT ACCEPTED**. В отличие от ранее принятого evidence, GitHub commit `a02eca549b05e057a9fe6c1542bd0d5d9918a7d8` не найден при отдельном запросе к репозиторию; интеграция именно этого SHA в удалённую ветку **UNVERIFIED**. Это не новая независимая проверка архивов, Windows runtime и push. Полная provenance и матрица G5 приведены в разделе P.
+
 **Основные направления:**
 
 - **DX11 — A–D:** DLSS, NIS, контроль качества апскейла, исследовательский SSGI/Hi-Z.
@@ -1840,9 +1842,30 @@ CoP/модовых материалах, **не подтверждены в на
 
 ---
 
-## Этап P — Portable PhysX Ragdoll: OGSR DX11 → IX-Ray (архитектура принята, реализация не начата)
+## Этап P — Portable PhysX Ragdoll: OGSR DX11 → IX-Ray (G4.2-R1 experimental review accepted; G5 planned)
 
 **Первый приоритет направления P (решение 2026-10-22): ragdoll-физика персонажа.** Самый первый игровой результат — **один NPC-сталкер, у которого анимированный скелет переключается на PhysX CPU ragdoll и сталкивается со статической геометрией настоящего игрового уровня на OGSR DX11/R4**. Оригинальное передвижение и AI остаются на ODE. Дополнительные PhysX-ящики — только инструмент тестирования, не самостоятельный игровой milestone. Полная замена character movement и GPU PhysX отложены.
+
+### Актуальный checkpoint P3.3 — G4.2-R1 → G5 (2026-11-06)
+
+**Ранее принятый milestone:** `P3.3-G4.2-R1` — **EXPERIMENTAL PASS WITH NOTES** по результатам предыдущей независимой проверки `p33g42r1-review.zip`. Из переданного текста review: 22 ZIP-записи (CRC PASS); source diff 5 файлов (+489/−79); Release x64 `XR_3DA` сборка успешно по журналу; CTest 10/10; `git diff --check` exit 0 по отчёту. При трёх загрузках уровня подтверждены три регистрации/снятия diagnostic callback и три успешных visual debug draws (`shapes=21 joints=10`); после unload `ReleaseAllV2 remaining=0 live=0`, DLL lease refs возвращаются к 0. В all-human v2 устранены несинхронизированные обращения к registry/lastBodyWorld; snapshot-by-value отрисовывается после освобождения mutex, callback снимается до уничтожения scene/level. **Эти свидетельства не перепроверялись здесь по оригинальному ZIP или новому игровому запуску.**
+
+**Git provenance:** SHA `a02eca549b05e057a9fe6c1542bd0d5d9918a7d8` указан в принятом отчёте, но не найден через GitHub commit API для `rafaelisraelyan/OGSR-Engine-rtx` в ходе текущей сверки. Не считать R1 **опубликованным / INTEGRATED**, пока не проверены фактический remote HEAD, ancestry и Git blobs. Roadmap обновляется как учёт достигнутого *по evidence*, а не подтверждение наличия этого исходного кода в `prypiat`.
+
+**Открытые наблюдения:** (1) для legacy/targeted diagnostic activation зарегистрирован callback, но индивидуальный unregister подтверждён только для v2, поэтому legacy lifecycle **NOT VERIFIED**; (2) один no-vis `0xC0000005` в `CLevel::IR_OnMouseMove` до ragdoll остаётся **UNRESOLVED**. Не маркировать crash автоматически как PhysX regression или как pre-existing: необходимы stack trace, baseline A/B и воспроизводимый сценарий.
+
+**P3.3-G5 — Real Gameplay Readiness.** Scope freeze: не добавлять новые физические возможности. Цель — доказать пригодность существующего PhysX ragdoll для обычной игры OGSR DX11/R4 при ODE movement/AI, ODE fallback и отсутствии регрессий.
+
+| Гейт | Требуемые доказательства | Статус |
+|---|---|---|
+| G5.0 — provenance/build | Remote commit + branch ancestry + исходники, clean feature-on/off Release x64 `XR_3DA`, CTest, SHA binary/logs | NOT RUN |
+| G5.1 — normal gameplay | Одновременно 4–8 PhysX v2 ragdolls, несколько разных игровых территорий/сцен; реальный AI/actor loop, непрерывная gameplay-сессия; видео+run-id+логи | NOT RUN |
+| G5.2 — save/load/lifecycle | Повторные сохранения/загрузки и level reload с ragdolls, выход из игры; до/после counts registry/callbacks/scene leases; нет stale snapshots, двойной симуляции, UAF | NOT RUN |
+| G5.3 — stability | Overlay on/off, повторные запуски и длительная игровая сессия, раздельная диагностика legacy callback и `IR_OnMouseMove` no-vis crash; fail-closed при ошибках | NOT RUN |
+| G5.4 — measured performance | На одном save/железе ODE baseline vs PhysX feature-on: physics CPU p50/p95/p99, кадр p50/p95/p99, память и рост live bodies; без подмены игровых замеров smoke/harness | NOT RUN |
+| G5.5 — independent review | Raw evidence manifest, commit hashes, воспроизводимые команды, source diff, runtime-логи, визуальная проверка, независимый verdict | NOT RUN |
+
+**Приёмка G5:** PASS только если реальный gameplay, save/load/reload, CPU/memory budget (согласованный по baseline), provenance и независимый review проходят все критичные гейты. Любой необъяснённый crash/lifetime violation — блокер соответствующего гейта. G4.2-R1 PASS не равен G5 PASS. Данный трек не блокирует F4.0/DX12.
 
 ### P-S — адаптация PhysX к скелету модели (решение 2026-10-25; PLANNED)
 
@@ -1879,7 +1902,7 @@ CoP/модовых материалах, **не подтверждены в на
 
 **Первый сквозной критерий успеха:** один физический скелет NPC в OGSR DX11, созданный из исходной модели и игровой позы, симулируется PhysX и правильно отображается в мире; весь остальной gameplay остаётся на ODE. Производственные гарантии P3 не объявлять выполненными после P2.
 
-**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** PLANNED / NOT IMPLEMENTED. PASS — только по коду, тестам, логам, evidence и независимому review.
+**Ссылка:** [Portable PhysX ADR](physics-portability-adr.md). **Статус P:** ранее принятый G4.2-R1 EXPERIMENTAL PASS WITH NOTES по внешнему evidence; R1 Git provenance UNVERIFIED; G5 NOT ACCEPTED. Остальные независимые треки P-C/P-M/P4–P6 — PLANNED. PASS — только по коду, тестам, логам, evidence и независимому review.
 
 ### P-M — Индивидуальная масса NPC и подвижность экипировки (решение 2026-10-25; PLANNED)
 
