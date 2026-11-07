@@ -1655,9 +1655,7 @@ V-Visual-итерации **не запускать по инерции**; во�
 - **Storm/Cumulonimbus** не считать решённым: V-Visual-04–07 и
   V-SF-GPU-01 как грозовой фронт не приняты; не возвращать V-04 с
   угловатыми формами в качестве художественного default.
-- **V2 = NOT ACCEPTED**, GPU performance qualification оригинального
-  V-SF Rain ещё `NOT RUN`, игровой cloud runtime `NOT INTEGRATED`.
-  Успех standalone не равен успеху в игре.
+- **V2/V3 = NOT ACCEPTED**. V-Q1 / Gate D: `VISUAL PASS — NO HIGH-RESOLUTION DEGRADATION` (1600×900); V-Q2 / Gate E: `REPORT COMPLETE WITH NOTES` (standalone GPU, unequal cloud coverage/clocks, **не equal-cloud claim**). V-Q3: standalone extraction `PASS WITH NOTES`, game-side integration `BLOCKED` до наличия game-owned DX12 camera/HDR/depth/descriptor/frame. Игровой cloud runtime `NOT INTEGRATED`.
 
 **Ближайший порядок без повторного морфологического исследования:**
 
@@ -1689,6 +1687,30 @@ V-Visual-итерации **не запускать по инерции**; во�
 но и не подключать облака до корректных camera/target/depth/barriers.
 Не менять DX11/R4 и production без отдельной приёмки/разрешения;
 любые Git-изменения — отдельным согласованным scope.
+
+
+### V-WEATHER — погодные режимы, переходы и настройки облаков (решение 2026-11-08)
+
+**Актуальная задача параллельного облачного трека:** развивать уже работающую standalone DX12 cloud system, не дожидаясь полного F4.0, и затем перенести её в игровой DX12. Новых V-Visual/FOMS/Storm-morphology экспериментов без доказанного блокера не проводить. **Original V-SF Rain — неизменяемый контроль**; Gate C не применять, V-03 оставить контрольным вариантом.
+
+**Режимы первой версии:** `clear` (малооблачно), `partly` (переменная облачность), `overcast` (пасмурно), `rain_sf` (локальная дождевая масса оригинального V-SF Rain); `storm_preview` — только экспериментальный developer preview, визуально **NOT ACCEPTED**. `sunset` считать пресетом освещения/времени суток, а не новой морфологией. Сохранять legacy CLI `--preset=rain`, `--preset=storm` и исходные hashes/PNG при статических endpoints.
+
+**Переходы:** переиспользовать существующие `StartCloudTransition()` и `LerpCloudParams()` для совместимых численных полей. Между обычным полем и V-SF Rain `stormFront` — дискретный bool, поэтому простой toggle вызывает скачок: требуется непрерывный `modelMix` density/extinction **в world-space**, учитывающий то же поле в light/shadow sampling; без screen-space crossfade, пересоздания noise или внезапной смены seed/time. При `mix=0/1` неизменный исходный быстрый path, на mid-transition измерить GPU cost. Контролировать bounds, повторное переключение из текущего состояния, pause/resize/reset и сохранение направления ветра/солнца.
+
+**Release UI / безопасность пользовательских параметров — строгое разграничение:**
+
+- **В обычном игровом Release ручная настройка погоды СКРЫТА И НЕДОСТУПНА.** Игрок не выбирает `clear/partly/overcast/rain_sf/storm_preview`, не меняет длительность погодного перехода, weather seed, density/weather debug values и не получает dev-хоткеев. Недостаточно спрятать кнопку: не регистрировать debug weather CLI/console commands, debug-панель и ручные override пути в shipping build. Игровое состояние погоды формируется штатной системой `CEnvironment`/сценариями. Developer weather override не должен попадать в release user config.
+- **Пользовательские настройки ГРАФИКИ в Release доступны:** выбор Classic 2D / Volumetric 3D после V4, проверенные профили качества облаков (Performance / Balanced / Quality / Reference либо безопасный сокращённый набор), on/off при наличии поддержанного fallback. Они управляют только качеством и GPU-ценой рендеринга, **не игровой погодой**. DX11/R4 сохраняется.
+- **Standalone и явно включённая developer/test build:** разрешены ручные погодные пресеты, scripted sequences, CLI, хоткеи, `storm_preview`, debug overlay и настройка длительности перехода для visual/GPU validation. Разделить development-only features явным build/config guard с тестом shipping-off; не путать Release-бинарник standalone runner с игровым shipping Release.
+
+**Ближайшие гейты, выполнять последовательно:**
+
+1. **V-WEATHER-01A — статические режимы (ПЕРВЫЙ):** включить существующие `clear/partly/overcast`, отдельно именованный `rain_sf` (immutable original V-SF Rain), `storm_preview` только как debug. 800×450 Front/Ground/Oblique, fixed seed/time/camera/sun; `rain_sf` при равных условиях **byte-identical** Gate B/Gate D; legacy `--preset`/feature-off без регрессий. Build/PNG/GBV/InfoQueue/patch evidence. Без нового density HLSL.
+2. **V-WEATHER-01B — плавные модели:** `clear→partly→overcast→rain_sf→partly`, `rain_sf→overcast→rain_sf`, кадры 0/25/50/75/100%, плавность в world-space, независимый контроль endpoints, прерывания перехода, смещение камеры, замеры GPU median/p95 в mid-blend.
+3. **V-WEATHER-01C — настройки и release-gating:** развести quality vs weather, реализовать standalone settings persistence и validation/restore defaults, profiles и clouds-off, tests restart/resize/feature-off. Shipping build/CLI tests доказывают **отсутствие** ручных weather controls, а качество и cloud mode остаются настраиваемыми. Не изменять production игрового UI до отдельного разрешения.
+4. **V-Q4/V3 позже:** после game-owned DX12 camera/HDR/depth/queue и нормального frame lifecycle — адаптер к `CEnvironment`, HDR compositing, depth, fallback, GPU timings, погодные сценарии. GameDx12Bridge diagnostic device **не** использовать как game-owned renderer. Для первого opt-in preview допустим fixed Rain; полноценная V3 приемка только после погодных и игровых тестов.
+
+**Статус:** V-WEATHER-01A/B/C `PLANNED / NOT RUN`; V-Q1 visual `PASS`, V-Q2 standalone perf `COMPLETE WITH NOTES`, V-Q3 standalone extraction `PASS WITH NOTES`, game-side `BLOCKED`; V2/V3 `NOT ACCEPTED`. Это план, а не реализованная погода/UI.
 
 ### V2-O — оптимизация без потери уникальности облаков (решение 2026-10-27)
 
