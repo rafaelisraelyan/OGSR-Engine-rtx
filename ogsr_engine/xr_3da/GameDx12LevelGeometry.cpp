@@ -331,6 +331,32 @@ bool GameDx12LevelGeometry12::LoadFromVfsImpl(
         static_cast<unsigned long long>(m_levelEpoch),
         m_asset.vertices.size(), m_assetIndexCount,
         static_cast<unsigned long long>(m_generation));
+    Msg("ph_dx12_geometry: bounds visual=%u min=(%.3f,%.3f,%.3f) "
+        "max=(%.3f,%.3f,%.3f) center=(%.3f,%.3f,%.3f) radius=%.3f",
+        visualId, m_asset.minimum.x, m_asset.minimum.y, m_asset.minimum.z,
+        m_asset.maximum.x, m_asset.maximum.y, m_asset.maximum.z,
+        m_asset.sphere.center.x, m_asset.sphere.center.y,
+        m_asset.sphere.center.z, m_asset.sphere.radius);
+    return true;
+}
+
+bool GameDx12LevelGeometry12::GetBounds(float minimum[3], float maximum[3],
+                                        float center[3],
+                                        float& radius) const
+{
+    if (!m_loaded || minimum == nullptr || maximum == nullptr ||
+        center == nullptr)
+        return false;
+    minimum[0] = m_asset.minimum.x;
+    minimum[1] = m_asset.minimum.y;
+    minimum[2] = m_asset.minimum.z;
+    maximum[0] = m_asset.maximum.x;
+    maximum[1] = m_asset.maximum.y;
+    maximum[2] = m_asset.maximum.z;
+    center[0] = m_asset.sphere.center.x;
+    center[1] = m_asset.sphere.center.y;
+    center[2] = m_asset.sphere.center.z;
+    radius = m_asset.sphere.radius;
     return true;
 }
 
@@ -447,6 +473,9 @@ bool GameDx12LevelGeometry12::RecordDraw(ID3D12GraphicsCommandList* list,
     if (!m_registry.RecordDraw(list, m_resolved.draws[0], m_frameCBVA,
                                m_objectCBVA))
         return Fail(reason, "level geometry RecordDraw failed");
+    Msg("ph_dx12_geometry: recorded DrawIndexedInstanced visual=%u "
+        "indices=%u instances=1 pipeline=1 depth=D32_FLOAT",
+        m_visualId, m_assetIndexCount);
     m_drawFence.Reset();
     m_drawDevice.Reset();
     m_drawRecorded = true;

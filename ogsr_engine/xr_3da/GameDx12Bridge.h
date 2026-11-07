@@ -18,6 +18,8 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12ReadbackCoverage.h"
+
 #include <DirectXMath.h>
 #include <string>
 
@@ -29,6 +31,18 @@ void GameDx12Bridge_Shutdown();
 
 bool GameDx12Bridge_IsEnabled();
 
+// R2A diagnostic outcome. gpuCompleted means the exact owner fence/device
+// identity was confirmed by OnDrawCompleted. imageGatePass is independent:
+// zero non-clear readback pixels must fail the J1 image gate even when the
+// GPU completed. pngSaved is true only when a requested PNG was written.
+struct GameDx12DiagnosticResult
+{
+    bool gpuCompleted = false;
+    bool imageGatePass = false;
+    bool pngSaved = false;
+    GameDx12ReadbackCoverage12 coverage{};
+};
+
 // J1.2B owner-only diagnostic render. logicalViewProjection and logicalWorld
 // must come from the real game camera/placement; this function does not
 // synthesize either. pngPath may be null to skip the PNG save.
@@ -36,7 +50,8 @@ bool GameDx12Bridge_RenderOffscreenDiagnostic(
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const DirectX::XMFLOAT4X4& logicalWorld,
     const wchar_t* pngPath,
-    std::string& reason);
+    std::string& reason,
+    GameDx12DiagnosticResult* result = nullptr);
 
 #else // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 

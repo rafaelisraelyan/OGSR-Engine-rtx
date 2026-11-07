@@ -2,6 +2,8 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12ReadbackCoverage.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -36,6 +38,7 @@ public:
     // been confirmed complete. Never call while submission is unknown.
     void CommitSubmittedFrame() noexcept;
     bool Readback(std::string& reason);
+    GameDx12ReadbackCoverage12 EvaluateCoverage() const noexcept;
     bool SavePng(const wchar_t* path, std::string& reason) const;
     void Release();
     void Quarantine(BridgeQuarantineStorage& quarantine);

@@ -95,10 +95,10 @@ bool GameDx12OffscreenPass12::Create(ID3D12Device* device, uint32_t width,
     colorDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE colorClear = {};
     colorClear.Format = colorDesc.Format;
-    colorClear.Color[0] = 0.03f;
-    colorClear.Color[1] = 0.05f;
-    colorClear.Color[2] = 0.09f;
-    colorClear.Color[3] = 1.0f;
+    colorClear.Color[0] = kGameDx12DiagnosticClearColor[0];
+    colorClear.Color[1] = kGameDx12DiagnosticClearColor[1];
+    colorClear.Color[2] = kGameDx12DiagnosticClearColor[2];
+    colorClear.Color[3] = kGameDx12DiagnosticClearColor[3];
 
     HRESULT hr = device->CreateCommittedResource(
         &defaultHeap, D3D12_HEAP_FLAG_NONE, &colorDesc,
@@ -266,8 +266,12 @@ void GameDx12OffscreenPass12::CommitSubmittedFrame() noexcept
 
 bool GameDx12OffscreenPass12::Readback(std::string& reason)
 {
-    if (!m_created || m_pixels.empty() || m_readback == nullptr)
+    if (!m_created || m_readback == nullptr || m_pixels.empty())
         return Fail(reason, "offscreen readback is not ready");
+    if (!ValidateGameDx12ReadbackLayout(
+            m_width, m_height, m_rowPitch, m_readbackBytes,
+            static_cast<uint64_t>(m_pixels.size())))
+        return Fail(reason, "offscreen readback buffer size mismatch");
     void* mapped = nullptr;
     D3D12_RANGE range = {0, static_cast<SIZE_T>(m_readbackBytes)};
     const HRESULT hr = m_readback->Map(0, &range, &mapped);
@@ -279,11 +283,26 @@ bool GameDx12OffscreenPass12::Readback(std::string& reason)
     return true;
 }
 
+GameDx12ReadbackCoverage12 GameDx12OffscreenPass12::EvaluateCoverage()
+    const noexcept
+{
+    if (!ValidateGameDx12ReadbackLayout(
+            m_width, m_height, m_rowPitch, m_readbackBytes,
+            static_cast<uint64_t>(m_pixels.size())))
+        return {};
+    return EvaluateGameDx12ReadbackCoverage(
+        m_pixels.data(), m_width, m_height, m_rowPitch);
+}
+
 bool GameDx12OffscreenPass12::SavePng(const wchar_t* path,
                                       std::string& reason) const
 {
     if (!m_created || path == nullptr || m_pixels.empty())
         return Fail(reason, "offscreen PNG is not ready");
+    if (!ValidateGameDx12ReadbackLayout(
+            m_width, m_height, m_rowPitch, m_readbackBytes,
+            static_cast<uint64_t>(m_pixels.size())))
+        return Fail(reason, "offscreen PNG readback buffer size mismatch");
 
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(co) && co != RPC_E_CHANGED_MODE)

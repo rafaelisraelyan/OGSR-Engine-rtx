@@ -113,6 +113,10 @@ public:
     uint64_t DrawFenceValue() const { return m_drawFenceValue; }
     uint32_t VisualId() const { return m_visualId; }
     uint32_t IndexCount() const { return m_assetIndexCount; }
+    // Returns the authored asset bounds. The bridge uses these only for the
+    // opt-in diagnostic frustum check; no synthetic world transform is built.
+    bool GetBounds(float minimum[3], float maximum[3], float center[3],
+                   float& radius) const;
     uint64_t LevelSession() const { return m_levelSession; }
     uint64_t LevelEpoch() const { return m_levelEpoch; }
     uint64_t Generation() const { return m_generation; }

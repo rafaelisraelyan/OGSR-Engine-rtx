@@ -73,6 +73,13 @@ struct BridgeStateData
     bool prePolicyFilterUnsafe = false;
     bool matrixBitsRequested = false;
     bool matrixBitsChecked = false;
+    bool diagnosticAttempted = false;
+    bool diagnosticVisibilityLogged = false;
+    bool diagnosticLevelMismatchLogged = false;
+    bool diagnosticLevelBound = false;
+    char diagnosticLevelName[128]{};
+    uint64_t diagnosticLevelSession = 0;
+    uint64_t diagnosticLevelEpoch = 0;
     DWORD ownerThreadId = 0;
 
     ComPtr<ID3D12Device> device;
@@ -226,6 +233,76 @@ void QuarantineForGeometryUnknown(const char* stage)
     state.objectsReleased = true;
     state.state = BridgeState::Disabled;
     state.levelActive = false;
+}
+
+// R2B: after a device reset the bridge and geometry epochs advance, but the
+// diagnostic binding must only be renewed when the same level/session and a
+// safe, already-loaded geometry object still own the new epoch. This never
+// resets diagnosticAttempted and never releases quarantined/unknown work.
+void RebindDiagnosticAfterDeviceReset(const char* stage)
+{
+    BridgeStateData& state = State();
+    const char* reason = nullptr;
+
+    if (state.state != BridgeState::Ready)
+        reason = "bridge is not ready";
+    else if (!state.levelActive)
+        reason = "level is not active";
+    else if (!state.diagnosticLevelBound)
+        reason = "diagnostic level was not bound";
+    else if (_stricmp(state.levelName, state.diagnosticLevelName) != 0)
+        reason = "level name mismatch";
+    else if (state.levelSession != state.diagnosticLevelSession)
+        reason = "level session mismatch";
+    else if (!state.geometry.IsLoaded())
+        reason = "geometry is not loaded";
+    else if (state.geometry.LevelSession() != state.levelSession)
+        reason = "geometry session mismatch";
+    else if (state.geometry.LevelEpoch() != state.captureEpoch)
+        reason = "geometry epoch was not advanced";
+    else if (state.geometry.GpuCompletionUnknown() ||
+             state.geometry.IsDrawRecorded() ||
+             state.geometry.IsDrawSubmitted())
+        reason = "geometry has unknown or in-flight GPU work";
+    else if (state.gpuUnknown || state.quarantined ||
+             state.objectsReleased)
+        reason = "bridge GPU state is unsafe";
+    else if (state.diagnosticAttempted)
+        reason = "one-shot diagnostic attempt was already consumed";
+    else
+    {
+        const uint64_t previousEpoch = state.diagnosticLevelEpoch;
+        state.diagnosticLevelEpoch = state.captureEpoch;
+        Msg("ph_dx12_geometry: diagnostic rebound after %s level='%s' "
+            "session=%llu epoch=%llu previous_epoch=%llu visual=%u",
+            stage != nullptr ? stage : "?",
+            state.diagnosticLevelName,
+            static_cast<unsigned long long>(state.levelSession),
+            static_cast<unsigned long long>(state.captureEpoch),
+            static_cast<unsigned long long>(previousEpoch),
+            state.geometry.VisualId());
+        return;
+    }
+
+    Msg("ph_dx12_geometry: diagnostic reset rebind refused stage='%s' "
+        "reason='%s' current_level='%s' session=%llu epoch=%llu "
+        "bound_level='%s' bound_session=%llu bound_epoch=%llu "
+        "geometry_loaded=%d geometry_session=%llu geometry_epoch=%llu "
+        "attempted=%d gpu_unknown=%d quarantine=%d draw_recorded=%d "
+        "draw_submitted=%d",
+        stage != nullptr ? stage : "?", reason, state.levelName,
+        static_cast<unsigned long long>(state.levelSession),
+        static_cast<unsigned long long>(state.captureEpoch),
+        state.diagnosticLevelName,
+        static_cast<unsigned long long>(state.diagnosticLevelSession),
+        static_cast<unsigned long long>(state.diagnosticLevelEpoch),
+        state.geometry.IsLoaded() ? 1 : 0,
+        static_cast<unsigned long long>(state.geometry.LevelSession()),
+        static_cast<unsigned long long>(state.geometry.LevelEpoch()),
+        state.diagnosticAttempted ? 1 : 0,
+        state.gpuUnknown ? 1 : 0, state.quarantined ? 1 : 0,
+        state.geometry.IsDrawRecorded() ? 1 : 0,
+        state.geometry.IsDrawSubmitted() ? 1 : 0);
 }
 
 void ReleaseObjects()
@@ -1065,6 +1142,94 @@ void LogCameraBits(const Matrix4& view, const Matrix4& projection,
     logMatrix("projection", projection);
     logMatrix("full", fullTransform);
 }
+
+struct FrustumPlane
+{
+    float nx = 0.0f;
+    float ny = 0.0f;
+    float nz = 0.0f;
+    float d = 0.0f;
+};
+
+bool NormalizePlane(FrustumPlane& plane)
+{
+    const float length =
+        std::sqrt(plane.nx * plane.nx + plane.ny * plane.ny +
+                  plane.nz * plane.nz);
+    if (!std::isfinite(length) || length < 1.0e-9f)
+        return false;
+    plane.nx /= length;
+    plane.ny /= length;
+    plane.nz /= length;
+    plane.d /= length;
+    return true;
+}
+
+bool BuildFrustumPlanes(const Matrix4& fullTransform,
+                        FrustumPlane planes[6])
+{
+    // Row-vector convention: clip.x = dot(p, column0), etc. D3D clip volume
+    // is -w <= x,y <= w and 0 <= z <= w.
+    float column[4][4] = {};
+    for (uint32_t row = 0; row < 4; ++row)
+        for (uint32_t index = 0; index < 4; ++index)
+            column[index][row] = fullTransform.m[row][index];
+
+    const auto set = [&planes, &column](uint32_t index, const float sign0,
+                                        const float sign3) {
+        FrustumPlane& plane = planes[index];
+        plane.nx = column[0][0] * sign0 + column[3][0] * sign3;
+        plane.ny = column[0][1] * sign0 + column[3][1] * sign3;
+        plane.nz = column[0][2] * sign0 + column[3][2] * sign3;
+        plane.d = column[0][3] * sign0 + column[3][3] * sign3;
+        return NormalizePlane(plane);
+    };
+    const auto setAxis = [&planes, &column](uint32_t index, const float sign1,
+                                            const float sign3) {
+        FrustumPlane& plane = planes[index];
+        plane.nx = column[1][0] * sign1 + column[3][0] * sign3;
+        plane.ny = column[1][1] * sign1 + column[3][1] * sign3;
+        plane.nz = column[1][2] * sign1 + column[3][2] * sign3;
+        plane.d = column[1][3] * sign1 + column[3][3] * sign3;
+        return NormalizePlane(plane);
+    };
+
+    if (!set(0, 1.0f, 1.0f) || !set(1, -1.0f, 1.0f) ||
+        !setAxis(2, 1.0f, 1.0f) || !setAxis(3, -1.0f, 1.0f))
+        return false;
+
+    FrustumPlane& nearPlane = planes[4];
+    nearPlane.nx = column[2][0];
+    nearPlane.ny = column[2][1];
+    nearPlane.nz = column[2][2];
+    nearPlane.d = column[2][3];
+    FrustumPlane& farPlane = planes[5];
+    farPlane.nx = column[3][0] - column[2][0];
+    farPlane.ny = column[3][1] - column[2][1];
+    farPlane.nz = column[3][2] - column[2][2];
+    farPlane.d = column[3][3] - column[2][3];
+    return NormalizePlane(nearPlane) && NormalizePlane(farPlane);
+}
+
+bool SphereInFrustum(const Matrix4& fullTransform, const float center[3],
+                     float radius, float distances[6])
+{
+    FrustumPlane planes[6];
+    if (!BuildFrustumPlanes(fullTransform, planes))
+        return false;
+    bool visible = true;
+    for (uint32_t index = 0; index < 6; ++index)
+    {
+        const FrustumPlane& plane = planes[index];
+        const float distance = plane.nx * center[0] +
+                               plane.ny * center[1] +
+                               plane.nz * center[2] + plane.d;
+        distances[index] = distance;
+        if (distance < -radius)
+            visible = false;
+    }
+    return visible;
+}
 } // namespace
 
 void GameDx12Bridge_OnLevelReady(const char* levelName)
@@ -1117,14 +1282,22 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         static_cast<unsigned long long>(state.levelSession),
         static_cast<unsigned long long>(state.captureEpoch));
 
-    // J1.2A diagnostic load path. It is opt-in and never synthesizes a world
-    // transform or draws. A full runtime can exercise the real VFS ->
-    // ReadVisual -> BuildXrayLevelAsset12 -> GpuMeshRegistry12 upload path
-    // before J1.2B supplies the validated visual placement.
+    // J1.2A diagnostic load path. R2A requires an explicit game-level
+    // selection so visual ID 9 cannot accidentally run on Zaton. The loaded
+    // geometry is bound to the current level name/session/epoch and is never
+    // reused after a level transition.
+    state.diagnosticLevelBound = false;
+    state.diagnosticLevelSession = 0;
+    state.diagnosticLevelEpoch = 0;
+    state.diagnosticLevelMismatchLogged = false;
+    state.diagnosticLevelName[0] = '\0';
+
     const char* geometryVisual =
         std::getenv("OGSR_DX12_GAME_GEOMETRY_VISUAL");
     if (geometryVisual != nullptr && geometryVisual[0] != '\0')
     {
+        const char* requestedLevel =
+            std::getenv("OGSR_DX12_GAME_DIAGNOSTIC_LEVEL");
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(geometryVisual, &end, 10);
         if (end == geometryVisual || *end != '\0' ||
@@ -1132,28 +1305,64 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         {
             Msg("ph_dx12_geometry: invalid OGSR_DX12_GAME_GEOMETRY_VISUAL");
         }
+        else if (requestedLevel == nullptr || requestedLevel[0] == '\0')
+        {
+            Msg("ph_dx12_geometry: diagnostic skipped: "
+                "OGSR_DX12_GAME_DIAGNOSTIC_LEVEL is required");
+        }
+        else if (std::strlen(requestedLevel) >=
+                 sizeof(state.diagnosticLevelName))
+        {
+            Msg("ph_dx12_geometry: diagnostic level name too long");
+        }
         else
         {
-            GameDx12LevelGeometryOwner12 owner;
-            owner.device = state.device.Get();
-            owner.queue = state.queue.Get();
-            owner.fence = state.fence.Get();
-            owner.fenceEvent = state.fenceEvent;
-            owner.allocator = state.allocator.Get();
-            owner.list = state.list.Get();
-            owner.fenceValue = &state.fenceValue;
-            std::string reason;
-            const bool loaded = state.geometry.LoadFromVfs(
-                owner, state.levelName, static_cast<uint32_t>(parsed),
-                state.levelSession, state.captureEpoch, reason);
-            if (!loaded)
+            std::snprintf(state.diagnosticLevelName,
+                          sizeof(state.diagnosticLevelName), "%s",
+                          requestedLevel);
+            if (_stricmp(state.diagnosticLevelName, state.levelName) != 0)
             {
-                Msg("ph_dx12_geometry: load failed reason='%s'",
-                    reason.empty() ? "allocation or unknown failure"
-                                   : reason.c_str());
+                Msg("ph_dx12_geometry: diagnostic skipped: level='%s' "
+                    "requested='%s'",
+                    state.levelName, state.diagnosticLevelName);
             }
-            if (state.geometry.GpuCompletionUnknown())
-                QuarantineForGeometryUnknown("level_ready");
+            else
+            {
+                GameDx12LevelGeometryOwner12 owner;
+                owner.device = state.device.Get();
+                owner.queue = state.queue.Get();
+                owner.fence = state.fence.Get();
+                owner.fenceEvent = state.fenceEvent;
+                owner.allocator = state.allocator.Get();
+                owner.list = state.list.Get();
+                owner.fenceValue = &state.fenceValue;
+                std::string reason;
+                const bool loaded = state.geometry.LoadFromVfs(
+                    owner, state.levelName, static_cast<uint32_t>(parsed),
+                    state.levelSession, state.captureEpoch, reason);
+                if (!loaded)
+                {
+                    Msg("ph_dx12_geometry: load failed reason='%s'",
+                        reason.empty() ? "allocation or unknown failure"
+                                       : reason.c_str());
+                }
+                else
+                {
+                    state.diagnosticLevelSession = state.levelSession;
+                    state.diagnosticLevelEpoch = state.captureEpoch;
+                    state.diagnosticLevelBound = true;
+                    Msg("ph_dx12_geometry: diagnostic bound level='%s' "
+                        "session=%llu epoch=%llu visual=%u",
+                        state.diagnosticLevelName,
+                        static_cast<unsigned long long>(
+                            state.diagnosticLevelSession),
+                        static_cast<unsigned long long>(
+                            state.diagnosticLevelEpoch),
+                        static_cast<uint32_t>(parsed));
+                }
+                if (state.geometry.GpuCompletionUnknown())
+                    QuarantineForGeometryUnknown("level_ready");
+            }
         }
     }
 }
@@ -1166,6 +1375,7 @@ void GameDx12Bridge_OnLevelTeardown()
     if (!state.levelActive)
         return;
     state.levelActive = false;
+    state.diagnosticLevelBound = false;
     if (ForceOverflow("teardown-epoch"))
         state.captureEpoch = std::numeric_limits<uint64_t>::max();
     if (state.captureEpoch == std::numeric_limits<uint64_t>::max())
@@ -1228,10 +1438,23 @@ void GameDx12Bridge_OnFrame()
         ++state.rejectedFrames;
         if (state.rejectedFrames == 1 ||
             (state.rejectedFrames % 60) == 0)
+        {
             Msg("ph_dx12_bridge: invalid camera rejected count=%llu "
-                "frame=%u",
+                "frame=%u position=(%.3f,%.3f,%.3f) view_det=%.9g "
+                "proj_23=%.9g proj_33=%.9g",
                 static_cast<unsigned long long>(state.rejectedFrames),
-                Device.dwFrame);
+                Device.dwFrame, Device.vCameraPosition.x,
+                Device.vCameraPosition.y, Device.vCameraPosition.z,
+                view.m[0][0] * (view.m[1][1] * view.m[2][2] -
+                                view.m[1][2] * view.m[2][1]) -
+                    view.m[0][1] * (view.m[1][0] * view.m[2][2] -
+                                    view.m[1][2] * view.m[2][0]) +
+                    view.m[0][2] * (view.m[1][0] * view.m[2][1] -
+                                    view.m[1][1] * view.m[2][0]),
+                projection.m[2][3], projection.m[3][3]);
+            if (MatrixBitsRequested())
+                LogCameraBits(view, projection, fullTransform);
+        }
         return;
     }
 
@@ -1242,14 +1465,156 @@ void GameDx12Bridge_OnFrame()
         LogCameraBits(view, projection, fullTransform);
     if (state.capturedFrames == 1 || (state.capturedFrames % 60) == 0)
         LogCamera(view, projection, fullTransform, hash);
+
+    // F4.0-J1 owner-thread one-shot diagnostic caller. It runs only after the
+    // existing camera checks above, uses the real game ViewProjection and the
+    // authored static-geometry identity world, and never repeats automatically.
+    if (!state.diagnosticAttempted && state.geometry.IsLoaded())
+    {
+        const bool identityMatches =
+            state.diagnosticLevelBound && state.levelActive &&
+            state.levelSession == state.diagnosticLevelSession &&
+            state.captureEpoch == state.diagnosticLevelEpoch &&
+            state.geometry.LevelSession() == state.diagnosticLevelSession &&
+            state.geometry.LevelEpoch() == state.diagnosticLevelEpoch &&
+            _stricmp(state.levelName, state.diagnosticLevelName) == 0;
+        if (!identityMatches)
+        {
+            if (!state.diagnosticLevelMismatchLogged)
+            {
+                state.diagnosticLevelMismatchLogged = true;
+                Msg("ph_dx12_geometry: diagnostic blocked: "
+                    "level/session/epoch mismatch current='%s' "
+                    "session=%llu epoch=%llu bound='%s' session=%llu "
+                    "epoch=%llu",
+                    state.levelName,
+                    static_cast<unsigned long long>(state.levelSession),
+                    static_cast<unsigned long long>(state.captureEpoch),
+                    state.diagnosticLevelName,
+                    static_cast<unsigned long long>(
+                        state.diagnosticLevelSession),
+                    static_cast<unsigned long long>(
+                        state.diagnosticLevelEpoch));
+            }
+            return;
+        }
+
+        float minimum[3] = {};
+        float maximum[3] = {};
+        float center[3] = {};
+        float radius = 0.0f;
+        if (!state.geometry.GetBounds(minimum, maximum, center, radius))
+            return;
+        float planeDistances[6] = {};
+        const bool visible = SphereInFrustum(fullTransform, center, radius,
+                                             planeDistances);
+        if (!state.diagnosticVisibilityLogged ||
+            (!visible && (state.capturedFrames % 60) == 0))
+        {
+            state.diagnosticVisibilityLogged = true;
+            Msg("ph_dx12_geometry: visibility visual=%u session=%llu "
+                "epoch=%llu camera=(%.3f,%.3f,%.3f) "
+                "min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f) "
+                "center=(%.3f,%.3f,%.3f) radius=%.3f "
+                "planes=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] visible=%d",
+                state.geometry.VisualId(),
+                static_cast<unsigned long long>(state.levelSession),
+                static_cast<unsigned long long>(state.captureEpoch),
+                Device.vCameraPosition.x, Device.vCameraPosition.y,
+                Device.vCameraPosition.z,
+                minimum[0], minimum[1], minimum[2],
+                maximum[0], maximum[1], maximum[2],
+                center[0], center[1], center[2],
+                radius, planeDistances[0], planeDistances[1],
+                planeDistances[2], planeDistances[3], planeDistances[4],
+                planeDistances[5], visible ? 1 : 0);
+        }
+        if (!visible)
+            return;
+
+        state.diagnosticAttempted = true;
+        DirectX::XMFLOAT4X4 logicalViewProjection = {};
+        std::memcpy(&logicalViewProjection, fullTransform.m,
+                    sizeof(logicalViewProjection));
+        const DirectX::XMFLOAT4X4 identityWorld = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+
+        wchar_t pngPath[MAX_PATH] = {};
+        const DWORD pngLength = GetEnvironmentVariableW(
+            L"OGSR_DX12_GAME_DIAGNOSTIC_PNG", pngPath, MAX_PATH);
+        if (pngLength >= MAX_PATH)
+        {
+            Msg("ph_dx12_geometry: J1 diagnostic aborted: PNG path too long "
+                "(required=%lu max=%u)",
+                static_cast<unsigned long>(pngLength),
+                static_cast<unsigned>(MAX_PATH));
+            EvaluateInfoQueue("diagnostic");
+            return;
+        }
+        const wchar_t* png = pngLength > 0 ? pngPath : nullptr;
+        std::string reason;
+        GameDx12DiagnosticResult diagnostic;
+        const bool rendered = GameDx12Bridge_RenderOffscreenDiagnostic(
+            logicalViewProjection, identityWorld, png, reason, &diagnostic);
+        if (rendered)
+        {
+            Msg("ph_dx12_geometry: J1 image gate PASS visual=%u "
+                "session=%llu epoch=%llu nonclear=%llu/%llu "
+                "bbox=(%u,%u)-(%u,%u) png_saved=%d",
+                state.geometry.VisualId(),
+                static_cast<unsigned long long>(state.levelSession),
+                static_cast<unsigned long long>(state.captureEpoch),
+                static_cast<unsigned long long>(
+                    diagnostic.coverage.nonClearPixels),
+                static_cast<unsigned long long>(
+                    diagnostic.coverage.totalPixels),
+                diagnostic.coverage.minX, diagnostic.coverage.minY,
+                diagnostic.coverage.maxX, diagnostic.coverage.maxY,
+                diagnostic.pngSaved ? 1 : 0);
+        }
+        else if (diagnostic.gpuCompleted)
+        {
+            Msg("ph_dx12_geometry: J1 GPU completion confirmed; "
+                "image/PNG gate FAIL visual=%u session=%llu epoch=%llu "
+                "image_gate=%d nonclear=%llu/%llu png_saved=%d "
+                "reason='%s'",
+                state.geometry.VisualId(),
+                static_cast<unsigned long long>(state.levelSession),
+                static_cast<unsigned long long>(state.captureEpoch),
+                diagnostic.imageGatePass ? 1 : 0,
+                static_cast<unsigned long long>(
+                    diagnostic.coverage.nonClearPixels),
+                static_cast<unsigned long long>(
+                    diagnostic.coverage.totalPixels),
+                diagnostic.pngSaved ? 1 : 0,
+                reason.empty() ? "unknown failure" : reason.c_str());
+        }
+        else
+        {
+            Msg("ph_dx12_geometry: J1 GPU completion NOT confirmed "
+                "visual=%u reason='%s'",
+                state.geometry.VisualId(),
+                reason.empty() ? "unknown failure" : reason.c_str());
+        }
+        EvaluateInfoQueue("diagnostic");
+    }
 }
 
 bool GameDx12Bridge_RenderOffscreenDiagnostic(
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const DirectX::XMFLOAT4X4& logicalWorld,
     const wchar_t* pngPath,
-    std::string& reason)
+    std::string& reason,
+    GameDx12DiagnosticResult* result)
 {
+    GameDx12DiagnosticResult localResult;
+    if (result == nullptr)
+        result = &localResult;
+    *result = {};
+
     if (!EnsureOwnerThread("offscreen_diagnostic"))
         return false;
     BridgeStateData& state = State();
@@ -1313,7 +1678,7 @@ bool GameDx12Bridge_RenderOffscreenDiagnostic(
         return false;
     }
 
-    const float clearColor[4] = {0.03f, 0.05f, 0.09f, 1.0f};
+    const float* clearColor = kGameDx12DiagnosticClearColor;
     if (!state.offscreen.RecordBegin(state.list.Get(), clearColor, reason))
     {
         RecoverUnsubmittedDiagnosticList(state, "record-begin", reason);
@@ -1376,8 +1741,9 @@ bool GameDx12Bridge_RenderOffscreenDiagnostic(
             return false;
         }
     }
+    const HRESULT removedReason = state.device->GetDeviceRemovedReason();
     if (state.fence->GetCompletedValue() < expected ||
-        state.device->GetDeviceRemovedReason() != S_OK)
+        removedReason != S_OK)
     {
         QuarantineForGeometryUnknown("diagnostic-completion");
         reason = "diagnostic GPU completion unconfirmed";
@@ -1391,15 +1757,43 @@ bool GameDx12Bridge_RenderOffscreenDiagnostic(
     }
     // Exact Draw fence and device status are confirmed here. Only now may the
     // offscreen pass forget its submitted frame before CPU readback.
+    result->gpuCompleted = true;
     state.offscreen.CommitSubmittedFrame();
     if (!state.offscreen.Readback(reason))
         return false;
-    if (pngPath != nullptr && !state.offscreen.SavePng(pngPath, reason))
-        return false;
+    result->coverage = state.offscreen.EvaluateCoverage();
+    result->imageGatePass = result->coverage.HasVisiblePixels();
+    const bool pngRequested = pngPath != nullptr;
+    bool pngOk = true;
+    if (pngRequested)
+    {
+        pngOk = state.offscreen.SavePng(pngPath, reason);
+        result->pngSaved = pngOk;
+    }
 
     Msg("ph_dx12_geometry: offscreen diagnostic submitted fence=%llu "
-        "size=%ux%u",
-        static_cast<unsigned long long>(expected), state.width, state.height);
+        "size=%ux%u visual=%u indices=%u instances=1 "
+        "rt=R8G8B8A8_UNORM depth=D32_FLOAT readback=1 removed=0x%08X "
+        "gpu_completed=1 image_gate=%d nonclear=%llu/%llu "
+        "bbox=(%u,%u)-(%u,%u) png_requested=%d png_saved=%d",
+        static_cast<unsigned long long>(expected), state.width, state.height,
+        state.geometry.VisualId(), state.geometry.IndexCount(),
+        static_cast<unsigned>(removedReason),
+        result->imageGatePass ? 1 : 0,
+        static_cast<unsigned long long>(result->coverage.nonClearPixels),
+        static_cast<unsigned long long>(result->coverage.totalPixels),
+        result->coverage.minX, result->coverage.minY,
+        result->coverage.maxX, result->coverage.maxY,
+        pngRequested ? 1 : 0, result->pngSaved ? 1 : 0);
+
+    if (!result->imageGatePass)
+    {
+        if (reason.empty())
+            reason = "diagnostic image gate failed: zero non-clear pixels";
+        return false;
+    }
+    if (pngRequested && !pngOk)
+        return false;
     return true;
 }
 
@@ -1426,6 +1820,7 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         state.geometry.OnDeviceReset(state.captureEpoch);
         if (state.geometry.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("device_reset");
+        RebindDiagnosticAfterDeviceReset("device_reset");
     }
     Msg("ph_dx12_bridge: device reset width=%u height=%u epoch=%llu "
         "(offscreen target resized on next diagnostic)",
