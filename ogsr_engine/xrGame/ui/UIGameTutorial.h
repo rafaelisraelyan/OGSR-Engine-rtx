@@ -13,6 +13,7 @@ protected:
     CUIWindow* m_UIWindow;
     ref_sound m_global_sound;
     xr_deque<CUISequenceItem*> m_sequencer_items;
+    bool m_bDestroyed = false;
 
     bool GrabInput();
     CUISequenceItem* GetNextItem();
@@ -24,9 +25,10 @@ public:
     CUISequencer();
     bool Start(LPCSTR tutor_name);
     void Stop();
+    void StopForced(); // full teardown; never invokes m_on_destroy_event
     void Next();
 
-    void Destroy(); // be careful
+    void Destroy(bool bNotify = true); // idempotent; owner must delete afterwards
 
     virtual void OnFrame();
     virtual void OnRender();
@@ -94,7 +96,9 @@ public:
     virtual void Load(CUIXml* xml, int idx) = 0;
 
     virtual void Start();
-    virtual bool Stop(bool bForce = false) = 0;
+    // bNotify=false is used by forced disconnect teardown: UI/sound/pause
+    // cleanup still runs, but game-dependent Lua stop callbacks are skipped.
+    virtual bool Stop(bool bForce = false, bool bNotify = true) = 0;
 
     virtual void Update();
     virtual void OnRender() = 0;
@@ -152,7 +156,7 @@ public:
     virtual void Load(CUIXml* xml, int idx);
 
     virtual void Start();
-    virtual bool Stop(bool bForce = false);
+    virtual bool Stop(bool bForce = false, bool bNotify = true);
 
     virtual void Update();
     virtual void OnRender();
@@ -189,7 +193,7 @@ public:
     virtual void Load(CUIXml* xml, int idx);
 
     virtual void Start();
-    virtual bool Stop(bool bForce = false);
+    virtual bool Stop(bool bForce = false, bool bNotify = true);
 
     virtual void Update();
     virtual void OnRender();

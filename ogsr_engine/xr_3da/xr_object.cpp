@@ -27,30 +27,46 @@ void CObject::cNameVisual_set(shared_str N)
         if (N == NameVisual)
             return;
 
-    // replace model
+    IRenderVisual* old_v = renderable.visual;
+    IKinematics* old_k = old_v ? old_v->dcast_PKinematics() : nullptr;
+
+    // Build the replacement first. The old visual remains current and usable
+    // until cleanup has completed.
+    IRenderVisual* new_v = nullptr;
     if (*N && N[0])
     {
-        IRenderVisual* old_v = renderable.visual;
+        new_v = Render->model_Create(*N);
+        // CModelPool currently reports a missing asset as FATAL, but keep the
+        // old visual intact if a non-fatal loader ever returns null.
+        if (!new_v)
+            return;
+    }
 
+    OnBeforeVisualChange();
+
+    // Per-bone callbacks belong to the old skeleton and must not be copied.
+    // Only the global update callback/param is inherited.
+    IKinematics* new_k = new_v ? new_v->dcast_PKinematics() : nullptr;
+    if (old_k && new_k)
+    {
+        new_k->SetUpdateCallback(old_k->GetUpdateCallback());
+        new_k->SetUpdateCallbackParam(old_k->GetUpdateCallbackParam());
+    }
+
+    if (new_v)
+    {
+        renderable.visual = new_v;
         NameVisual = N;
-        renderable.visual = Render->model_Create(*N);
-
-        IKinematics* old_k = old_v ? old_v->dcast_PKinematics() : nullptr;
-        IKinematics* new_k = renderable.visual->dcast_PKinematics();
-
-        if (old_k && new_k)
-        {
-            new_k->SetUpdateCallback(old_k->GetUpdateCallback());
-            new_k->SetUpdateCallbackParam(old_k->GetUpdateCallbackParam());
-        }
-
-        ::Render->model_Delete(old_v);
     }
     else
     {
-        ::Render->model_Delete(renderable.visual);
+        renderable.visual = nullptr;
         NameVisual = nullptr;
     }
+
+    if (old_v)
+        ::Render->model_Delete(old_v);
+
     OnChangeVisual();
 }
 

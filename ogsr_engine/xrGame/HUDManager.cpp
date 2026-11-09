@@ -283,6 +283,8 @@ void CHUDManager::RenderUI()
 {
     if (!b_online)
         return;
+    if (!need_render_hud() || !m_Renderable)
+        return;
 
     {
         HitMarker.Render();

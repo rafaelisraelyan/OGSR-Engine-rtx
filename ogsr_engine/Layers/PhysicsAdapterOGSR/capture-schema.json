@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ogsr.invalid/physics/ragdoll-capture.schema.json",
+  "title": "OGSR ragdoll capture",
+  "type": "object",
+  "required": ["schemaVersion", "description", "initial"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "source": {
+      "type": "object",
+      "properties": {
+        "ogsrCommit": { "type": "string" },
+        "visual": { "type": "string" },
+        "modelHash": { "type": "integer" },
+        "fixCopJoints": { "type": "boolean" }
+      }
+    },
+    "description": {
+      "type": "object",
+      "required": ["schemaVersion", "rootBody", "bones", "bodies", "joints"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "skeletonName": { "type": "string" },
+        "sourceHash": { "type": "integer" },
+        "rootBody": { "type": "integer", "minimum": 0 },
+        "bones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "parent", "bindLocal", "visible", "disposition"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "parent": { "type": "integer", "minimum": -1 },
+              "name": { "type": "string" },
+              "bindLocal": { "$ref": "#/$defs/transform" },
+              "visible": { "type": "boolean" },
+              "disposition": {
+                "enum": ["Body", "MergedIntoParent", "SkippedInvisible", "FreeBody"]
+              },
+              "body": { "type": "integer", "minimum": -1 },
+              "sourceShapeFlags": { "type": "integer" }
+            }
+          }
+        },
+        "bodies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "boneId", "role", "mass", "centerOfMass", "inertia", "bindPose", "shapes"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "boneId": { "type": "integer", "minimum": 0 },
+              "parentBody": { "type": "integer", "minimum": -1 },
+              "role": { "enum": ["Dynamic", "StaticRoot", "FreeBody"] },
+              "isFixed": { "type": "boolean" },
+              "mass": { "type": "number", "minimum": 0 },
+              "centerOfMass": { "$ref": "#/$defs/vec3" },
+              "inertia": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": { "type": "number" }
+              },
+              "bindPose": { "$ref": "#/$defs/transform" },
+              "mergedBones": { "type": "array", "items": { "type": "integer" } },
+              "collisionGroup": { "type": "integer" },
+              "shapes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["type", "local"],
+                  "properties": {
+                    "type": { "enum": ["Box", "Sphere", "Cylinder"] },
+                    "local": { "$ref": "#/$defs/transform" },
+                    "halfExtents": { "$ref": "#/$defs/vec3" },
+                    "radius": { "type": "number", "minimum": 0 },
+                    "height": { "type": "number", "minimum": 0 },
+                    "margin": { "type": "number", "minimum": 0 },
+                    "materialId": { "type": "integer" },
+                    "sourceBoneId": { "type": "integer" },
+                    "flags": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "joints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "parentBody", "childBody", "kind", "parentFrame", "childFrame", "axes"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "boneId": { "type": "integer", "minimum": 0 },
+              "parentBody": { "type": "integer", "minimum": 0 },
+              "childBody": { "type": "integer", "minimum": 0 },
+              "kind": { "enum": ["Ball", "Hinge", "Hinge2", "Slider", "Euler3", "Fixed"] },
+              "parentFrame": { "$ref": "#/$defs/transform" },
+              "childFrame": { "$ref": "#/$defs/transform" },
+              "axisCount": { "type": "integer", "minimum": 0, "maximum": 3 },
+              "axes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["space", "axis", "lower", "upper"],
+                  "properties": {
+                    "space": { "enum": ["Parent", "Child", "World"] },
+                    "axis": { "$ref": "#/$defs/vec3" },
+                    "lower": { "type": "number" },
+                    "upper": { "type": "number" },
+                    "sourceLower": { "type": "number" },
+                    "sourceUpper": { "type": "number" },
+                    "spring": { "type": "number" },
+                    "damping": { "type": "number" },
+                    "zero": { "type": "number" }
+                  }
+                }
+              },
+              "breakable": { "type": "boolean" },
+              "breakForce": { "type": "number", "minimum": 0 },
+              "breakTorque": { "type": "number", "minimum": 0 },
+              "swingLimitMode": { "enum": ["Auto", "Cone", "Pyramid"] }
+            }
+          }
+        },
+        "materials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "integer" },
+              "name": { "type": "string" },
+              "friction": { "type": "number" },
+              "restitution": { "type": "number" },
+              "spring": { "type": "number" },
+              "damping": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "initial": {
+      "type": "object",
+      "required": ["entityWorld", "rootToEntity", "bodyWorld", "linearVelocity", "angularVelocity"],
+      "properties": {
+        "entityWorld": { "$ref": "#/$defs/transform" },
+        "rootToEntity": { "$ref": "#/$defs/transform" },
+        "bodyWorld": { "type": "array", "items": { "$ref": "#/$defs/transform" } },
+        "linearVelocity": { "type": "array", "items": { "$ref": "#/$defs/vec3" } },
+        "angularVelocity": { "type": "array", "items": { "$ref": "#/$defs/vec3" } },
+        "enabled": { "type": "array", "items": { "type": "boolean" } }
+      }
+    }
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "quat": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "type": "number" }
+    },
+    "transform": {
+      "type": "object",
+      "required": ["rotation", "translation"],
+      "properties": {
+        "rotation": { "$ref": "#/$defs/quat" },
+        "translation": { "$ref": "#/$defs/vec3" }
+      }
+    }
+  }
+}

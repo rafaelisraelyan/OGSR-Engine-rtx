@@ -95,6 +95,7 @@ public:
     void init();
 
     virtual void OnChangeVisual();
+    virtual void OnBeforeVisualChange();
     // для наследования CParticlesPlayer
     virtual void UpdateCL();
     void correct_spawn_pos();

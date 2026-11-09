@@ -135,6 +135,16 @@ void CDialogHolder::RemoveDialogToRender(CUIWindow* pDialog)
         (*it).wnd->Enable(false);
         (*it).enabled = false;
     }
+
+    // A dialog can be queued while OnFrame is running. Remove it from the
+    // pending queue as well so a later flush cannot resurrect a dead pointer.
+    xr_vector<dlgItem>::iterator pending = std::find(m_dialogsToRender_new.begin(), m_dialogsToRender_new.end(), itm);
+    if (pending != m_dialogsToRender_new.end())
+    {
+        pending->wnd->Show(false);
+        pending->wnd->Enable(false);
+        m_dialogsToRender_new.erase(pending);
+    }
 }
 
 void CDialogHolder::DoRenderDialogs()
@@ -245,6 +255,7 @@ void CDialogHolder::CleanInternals()
         m_input_receivers.pop_back();
 
     m_dialogsToRender.clear();
+    m_dialogsToRender_new.clear();
     GetUICursor().Hide();
 }
 

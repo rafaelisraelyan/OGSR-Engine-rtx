@@ -53,6 +53,10 @@
 
 #include <filesystem>
 
+#ifdef OGSR_DIAGNOSTIC_CAPTURE
+void RegisterOgsrCaptureCommand();
+#endif
+
 string_path g_last_saved_game;
 
 #ifdef DEBUG
@@ -2300,4 +2304,8 @@ void CCC_RegisterCommands()
 
     extern BOOL bSenvironmentXrExport;
     CMD4(CCC_Integer, "senvironment_xr_export", &bSenvironmentXrExport, FALSE, TRUE);
+
+#ifdef OGSR_DIAGNOSTIC_CAPTURE
+    RegisterOgsrCaptureCommand();
+#endif
 }

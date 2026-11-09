@@ -65,6 +65,7 @@ public:
 
     // Lain: added
     void SetRenderable(bool renderable) { m_Renderable = renderable; }
+    bool IsRenderable() const { return m_Renderable; }
 };
 
 IC CHUDManager& HUD() { return *((CHUDManager*)g_hud); }

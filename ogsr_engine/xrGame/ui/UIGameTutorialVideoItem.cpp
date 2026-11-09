@@ -197,7 +197,7 @@ void CUISequenceVideoItem::Start()
     }
 }
 
-bool CUISequenceVideoItem::Stop(bool bForce)
+bool CUISequenceVideoItem::Stop(bool bForce, bool bNotify)
 {
     if (m_flags.test(etiStoredCursorState))
         GetUICursor().Show();
@@ -223,6 +223,6 @@ bool CUISequenceVideoItem::Stop(bool bForce)
     if (m_flags.test(etiNeedPauseSound))
         Device.Pause(FALSE, FALSE, TRUE, "videoitem_stop");
 
-    inherited::Stop();
+    inherited::Stop(bForce, bNotify);
     return true;
 }

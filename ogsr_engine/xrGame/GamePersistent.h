@@ -22,6 +22,7 @@ class CGamePersistent : public IGame_Persistent, public IEventReceiver
     bool ambient_effect_wind_on;
 
     CUISequencer* m_intro;
+    bool m_start_game_intro_pending = false;
     EVENT eQuickLoad;
 
     fastdelegate::FastDelegate<void()> m_intro_event;
@@ -32,7 +33,7 @@ class CGamePersistent : public IGame_Persistent, public IEventReceiver
     void game_loaded();
     void update_game_loaded();
 
-    void start_game_intro();
+    void start_game_intro(bool bDeferred = false);
     void update_game_intro();
 
 #ifdef DEBUG
