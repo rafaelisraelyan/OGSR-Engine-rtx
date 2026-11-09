@@ -1101,13 +1101,7 @@ preparation и реальная параллельная запись через
 `ExecuteCommandLists`; F3.5.3B и F3.5.5C). В проекте
 `xrRender_R5_DX12.vcxproj` есть `ProjectReference` на `gr_job_system`,
 но наличие build-зависимости **не доказывает игровое runtime-использование**.
-Изолированный in-process `GameDx12Bridge` G1B выполняет только
-служебный single-list submit без игрового draw и без GR workers. G1B
-Round 2.4 source-only принят (`bb62c00ac`), J1.1 standalone GPU принят
-отдельно (`a1c751274`); на момент принятия G1B/J1.1 игровой Jupiter runtime был заблокирован
-недостающим совместимым level payload; Asset Recovery R3 (2026-11-06) закрыл
-VFS/CPU gate, но J1 in-game Draw и GPU readback ещё не проверены. **GR parallel recording не объявлен
-принятым; принятые G1B/J1.1 не являются in-game renderer.**
+Исторический G1B был только служебным single-list bridge; с тех пор **F4.0-J1 R2B source интегрирован** (`656652be7`), а post-merge Windows Jupiter visual9 DX12 Draw/readback **ACCEPTED WITH NOTES** (2026-11-08). Это один диагностический Draw, **не** game GR multi-list recording и не полная геометрия уровня. J2A R5 CPU-prep остаётся **только targeted pre-review PASS WITH NOTES, full Codex verdict PENDING**, production source HOLD. Standalone GR parallel recording имеет самостоятельную ограниченную / conditional acceptance из F3.5; его игровой GPU runtime пока **NOT TESTED**.
 
 | Гейт | Содержание и порядок | Доказательство |
 |---|---|---|
@@ -1134,6 +1128,18 @@ frame), J2/J3 — к последующему росту F4.0/F4 renderer, J4 �
 GR/packet/allocator/lifetime контракт. Обозначения **F4.0-J0–J4** не
 переименовывают **DXR-G0–G5** (где G3 — RT-тени). Не принимать native
 DX12 Presentation, PBR и DXR на основании одного GR теста.
+
+### F4.0-J3 portability audit — reuse implemented DX12 Smoke multithreading (2026-11-09; READ-ONLY / DESIGN)
+
+**Source-checked in current `prypiat`:** `ogsr_engine/Layers/xrRenderDX12/CHW12.cpp/.h`, `dx12renderprep.cpp/.h`, `dx12packetplan.cpp/.h`, `dx12geometrycatalog.cpp/.h`, `dx12geometryregistry.cpp/.h`, `ogsr_engine/Layers/JobSystem/include/gr/jobs/JobGroup.h`, `JobSystem.h`. Existing standalone `xrDX12Smoke.cpp` has serial/multi/parallel recording modes and fault injection. F3.5 Foundation is implemented and earlier independently **CONDITIONAL PASS** for standalone; synthetic perf does not establish game FPS. This is **reuse of verified architecture**, not need for a new scheduler.
+
+- **Reusable CPU handoff:** `RenderSceneSnapshot12` immutable camera/object copies → GR `PrepareOrdered(..., Mode::Serial/Parallel/Verify)` → deterministic `OrderedFrame12` → `BuildPacketBatchPlan` + `ValidatePacketBatchPlan`, **before the first D3D12 Reset**. The plan owns ranges only and must not outlive the ordered packets it references.
+- **Reusable recording pattern in `CHW12::RenderFrame`:** owner first confirms per-frame-slot GPU fence; writes mapped object constants once; creates/retains unique **allocator/list per worker and frame slot**; owner Begin list manages state/transitions/RTV/depth and owner End list handles final state. When `packetPlan.lists.size() <= 1`, owner-only serial recording (no synthetic worker submissions); otherwise `JobGroup::Submit` records nonempty draw list ranges, `Wait` drains *all accepted work* even if later `Submit` throws. Validate every list `Close` and per-worker outcome before owner-only `ExecuteCommandLists` and exact owner fence. Never submit partially recorded lists.
+- **Reuse utilities/contracts, not standalone object lifetime:** `CHW12` owns standalone swapchain/backbuffers, `FrameResource`, `GpuQuarantine` and synthetic/X-Ray fixed slots. Gameplay `GameDx12Bridge` owns a **different** device/queue/fence/offscreen target and P3 experimental `BridgeQuarantineStorage`; transplant the algorithm with an adapter and explicit game-session/epoch/geometry generations, not `CHW12` swapchain or its process-lifetime quarantine. First ensure real source 9/105/106/107 `ReadVisual` and `BuildXrayLevelAsset12` compatibility, GPU resident mesh handles/CB slices and **one serial four-draw offscreen frame**, verified per-visual contribution; J3 parallel recording follows that game GPU gate.
+- **Hard failure and thread guarantees:** workers never read mutable game/VFS state or create/reset shared owner resources; groups are bound to an authorized GR thread, callbacks' captures live through `Wait/DrainNoThrow`. `JobGroup::Wait` has **no built-in timeout** (risk documented in `CHW12.cpp`), unlike GPU fence waiting; add design/soak/watchdog strategy before runtime parallel default. CPU job completion is not GPU fence completion. Per Microsoft D3D12 docs, allocator `Reset` before GPU completion or concurrently on a shared allocator is invalid; only the owner submits command lists and manages queue fences, resource barriers, quarantine and late GPU failures.
+- **Gate order:** J2A R5 Codex PASS → independent J2A source acceptance → explicit authorized source integration → post-merge Windows tests → **J2B-M0 real four-visual conversion test** → J2B-M1/M2 serial four-mesh GPU upload and one-list Draw/image oracle → **J3-M0 reuse `CHW12` CPU plan / per-worker recorder with 2+ nonempty lists** → J3 correctness/failure/lifetime & serial equivalence → only then adaptive parallel defaults / scaling measurements. No J2A source or J3 code change is authorized by this documentation entry.
+
+References: Microsoft [Recording command lists and bundles](https://learn.microsoft.com/en-us/windows/win32/direct3d12/recording-command-lists-and-bundles), [ID3D12CommandAllocator::Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandallocator-reset), [ExecuteCommandLists](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-executecommandlists).
 
 ### F4-PBR — Physically Based Materials & Lighting (решение 2026-10-30; PLANNED)
 
