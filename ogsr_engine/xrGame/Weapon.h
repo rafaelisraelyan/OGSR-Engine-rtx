@@ -323,6 +323,12 @@ public:
 
     virtual const Fvector& get_CurrentFirePoint() { return get_LastFP(); }
     virtual const Fvector& get_CurrentFirePoint2() { return get_LastFP2(); }
+#ifdef OGSR_PHYSX_RAGDOLL
+    // Diagnostic-only entry point for the P3.3-G3 real-weapon harness. It
+    // invokes the normal CWeapon::FireTrace path with an explicit muzzle and
+    // direction; production gameplay never calls it.
+    void DebugFireTrace(const Fvector& P, const Fvector& D) { FireTrace(P, D); }
+#endif
     virtual const Fmatrix& get_ParticlesXFORM()
     {
         UpdateFireDependencies_internal();

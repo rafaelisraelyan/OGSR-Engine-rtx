@@ -283,7 +283,7 @@ void CUISequenceSimpleItem::Start()
     }
 }
 
-bool CUISequenceSimpleItem::Stop(bool bForce)
+bool CUISequenceSimpleItem::Stop(bool bForce, bool bNotify)
 {
     if (!m_flags.test(etiCanBeStopped) && !bForce)
         return false;
@@ -310,7 +310,7 @@ bool CUISequenceSimpleItem::Stop(bool bForce)
             ui_game_sp->PdaMenu().HideDialog();
         }
     }
-    inherited::Stop();
+    inherited::Stop(bForce, bNotify);
     return true;
 }
 

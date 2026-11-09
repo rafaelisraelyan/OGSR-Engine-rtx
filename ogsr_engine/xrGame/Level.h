@@ -277,6 +277,7 @@ public:
     IC CClientSpawnManager& client_spawn_manager();
     IC CAutosaveManager& autosave_manager();
     IC CDebugRenderer& debug_renderer();
+    IC bool has_debug_renderer() const;
 
     IC CPHCommander& ph_commander();
     IC CPHCommanderScripts& ph_commander_scripts();
@@ -388,6 +389,11 @@ IC CDebugRenderer& CLevel::debug_renderer()
 {
     VERIFY(m_debug_renderer);
     return (*m_debug_renderer);
+}
+
+IC bool CLevel::has_debug_renderer() const
+{
+    return m_debug_renderer != nullptr;
 }
 
 IC CPHCommander& CLevel::ph_commander()

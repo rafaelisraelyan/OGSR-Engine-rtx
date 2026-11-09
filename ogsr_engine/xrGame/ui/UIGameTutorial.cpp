@@ -89,9 +89,10 @@ void CUISequenceItem::Start()
     }
 }
 
-bool CUISequenceItem::Stop(bool bForce)
+bool CUISequenceItem::Stop(bool bForce, bool bNotify)
 {
-    CallFunctions(m_stop_lua_functions);
+    if (bNotify)
+        CallFunctions(m_stop_lua_functions);
     return true;
 }
 
@@ -235,9 +236,15 @@ CUISequenceItem* CUISequencer::GetNextItem()
 extern CUISequencer* g_tutorial;
 extern CUISequencer* g_tutorial2;
 
-void CUISequencer::Destroy()
+void CUISequencer::Destroy(bool bNotify)
 {
-    if (m_stop_lua_function.size())
+    if (m_bDestroyed)
+        return;
+    m_bDestroyed = true;
+
+    // Forced teardown runs while the level/actor globals may already be gone;
+    // skip both sequencer-level and item-level Lua stop callbacks in that case.
+    if (bNotify && m_stop_lua_function.size())
         CallFunction(m_stop_lua_function);
 
     m_global_sound.stop();
@@ -251,7 +258,7 @@ void CUISequencer::Destroy()
     m_flags.set(etsActive, FALSE);
     m_pStoredInputReceiver = nullptr;
 
-    if (!m_on_destroy_event.empty())
+    if (bNotify && !m_on_destroy_event.empty())
         m_on_destroy_event();
 
     if (g_tutorial == this)
@@ -266,6 +273,12 @@ void CUISequencer::Destroy()
 
 void CUISequencer::Stop()
 {
+    // F2: a completed sequencer may still be referenced by its owner until
+    // OnFrame deletes it. Repeated Stop() must not touch pause/input/device
+    // state or run item/callback side effects a second time.
+    if (m_bDestroyed)
+        return;
+
     if (m_sequencer_items.size())
     {
         if (m_flags.test(etsPlayEachItem))
@@ -287,6 +300,27 @@ void CUISequencer::Stop()
             Device.Pause(TRUE, TRUE, FALSE, "tutorial_stop");
     }
     Destroy();
+}
+
+void CUISequencer::StopForced()
+{
+    if (m_bDestroyed)
+        return;
+
+    // Do not take the etsPlayEachItem -> Next() early-out here: disconnect
+    // must always remove the sequencer from Device and release input.
+    // bNotify=false suppresses game-dependent Lua stop callbacks, which can
+    // run after the actor/level globals have already been torn down.
+    if (!m_sequencer_items.empty())
+        m_sequencer_items.front()->Stop(true, false);
+
+    if (m_flags.test(etsNeedPauseOn) && !m_flags.test(etsStoredPauseState))
+        Device.Pause(FALSE, TRUE, TRUE, "tutorial_stop_forced");
+
+    if (m_flags.test(etsNeedPauseOff) && m_flags.test(etsStoredPauseState))
+        Device.Pause(TRUE, TRUE, FALSE, "tutorial_stop_forced");
+
+    Destroy(false);
 }
 
 void CUISequencer::OnFrame()

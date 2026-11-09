@@ -92,6 +92,12 @@ CGamePersistent::CGamePersistent(void)
 
 CGamePersistent::~CGamePersistent(void)
 {
+    if (m_intro)
+    {
+        m_intro->StopForced();
+        xr_delete(m_intro);
+    }
+
     FS.r_close(pDemoFile);
     Device.seqFrame.Remove(this);
     Engine.Event.Handler_Detach(eDemoStart, this);
@@ -167,6 +173,20 @@ void CGamePersistent::Start(LPCSTR op) { __super::Start(op); }
 
 void CGamePersistent::Disconnect()
 {
+    // The game/loading intro is tied to the previous level's HUD lifetime.
+    // Forced teardown suppresses the completion callback: the owner deletes
+    // m_intro exactly once after Device registrations and input are released.
+    if (m_intro)
+    {
+        m_intro->StopForced();
+        xr_delete(m_intro);
+    }
+    m_start_game_intro_pending = false;
+
+    // Preserve the normal game_loaded callback side effect without starting
+    // a new intro during disconnect.
+    load_screen_renderer.stop();
+
     // destroy ambient particles
     CParticlesObject::Destroy(ambient_particles);
 
@@ -410,7 +430,8 @@ void CGamePersistent::start_logo_intro()
 
 void CGamePersistent::update_logo_intro()
 {
-    xr_delete(m_intro);
+    // m_intro is owned by CGamePersistent and deleted from OnFrame after
+    // CUISequencer::Destroy has returned.
     Msg("intro_delete ::update_logo_intro");
     Console->Execute("main_menu on");
 }
@@ -437,20 +458,28 @@ void CGamePersistent::game_loaded()
 
 void CGamePersistent::update_game_loaded()
 {
-    xr_delete(m_intro);
+    // Do not delete m_intro or start the next intro from inside
+    // CUISequencer::Destroy(). OnFrame deletes the inactive object first and
+    // then performs the deferred game-intro transition.
     load_screen_renderer.stop();
     Msg("intro_delete ::update_game_loaded");
-    start_game_intro();
+
+    // Capture the timing decision now. OnFrame will delete m_intro first and
+    // then create intro_game without re-checking dwPrecacheFrame later.
+    m_start_game_intro_pending =
+        allow_game_intro() && g_pGameLevel && g_pGameLevel->bReady &&
+        Device.dwPrecacheFrame <= 2 &&
+        0 == _stricmp(m_game_params.m_new_or_load, "new");
 }
 
-void CGamePersistent::start_game_intro()
+void CGamePersistent::start_game_intro(bool bDeferred)
 {
     if (!allow_game_intro())
     {
         return;
     }
 
-    if (g_pGameLevel && g_pGameLevel->bReady && Device.dwPrecacheFrame <= 2)
+    if (g_pGameLevel && g_pGameLevel->bReady && (bDeferred || Device.dwPrecacheFrame <= 2))
     {
         if (0 == _stricmp(m_game_params.m_new_or_load, "new"))
         {
@@ -465,16 +494,10 @@ void CGamePersistent::start_game_intro()
 
 void CGamePersistent::update_game_intro()
 {
-    if (m_intro && (false == m_intro->IsActive()))
-    {
-        xr_delete(m_intro);
-        Msg("intro_delete ::update_game_intro");
-        m_intro_event = 0;
-    }
-    else if (!m_intro)
-    {
-        m_intro_event = 0;
-    }
+    // Ownership stays with CGamePersistent; OnFrame deletes the inactive
+    // sequencer after Destroy() returns.
+    Msg("intro_delete ::update_game_intro");
+    m_intro_event = 0;
 }
 
 extern CUISequencer* g_tutorial;
@@ -499,6 +522,20 @@ void CGamePersistent::OnFrame()
     {
         xr_delete(g_tutorial);
     }
+
+    // CUISequencer::Destroy() is now callback-safe and leaves the object
+    // inactive. Delete it here, after Destroy() has returned, and only then
+    // perform the deferred intro_game transition.
+    if (m_intro && !m_intro->IsActive())
+    {
+        xr_delete(m_intro);
+        if (m_start_game_intro_pending)
+        {
+            m_start_game_intro_pending = false;
+            start_game_intro(true);
+        }
+    }
+
     if (0 == Device.dwFrame % 200)
         CUITextureMaster::FreeCachedShaders();
 
@@ -508,7 +545,7 @@ void CGamePersistent::OnFrame()
     if (!m_intro_event.empty())
         m_intro_event();
 
-    if (Device.dwPrecacheFrame == 0 && load_screen_renderer.b_registered /*&& !GameAutopaused*/)
+    if (Device.dwPrecacheFrame == 0 && load_screen_renderer.b_registered && g_pGameLevel /*&& !GameAutopaused*/)
     {
         RESET_SECTORS_HACK = true;
 
@@ -656,6 +693,13 @@ void CGamePersistent::OnEvent(EVENT E, u64 P1, u64 P2)
 
         if (g_tutorial2)
             g_tutorial2->Stop();
+
+        if (m_intro)
+        {
+            m_intro->StopForced();
+            xr_delete(m_intro);
+        }
+        m_start_game_intro_pending = false;
 
         LPSTR saved_name = (LPSTR)(P1);
 
