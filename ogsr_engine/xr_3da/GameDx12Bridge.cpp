@@ -5,6 +5,7 @@
 #include "GameDx12BridgeQuarantine.h"
 #include "GameDx12LevelGeometry.h"
 #include "GameDx12OffscreenPass.h"
+#include "GameDx12J2APreparation.h"
 
 #include "igame_level.h"
 
@@ -77,6 +78,9 @@ struct BridgeStateData
     bool diagnosticVisibilityLogged = false;
     bool diagnosticLevelMismatchLogged = false;
     bool diagnosticLevelBound = false;
+    bool j2aPending = false;
+    bool j2aAttempted = false;
+    bool j2aEnabledLogged = false;
     char diagnosticLevelName[128]{};
     uint64_t diagnosticLevelSession = 0;
     uint64_t diagnosticLevelEpoch = 0;
@@ -1365,6 +1369,18 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
             }
         }
     }
+
+    // F4.0-J2A opt-in CPU preparation. It runs once on the first validated
+    // frame after level ready, when the real game camera is available. The
+    // first prototype is intentionally limited to Jupiter.
+    state.j2aPending = GameDx12J2A_IsEnabled() &&
+                       _stricmp(state.levelName, "jupiter") == 0;
+    state.j2aAttempted = false;
+    if (state.j2aPending && !state.j2aEnabledLogged)
+    {
+        state.j2aEnabledLogged = true;
+        Msg("ph_dx12_j2a: enabled");
+    }
 }
 
 void GameDx12Bridge_OnLevelTeardown()
@@ -1376,6 +1392,8 @@ void GameDx12Bridge_OnLevelTeardown()
         return;
     state.levelActive = false;
     state.diagnosticLevelBound = false;
+    state.j2aPending = false;
+    state.j2aAttempted = false;
     if (ForceOverflow("teardown-epoch"))
         state.captureEpoch = std::numeric_limits<uint64_t>::max();
     if (state.captureEpoch == std::numeric_limits<uint64_t>::max())
@@ -1465,6 +1483,53 @@ void GameDx12Bridge_OnFrame()
         LogCameraBits(view, projection, fullTransform);
     if (state.capturedFrames == 1 || (state.capturedFrames % 60) == 0)
         LogCamera(view, projection, fullTransform, hash);
+
+    // F4.0-J2A opt-in CPU-only preparation: one bounded immutable snapshot per
+    // level session, using the already validated real game camera.
+    if (state.j2aPending && !state.j2aAttempted)
+    {
+        state.j2aAttempted = true;
+        state.j2aPending = false;
+        DirectX::XMFLOAT4X4 j2aView{};
+        DirectX::XMFLOAT4X4 j2aProjection{};
+        std::memcpy(&j2aView, Device.mView.m, sizeof(j2aView));
+        std::memcpy(&j2aProjection, Device.mProject.m, sizeof(j2aProjection));
+        GameDx12J2AResult12 j2aResult;
+        try
+        {
+            (void)GameDx12J2A_RunForBridge(
+                state.levelName, state.levelSession, state.captureEpoch,
+                j2aView, j2aProjection, j2aResult);
+        }
+        catch (...)
+        {
+            // Defensive bridge boundary. GameDx12J2A_RunForBridge is noexcept;
+            // keep OnFrame safe even if a future edit breaks that contract.
+            j2aResult.ok = false;
+            j2aResult.error = GameDx12J2AError12::Unknown;
+            j2aResult.instances = 0;
+            j2aResult.uniqueVisuals = 0;
+            j2aResult.packets = 0;
+            j2aResult.visiblePackets = 0;
+            j2aResult.culledPackets = 0;
+            j2aResult.batches = 0;
+            j2aResult.lists = 0;
+            j2aResult.stableHash = 0;
+            j2aResult.serialMs = 0.0;
+            j2aResult.parallelMs = 0.0;
+            j2aResult.verifyMs = 0.0;
+            try
+            {
+                Msg("ph_dx12_j2a: failure_detail sector=%u code=%u "
+                    "reason='bridge boundary exception'",
+                    j2aResult.sectorIndex,
+                    static_cast<unsigned>(j2aResult.error));
+            }
+            catch (...)
+            {
+            }
+        }
+    }
 
     // F4.0-J1 owner-thread one-shot diagnostic caller. It runs only after the
     // existing camera checks above, uses the real game ViewProjection and the
@@ -1821,6 +1886,12 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         if (state.geometry.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("device_reset");
         RebindDiagnosticAfterDeviceReset("device_reset");
+        if (state.j2aPending)
+        {
+            state.j2aPending = false;
+            state.j2aAttempted = true;
+            Msg("ph_dx12_j2a: pending preparation invalidated by device reset");
+        }
     }
     Msg("ph_dx12_bridge: device reset width=%u height=%u epoch=%llu "
         "(offscreen target resized on next diagnostic)",
@@ -1862,6 +1933,7 @@ void GameDx12Bridge_Shutdown()
     }
     state.levelActive = false;
     state.state = BridgeState::Shutdown;
+    GameDx12J2A_Shutdown();
     if (!state.shutdownLogged)
     {
         state.shutdownLogged = true;

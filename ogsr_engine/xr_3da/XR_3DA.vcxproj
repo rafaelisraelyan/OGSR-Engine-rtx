@@ -190,6 +190,11 @@
       <Command>call "$(ProjectDir)generate_build_info.bat"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\JobSystem\include;$(SolutionDir)ogsr_engine\Layers\JobSystem\thirdparty\enkiTS\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'=='true'">
     <ClCompile>
       <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;$(SolutionDir)ogsr_engine\Layers\JobSystem\include;$(SolutionDir)ogsr_engine\Layers\JobSystem\thirdparty\enkiTS\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -206,6 +211,11 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
     <ClCompile Include="..\Layers\xrRenderDX12\dx12renderprep.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12levelhierarchy.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <FloatingPointModel>Precise</FloatingPointModel>
       <ExceptionHandling>Sync</ExceptionHandling>
@@ -239,6 +249,43 @@
     <ClInclude Include="GameCameraCaptureDiagnostics.h" />
     <ClInclude Include="GameCameraCaptureExportPath.h" />
   </ItemGroup>
+  <ItemGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true' and '$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'!='true'">
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12renderprep.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12packetplan.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12levelhierarchy.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\JobSystem\src\JobSystem.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\JobSystem\src\JobGroup.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\JobSystem\src\EnkiBackend.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\JobSystem\src\CpuTopology.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\Layers\JobSystem\thirdparty\enkiTS\src\TaskScheduler.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemGroup>
   <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
     <ClCompile>
       <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -257,7 +304,13 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
+    <ClCompile Include="GameDx12J2APreparation.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
     <ClInclude Include="GameDx12Bridge.h" />
+    <ClInclude Include="GameDx12J2APreparation.h" />
+    <ClInclude Include="..\Layers\xrRenderDX12\dx12scopeguard.h" />
     <ClInclude Include="GameDx12BridgeCommandLine.h" />
     <ClInclude Include="GameDx12BridgeDiagnostics.h" />
     <ClInclude Include="GameDx12BridgeQuarantine.h" />
@@ -289,10 +342,6 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
     <ClCompile Include="..\Layers\xrRenderDX12\dx12log.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <ExceptionHandling>Sync</ExceptionHandling>
-    </ClCompile>
-    <ClCompile Include="..\Layers\xrRenderDX12\dx12packetplan.cpp" Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE)'!='true'">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
