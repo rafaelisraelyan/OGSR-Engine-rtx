@@ -8,11 +8,17 @@
 
 #include <array>
 #include <cstdint>
-#include <span>
 #include <string>
 #include <vector>
 
-// F4.0-J2B-M1: CPU-only, transactional four-visual batch.
+// F4.0-J2B-M1-R1: CPU-only, transactional four-visual batch.
+//
+// Failure contract:
+//   - every public entry point is noexcept;
+//   - failure status and error code are always available without allocation;
+//   - error text is best-effort and fixed-capacity, never required for status;
+//   - a failed call clears all published assets and the stable hash;
+//   - a subsequent call on the same owner thread can succeed normally.
 //
 // The batch owns only CPU data. It never creates D3D12 resources and never
 // publishes a partial result: all four requested visuals must read and convert
@@ -20,6 +26,47 @@
 namespace j2bbatch12
 {
 constexpr uint32_t kTargetVisualCount = 4;
+constexpr size_t kErrorTextCapacity = 192;
+
+enum class Error12 : uint32_t
+{
+    None = 0,
+    InvalidIdentity,
+    EmptyInput,
+    InputLimit,
+    DuplicateVisual,
+    HierarchyParse,
+    SectorCollect,
+    MissingVisual,
+    RootMismatch,
+    ReadVisual,
+    Convert,
+    AssetLimit,
+    TotalAssetLimit,
+    WorkerAllocation,
+    WorkerException,
+    SubmitException,
+    AllocationFailure,
+    Exception,
+    Unknown,
+    LevelMismatch,
+    OwnerThreadViolation,
+    LevelNameTooLong,
+    VfsOpen,
+    VfsSize,
+    VfsRead,
+    VfsAllocation,
+};
+
+struct ErrorInfo12
+{
+    Error12 code = Error12::None;
+    char text[kErrorTextCapacity] = {};
+};
+
+void SetErrorInfo(ErrorInfo12& info, Error12 code, const char* text) noexcept;
+void SetErrorInfo2(ErrorInfo12& info, Error12 code, const char* first,
+                   const char* second) noexcept;
 
 struct Identity12
 {
@@ -39,6 +86,9 @@ struct Snapshot12
     Identity12 identity;
     uint64_t levelHash = 0;
     uint64_t geomHash = 0;
+    double vfsOpenMs = 0.0;
+    double vfsCopyMs = 0.0;
+    double snapshotHashMs = 0.0;
 };
 
 struct Limits12
@@ -98,7 +148,7 @@ struct Slot12
     bool completed = false;
     double readMs = 0.0;
     double convertMs = 0.0;
-    std::string reason;
+    ErrorInfo12 error{};
 };
 
 struct BatchResult12
@@ -114,9 +164,29 @@ struct BatchResult12
     double collectMs = 0.0;
     double readVisualMs = 0.0;
     double convertMs = 0.0;
+    double grSubmitMs = 0.0;
+    double grWaitMs = 0.0;
+    double stableHashMs = 0.0;
     double totalMs = 0.0;
-    std::string reason;
+    double vfsOpenMs = 0.0;
+    double vfsCopyMs = 0.0;
+    double snapshotHashMs = 0.0;
+    ErrorInfo12 error{};
 };
+
+enum class AcceptStatus12 : uint32_t
+{
+    Accepted = 0,
+    NotReady,
+    InvalidResult,
+    StaleSession,
+    StaleEpoch,
+};
+
+// CPU-only acceptance token check. Call immediately before consuming a batch.
+// It never publishes, allocates or mutates the result.
+AcceptStatus12 AcceptBatch12(const BatchResult12& result,
+                             const Identity12& live) noexcept;
 
 uint64_t HashBytes(uint64_t seed, const void* data, size_t size) noexcept;
 uint64_t HashSnapshot(const Snapshot12& snapshot) noexcept;

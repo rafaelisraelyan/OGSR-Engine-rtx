@@ -7,6 +7,7 @@
 #include <cstring>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
 #include "j2b_m1_fault.h"
@@ -18,7 +19,12 @@ namespace
 {
 using Clock = std::chrono::steady_clock;
 
-double Ms(Clock::time_point start)
+static_assert(std::is_nothrow_move_assignable_v<BatchResult12>,
+              "BatchResult12 must be nothrow move-assignable");
+static_assert(std::is_nothrow_move_assignable_v<Snapshot12>,
+              "Snapshot12 must be nothrow move-assignable");
+
+double Ms(Clock::time_point start) noexcept
 {
     return std::chrono::duration<double, std::milli>(Clock::now() - start)
         .count();
@@ -31,24 +37,80 @@ uint64_t HashFloat(uint64_t hash, float value) noexcept
     return HashBytes(hash, &raw, sizeof(raw));
 }
 
+void ClearAsset(XrayAssetData12& asset) noexcept
+{
+    asset.vertices.clear();
+    asset.indices.clear();
+    asset.textureName.clear();
+    asset.shaderName.clear();
+    asset.minimum = {};
+    asset.maximum = {};
+    asset.sphere = {};
+}
+
+void ResetSlot(Slot12& slot) noexcept
+{
+    slot.valid = false;
+    slot.source = {};
+    slot.instance = {};
+    slot.vertexCount = 0;
+    slot.indexCount = 0;
+    slot.compactVbHash = 0;
+    slot.compactIbHash = 0;
+    slot.assetVbHash = 0;
+    slot.assetIbHash = 0;
+    slot.readError = xraylevel12::ReadError::None;
+    slot.readOk = false;
+    slot.converted = false;
+    slot.completed = false;
+    slot.readMs = 0.0;
+    slot.convertMs = 0.0;
+    slot.error.code = Error12::None;
+    slot.error.text[0] = '\0';
+    ClearAsset(slot.asset);
+}
+
 void ClearPublishedAssets(BatchResult12& result) noexcept
 {
     for (Slot12& slot : result.slots)
-    {
-        slot.valid = false;
-        slot.asset = {};
-    }
+        ResetSlot(slot);
 }
 
-void Fail(BatchResult12& result, const char* text)
+void FailSlot(Slot12& slot, Error12 code, const char* text) noexcept
+{
+    slot.valid = false;
+    slot.converted = false;
+    slot.assetVbHash = 0;
+    slot.assetIbHash = 0;
+    ClearAsset(slot.asset);
+    SetErrorInfo(slot.error, code, text);
+}
+
+void PublishFailure(BatchResult12& result, const BatchResult12& candidate,
+                    Error12 code, const char* text, double totalMs) noexcept
 {
     result.ok = false;
+    result.identity = candidate.identity;
+    result.sectorId = candidate.sectorId;
+    result.rootVisualId = candidate.rootVisualId;
+    result.instances = candidate.instances;
     result.stableHash = 0;
+    result.parseMs = candidate.parseMs;
+    result.collectMs = candidate.collectMs;
+    result.readVisualMs = candidate.readVisualMs;
+    result.convertMs = candidate.convertMs;
+    result.grSubmitMs = candidate.grSubmitMs;
+    result.grWaitMs = candidate.grWaitMs;
+    result.stableHashMs = candidate.stableHashMs;
+    result.totalMs = totalMs;
+    result.vfsOpenMs = candidate.vfsOpenMs;
+    result.vfsCopyMs = candidate.vfsCopyMs;
+    result.snapshotHashMs = candidate.snapshotHashMs;
+    SetErrorInfo(result.error, code, text);
     ClearPublishedAssets(result);
-    result.reason = text != nullptr ? text : "batch preparation failed";
 }
 
-bool SameVisuals(const std::array<uint32_t, kTargetVisualCount>& visuals)
+bool SameVisuals(const std::array<uint32_t, kTargetVisualCount>& visuals) noexcept
 {
     for (uint32_t i = 0; i < visuals.size(); ++i)
         for (uint32_t j = i + 1; j < visuals.size(); ++j)
@@ -61,6 +123,10 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
                  const InstanceKey12& instance, const Limits12& limits,
                  Slot12& slot)
 {
+#if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+    j2b_m1_fault::MaybeEnablePersistentOom(
+        j2b_m1_fault::Point::BeforeConvert);
+#endif
     const Clock::time_point readStart = Clock::now();
     xraylevel12::Geometry geometry;
     std::string readReason;
@@ -74,15 +140,17 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
     if (slot.readError != xraylevel12::ReadError::None)
     {
         slot.readOk = false;
-        slot.reason = readReason.empty()
-                          ? xraylevel12::ReadErrorMessage(slot.readError)
-                          : readReason;
+        FailSlot(slot, Error12::ReadVisual,
+                 readReason.empty() ? xraylevel12::ReadErrorMessage(
+                                          slot.readError)
+                                    : readReason.c_str());
         return false;
     }
 
     slot.readOk = true;
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
     j2b_m1_fault::MaybeThrow(j2b_m1_fault::Point::AfterRead);
+    j2b_m1_fault::MaybeBlock(j2b_m1_fault::Point::AfterRead);
 #endif
     slot.source.levelSession = snapshot.identity.levelSession;
     slot.source.visualId = geometry.visual_id;
@@ -114,9 +182,9 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
     slot.convertMs = Ms(convertStart);
     if (!converted)
     {
-        slot.converted = false;
-        slot.reason = convertReason != nullptr ? convertReason
-                                               : "asset conversion failed";
+        FailSlot(slot, Error12::Convert,
+                 convertReason != nullptr ? convertReason
+                                          : "asset conversion failed");
         return false;
     }
 
@@ -125,8 +193,8 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
         static_cast<uint64_t>(asset.indices.size()) * sizeof(uint16_t);
     if (assetBytes > limits.maxAssetBytes)
     {
-        slot.converted = false;
-        slot.reason = "asset exceeds per-visual byte limit";
+        FailSlot(slot, Error12::AssetLimit,
+                 "asset exceeds per-visual byte limit");
         return false;
     }
     slot.assetVbHash = HashBytes(1469598103934665603ull,
@@ -140,7 +208,8 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
     slot.asset = std::move(asset);
     slot.converted = true;
     slot.valid = true;
-    slot.reason.clear();
+    slot.error.code = Error12::None;
+    slot.error.text[0] = '\0';
     return true;
 }
 
@@ -194,6 +263,37 @@ uint64_t HashSlot(uint64_t hash, const Slot12& slot) noexcept
 }
 } // namespace
 
+void SetErrorInfo(ErrorInfo12& info, Error12 code, const char* text) noexcept
+{
+    info.code = code;
+    size_t i = 0;
+    if (text != nullptr)
+    {
+        for (; i + 1 < sizeof(info.text) && text[i] != '\0'; ++i)
+            info.text[i] = text[i];
+    }
+    info.text[i] = '\0';
+}
+
+void SetErrorInfo2(ErrorInfo12& info, Error12 code, const char* first,
+                   const char* second) noexcept
+{
+    info.code = code;
+    size_t i = 0;
+    if (first != nullptr)
+    {
+        for (; i + 1 < sizeof(info.text) && first[i] != '\0'; ++i)
+            info.text[i] = first[i];
+    }
+    if (second != nullptr)
+    {
+        for (size_t j = 0; i + 1 < sizeof(info.text) && second[j] != '\0';
+             ++i, ++j)
+            info.text[i] = second[j];
+    }
+    info.text[i] = '\0';
+}
+
 uint64_t HashBytes(uint64_t seed, const void* data, size_t size) noexcept
 {
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
@@ -218,6 +318,24 @@ uint64_t HashSnapshot(const Snapshot12& snapshot) noexcept
     return hash;
 }
 
+AcceptStatus12 AcceptBatch12(const BatchResult12& result,
+                             const Identity12& live) noexcept
+{
+    if (!result.ok || result.error.code != Error12::None ||
+        result.stableHash == 0)
+        return AcceptStatus12::NotReady;
+    if (live.levelSession == 0 || live.levelEpoch == 0)
+        return AcceptStatus12::NotReady;
+    if (result.identity.levelSession != live.levelSession)
+        return AcceptStatus12::StaleSession;
+    if (result.identity.levelEpoch != live.levelEpoch)
+        return AcceptStatus12::StaleEpoch;
+    for (const Slot12& slot : result.slots)
+        if (!slot.valid)
+            return AcceptStatus12::InvalidResult;
+    return AcceptStatus12::Accepted;
+}
+
 bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
                       uint32_t sectorId, uint32_t rootVisualId,
                       const std::array<uint32_t, kTargetVisualCount>& visuals,
@@ -228,6 +346,9 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
     candidate.identity = expected;
     candidate.sectorId = sectorId;
     candidate.rootVisualId = rootVisualId;
+    candidate.vfsOpenMs = snapshot.vfsOpenMs;
+    candidate.vfsCopyMs = snapshot.vfsCopyMs;
+    candidate.snapshotHashMs = snapshot.snapshotHashMs;
 
     const Clock::time_point totalStart = Clock::now();
     try
@@ -235,27 +356,27 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         if (expected.levelSession == 0 || expected.levelEpoch == 0 ||
             snapshot.identity != expected)
         {
-            Fail(candidate, "snapshot session/epoch mismatch");
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::InvalidIdentity,
+                           "snapshot session/epoch mismatch", Ms(totalStart));
             return false;
         }
         if (snapshot.levelBytes.empty() || snapshot.geomBytes.empty())
         {
-            Fail(candidate, "empty snapshot input");
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::EmptyInput,
+                           "empty snapshot input", Ms(totalStart));
             return false;
         }
         if (snapshot.levelBytes.size() > limits.maxLevelBytes ||
             snapshot.geomBytes.size() > limits.maxGeomBytes)
         {
-            Fail(candidate, "snapshot exceeds input byte limit");
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::InputLimit,
+                           "snapshot exceeds input byte limit", Ms(totalStart));
             return false;
         }
         if (!SameVisuals(visuals))
         {
-            Fail(candidate, "duplicate target visual");
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::DuplicateVisual,
+                           "duplicate target visual", Ms(totalStart));
             return false;
         }
 
@@ -265,11 +386,11 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         if (!levelhierarchy12::Parse(snapshot.levelBytes, hierarchy,
                                      parseReason))
         {
-            candidate.reason = parseReason.empty() ? "hierarchy parse failed"
-                                                   : parseReason;
             candidate.parseMs = Ms(parseStart);
-            Fail(candidate, candidate.reason.c_str());
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::HierarchyParse,
+                           parseReason.empty() ? "hierarchy parse failed"
+                                               : parseReason.c_str(),
+                           Ms(totalStart));
             return false;
         }
         candidate.parseMs = Ms(parseStart);
@@ -289,11 +410,10 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         candidate.instances = static_cast<uint32_t>(selected.size());
         if (collect != levelhierarchy12::CollectStatus::Complete)
         {
-            candidate.reason = collectReason.empty()
-                                   ? "sector collection failed"
-                                   : collectReason;
-            Fail(candidate, candidate.reason.c_str());
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::SectorCollect,
+                           collectReason.empty() ? "sector collection failed"
+                                                 : collectReason.c_str(),
+                           Ms(totalStart));
             return false;
         }
 
@@ -313,19 +433,21 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
             if (found == nullptr)
             {
                 candidate.slots[i].completed = true;
-                candidate.slots[i].reason = "target visual missing from sector";
-                candidate.reason = candidate.slots[i].reason;
-                Fail(candidate, candidate.reason.c_str());
-                result = std::move(candidate);
+                SetErrorInfo(candidate.slots[i].error,
+                             Error12::MissingVisual,
+                             "target visual missing from sector");
+                PublishFailure(result, candidate, Error12::MissingVisual,
+                               "target visual missing from sector",
+                               Ms(totalStart));
                 return false;
             }
             if (rootVisualId != 0 && found->rootVisualId != rootVisualId)
             {
                 candidate.slots[i].completed = true;
-                candidate.slots[i].reason = "target root mismatch";
-                candidate.reason = candidate.slots[i].reason;
-                Fail(candidate, candidate.reason.c_str());
-                result = std::move(candidate);
+                SetErrorInfo(candidate.slots[i].error, Error12::RootMismatch,
+                             "target root mismatch");
+                PublishFailure(result, candidate, Error12::RootMismatch,
+                               "target root mismatch", Ms(totalStart));
                 return false;
             }
             instanceKeys[i].sectorId = sectorId;
@@ -339,7 +461,7 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
             return ConvertSlot(snapshot, visuals[i], instanceKeys[i], limits,
                                candidate.slots[i]);
         };
-        const auto accumulateTimings = [&]()
+        const auto accumulateTimings = [&]() noexcept
         {
             candidate.readVisualMs = 0.0;
             candidate.convertMs = 0.0;
@@ -351,11 +473,13 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         };
         const auto failSlot = [&](uint32_t i) -> bool
         {
-            candidate.reason = candidate.slots[i].reason.empty()
-                                   ? "visual conversion failed"
-                                   : candidate.slots[i].reason;
-            Fail(candidate, candidate.reason.c_str());
-            result = std::move(candidate);
+            const Error12 code = candidate.slots[i].error.code == Error12::None
+                                     ? Error12::Convert
+                                     : candidate.slots[i].error.code;
+            const char* text = candidate.slots[i].error.text[0] != '\0'
+                                   ? candidate.slots[i].error.text
+                                   : "visual conversion failed";
+            PublishFailure(result, candidate, code, text, Ms(totalStart));
             return false;
         };
 
@@ -386,47 +510,94 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
             }
             else
             {
+                const Clock::time_point submitStart = Clock::now();
                 for (uint32_t i = 0; i < visuals.size(); ++i)
                 {
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+                    j2b_m1_fault::BeforeSubmit(i);
                     if (j2b_m1_fault::RejectSubmit(i))
                         throw std::runtime_error(
                             "injected submit rejection");
                     if (j2b_m1_fault::SkipSubmit(i))
                         continue;
 #endif
-                    group.Submit([&, i]() { (void)convertOne(i); });
+                    try
+                    {
+                        group.Submit([&, i]() { (void)convertOne(i); });
+                    }
+                    catch (const std::bad_alloc&)
+                    {
+                        group.DrainNoThrow();
+                        PublishFailure(result, candidate,
+                                       Error12::SubmitException,
+                                       "submit allocation failed",
+                                       Ms(totalStart));
+                        return false;
+                    }
+                    catch (const std::exception&)
+                    {
+                        group.DrainNoThrow();
+                        PublishFailure(result, candidate,
+                                       Error12::SubmitException,
+                                       "submit exception", Ms(totalStart));
+                        return false;
+                    }
+                    catch (...)
+                    {
+                        group.DrainNoThrow();
+                        PublishFailure(result, candidate,
+                                       Error12::SubmitException,
+                                       "submit unknown exception",
+                                       Ms(totalStart));
+                        return false;
+                    }
                 }
+                candidate.grSubmitMs = Ms(submitStart);
+
+                const Clock::time_point waitStart = Clock::now();
                 try
                 {
                     group.Wait();
                 }
                 catch (const std::bad_alloc&)
                 {
-                    Fail(candidate, "worker allocation failed");
-                    result = std::move(candidate);
+                    candidate.grWaitMs = Ms(waitStart);
+                    group.DrainNoThrow();
+                    PublishFailure(result, candidate,
+                                   Error12::WorkerAllocation,
+                                   "worker allocation failed",
+                                   Ms(totalStart));
                     return false;
                 }
                 catch (const std::exception&)
                 {
-                    Fail(candidate, "worker exception");
-                    result = std::move(candidate);
+                    candidate.grWaitMs = Ms(waitStart);
+                    group.DrainNoThrow();
+                    PublishFailure(result, candidate, Error12::WorkerException,
+                                   "worker exception", Ms(totalStart));
                     return false;
                 }
                 catch (...)
                 {
-                    Fail(candidate, "worker unknown exception");
-                    result = std::move(candidate);
+                    candidate.grWaitMs = Ms(waitStart);
+                    group.DrainNoThrow();
+                    PublishFailure(result, candidate, Error12::Unknown,
+                                   "worker unknown exception", Ms(totalStart));
                     return false;
                 }
+                candidate.grWaitMs = Ms(waitStart);
+
                 for (uint32_t i = 0; i < visuals.size(); ++i)
                 {
                     if (!candidate.slots[i].completed ||
                         !candidate.slots[i].valid)
                     {
-                        if (candidate.slots[i].reason.empty())
-                            candidate.slots[i].reason =
-                                "accepted job did not publish a result";
+                        if (candidate.slots[i].error.code == Error12::None)
+                        {
+                            SetErrorInfo(candidate.slots[i].error,
+                                         Error12::WorkerException,
+                                         "accepted job did not publish a result");
+                        }
                         return failSlot(i);
                     }
                 }
@@ -445,11 +616,13 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         }
         if (totalAssetBytes > limits.maxTotalAssetBytes)
         {
-            Fail(candidate, "batch exceeds total asset byte limit");
-            result = std::move(candidate);
+            PublishFailure(result, candidate, Error12::TotalAssetLimit,
+                           "batch exceeds total asset byte limit",
+                           Ms(totalStart));
             return false;
         }
 
+        const Clock::time_point hashStart = Clock::now();
         uint64_t hash = 1469598103934665603ull;
         hash = HashBytes(hash, &candidate.identity.levelSession,
                          sizeof(candidate.identity.levelSession));
@@ -459,30 +632,32 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
         hash = HashBytes(hash, &rootVisualId, sizeof(rootVisualId));
         for (const Slot12& slot : candidate.slots)
             hash = HashSlot(hash, slot);
+        candidate.stableHashMs = Ms(hashStart);
 
         candidate.stableHash = hash;
         candidate.totalMs = Ms(totalStart);
         candidate.ok = true;
-        candidate.reason.clear();
+        candidate.error.code = Error12::None;
+        candidate.error.text[0] = '\0';
         result = std::move(candidate);
         return true;
     }
     catch (const std::bad_alloc&)
     {
-        Fail(candidate, "batch allocation failed");
-        result = std::move(candidate);
+        PublishFailure(result, candidate, Error12::AllocationFailure,
+                       "batch allocation failed", Ms(totalStart));
         return false;
     }
     catch (const std::exception&)
     {
-        Fail(candidate, "batch exception");
-        result = std::move(candidate);
+        PublishFailure(result, candidate, Error12::Exception, "batch exception",
+                       Ms(totalStart));
         return false;
     }
     catch (...)
     {
-        Fail(candidate, "batch unknown exception");
-        result = std::move(candidate);
+        PublishFailure(result, candidate, Error12::Unknown,
+                       "batch unknown exception", Ms(totalStart));
         return false;
     }
 }

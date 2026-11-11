@@ -11,9 +11,14 @@ enum class Point
 {
     AfterRead,
     BeforePublish,
+    BeforeConvert,
+    BeforeVfsCopy,
 };
 
 void MaybeThrow(Point point);
+void MaybeBlock(Point point);
+void MaybeEnablePersistentOom(Point point);
+void BeforeSubmit(uint32_t index);
 bool SkipSubmit(uint32_t index);
 bool RejectSubmit(uint32_t index);
 } // namespace j2b_m1_fault
