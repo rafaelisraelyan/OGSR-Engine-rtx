@@ -1960,6 +1960,19 @@ V-Visual-итерации **не запускать по инерции**; во�
 любые Git-изменения — отдельным согласованным scope.
 
 
+
+#### V-Q3/V-Q4 — единый game-owned DX12 runtime и существующий GR JobSystem (архитектурное решение 2026-11-11; CONTRACT / NOT IMPLEMENTED)
+
+**Обязательное правило для будущей игровой интеграции Volumetric Clouds:** игровой cloud pass **не создаёт второй независимый GPU runtime**. Он использует предоставленные основным игровым DX12 renderer **ID3D12Device**, command queue/command lists, frame slots, descriptors, constant-buffer/upload resources, resource-state/barrier policy, GPU fences и общий порядок resize/reload/shutdown. Владение, публикация команд, GPU completion и retirement ресурсов определяются единым игровым frame lifecycle. **GameDx12Bridge** с отдельным device/queue остаётся только diagnostic/test infrastructure и не удовлетворяет этому контракту.
+
+**CPU preparation / GPU execution:** обновление погоды (**CEnvironment**/timeline), камера, солнце, ветер, cloud time, seed, transition state и graphics quality формируют согласованный immutable per-frame cloud snapshot из **той же версии игрового кадра**, что и геометрия/небо. CPU подготавливает константы и Dispatch/composite commands, **но не рассчитывает изображение облаков на CPU**: ray marching, density, lighting и self-shadowing выполняются GPU compute shaders. Нельзя допускать независимый cloud frame clock, stale camera/weather snapshots или сброс weather state при Clouds Off/On/quality switch.
+
+**Единый планировщик CPU:** **не создавать второй JobSystem/thread pool для cloud integration**, дублирующий существующий **gr::jobs::JobSystem**. Если CPU cloud preparation действительно требует распараллеливания, она использует существующий GR scheduler и его жизненный цикл/синхронизацию; при малой стоимости достаточно owner-thread подготовки. Cloud GPU compute не следует ошибочно оформлять как CPU render-preparation job. Командная запись работниками возможна только при соблюдении DX12 allocator/list ownership и общего frame snapshot.
+
+**GPU queue policy:** начальный V-Q4 preview выполнять через game-owned Direct Queue с явными resource-state transitions и корректной синхронизацией. Возможная отдельная async Compute Queue рассматривается **только** как ресурс, принадлежащий общему игровому renderer, после отдельного profiling/overlap/correctness gate; она не даёт разрешения на независимый cloud device/queue или отдельный GPU lifetime.
+
+**Acceptance / boundary:** перед V-Q4 проверить source-level dependency injection без cloud-owned device/queue/JobSystem, одинаковую camera/weather/frame generation, fence-safe retirement/resize/reload, GPU Debug Layer/GBV/InfoQueue, переходы Clouds On/Off и неизменность DX11/R4. Standalone harness вправе владеть собственным device/queue для самостоятельных тестов — **это не game integration PASS**. Пункт является утверждённым **архитектурным контрактом**, не реализованной возможностью: V-Q4 **BLOCKED**, V2/V3 **NOT ACCEPTED**; текущий **V-WEATHER-01C-B** остаётся самостоятельным standalone checkpoint без расширения его scope.
+
 ### V-WEATHER — погодные режимы, переходы и настройки облаков (решение 2026-11-08)
 
 **Актуальная задача параллельного облачного трека:** развивать уже работающую standalone DX12 cloud system, не дожидаясь полного F4.0, и затем перенести её в игровой DX12. Новых V-Visual/FOMS/Storm-morphology экспериментов без доказанного блокера не проводить. **Original V-SF Rain — неизменяемый контроль**; Gate C не применять, V-03 оставить контрольным вариантом.
