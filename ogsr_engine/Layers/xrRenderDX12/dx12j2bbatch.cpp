@@ -1,10 +1,16 @@
 #include "dx12j2bbatch.h"
 
+#include "gr/jobs/JobGroup.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <new>
 #include <stdexcept>
+
+#if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+#include "j2b_m1_fault.h"
+#endif
 
 namespace j2bbatch12
 {
@@ -75,6 +81,9 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
     }
 
     slot.readOk = true;
+#if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+    j2b_m1_fault::MaybeThrow(j2b_m1_fault::Point::AfterRead);
+#endif
     slot.source.levelSession = snapshot.identity.levelSession;
     slot.source.visualId = geometry.visual_id;
     slot.source.sourceVbId = geometry.source_vb_id;
@@ -125,6 +134,9 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
                                  asset.vertices.size() * sizeof(XrayVertex12));
     slot.assetIbHash = HashBytes(1469598103934665603ull, asset.indices.data(),
                                  asset.indices.size() * sizeof(uint16_t));
+#if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+    j2b_m1_fault::MaybeThrow(j2b_m1_fault::Point::BeforePublish);
+#endif
     slot.asset = std::move(asset);
     slot.converted = true;
     slot.valid = true;
@@ -206,10 +218,11 @@ uint64_t HashSnapshot(const Snapshot12& snapshot) noexcept
     return hash;
 }
 
-bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
-                  uint32_t sectorId, uint32_t rootVisualId,
-                  const std::array<uint32_t, kTargetVisualCount>& visuals,
-                  BatchResult12& result, const Limits12& limits) noexcept
+bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
+                      uint32_t sectorId, uint32_t rootVisualId,
+                      const std::array<uint32_t, kTargetVisualCount>& visuals,
+                      gr::jobs::JobSystem* jobs, bool parallel,
+                      BatchResult12& result, const Limits12& limits) noexcept
 {
     BatchResult12 candidate;
     candidate.identity = expected;
@@ -284,6 +297,7 @@ bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
             return false;
         }
 
+        std::array<InstanceKey12, kTargetVisualCount> instanceKeys{};
         for (uint32_t i = 0; i < visuals.size(); ++i)
         {
             const uint32_t visualId = visuals[i];
@@ -314,21 +328,106 @@ bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
                 result = std::move(candidate);
                 return false;
             }
-            InstanceKey12 instance;
-            instance.sectorId = sectorId;
-            instance.rootVisualId = found->rootVisualId;
-            instance.occurrenceOrdinal = found->referenceOrdinal;
-            instance.visualId = visualId;
-            const bool converted = ConvertSlot(snapshot, visualId, instance,
-                                               limits, candidate.slots[i]);
-            candidate.readVisualMs += candidate.slots[i].readMs;
-            candidate.convertMs += candidate.slots[i].convertMs;
-            if (!converted)
+            instanceKeys[i].sectorId = sectorId;
+            instanceKeys[i].rootVisualId = found->rootVisualId;
+            instanceKeys[i].occurrenceOrdinal = found->referenceOrdinal;
+            instanceKeys[i].visualId = visualId;
+        }
+
+        const auto convertOne = [&](uint32_t i)
+        {
+            return ConvertSlot(snapshot, visuals[i], instanceKeys[i], limits,
+                               candidate.slots[i]);
+        };
+        const auto accumulateTimings = [&]()
+        {
+            candidate.readVisualMs = 0.0;
+            candidate.convertMs = 0.0;
+            for (const Slot12& slot : candidate.slots)
             {
-                candidate.reason = candidate.slots[i].reason;
-                Fail(candidate, candidate.reason.c_str());
-                result = std::move(candidate);
-                return false;
+                candidate.readVisualMs += slot.readMs;
+                candidate.convertMs += slot.convertMs;
+            }
+        };
+        const auto failSlot = [&](uint32_t i) -> bool
+        {
+            candidate.reason = candidate.slots[i].reason.empty()
+                                   ? "visual conversion failed"
+                                   : candidate.slots[i].reason;
+            Fail(candidate, candidate.reason.c_str());
+            result = std::move(candidate);
+            return false;
+        };
+
+        const bool useParallel =
+            parallel && jobs != nullptr && jobs->IsInitialized();
+        if (!useParallel)
+        {
+            for (uint32_t i = 0; i < visuals.size(); ++i)
+            {
+                if (!convertOne(i))
+                    return failSlot(i);
+            }
+            accumulateTimings();
+        }
+        else
+        {
+            gr::jobs::JobGroup group = jobs->CreateGroup();
+            if (!group.IsValid())
+            {
+                // A system that became unavailable falls back to the serial
+                // baseline rather than publishing a partial batch.
+                for (uint32_t i = 0; i < visuals.size(); ++i)
+                {
+                    if (!convertOne(i))
+                        return failSlot(i);
+                }
+                accumulateTimings();
+            }
+            else
+            {
+                for (uint32_t i = 0; i < visuals.size(); ++i)
+                {
+#if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+                    if (j2b_m1_fault::SkipSubmit(i))
+                        continue;
+#endif
+                    group.Submit([&, i]() { (void)convertOne(i); });
+                }
+                try
+                {
+                    group.Wait();
+                }
+                catch (const std::bad_alloc&)
+                {
+                    Fail(candidate, "worker allocation failed");
+                    result = std::move(candidate);
+                    return false;
+                }
+                catch (const std::exception&)
+                {
+                    Fail(candidate, "worker exception");
+                    result = std::move(candidate);
+                    return false;
+                }
+                catch (...)
+                {
+                    Fail(candidate, "worker unknown exception");
+                    result = std::move(candidate);
+                    return false;
+                }
+                for (uint32_t i = 0; i < visuals.size(); ++i)
+                {
+                    if (!candidate.slots[i].completed ||
+                        !candidate.slots[i].valid)
+                    {
+                        if (candidate.slots[i].reason.empty())
+                            candidate.slots[i].reason =
+                                "accepted job did not publish a result";
+                        return failSlot(i);
+                    }
+                }
+                accumulateTimings();
             }
         }
 
@@ -383,5 +482,24 @@ bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
         result = std::move(candidate);
         return false;
     }
+}
+
+bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
+                  uint32_t sectorId, uint32_t rootVisualId,
+                  const std::array<uint32_t, kTargetVisualCount>& visuals,
+                  BatchResult12& result, const Limits12& limits) noexcept
+{
+    return PrepareBatchImpl(snapshot, expected, sectorId, rootVisualId, visuals,
+                            nullptr, false, result, limits);
+}
+
+bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
+                  uint32_t sectorId, uint32_t rootVisualId,
+                  const std::array<uint32_t, kTargetVisualCount>& visuals,
+                  gr::jobs::JobSystem* jobs, bool parallel,
+                  BatchResult12& result, const Limits12& limits) noexcept
+{
+    return PrepareBatchImpl(snapshot, expected, sectorId, rootVisualId, visuals,
+                            jobs, parallel, result, limits);
 }
 } // namespace j2bbatch12

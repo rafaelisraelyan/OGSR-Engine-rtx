@@ -4,6 +4,8 @@
 #include "dx12xraylevelasset.h"
 #include "dx12xraylevelgeometry.h"
 
+#include "gr/jobs/JobSystem.h"
+
 #include <array>
 #include <cstdint>
 #include <span>
@@ -131,5 +133,13 @@ bool ReadSnapshotFromVfs(const char* levelName, const Identity12& identity,
 bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
                   uint32_t sectorId, uint32_t rootVisualId,
                   const std::array<uint32_t, kTargetVisualCount>& visuals,
+                  BatchResult12& result, const Limits12& limits) noexcept;
+
+// M1-C: optional existing GR Job System. If jobs is null/uninitialized, the
+// serial baseline is used. A partially submitted/failed group fails closed.
+bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
+                  uint32_t sectorId, uint32_t rootVisualId,
+                  const std::array<uint32_t, kTargetVisualCount>& visuals,
+                  gr::jobs::JobSystem* jobs, bool parallel,
                   BatchResult12& result, const Limits12& limits) noexcept;
 } // namespace j2bbatch12

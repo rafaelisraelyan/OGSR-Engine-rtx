@@ -1,4 +1,5 @@
 #include "dx12j2bbatch.h"
+#include "j2b_m1_fault.h"
 
 #include <algorithm>
 #include <array>
@@ -7,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -14,6 +16,32 @@ namespace
 {
 int g_passed = 0;
 int g_failed = 0;
+int g_faultPoint = -1;
+bool g_throwRuntime = false;
+bool g_skipSubmit = false;
+uint32_t g_skipIndex = 0;
+
+} // namespace
+
+namespace j2b_m1_fault
+{
+void MaybeThrow(Point point)
+{
+    if (g_faultPoint != static_cast<int>(point))
+        return;
+    if (g_throwRuntime)
+        throw std::runtime_error("injected worker exception");
+    throw std::bad_alloc();
+}
+
+bool SkipSubmit(uint32_t index)
+{
+    return g_skipSubmit && index == g_skipIndex;
+}
+} // namespace j2b_m1_fault
+
+namespace
+{
 
 bool ReadFileBytes(const char* path, std::vector<uint8_t>& bytes,
                    size_t maxBytes, std::string& reason)
@@ -135,6 +163,104 @@ int main(int argc, char** argv)
           VerifyExpectedSlot(serial.slots[3], 107, 15, 42683, 385, 5, 267702,
                              876));
     Check("serial stable hash nonzero", serial.stableHash != 0);
+
+    gr::jobs::JobSystem jobs;
+    gr::jobs::JobConfig config;
+    config.backgroundWorkers = 2;
+    config.automaticWorkers = false;
+    config.maxAutoBackgroundWorkers = 4;
+    config.defaultGrainSize = 1;
+    config.enableStats = true;
+    const bool jobsReady = jobs.Initialize(config);
+    Check("GR JobSystem initialize", jobsReady);
+
+    j2bbatch12::BatchResult12 parallel;
+    const bool parallelOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        parallel, j2bbatch12::Limits12{});
+    std::printf("M1_BATCH_PARALLEL ok=%d hash=%016llX reason='%s'\n",
+                parallelOk ? 1 : 0,
+                static_cast<unsigned long long>(parallel.stableHash),
+                parallel.reason.c_str());
+    Check("parallel all-four ok", parallelOk && parallel.ok);
+    Check("parallel hash equals serial",
+          parallel.stableHash == serial.stableHash);
+    bool slotHashesEqual = true;
+    for (size_t i = 0; i < serial.slots.size(); ++i)
+    {
+        slotHashesEqual &=
+            serial.slots[i].source == parallel.slots[i].source &&
+            serial.slots[i].instance == parallel.slots[i].instance &&
+            serial.slots[i].assetVbHash == parallel.slots[i].assetVbHash &&
+            serial.slots[i].assetIbHash == parallel.slots[i].assetIbHash;
+    }
+    Check("parallel slot identities equal serial", slotHashesEqual);
+
+    jobs.Shutdown();
+    j2bbatch12::BatchResult12 uninitialized;
+    const bool uninitializedOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        uninitialized, j2bbatch12::Limits12{});
+    Check("uninitialized GR falls back serial",
+          uninitializedOk && uninitialized.ok &&
+              uninitialized.stableHash == serial.stableHash);
+
+    jobs.Initialize(config);
+    g_skipSubmit = true;
+    g_skipIndex = 2;
+    j2bbatch12::BatchResult12 partial;
+    const bool partialOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true, partial,
+        j2bbatch12::Limits12{});
+    g_skipSubmit = false;
+    Check("partial submit rejects batch",
+          !partialOk && !partial.ok && AllSlotsEmpty(partial));
+
+    j2bbatch12::BatchResult12 afterPartial;
+    const bool afterPartialOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, afterPartial,
+        j2bbatch12::Limits12{});
+    Check("drain/reuse after partial submit",
+          afterPartialOk && afterPartial.ok &&
+              afterPartial.stableHash == serial.stableHash);
+
+    g_faultPoint = static_cast<int>(j2b_m1_fault::Point::AfterRead);
+    g_throwRuntime = true;
+    j2bbatch12::BatchResult12 workerException;
+    const bool workerExceptionOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        workerException, j2bbatch12::Limits12{});
+    g_faultPoint = -1;
+    g_throwRuntime = false;
+    Check("worker exception rejects batch",
+          !workerExceptionOk && !workerException.ok &&
+              AllSlotsEmpty(workerException));
+
+    j2bbatch12::BatchResult12 afterException;
+    const bool afterExceptionOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, afterException,
+        j2bbatch12::Limits12{});
+    Check("drain/reuse after worker exception",
+          afterExceptionOk && afterException.ok &&
+              afterException.stableHash == serial.stableHash);
+
+    g_faultPoint = static_cast<int>(j2b_m1_fault::Point::BeforePublish);
+    j2bbatch12::BatchResult12 lateOom;
+    const bool lateOomOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true, lateOom,
+        j2bbatch12::Limits12{});
+    g_faultPoint = -1;
+    Check("late allocation failure rejects batch",
+          !lateOomOk && !lateOom.ok && AllSlotsEmpty(lateOom));
+
+    j2bbatch12::BatchResult12 afterOom;
+    const bool afterOomOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, afterOom,
+        j2bbatch12::Limits12{});
+    Check("drain/reuse after late allocation failure",
+          afterOomOk && afterOom.ok &&
+              afterOom.stableHash == serial.stableHash);
+    jobs.Shutdown();
 
     j2bbatch12::BatchResult12 missing;
     const std::array<uint32_t, 4> missingVisuals = {9, 105, 106, 999};
