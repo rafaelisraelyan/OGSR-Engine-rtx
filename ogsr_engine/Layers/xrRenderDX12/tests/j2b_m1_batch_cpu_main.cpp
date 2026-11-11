@@ -20,6 +20,8 @@ int g_faultPoint = -1;
 bool g_throwRuntime = false;
 bool g_skipSubmit = false;
 uint32_t g_skipIndex = 0;
+bool g_rejectSubmit = false;
+uint32_t g_rejectIndex = 0;
 
 } // namespace
 
@@ -37,6 +39,11 @@ void MaybeThrow(Point point)
 bool SkipSubmit(uint32_t index)
 {
     return g_skipSubmit && index == g_skipIndex;
+}
+
+bool RejectSubmit(uint32_t index)
+{
+    return g_rejectSubmit && index == g_rejectIndex;
 }
 } // namespace j2b_m1_fault
 
@@ -223,6 +230,25 @@ int main(int argc, char** argv)
     Check("drain/reuse after partial submit",
           afterPartialOk && afterPartial.ok &&
               afterPartial.stableHash == serial.stableHash);
+
+    g_rejectSubmit = true;
+    g_rejectIndex = 1;
+    j2bbatch12::BatchResult12 submitRejected;
+    const bool submitRejectedOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        submitRejected, j2bbatch12::Limits12{});
+    g_rejectSubmit = false;
+    Check("submit rejection rejects batch",
+          !submitRejectedOk && !submitRejected.ok &&
+              AllSlotsEmpty(submitRejected));
+
+    j2bbatch12::BatchResult12 afterSubmitReject;
+    const bool afterSubmitRejectOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, afterSubmitReject,
+        j2bbatch12::Limits12{});
+    Check("drain/reuse after submit rejection",
+          afterSubmitRejectOk && afterSubmitReject.ok &&
+              afterSubmitReject.stableHash == serial.stableHash);
 
     g_faultPoint = static_cast<int>(j2b_m1_fault::Point::AfterRead);
     g_throwRuntime = true;

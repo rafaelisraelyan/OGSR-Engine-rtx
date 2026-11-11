@@ -15,4 +15,5 @@ enum class Point
 
 void MaybeThrow(Point point);
 bool SkipSubmit(uint32_t index);
+bool RejectSubmit(uint32_t index);
 } // namespace j2b_m1_fault

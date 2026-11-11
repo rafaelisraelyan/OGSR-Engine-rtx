@@ -389,6 +389,9 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
                 for (uint32_t i = 0; i < visuals.size(); ++i)
                 {
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
+                    if (j2b_m1_fault::RejectSubmit(i))
+                        throw std::runtime_error(
+                            "injected submit rejection");
                     if (j2b_m1_fault::SkipSubmit(i))
                         continue;
 #endif
