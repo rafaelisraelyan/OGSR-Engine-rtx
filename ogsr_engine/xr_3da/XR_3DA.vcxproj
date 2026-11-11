@@ -308,8 +308,13 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
+    <ClCompile Include="GameDx12J2ABatch.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
     <ClInclude Include="GameDx12Bridge.h" />
     <ClInclude Include="GameDx12J2APreparation.h" />
+    <ClInclude Include="GameDx12J2ABatch.h" />
     <ClInclude Include="..\Layers\xrRenderDX12\dx12scopeguard.h" />
     <ClInclude Include="GameDx12BridgeCommandLine.h" />
     <ClInclude Include="GameDx12BridgeDiagnostics.h" />
@@ -325,6 +330,12 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
+    <ClCompile Include="..\Layers\xrRenderDX12\dx12j2bbatch.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClInclude Include="..\Layers\xrRenderDX12\dx12j2bbatch.h" />
     <ClCompile Include="..\Layers\xrRenderDX12\dx12xrayasset.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ExceptionHandling>Sync</ExceptionHandling>
