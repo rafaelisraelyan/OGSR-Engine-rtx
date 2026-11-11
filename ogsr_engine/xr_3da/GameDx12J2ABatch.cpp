@@ -120,6 +120,7 @@ bool GameDx12J2ABatch_PrepareFromVfs(
     const char* levelName, const j2bbatch12::Identity12& identity,
     uint32_t sectorId, uint32_t rootVisualId,
     const std::array<uint32_t, j2bbatch12::kTargetVisualCount>& visuals,
+    gr::jobs::JobSystem* jobs, bool parallel,
     j2bbatch12::BatchResult12& result,
     const j2bbatch12::Limits12& limits) noexcept
 {
@@ -134,7 +135,7 @@ bool GameDx12J2ABatch_PrepareFromVfs(
         return false;
     }
     return j2bbatch12::PrepareBatch(snapshot, identity, sectorId, rootVisualId,
-                                    visuals, result, limits);
+                                    visuals, jobs, parallel, result, limits);
 }
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
