@@ -121,12 +121,10 @@ struct BatchResult12
 uint64_t HashBytes(uint64_t seed, const void* data, size_t size) noexcept;
 uint64_t HashSnapshot(const Snapshot12& snapshot) noexcept;
 
-// Owner VFS read into an owned snapshot. The adapter is implemented in
-// GameDx12J2ABatch.cpp (engine side); this declaration is kept here so tests
-// can construct snapshots from immutable file bytes as well.
-bool ReadSnapshotFromVfs(const char* levelName, const Identity12& identity,
-                         Snapshot12& snapshot, const Limits12& limits,
-                         std::string& reason) noexcept;
+// The engine-side owner VFS adapter is declared in GameDx12J2ABatch.h as
+// GameDx12J2ABatch_ReadSnapshot/GameDx12J2ABatch_PrepareFromVfs. The batch
+// core itself only accepts an already-owned Snapshot12, so tests can build
+// snapshots from immutable file bytes without linking engine code.
 
 // Serial baseline: parse hierarchy, collect the requested sector, read and
 // convert all four visuals, then publish the batch only if every slot passed.
