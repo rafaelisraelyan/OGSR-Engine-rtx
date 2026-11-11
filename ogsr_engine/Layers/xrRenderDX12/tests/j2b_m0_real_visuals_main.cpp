@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -42,7 +43,9 @@ double Ms(Clock::time_point start)
         .count();
 }
 
-HashResult Sha256Hex(const void* data, size_t size, Fault fault = Fault::None)
+HashResult Sha256HexWithAlgorithm(const wchar_t* algorithmName,
+                                  const void* data, size_t size,
+                                  Fault fault = Fault::None)
 {
     HashResult result;
     if (fault == Fault::HashFailure)
@@ -58,8 +61,7 @@ HashResult Sha256Hex(const void* data, size_t size, Fault fault = Fault::None)
     std::vector<uint8_t> object;
     uint8_t digest[32]{};
 
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
-                                   nullptr, 0) < 0)
+    if (BCryptOpenAlgorithmProvider(&algorithm, algorithmName, nullptr, 0) < 0)
     {
         result.error = "BCryptOpenAlgorithmProvider failed";
         return result;
@@ -110,9 +112,45 @@ HashResult Sha256Hex(const void* data, size_t size, Fault fault = Fault::None)
     return result;
 }
 
+HashResult Sha256Hex(const void* data, size_t size, Fault fault = Fault::None)
+{
+    return Sha256HexWithAlgorithm(BCRYPT_SHA256_ALGORITHM, data, size, fault);
+}
+
+bool HashEqual(const HashResult& left, const HashResult& right)
+{
+    return left.ok && right.ok && left.hex == right.hex;
+}
+
+bool ReadExactBytes(std::istream& file, size_t expected,
+                    std::vector<uint8_t>& bytes, size_t maxBytes,
+                    std::string& reason)
+{
+    if (expected == 0)
+    {
+        reason = "empty or invalid file size";
+        return false;
+    }
+    if (expected > maxBytes)
+    {
+        reason = "file exceeds read limit";
+        return false;
+    }
+    bytes.resize(expected);
+    file.read(reinterpret_cast<char*>(bytes.data()),
+              static_cast<std::streamsize>(expected));
+    if (file.gcount() != static_cast<std::streamsize>(expected) ||
+        file.bad())
+    {
+        bytes.clear();
+        reason = "incomplete file read";
+        return false;
+    }
+    return true;
+}
+
 bool ReadFileBytes(const char* path, std::vector<uint8_t>& bytes,
-                   size_t maxBytes, std::string& reason,
-                   size_t readLimit = std::numeric_limits<size_t>::max())
+                   size_t maxBytes, std::string& reason)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
@@ -127,24 +165,8 @@ bool ReadFileBytes(const char* path, std::vector<uint8_t>& bytes,
         return false;
     }
     const size_t size = static_cast<size_t>(length);
-    if (size > maxBytes)
-    {
-        reason = "file exceeds read limit";
-        return false;
-    }
-    const size_t toRead = std::min(size, readLimit);
-    bytes.resize(toRead);
     file.seekg(0, std::ios::beg);
-    file.read(reinterpret_cast<char*>(bytes.data()),
-              static_cast<std::streamsize>(toRead));
-    if (file.gcount() != static_cast<std::streamsize>(toRead) || file.bad() ||
-        toRead != size)
-    {
-        bytes.clear();
-        reason = "incomplete file read";
-        return false;
-    }
-    return true;
+    return ReadExactBytes(file, size, bytes, maxBytes, reason);
 }
 
 void PrintBounds(const char* label, const xraylevel12::Bounds& bounds)
@@ -382,23 +404,16 @@ int RunSelfTest(const char* levelPath, const char* geomPath)
 {
     int failures = 0;
 
-    // 1. Incomplete read must fail, not return a zero-filled buffer.
+    // 1. A real short stream (gcount < requested) must fail and clear bytes.
     {
-        const char* tempPath = "j2b_m0_harness_negative.tmp";
-        FILE* file = nullptr;
-        if (fopen_s(&file, tempPath, "wb") == 0 && file != nullptr)
-        {
-            const uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-            fwrite(data, 1, sizeof(data), file);
-            fclose(file);
-        }
+        const char shortData[4] = {1, 2, 3, 4};
+        std::istringstream stream(std::string(shortData, sizeof(shortData)));
         std::vector<uint8_t> bytes;
         std::string reason;
         const bool truncated =
-            !ReadFileBytes(tempPath, bytes, 1024, reason, 7) && bytes.empty();
+            !ReadExactBytes(stream, 8, bytes, 1024, reason) && bytes.empty();
         std::printf("HARNESS_NEGATIVE truncated_read=%s reason='%s'\n",
                     truncated ? "PASS" : "FAIL", reason.c_str());
-        remove(tempPath);
         if (!truncated)
             ++failures;
     }
@@ -454,14 +469,56 @@ int RunSelfTest(const char* levelPath, const char* geomPath)
 int main(int argc, char** argv)
 {
     const bool selfTest = argc > 1 && std::strcmp(argv[1], "--self-test") == 0;
-    const int base = selfTest ? 2 : 1;
-    if (argc < base + 2)
+    const bool negativeDeterminism =
+        argc > 1 && std::strcmp(argv[1], "--negative-determinism") == 0;
+    const bool negativeShortRead =
+        argc > 1 && std::strcmp(argv[1], "--negative-short-read") == 0;
+    const bool negativeHashFailure =
+        argc > 1 && std::strcmp(argv[1], "--negative-hash-failure") == 0;
+
+    if (negativeShortRead)
     {
-        std::printf("usage: %s [--self-test] <level> <level.geom>\n", argv[0]);
+        const char shortData[4] = {1, 2, 3, 4};
+        std::istringstream stream(std::string(shortData, sizeof(shortData)));
+        std::vector<uint8_t> bytes;
+        std::string reason;
+        const bool detected =
+            !ReadExactBytes(stream, 8, bytes, 1024, reason) && bytes.empty();
+        std::printf("M0_NEGATIVE_SHORT_READ %s reason='%s'\n",
+                    detected ? "PASS" : "FAIL", reason.c_str());
+        return detected ? 1 : 0;
+    }
+
+    if (negativeHashFailure)
+    {
+        const HashResult first =
+            Sha256HexWithAlgorithm(L"INVALID-SHA-ALGORITHM", "x", 1);
+        const HashResult second =
+            Sha256HexWithAlgorithm(L"INVALID-SHA-ALGORITHM-2", "x", 1);
+        const bool explicitFailure =
+            !first.ok && !first.error.empty() && first.hex.empty();
+        const bool notEqual = !HashEqual(first, second);
+        std::printf("M0_NEGATIVE_HASH_FAILURE %s explicit=%d not_equal=%d "
+                    "error='%s'\n",
+                    (explicitFailure && notEqual) ? "PASS" : "FAIL",
+                    explicitFailure ? 1 : 0, notEqual ? 1 : 0,
+                    first.error.c_str());
+        return (explicitFailure && notEqual) ? 1 : 0;
+    }
+
+    const bool needsInputs = !negativeShortRead && !negativeHashFailure;
+    const int base = (selfTest || negativeDeterminism) ? 2 : 1;
+    if (needsInputs && argc < base + 2)
+    {
+        std::printf("usage: %s [--self-test|--negative-determinism] "
+                    "<level> <level.geom>\n"
+                    "       %s --negative-short-read\n"
+                    "       %s --negative-hash-failure\n",
+                    argv[0], argv[0], argv[0]);
         return 2;
     }
-    const char* levelPath = argv[base];
-    const char* geomPath = argv[base + 1];
+    const char* levelPath = needsInputs ? argv[base] : nullptr;
+    const char* geomPath = needsInputs ? argv[base + 1] : nullptr;
 
     if (selfTest)
         return RunSelfTest(levelPath, geomPath);
@@ -497,13 +554,19 @@ int main(int argc, char** argv)
 
     const xraylevel12::Limits limits{};
     const uint32_t visuals[] = {9, 105, 106, 107};
+    const Fault fault =
+        negativeDeterminism ? Fault::DeterminismFailure : Fault::None;
     int failures = 0;
     for (uint32_t visual : visuals)
     {
         const VisualResult result =
-            AnalyzeVisual(visual, levelBytes, geomBytes, limits);
+            AnalyzeVisual(visual, levelBytes, geomBytes, limits, fault);
         if (result.readError != xraylevel12::ReadError::None ||
-            !result.converted || !result.hashOk || !result.deterministic)
+            !result.converted || !result.hashOk
+#ifndef OGSR_J2B_M0_MUTATE_NO_DETERMINISM_CHECK
+            || !result.deterministic
+#endif
+        )
             ++failures;
     }
 
