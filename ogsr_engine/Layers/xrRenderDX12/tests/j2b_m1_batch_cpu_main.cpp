@@ -1,15 +1,22 @@
-#include "dx12j2bbatch.h"
+﻿#include "dx12j2bbatch.h"
 #include "j2b_m1_fault.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -22,8 +29,62 @@ bool g_skipSubmit = false;
 uint32_t g_skipIndex = 0;
 bool g_rejectSubmit = false;
 uint32_t g_rejectIndex = 0;
+thread_local bool g_failNextAllocation = false;
+std::atomic<bool> g_blockAfterRead{false};
+std::atomic<bool> g_releaseBlock{false};
+std::atomic<bool> g_blockTimedOut{false};
+std::atomic<int> g_blockedCount{0};
+std::atomic<bool> g_armSubmitFailure{false};
+std::mutex g_blockMutex;
+std::condition_variable g_blockCv;
 
 } // namespace
+
+void* operator new(std::size_t size)
+{
+    if (g_failNextAllocation)
+    {
+        g_failNextAllocation = false;
+        throw std::bad_alloc();
+    }
+    void* memory = std::malloc(size == 0 ? 1 : size);
+    if (memory == nullptr)
+        throw std::bad_alloc();
+    return memory;
+}
+
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept
+{
+    try
+    {
+        return ::operator new(size);
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept
+{
+    return ::operator new(size, std::nothrow);
+}
+
+void operator delete(void* memory, const std::nothrow_t&) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete[](void* memory, const std::nothrow_t&) noexcept
+{
+    std::free(memory);
+}
 
 namespace j2b_m1_fault
 {
@@ -34,6 +95,30 @@ void MaybeThrow(Point point)
     if (g_throwRuntime)
         throw std::runtime_error("injected worker exception");
     throw std::bad_alloc();
+}
+
+void MaybeBlock(Point point)
+{
+    if (point != Point::AfterRead || !g_blockAfterRead.load())
+        return;
+    std::unique_lock lock(g_blockMutex);
+    g_blockedCount.fetch_add(1);
+    g_blockCv.notify_all();
+    if (!g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                            []() { return g_releaseBlock.load(); }))
+    {
+        g_blockTimedOut.store(true);
+    }
+}
+
+void MaybeEnablePersistentOom(Point)
+{
+}
+
+void BeforeSubmit(uint32_t index)
+{
+    if (index == 1 && g_armSubmitFailure.exchange(false))
+        g_failNextAllocation = true;
 }
 
 bool SkipSubmit(uint32_t index)
@@ -155,7 +240,7 @@ int main(int argc, char** argv)
     std::printf("M1_BATCH_SERIAL ok=%d hash=%016llX reason='%s'\n",
                 serialOk ? 1 : 0,
                 static_cast<unsigned long long>(serial.stableHash),
-                serial.reason.c_str());
+                serial.error.text);
     Check("serial all-four ok", serialOk && serial.ok);
     Check("serial slot 9 source identity",
           VerifyExpectedSlot(serial.slots[0], 9, 9, 42158, 545, 4, 782316,
@@ -188,7 +273,7 @@ int main(int argc, char** argv)
     std::printf("M1_BATCH_PARALLEL ok=%d hash=%016llX reason='%s'\n",
                 parallelOk ? 1 : 0,
                 static_cast<unsigned long long>(parallel.stableHash),
-                parallel.reason.c_str());
+                parallel.error.text);
     Check("parallel all-four ok", parallelOk && parallel.ok);
     Check("parallel hash equals serial",
           parallel.stableHash == serial.stableHash);
@@ -225,8 +310,8 @@ int main(int argc, char** argv)
 
     j2bbatch12::BatchResult12 afterPartial;
     const bool afterPartialOk = j2bbatch12::PrepareBatch(
-        snapshot, snapshot.identity, 129, 17431, visuals, afterPartial,
-        j2bbatch12::Limits12{});
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        afterPartial, j2bbatch12::Limits12{});
     Check("drain/reuse after partial submit",
           afterPartialOk && afterPartial.ok &&
               afterPartial.stableHash == serial.stableHash);
@@ -244,8 +329,8 @@ int main(int argc, char** argv)
 
     j2bbatch12::BatchResult12 afterSubmitReject;
     const bool afterSubmitRejectOk = j2bbatch12::PrepareBatch(
-        snapshot, snapshot.identity, 129, 17431, visuals, afterSubmitReject,
-        j2bbatch12::Limits12{});
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        afterSubmitReject, j2bbatch12::Limits12{});
     Check("drain/reuse after submit rejection",
           afterSubmitRejectOk && afterSubmitReject.ok &&
               afterSubmitReject.stableHash == serial.stableHash);
@@ -264,8 +349,8 @@ int main(int argc, char** argv)
 
     j2bbatch12::BatchResult12 afterException;
     const bool afterExceptionOk = j2bbatch12::PrepareBatch(
-        snapshot, snapshot.identity, 129, 17431, visuals, afterException,
-        j2bbatch12::Limits12{});
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        afterException, j2bbatch12::Limits12{});
     Check("drain/reuse after worker exception",
           afterExceptionOk && afterException.ok &&
               afterException.stableHash == serial.stableHash);
@@ -281,11 +366,54 @@ int main(int argc, char** argv)
 
     j2bbatch12::BatchResult12 afterOom;
     const bool afterOomOk = j2bbatch12::PrepareBatch(
-        snapshot, snapshot.identity, 129, 17431, visuals, afterOom,
-        j2bbatch12::Limits12{});
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        afterOom, j2bbatch12::Limits12{});
     Check("drain/reuse after late allocation failure",
           afterOomOk && afterOom.ok &&
               afterOom.stableHash == serial.stableHash);
+
+    // Real GR submit rejection: job 0 is accepted and blocked in a worker,
+    // job 1's JobGroup::Submit allocation fails, and the accepted job must be
+    // drained before the batch returns.
+    g_blockAfterRead.store(true);
+    g_releaseBlock.store(false);
+    g_blockTimedOut.store(false);
+    g_blockedCount.store(0);
+    g_armSubmitFailure.store(true);
+    std::thread releaser(
+        []()
+        {
+            std::unique_lock lock(g_blockMutex);
+            g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                               []() { return g_blockedCount.load() > 0; });
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            g_releaseBlock.store(true);
+            g_blockCv.notify_all();
+        });
+    j2bbatch12::BatchResult12 submitFailure;
+    const bool submitFailureOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        submitFailure, j2bbatch12::Limits12{});
+    releaser.join();
+    g_blockAfterRead.store(false);
+    g_armSubmitFailure.store(false);
+    Check("real GR submit rejection rejects batch",
+          !submitFailureOk && !submitFailure.ok &&
+              submitFailure.error.code ==
+                  j2bbatch12::Error12::SubmitException &&
+              AllSlotsEmpty(submitFailure));
+    Check("accepted GR job drained before return",
+          g_blockedCount.load() > 0 && g_releaseBlock.load() &&
+              !g_blockTimedOut.load());
+
+    j2bbatch12::BatchResult12 afterSubmitFailure;
+    const bool afterSubmitFailureOk = j2bbatch12::PrepareBatch(
+        snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
+        afterSubmitFailure, j2bbatch12::Limits12{});
+    Check("same GR pool parallel reuse after submit rejection",
+          afterSubmitFailureOk && afterSubmitFailure.ok &&
+              afterSubmitFailure.stableHash == serial.stableHash);
     jobs.Shutdown();
 
     j2bbatch12::BatchResult12 missing;
@@ -318,6 +446,22 @@ int main(int argc, char** argv)
         j2bbatch12::Limits12{});
     Check("duplicate visual rejects batch",
           !duplicateOk && !duplicate.ok && AllSlotsEmpty(duplicate));
+
+    Check("accept live session/epoch",
+          j2bbatch12::AcceptBatch12(serial, snapshot.identity) ==
+              j2bbatch12::AcceptStatus12::Accepted);
+    Check("reject stale session",
+          j2bbatch12::AcceptBatch12(serial, {3, 3}) ==
+              j2bbatch12::AcceptStatus12::StaleSession);
+    Check("reject stale epoch",
+          j2bbatch12::AcceptBatch12(serial, {2, 4}) ==
+              j2bbatch12::AcceptStatus12::StaleEpoch);
+    j2bbatch12::BatchResult12 notReady = serial;
+    notReady.ok = false;
+    notReady.stableHash = 0;
+    Check("reject failed result",
+          j2bbatch12::AcceptBatch12(notReady, snapshot.identity) ==
+              j2bbatch12::AcceptStatus12::NotReady);
 
     std::printf("M1_BATCH_CPU_RESULT %s passed=%d failed=%d\n",
                 g_failed == 0 ? "PASS" : "FAIL", g_passed, g_failed);
