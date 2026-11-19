@@ -695,6 +695,11 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
 
     if (!CreateGeometryBuffers(owner.device, owner.list, reason))
     {
+        // The list was Reset and may already contain barriers/copies. It must
+        // be closed before any later allocator/list Reset, even though these
+        // commands are discarded.
+        if (FAILED(owner.list->Close()))
+            m_listPoisoned = true;
         ReleaseGpu();
         return false;
     }
@@ -1015,6 +1020,8 @@ bool GameDx12FourVisual12::RunPass(
                                reason))
     {
         AbortRecordedPass();
+        if (FAILED(owner.list->Close()))
+            m_listPoisoned = true;
         return false;
     }
     if (!RecordDraws(owner.list, slotMask, combined, reason))
@@ -1206,6 +1213,7 @@ bool GameDx12FourVisual12::RenderDiagnostic(
         result->slots[slot].combinedMaxY = masks[slot].maxY;
     }
 
+    bool isolatedPurity = true;
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
     {
         PassResult12 isolatedPass;
@@ -1218,14 +1226,30 @@ bool GameDx12FourVisual12::RenderDiagnostic(
             return false;
         }
         result->isolatedFences[slot] = isolatedPass.fence;
-        result->slots[slot].isolatedPixels =
-            isolatedPass.coverage.nonClearPixels;
+        // The isolated target must contain only this slot's tint. Counting
+        // tinted pixels separately from non-clear pixels makes a foreign or
+        // partially written pixel a hard gate failure.
+        const GameDx12ColorMask12 isolatedMask =
+            EvaluateGameDx12ColorMask(
+                offscreen.Pixels().data(), width, height,
+                offscreen.RowPitch(), tintBytes[slot]);
+        result->slots[slot].isolatedPixels = isolatedMask.pixels;
+        if (isolatedMask.pixels !=
+            isolatedPass.coverage.nonClearPixels)
+            isolatedPurity = false;
     }
     result->isolatedDrawCount = kSlotCount;
     result->lastDrawUseFence = m_lastDrawUseFenceValue;
     result->gpuCompleted = true;
 
-    bool gate = combinedPass.coverage.HasVisiblePixels();
+    uint64_t combinedMaskSum = 0;
+    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+        combinedMaskSum += result->slots[slot].combinedPixels;
+
+    bool gate = combinedPass.coverage.HasVisiblePixels() &&
+                isolatedPurity &&
+                combinedMaskSum ==
+                    combinedPass.coverage.nonClearPixels;
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
     {
         const uint64_t isolated =
@@ -1261,7 +1285,8 @@ bool GameDx12FourVisual12::RenderDiagnostic(
     Msg("ph_dx12_m23: four-visual frame %s level_visuals=9,105,106,107 "
         "draws=%u isolated_draws=%u upload_fence=%llu combined_fence=%llu "
         "last_draw_use_fence=%llu cull=%s rt=R8G8B8A8_UNORM depth=D32_FLOAT "
-        "readback=1 image_gate=%d nonclear=%llu/%llu png_saved=%d",
+        "readback=1 image_gate=%d mask_sum=%llu nonclear=%llu/%llu "
+        "isolated_purity=%d png_saved=%d",
         gate ? "PASS" : "FAIL", result->combinedDrawCount,
         result->isolatedDrawCount,
         static_cast<unsigned long long>(result->uploadFence),
@@ -1269,10 +1294,12 @@ bool GameDx12FourVisual12::RenderDiagnostic(
         static_cast<unsigned long long>(result->lastDrawUseFence),
         result->cullMode == D3D12_CULL_MODE_NONE ? "none" : "back",
         gate ? 1 : 0,
+        static_cast<unsigned long long>(combinedMaskSum),
         static_cast<unsigned long long>(
             combinedPass.coverage.nonClearPixels),
         static_cast<unsigned long long>(
             combinedPass.coverage.totalPixels),
+        isolatedPurity ? 1 : 0,
         result->pngSaved ? 1 : 0);
 
     if (!gate)
