@@ -60,53 +60,73 @@ bool ReadVfsFile(const char* label, const char* name, uint64_t maxBytes,
                  j2bbatch12::ErrorInfo12& error, double& openMs,
                  double& copyMs) noexcept
 {
-    const Clock::time_point openStart = Clock::now();
-    IReader* reader = FS.r_open(fsgame::level, name);
-    openMs += Ms(openStart);
-    if (reader == nullptr)
-    {
-        j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsOpen,
-                                  "VFS open failed: ", label);
-        return false;
-    }
-    auto closeReader = dx12scope::MakeScopeGuard(
-        [&reader]() noexcept { CloseReaderNoThrow(reader); });
-    (void)closeReader;
-
-    const size_t size = reader->length();
-    if (size == 0 || static_cast<uint64_t>(size) > maxBytes)
-    {
-        j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsSize,
-                                  "VFS size rejected: ", label);
-        return false;
-    }
-
-    const Clock::time_point copyStart = Clock::now();
     try
     {
+        const Clock::time_point openStart = Clock::now();
+        IReader* reader = FS.r_open(fsgame::level, name);
+        openMs += Ms(openStart);
+        if (reader == nullptr)
+        {
+            j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsOpen,
+                                      "VFS open failed: ", label);
+            return false;
+        }
+        auto closeReader = dx12scope::MakeScopeGuard(
+            [&reader]() noexcept { CloseReaderNoThrow(reader); });
+        (void)closeReader;
+
+        const size_t size = reader->length();
+        if (size == 0 || static_cast<uint64_t>(size) > maxBytes)
+        {
+            j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsSize,
+                                      "VFS size rejected: ", label);
+            return false;
+        }
+
+        const Clock::time_point copyStart = Clock::now();
+        try
+        {
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
-        j2b_m1_fault::MaybeEnablePersistentOom(
-            j2b_m1_fault::Point::BeforeVfsCopy);
+            j2b_m1_fault::MaybeEnablePersistentOom(
+                j2b_m1_fault::Point::BeforeVfsCopy);
 #endif
-        bytes.resize(size);
+            bytes.resize(size);
+        }
+        catch (const std::bad_alloc&)
+        {
+            j2bbatch12::SetErrorInfo2(error,
+                                      j2bbatch12::Error12::VfsAllocation,
+                                      "VFS allocation failed: ", label);
+            return false;
+        }
+        catch (const std::length_error&)
+        {
+            j2bbatch12::SetErrorInfo2(error,
+                                      j2bbatch12::Error12::VfsAllocation,
+                                      "VFS allocation failed: ", label);
+            return false;
+        }
+        std::memcpy(bytes.data(), reader->begin(), size);
+        copyMs += Ms(copyStart);
+        return true;
     }
     catch (const std::bad_alloc&)
     {
         j2bbatch12::SetErrorInfo2(error,
                                   j2bbatch12::Error12::VfsAllocation,
-                                  "VFS allocation failed: ", label);
-        return false;
+                                  "VFS open allocation failed: ", label);
     }
-    catch (const std::length_error&)
+    catch (const std::exception&)
     {
-        j2bbatch12::SetErrorInfo2(error,
-                                  j2bbatch12::Error12::VfsAllocation,
-                                  "VFS allocation failed: ", label);
-        return false;
+        j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsOpen,
+                                  "VFS open exception: ", label);
     }
-    std::memcpy(bytes.data(), reader->begin(), size);
-    copyMs += Ms(copyStart);
-    return true;
+    catch (...)
+    {
+        j2bbatch12::SetErrorInfo2(error, j2bbatch12::Error12::VfsOpen,
+                                  "VFS open unknown exception: ", label);
+    }
+    return false;
 }
 } // namespace
 
