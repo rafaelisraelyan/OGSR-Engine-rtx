@@ -7,6 +7,12 @@
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2APreparation.h"
 
+#ifdef OGSR_J2B_M1_RUNTIME_PROBE
+#include "GameDx12J2ABatch.h"
+#include "FS.h"
+#include "LocatorAPI_defs.h"
+#endif
+
 #include "igame_level.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
@@ -1236,6 +1242,58 @@ bool SphereInFrustum(const Matrix4& fullTransform, const float center[3],
 }
 } // namespace
 
+#ifdef OGSR_J2B_M1_RUNTIME_PROBE
+void RunJ2BBatchRuntimeProbe(const char* levelName, uint64_t session,
+                             uint64_t epoch) noexcept
+{
+    FS_Path* path = FS.get_path(fsgame::level);
+    const char* before = (path != nullptr && path->m_Add != nullptr)
+                             ? path->m_Add
+                             : "";
+    char beforeCopy[260] = {};
+    std::snprintf(beforeCopy, sizeof(beforeCopy), "%s", before);
+
+    j2bbatch12::BatchResult12 result;
+    const std::array<uint32_t, 4> visuals = {9, 105, 106, 107};
+    const bool ok = GameDx12J2ABatch_PrepareFromVfs(
+        levelName, {session, epoch}, 129, 17431, visuals, nullptr, false,
+        result, j2bbatch12::Limits12{});
+
+    uint64_t contentHash = 1469598103934665603ull;
+    for (const j2bbatch12::Slot12& slot : result.slots)
+    {
+        const uint32_t values[] = {
+            slot.source.visualId,    slot.source.sourceVbId,
+            slot.source.sourceVBase, slot.source.sourceVCount,
+            slot.source.sourceIbId,  slot.source.sourceIBase,
+            slot.source.sourceICount, slot.vertexCount,
+            slot.indexCount,         slot.instance.sectorId,
+            slot.instance.rootVisualId, slot.instance.occurrenceOrdinal,
+            slot.instance.visualId};
+        const uint64_t hashes[] = {slot.assetVbHash, slot.assetIbHash};
+        contentHash = j2bbatch12::HashBytes(contentHash, values,
+                                            sizeof(values));
+        contentHash = j2bbatch12::HashBytes(contentHash, hashes,
+                                            sizeof(hashes));
+    }
+
+    const char* after = (path != nullptr && path->m_Add != nullptr)
+                            ? path->m_Add
+                            : "";
+    const bool unchanged = std::strcmp(beforeCopy, after) == 0;
+    Msg("ph_dx12_j2b_m1_probe: level='%s' session=%llu epoch=%llu ok=%d "
+        "hash=%016llX content_hash=%016llX error=%u text='%s' "
+        "path_before='%s' path_after='%s' path_unchanged=%d",
+        levelName != nullptr ? levelName : "?",
+        static_cast<unsigned long long>(session),
+        static_cast<unsigned long long>(epoch), ok ? 1 : 0,
+        static_cast<unsigned long long>(result.stableHash),
+        static_cast<unsigned long long>(contentHash),
+        static_cast<unsigned>(result.error.code), result.error.text,
+        beforeCopy, after, unchanged ? 1 : 0);
+}
+#endif
+
 void GameDx12Bridge_OnLevelReady(const char* levelName)
 {
     if (!EnsureOwnerThread("level_ready"))
@@ -1285,6 +1343,11 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
         static_cast<unsigned long long>(state.captureEpoch));
+
+#ifdef OGSR_J2B_M1_RUNTIME_PROBE
+    RunJ2BBatchRuntimeProbe(state.levelName, state.levelSession,
+                            state.captureEpoch);
+#endif
 
     // J1.2A diagnostic load path. R2A requires an explicit game-level
     // selection so visual ID 9 cannot accidentally run on Zaton. The loaded

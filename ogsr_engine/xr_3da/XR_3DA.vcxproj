@@ -286,6 +286,11 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_J2B_M1_RUNTIME_PROBE)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_J2B_M1_RUNTIME_PROBE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE)'=='true'">
     <ClCompile>
       <AdditionalIncludeDirectories>$(SolutionDir)ogsr_engine\Layers\xrRenderDX12;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
