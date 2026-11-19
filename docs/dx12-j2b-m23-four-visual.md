@@ -7,7 +7,8 @@
 >
 > **Ветка:** `feature/j2b-m23-four-real-jupiter-draws`
 > **База (M1-R2 HEAD):** `2a0a35fb969b04a8e5519234ede63b639d908d4a`
-> **Реализация M23:** `88ebf0bef6c3d6072b316e361249f168fd302018`
+> **Реализация M23:** `88ebf0bef6c3d6072b316e361249f168fd302018`,
+> hardening `6cfd8d939c01f7b5026f07b03cd810d1a4beb0ee`
 > **Дата evidence:** 2026-11-19
 
 ## 1. Цель и результат
@@ -165,49 +166,49 @@ Combined readback сканируется на четыре ожидаемых UN
 
 ## 5. Evidence
 
-### 5.1 Clean build matrix (Release x64, commit `88ebf0bef`)
+### 5.1 Clean build matrix (Release x64, commit `6cfd8d939`)
 
-- feature-off: `xrEngine_m23_final_off.exe`, 31 456 256 bytes,
-  SHA-256 `9DF4272DA86F2B5DD8F75C0D920D13EC599E7C9D0AB941D94303AB1AA142005B`,
+- feature-off: `xrEngine_m23_final2_off.exe`, 31 456 256 bytes,
+  SHA-256 `9C4E2E0E71CB4367C6B96DEADCD1E6C9C67A4A4E85B2424E9C7E8D4CA05038A8`,
   `d3d12.dll` imports = 0, `d3d11.dll` = 1.
-- feature-on: `xrEngine_m23_final_on.exe`, 31 766 016 bytes,
-  SHA-256 `E0B752321DE6DEF61FB98BC96B23BAAE944B6F005CD3465C76C26C8EBB765A27`,
+- feature-on: `xrEngine_m23_final2_on.exe`, 31 766 528 bytes,
+  SHA-256 `74916692FBFA3DACB149E3E2CD1818F595B6B878711ED797B9C0ABA5435C9B0B`,
   `d3d12.dll` imports = 1, `d3d11.dll` = 1.
-- camera-on: `xrEngine_m23_final_camera_on.exe`, 31 781 888 bytes,
-  SHA-256 `2F2D3B3B8B3870387D21AB6FA7411892A6C34AE5329A67776B20FE650DA1D5EA`,
+- camera-on: `xrEngine_m23_final2_camera_on.exe`, 31 781 888 bytes,
+  SHA-256 `E7535EBE3C5139FF7E06B81DFD18ED024D6A027509177E9D258FA3BED68B7A4E`,
   `d3d12.dll` imports = 1, `d3d11.dll` = 1.
 
-### 5.2 Основной кадр (`final-m23`)
+### 5.2 Основной кадр (`final2-m23`)
 
 ```
 ph_dx12_m23: four-visual frame PASS level_visuals=9,105,106,107
 draws=4 isolated_draws=4 upload_fence=2 combined_fence=3
 last_draw_use_fence=7 cull=back rt=R8G8B8A8_UNORM depth=D32_FLOAT
-readback=1 image_gate=1 nonclear=38235/4096000 png_saved=1
+readback=1 image_gate=1 nonclear=38245/4096000 png_saved=1
 ```
 
 Per-visual (combined == isolated):
 
-- visual 9: 440 px, bbox (483,430)–(822,476), 1314 индексов;
-- visual 105: 30 654 px, bbox (1779,304)–(1962,555), 312 индексов;
-- visual 106: 1335 px, bbox (625,1025)–(756,1311), 192 индекса;
-- visual 107: 5806 px, bbox (1784,1029)–(1929,1290), 876 индексов.
+- visual 9: 437 px, bbox (483,430)–(822,476), 1314 индексов;
+- visual 105: 30 653 px, bbox (1779,304)–(1962,555), 312 индексов;
+- visual 106: 1337 px, bbox (625,1025)–(756,1311), 192 индекса;
+- visual 107: 5818 px, bbox (1784,1029)–(1929,1290), 876 индексов.
 
 PNG SHA-256:
 
-- combined: `8076E10C85ACD767A8BED7739F63E67F04B161F0CD994CAC54752883E868B0B0`;
-- isolated 9: `C6309620776B1E841EF20AA83285DD0229A913B1F7CCF920CF52E8DF97F7FD72`;
-- isolated 105: `2545639A9F2865B500A97E9E3E80816BA1F4582497408C32C7749E87CA777D05`;
-- isolated 106: `53F06249842972F42F786469BA87205CF0A409BC7BE6A50E580FDD1D01B6E439`;
-- isolated 107: `969E14F8368EC13F748AEDE01BBE970404C2F708F019D31F8B185B28BB25078C`.
+- combined: `EA8C5FC7EDE2DEB1672A3F63A5FEDFB742EC5E36081CBCC6A5A944D423D6275C`;
+- isolated 9: `9D92C58F191D6CC7CC496C86A19BF8B1FA388636278F545B5B80BC2EDF789CA9`;
+- isolated 105: `3585984D78F100B718025CE00DC7BB251CE87519E78816EE8504D9FE24E2886B`;
+- isolated 106: `8739D8A9A2443E6B9282637E539972F485D377B40E5F4F7176A6478F09D23364`;
+- isolated 107: `7F633FE6DB0314AD622074AEEF2419967F29649099A018138CF1B9BFB9F60D84`.
 
 Независимый пересчёт PNG (не по логу) подтвердил размеры 2560×1600, счётчики,
 bboxes, отсутствие чужого цвета в isolated PNG, попарную непересекаемость и
 равенство суммы цветов non-clear. Отчёт: `png_verification.txt`, результат
 `M23_PNG_RESULT PASS failed=0`.
 
-R4 Present того же запуска: `r4_present_final-m23.png`, 3 764 886 bytes,
-SHA-256 `75162CC4E029BA7BB1DFB942918E49937BEC7EAB07FBD72F2C64942855C4567E`.
+R4 Present того же запуска: `r4_present_final2-m23.png`, 3 771 241 bytes,
+SHA-256 `17FCB998A0A0C97AA257F85C8F8F93BA94A7E5EBA528C10E70962D8A0E235A17`.
 
 ### 5.3 Debug Layer / GBV
 
@@ -220,24 +221,24 @@ completion=1 lifetime=0
 
 ### 5.4 Reset
 
-- **Reset-before** (`final-reset-before`): `vid_restart` после upload, но до
+- **Reset-before** (`final2-reset-before`): `vid_restart` после upload, но до
   первого кадра. Лог: `rebound after device_reset level='jupiter' session=2
   epoch=4 previous_epoch=3`; кадр PASS на `epoch=4`, `combined_fence=3`,
   `last_draw_use_fence=7`.
-- **Reset-after** (`final-reset-after`): кадр PASS, затем `vid_restart`.
+- **Reset-after** (`final2-reset-after`): кадр PASS, затем `vid_restart`.
   `DRAW_BEFORE=4 DRAW_AFTER=4`; повторного кадра нет, rebind refused
   `reason='one-shot M23 attempt was already consumed'`, чистый shutdown.
 
 ### 5.5 Unload / Zaton
 
-`final-unload`: Jupiter frame PASS → `level teardown level='jupiter'
+`final2-unload`: Jupiter frame PASS → `level teardown level='jupiter'
 session=2 epoch=5` → `level ready level='zaton' session=3 epoch=6` →
 `ph_dx12_m23: skipped: level='zaton' requested='jupiter'` → teardown Zaton →
 `shutdown complete`. Quarantine не сработал, утечек и повторного M23-кадра нет.
 
 ### 5.6 Quarantine
 
-`final-quarantine` с `OGSR_DX12_GAME_M23_FORCE_UNKNOWN=1`: четыре combined
+`final2-quarantine` с `OGSR_DX12_GAME_M23_FORCE_UNKNOWN=1`: четыре combined
 draw реально записаны, completion намеренно не подтверждён. Логи:
 `GPU completion unknown stage='forced-fault'; M23 resources are retained for
 process lifetime`, `GPU completion NOT confirmed`, bridge quarantine
@@ -247,11 +248,11 @@ CloseHandle)`, на shutdown — `quarantined objects are not released`,
 
 ### 5.7 Сохранение J1 и J2A
 
-- J1 (`final-j1`, M23 off): ровно `recorded DrawIndexedInstanced visual=9
+- J1 (`final2-j1`, M23 off): ровно `recorded DrawIndexedInstanced visual=9
   indices=1314`, `fence=3`, `nonclear=10623/4096000`, bbox
   (1129,1099)–(2108,1599), `infoqueue phase=diagnostic verdict=PASS`,
   clean shutdown.
-- J1+J2A (`final-j1j2a`, M23 off): J1 один Draw 10 623 px; J2A
+- J1+J2A (`final2-j1j2a`, M23 off): J1 один Draw 10 623 px; J2A
   `sector=129 root=17431 instances=5 unique=5 packets=4 visible=4 culled=1`
   `hash=EC3EAADD55DFCD6C prepared=1`, `J2A_FAIL_COUNT=0`.
 
