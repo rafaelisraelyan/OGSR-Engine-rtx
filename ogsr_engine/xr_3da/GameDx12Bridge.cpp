@@ -1520,7 +1520,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                         reason.empty() ? "allocation or unknown failure"
                                        : reason.c_str());
                     if (state.m23.ListPoisoned())
-                        DisableTerminal("m23 upload command list recovery");
+                        QuarantineForGeometryUnknown(
+                            "m23_upload_list_poisoned");
                 }
                 else
                 {
@@ -1535,7 +1536,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                         static_cast<unsigned long long>(
                             state.m23LevelEpoch));
                 }
-                if (state.m23.GpuCompletionUnknown())
+                if (!state.gpuUnknown && !state.quarantined &&
+                    state.m23.GpuCompletionUnknown())
                     QuarantineForGeometryUnknown("m23_level_ready");
             }
         }
@@ -1928,8 +1930,8 @@ void GameDx12Bridge_OnFrame()
             }
             EvaluateInfoQueue("m23");
             if (state.m23.ListPoisoned())
-                DisableTerminal("m23 command list recovery");
-            if (!rendered && state.m23.GpuCompletionUnknown())
+                QuarantineForGeometryUnknown("m23_draw_list_poisoned");
+            else if (!rendered && state.m23.GpuCompletionUnknown())
                 QuarantineForGeometryUnknown("m23_render");
         }
     }

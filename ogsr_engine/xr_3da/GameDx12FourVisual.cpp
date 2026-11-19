@@ -4,6 +4,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include "GameDx12OffscreenPass.h"
+#include "GameDx12M23Fault.h"
 #include "dx12xraylevelasset.h"
 #include "dx12xraylevelgeometry.h"
 
@@ -69,6 +70,82 @@ void DetachAndDrop(M23Ptr12<T>& object) noexcept
     object.Detach();
     ++g_quarantineDetachedResources;
 }
+
+// Exception-safe owner command-list recording guard. It is armed immediately
+// after a successful Reset and stays armed until Close succeeds. Any ordinary
+// return or C++ exception runs the noexcept destructor, which closes the list
+// or terminally poisons it. It performs no allocation and does not touch
+// std::string diagnostics, so persistent OOM cannot bypass it.
+class M23RecordingGuard12
+{
+public:
+    M23RecordingGuard12(ID3D12GraphicsCommandList* list, bool& poisoned,
+                        bool& closed, const char* closeFaultName) noexcept
+        : m_list(list), m_poisoned(poisoned), m_closed(closed),
+          m_closeFaultName(closeFaultName)
+    {
+        m_closed = false;
+    }
+    M23RecordingGuard12(const M23RecordingGuard12&) = delete;
+    M23RecordingGuard12& operator=(const M23RecordingGuard12&) = delete;
+    ~M23RecordingGuard12() noexcept { Abandon(); }
+
+    // Returns true only if Close succeeded. On failure the shared list is
+    // terminally poisoned and must never be reset or reused.
+    bool Close() noexcept
+    {
+        if (!m_armed)
+            return false;
+        m_armed = false;
+        if (m_closeFaultName != nullptr &&
+            m23fault12::Is(m_closeFaultName))
+        {
+            m_poisoned = true;
+            m_closed = false;
+            return false;
+        }
+        if (m_list == nullptr || FAILED(m_list->Close()))
+        {
+            m_poisoned = true;
+            m_closed = false;
+            return false;
+        }
+        m_closed = true;
+        return true;
+    }
+
+    // Discards an unsubmitted recording. Safe only before ExecuteCommandLists.
+    bool Abandon() noexcept
+    {
+        if (!m_armed)
+            return m_closed;
+        m_armed = false;
+        if (m_closeFaultName != nullptr &&
+            m23fault12::Is(m_closeFaultName))
+        {
+            m_poisoned = true;
+            m_closed = false;
+            return false;
+        }
+        if (m_list == nullptr || FAILED(m_list->Close()))
+        {
+            m_poisoned = true;
+            m_closed = false;
+            return false;
+        }
+        m_closed = true;
+        return true;
+    }
+
+    bool Armed() const noexcept { return m_armed; }
+
+private:
+    ID3D12GraphicsCommandList* m_list = nullptr;
+    bool& m_poisoned;
+    bool& m_closed;
+    const char* m_closeFaultName = nullptr;
+    bool m_armed = true;
+};
 
 bool FiniteMatrix(const DirectX::XMFLOAT4X4& matrix) noexcept
 {
@@ -220,6 +297,10 @@ GameDx12FourVisual12::~GameDx12FourVisual12()
 
 bool GameDx12FourVisual12::Fail(std::string& reason, const char* text)
 {
+#ifdef OGSR_M23_FAULT_INJECTION
+    if (m23fault12::ErrorOom())
+        throw std::bad_alloc();
+#endif
     m_lastError = text != nullptr ? text : "M23 four-visual failure";
     reason = m_lastError;
     return false;
@@ -228,6 +309,10 @@ bool GameDx12FourVisual12::Fail(std::string& reason, const char* text)
 bool GameDx12FourVisual12::Fail(std::string& reason,
                                 const std::string& text)
 {
+#ifdef OGSR_M23_FAULT_INJECTION
+    if (m23fault12::ErrorOom())
+        throw std::bad_alloc();
+#endif
     m_lastError = text;
     reason = m_lastError;
     return false;
@@ -430,6 +515,14 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
             sizeof(uint16_t);
         if (vertexBytes == 0 || indexBytes == 0)
             return Fail(reason, "M23 empty geometry asset");
+        if (slot == 2)
+        {
+            // Test-only faults after two complete slots have been recorded.
+            if (m23fault12::Is("upload-oom"))
+                throw std::bad_alloc();
+            if (m23fault12::Is("upload-error"))
+                return Fail(reason, "M23 injected upload failure");
+        }
         vertexBytesTotal += vertexBytes;
         indexBytesTotal += indexBytes;
 
@@ -579,28 +672,38 @@ bool GameDx12FourVisual12::LoadFromVfs(
     }
     catch (const std::bad_alloc&)
     {
-        if (m_gpuUnknown || m_quarantined ||
-            (m_uploadSubmitted && !m_uploadConfirmed))
-            QuarantineGpu();
-        else
-            ReleaseGpu();
-        InvalidateStaging();
-        m_loaded = false;
-        reason.clear();
-        return false;
+        return HandleLoadException(reason);
     }
     catch (const std::length_error&)
     {
-        if (m_gpuUnknown || m_quarantined ||
-            (m_uploadSubmitted && !m_uploadConfirmed))
-            QuarantineGpu();
-        else
-            ReleaseGpu();
-        InvalidateStaging();
-        m_loaded = false;
-        reason.clear();
-        return false;
+        return HandleLoadException(reason);
     }
+    catch (...)
+    {
+        return HandleLoadException(reason);
+    }
+}
+
+bool GameDx12FourVisual12::HandleLoadException(std::string& reason) noexcept
+{
+    try
+    {
+        Msg("ph_dx12_m23: upload exception boundary recording_closed=%d "
+            "poisoned=%d",
+            m_lastRecordingClosed ? 1 : 0, m_listPoisoned ? 1 : 0);
+    }
+    catch (...)
+    {
+    }
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned ||
+        (m_uploadSubmitted && !m_uploadConfirmed))
+        QuarantineGpu();
+    else
+        ReleaseGpu();
+    InvalidateStaging();
+    m_loaded = false;
+    reason.clear();
+    return false;
 }
 
 bool GameDx12FourVisual12::LoadFromVfsImpl(
@@ -619,6 +722,8 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
         return Fail(reason, "M23 invalid level identity");
     if (m_gpuUnknown)
         return Fail(reason, "M23 registry is quarantined");
+    if (m_listPoisoned)
+        return Fail(reason, "M23 command list is poisoned");
     if (m_loaded || m_slots[0].vertexBuffer != nullptr ||
         m_uploadSubmitted)
         return Fail(reason, "M23 registry is already loaded");
@@ -721,24 +826,25 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
         return Fail(reason, "M23 upload list reset failed");
     }
 
+    M23RecordingGuard12 recording(owner.list, m_listPoisoned,
+                                  m_lastRecordingClosed,
+                                  "close-failure");
     if (!CreateGeometryBuffers(owner.device, owner.list, reason))
     {
-        // The list was Reset and may already contain barriers/copies. It must
-        // be closed before any later allocator/list Reset, even though these
-        // commands are discarded.
-        if (FAILED(owner.list->Close()))
-            m_listPoisoned = true;
-        if (m_listPoisoned)
+        const bool closed = recording.Abandon();
+        Msg("ph_dx12_m23: upload recording failed list_closed=%d "
+            "poisoned=%d",
+            closed ? 1 : 0, m_listPoisoned ? 1 : 0);
+        if (!closed || m_listPoisoned)
             QuarantineGpu();
         else
             ReleaseGpu();
         return false;
     }
 
-    hr = owner.list->Close();
-    if (FAILED(hr))
+    if (!recording.Close())
     {
-        m_listPoisoned = true;
+        Msg("ph_dx12_m23: upload list close failed poisoned=1");
         QuarantineGpu();
         return Fail(reason, "M23 upload list close failed");
     }
@@ -1062,13 +1168,15 @@ bool GameDx12FourVisual12::RunPass(
     }
 
     m_passRecorded = true;
+    M23RecordingGuard12 recording(owner.list, m_listPoisoned,
+                                  m_lastRecordingClosed,
+                                  "draw-close-failure");
     if (!offscreen.RecordBegin(owner.list, fourvisual12::kClearColor,
                                reason))
     {
         offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
-        if (FAILED(owner.list->Close()))
-            m_listPoisoned = true;
+        recording.Abandon();
         if (m_listPoisoned)
             QuarantineGpu();
         return false;
@@ -1077,8 +1185,7 @@ bool GameDx12FourVisual12::RunPass(
     {
         offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
-        if (FAILED(owner.list->Close()))
-            m_listPoisoned = true;
+        recording.Abandon();
         if (m_listPoisoned)
             QuarantineGpu();
         return false;
@@ -1087,19 +1194,16 @@ bool GameDx12FourVisual12::RunPass(
     {
         offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
-        if (FAILED(owner.list->Close()))
-            m_listPoisoned = true;
+        recording.Abandon();
         if (m_listPoisoned)
             QuarantineGpu();
         return false;
     }
 
-    hr = owner.list->Close();
-    if (FAILED(hr))
+    if (!recording.Close())
     {
         offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
-        m_listPoisoned = true;
         QuarantineGpu();
         return Fail(reason, "M23 pass list close failed");
     }
@@ -1114,14 +1218,16 @@ bool GameDx12FourVisual12::RunPass(
     ID3D12CommandList* lists[] = {owner.list};
     owner.queue->ExecuteCommandLists(1, lists);
 
-    if (std::getenv("OGSR_DX12_GAME_M23_FORCE_UNKNOWN") != nullptr)
+#ifdef OGSR_M23_FAULT_INJECTION
+    if (m23fault12::Is("forced-unknown"))
     {
-        // Test-only fault injection for the quarantine path. The submission
-        // is real and in flight, but completion is deliberately not claimed;
-        // the owner must retain every M23 object until process exit.
+        // The submission is real and in flight, but completion is
+        // deliberately not claimed; the owner must retain every M23 object
+        // until process exit.
         FailPassUnknown("forced-fault", reason);
         return false;
     }
+#endif
 
     if (!MarkPassSubmitted(slotMask, expected, owner.fence, owner.device,
                            reason))
@@ -1130,12 +1236,31 @@ bool GameDx12FourVisual12::RunPass(
         return false;
     }
     *owner.fenceValue = expected;
+#ifdef OGSR_M23_FAULT_INJECTION
+    if (m23fault12::Is("signal-failure"))
+    {
+        FailPassUnknown("signal", reason);
+        return false;
+    }
+#endif
     hr = owner.queue->Signal(owner.fence, expected);
     if (FAILED(hr))
     {
         FailPassUnknown("signal", reason);
         return false;
     }
+#ifdef OGSR_M23_FAULT_INJECTION
+    if (m23fault12::Is("fence-event-failure"))
+    {
+        FailPassUnknown("fence-event", reason);
+        return false;
+    }
+    if (m23fault12::Is("fence-wait-failure"))
+    {
+        FailPassUnknown("fence-wait", reason);
+        return false;
+    }
+#endif
     if (owner.fence->GetCompletedValue() < expected)
     {
         hr = owner.fence->SetEventOnCompletion(expected, owner.fenceEvent);
@@ -1151,7 +1276,12 @@ bool GameDx12FourVisual12::RunPass(
             return false;
         }
     }
+    bool forceDeviceRemoved = false;
+#ifdef OGSR_M23_FAULT_INJECTION
+    forceDeviceRemoved = m23fault12::Is("device-removed");
+#endif
     if (owner.fence->GetCompletedValue() < expected ||
+        forceDeviceRemoved ||
         owner.device->GetDeviceRemovedReason() != S_OK)
     {
         FailPassUnknown("completion", reason);
@@ -1179,6 +1309,53 @@ bool GameDx12FourVisual12::RunPass(
 }
 
 bool GameDx12FourVisual12::RenderDiagnostic(
+    const GameDx12FourVisualOwner12& owner,
+    const DirectX::XMFLOAT4X4& logicalViewProjection,
+    const float cameraPosition[3],
+    GameDx12OffscreenPass12& offscreen, uint32_t width, uint32_t height,
+    const wchar_t* pngDirectory, Result12* result, std::string& reason)
+{
+    try
+    {
+        return RenderDiagnosticImpl(owner, logicalViewProjection,
+                                    cameraPosition, offscreen, width,
+                                    height, pngDirectory, result, reason);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return HandleRenderException(reason);
+    }
+    catch (const std::length_error&)
+    {
+        return HandleRenderException(reason);
+    }
+    catch (...)
+    {
+        return HandleRenderException(reason);
+    }
+}
+
+bool GameDx12FourVisual12::HandleRenderException(
+    std::string& reason) noexcept
+{
+    // A recorded pass may have reached ExecuteCommandLists before the
+    // exception; there is no way to prove completion, so retain all M23 GPU
+    // objects. If no pass was recorded, no GPU submission happened and the
+    // already-uploaded registry may stay loaded.
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned ||
+        m_passRecorded || m_passSubmitted)
+        QuarantineGpu();
+    try
+    {
+        reason = "M23 render boundary exception";
+    }
+    catch (...)
+    {
+    }
+    return false;
+}
+
+bool GameDx12FourVisual12::RenderDiagnosticImpl(
     const GameDx12FourVisualOwner12& owner,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const float cameraPosition[3],

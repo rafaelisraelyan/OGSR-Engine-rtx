@@ -207,6 +207,14 @@ private:
     void InvalidateStaging();
     void ReleaseGpu();
     void QuarantineGpu() noexcept;
+    bool RenderDiagnosticImpl(
+        const GameDx12FourVisualOwner12& owner,
+        const DirectX::XMFLOAT4X4& logicalViewProjection,
+        const float cameraPosition[3], GameDx12OffscreenPass12& offscreen,
+        uint32_t width, uint32_t height, const wchar_t* pngDirectory,
+        Result12* result, std::string& reason);
+    bool HandleRenderException(std::string& reason) noexcept;
+    bool HandleLoadException(std::string& reason) noexcept;
     void LogProbe(const char* stage) noexcept;
 
     SlotGpu12 m_slots[kSlotCount];
@@ -234,6 +242,7 @@ private:
     bool m_gpuUnknown = false;
     bool m_quarantined = false;
     bool m_listPoisoned = false;
+    bool m_lastRecordingClosed = false;
     bool m_shutdownProbeLogged = false;
     bool m_unknownProbeLogged = false;
 

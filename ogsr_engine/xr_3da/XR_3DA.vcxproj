@@ -331,6 +331,7 @@
     <ClInclude Include="GameDx12LevelGeometry.h" />
     <ClInclude Include="GameDx12FourVisual.h" />
     <ClInclude Include="GameDx12M23Lifetime.h" />
+    <ClInclude Include="GameDx12M23Fault.h" />
     <ClInclude Include="GameDx12OffscreenPass.h" />
     <ClInclude Include="GameDx12ReadbackCoverage.h" />
     <ClCompile Include="..\Layers\xrRenderDX12\dx12xraylevelgeometry.cpp">
