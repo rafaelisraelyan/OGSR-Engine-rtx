@@ -40,17 +40,34 @@ struct FourVisualQuarantine12
     IUnknown* constants = nullptr;
     IUnknown* rootSignature = nullptr;
     IUnknown* pipelineState = nullptr;
+    // Captured owner objects of an unknown submission. They must not be
+    // released by the M23 destructor while the last-use fence is unconfirmed.
+    IUnknown* passFence = nullptr;
+    IUnknown* passDevice = nullptr;
 };
 
 FourVisualQuarantine12 g_fourVisualQuarantine;
+uint64_t g_quarantineCalls = 0;
+uint64_t g_quarantineOccupiedAtEntry = 0;
+uint64_t g_quarantineDetachedResources = 0;
 
 template <typename T>
-void DetachToQuarantine(IUnknown*& destination, ComPtr<T>& object) noexcept
+void DetachToQuarantine(IUnknown*& destination, M23Ptr12<T>& object) noexcept
 {
     if (object == nullptr)
         return;
     destination = object.Get();
     object.Detach();
+    ++g_quarantineDetachedResources;
+}
+
+template <typename T>
+void DetachAndDrop(M23Ptr12<T>& object) noexcept
+{
+    if (object == nullptr)
+        return;
+    object.Detach();
+    ++g_quarantineDetachedResources;
 }
 
 bool FiniteMatrix(const DirectX::XMFLOAT4X4& matrix) noexcept
@@ -292,6 +309,7 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
         IID_PPV_ARGS(m_rootSignature.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "M23 root signature creation failed");
+    m23probe12::MarkCreated();
 
     ComPtr<ID3D10Blob> vertexShader;
     ComPtr<ID3D10Blob> pixelShader;
@@ -340,6 +358,7 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
         &desc, IID_PPV_ARGS(m_pipelineState.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "M23 graphics pipeline creation failed");
+    m23probe12::MarkCreated();
 
     Msg("ph_dx12_m23: pipeline ready rt=R8G8B8A8_UNORM depth=D32_FLOAT "
         "depth_func=LESS depth_write=1 cull=%s front_ccw=0 stride=%u",
@@ -363,6 +382,7 @@ bool GameDx12FourVisual12::CreateConstants(ID3D12Device* device,
         IID_PPV_ARGS(m_constants.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "M23 constant buffer creation failed");
+    m23probe12::MarkCreated();
 
     D3D12_RANGE noRead = {0, 0};
     hr = m_constants->Map(0, &noRead, &m_constantsMapped);
@@ -422,12 +442,14 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
             IID_PPV_ARGS(gpu.vertexBuffer.GetAddressOf()));
         if (FAILED(hr))
             return Fail(reason, "M23 vertex buffer creation failed");
+        m23probe12::MarkCreated();
         hr = device->CreateCommittedResource(
             &defaultHeap, D3D12_HEAP_FLAG_NONE, &indexDesc,
             D3D12_RESOURCE_STATE_COMMON, nullptr,
             IID_PPV_ARGS(gpu.indexBuffer.GetAddressOf()));
         if (FAILED(hr))
             return Fail(reason, "M23 index buffer creation failed");
+        m23probe12::MarkCreated();
 
         hr = device->CreateCommittedResource(
             &uploadHeap, D3D12_HEAP_FLAG_NONE, &vertexDesc,
@@ -435,12 +457,14 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
             IID_PPV_ARGS(gpu.uploadVertex.GetAddressOf()));
         if (FAILED(hr))
             return Fail(reason, "M23 upload vertex creation failed");
+        m23probe12::MarkCreated();
         hr = device->CreateCommittedResource(
             &uploadHeap, D3D12_HEAP_FLAG_NONE, &indexDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             IID_PPV_ARGS(gpu.uploadIndex.GetAddressOf()));
         if (FAILED(hr))
             return Fail(reason, "M23 upload index creation failed");
+        m23probe12::MarkCreated();
 
         D3D12_RANGE noRead = {0, 0};
         void* mapped = nullptr;
@@ -555,21 +579,25 @@ bool GameDx12FourVisual12::LoadFromVfs(
     }
     catch (const std::bad_alloc&)
     {
-        if (m_uploadSubmitted && !m_uploadConfirmed)
+        if (m_gpuUnknown || m_quarantined ||
+            (m_uploadSubmitted && !m_uploadConfirmed))
             QuarantineGpu();
         else
             ReleaseGpu();
         InvalidateStaging();
+        m_loaded = false;
         reason.clear();
         return false;
     }
     catch (const std::length_error&)
     {
-        if (m_uploadSubmitted && !m_uploadConfirmed)
+        if (m_gpuUnknown || m_quarantined ||
+            (m_uploadSubmitted && !m_uploadConfirmed))
             QuarantineGpu();
         else
             ReleaseGpu();
         InvalidateStaging();
+        m_loaded = false;
         reason.clear();
         return false;
     }
@@ -700,7 +728,10 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
         // commands are discarded.
         if (FAILED(owner.list->Close()))
             m_listPoisoned = true;
-        ReleaseGpu();
+        if (m_listPoisoned)
+            QuarantineGpu();
+        else
+            ReleaseGpu();
         return false;
     }
 
@@ -708,7 +739,7 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
     if (FAILED(hr))
     {
         m_listPoisoned = true;
-        ReleaseGpu();
+        QuarantineGpu();
         return Fail(reason, "M23 upload list close failed");
     }
 
@@ -974,13 +1005,28 @@ void GameDx12FourVisual12::AbortRecordedPass() noexcept
 }
 
 void GameDx12FourVisual12::FailPassUnknown(const char* stage,
-                                           std::string& reason)
+                                           std::string& reason) noexcept
 {
-    m_gpuUnknown = true;
-    Msg("ph_dx12_m23: GPU completion unknown stage='%s'; M23 resources are "
-        "retained for process lifetime",
-        stage != nullptr ? stage : "?");
-    reason = "M23 GPU completion unconfirmed";
+    // Detach every M23 GPU object before any owner/destructor path can release
+    // it. QuarantineGpu is nonallocating and idempotent.
+    QuarantineGpu();
+    try
+    {
+        Msg("ph_dx12_m23: GPU completion unknown stage='%s'; M23 resources "
+            "are quarantined for process lifetime",
+            stage != nullptr ? stage : "?");
+    }
+    catch (...)
+    {
+    }
+    try
+    {
+        reason = "M23 GPU completion unconfirmed";
+    }
+    catch (...)
+    {
+    }
+    LogProbe("unknown-draw");
 }
 
 bool GameDx12FourVisual12::RunPass(
@@ -1019,9 +1065,12 @@ bool GameDx12FourVisual12::RunPass(
     if (!offscreen.RecordBegin(owner.list, fourvisual12::kClearColor,
                                reason))
     {
+        offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
         if (FAILED(owner.list->Close()))
             m_listPoisoned = true;
+        if (m_listPoisoned)
+            QuarantineGpu();
         return false;
     }
     if (!RecordDraws(owner.list, slotMask, combined, reason))
@@ -1030,6 +1079,8 @@ bool GameDx12FourVisual12::RunPass(
         AbortRecordedPass();
         if (FAILED(owner.list->Close()))
             m_listPoisoned = true;
+        if (m_listPoisoned)
+            QuarantineGpu();
         return false;
     }
     if (!offscreen.RecordEnd(owner.list, reason))
@@ -1038,6 +1089,8 @@ bool GameDx12FourVisual12::RunPass(
         AbortRecordedPass();
         if (FAILED(owner.list->Close()))
             m_listPoisoned = true;
+        if (m_listPoisoned)
+            QuarantineGpu();
         return false;
     }
 
@@ -1047,6 +1100,7 @@ bool GameDx12FourVisual12::RunPass(
         offscreen.AbortUnsubmittedFrame();
         AbortRecordedPass();
         m_listPoisoned = true;
+        QuarantineGpu();
         return Fail(reason, "M23 pass list close failed");
     }
 
@@ -1316,10 +1370,16 @@ void GameDx12FourVisual12::OnLevelTeardown(uint64_t nextEpoch)
     m_levelEpoch = nextEpoch;
     InvalidateStaging();
     m_loaded = false;
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned)
+    {
+        QuarantineGpu();
+        return;
+    }
     if (m_passRecorded || m_passSubmitted)
     {
         // A recorded/submitted pass has no verified completion here.
         m_generation = 0;
+        QuarantineGpu();
         return;
     }
     if (m_uploadSubmitted && !m_uploadConfirmed)
@@ -1342,11 +1402,17 @@ void GameDx12FourVisual12::OnDeviceReset(uint64_t nextEpoch)
 {
     m_levelEpoch = nextEpoch;
     InvalidateStaging();
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned)
+    {
+        QuarantineGpu();
+        return;
+    }
     if (m_passRecorded || m_passSubmitted)
     {
         // The old pass has no verified completion on this reset path.
         m_generation = 0;
         m_loaded = false;
+        QuarantineGpu();
         return;
     }
     if (m_loaded && m_uploadConfirmed)
@@ -1360,6 +1426,11 @@ void GameDx12FourVisual12::OnDeviceReset(uint64_t nextEpoch)
 
 void GameDx12FourVisual12::ReleaseGpu()
 {
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned)
+    {
+        QuarantineGpu();
+        return;
+    }
     if (m_constantsMapped != nullptr && m_constants != nullptr)
         m_constants->Unmap(0, nullptr);
     m_constantsMapped = nullptr;
@@ -1388,13 +1459,17 @@ void GameDx12FourVisual12::ReleaseGpu()
         m_objectCBVA[slot] = 0;
 }
 
-void GameDx12FourVisual12::QuarantineGpu()
+void GameDx12FourVisual12::QuarantineGpu() noexcept
 {
+    ++g_quarantineCalls;
+    const bool occupiedAtEntry = g_fourVisualQuarantine.occupied;
+    g_quarantineOccupiedAtEntry = occupiedAtEntry ? 1u : 0u;
+
     if (m_constantsMapped != nullptr && m_constants != nullptr)
         m_constants->Unmap(0, nullptr);
     m_constantsMapped = nullptr;
 
-    if (!g_fourVisualQuarantine.occupied)
+    if (!occupiedAtEntry)
     {
         g_fourVisualQuarantine.occupied = true;
         for (uint32_t slot = 0; slot < kSlotCount; ++slot)
@@ -1413,6 +1488,8 @@ void GameDx12FourVisual12::QuarantineGpu()
                            m_rootSignature);
         DetachToQuarantine(g_fourVisualQuarantine.pipelineState,
                            m_pipelineState);
+        DetachToQuarantine(g_fourVisualQuarantine.passFence, m_passFence);
+        DetachToQuarantine(g_fourVisualQuarantine.passDevice, m_passDevice);
     }
     else
     {
@@ -1421,14 +1498,16 @@ void GameDx12FourVisual12::QuarantineGpu()
         // released while completion is unknown.
         for (uint32_t slot = 0; slot < kSlotCount; ++slot)
         {
-            m_slots[slot].vertexBuffer.Detach();
-            m_slots[slot].indexBuffer.Detach();
-            m_slots[slot].uploadVertex.Detach();
-            m_slots[slot].uploadIndex.Detach();
+            DetachAndDrop(m_slots[slot].vertexBuffer);
+            DetachAndDrop(m_slots[slot].indexBuffer);
+            DetachAndDrop(m_slots[slot].uploadVertex);
+            DetachAndDrop(m_slots[slot].uploadIndex);
         }
-        m_constants.Detach();
-        m_rootSignature.Detach();
-        m_pipelineState.Detach();
+        DetachAndDrop(m_constants);
+        DetachAndDrop(m_rootSignature);
+        DetachAndDrop(m_pipelineState);
+        DetachAndDrop(m_passFence);
+        DetachAndDrop(m_passDevice);
     }
 
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
@@ -1436,9 +1515,14 @@ void GameDx12FourVisual12::QuarantineGpu()
     InvalidateStaging();
     m_loaded = false;
     m_gpuUnknown = true;
+    m_quarantined = true;
     m_uploadSubmitted = false;
     m_uploadConfirmed = false;
     m_uploadFenceValue = 0;
+    m_passRecorded = false;
+    m_passSubmitted = false;
+    m_passSlotMask = 0;
+    m_passFenceValue = 0;
     m_levelSession = 0;
     m_levelEpoch = 0;
     m_generation = 0;
@@ -1447,14 +1531,66 @@ void GameDx12FourVisual12::QuarantineGpu()
         m_objectCBVA[slot] = 0;
 }
 
+void GameDx12FourVisual12::LogProbe(const char* stage) noexcept
+{
+#ifdef OGSR_M23_LIFETIME_PROBE
+    const bool shutdown =
+        stage != nullptr && std::strcmp(stage, "shutdown") == 0;
+    if (shutdown)
+    {
+        if (m_shutdownProbeLogged)
+            return;
+        m_shutdownProbeLogged = true;
+    }
+    else
+    {
+        if (m_unknownProbeLogged)
+            return;
+        m_unknownProbeLogged = true;
+    }
+    try
+    {
+        Msg("ph_dx12_m23_probe: stage=%s created=%llu captured=%llu "
+            "released=%llu detached=%llu live=%lld quarantine_calls=%llu "
+            "quarantine_occupied_last=%llu quarantine_detached=%llu "
+            "gpu_unknown=%d quarantined=%d poisoned=%d",
+            stage != nullptr ? stage : "?",
+            static_cast<unsigned long long>(
+                m23probe12::CreatedCounter().load()),
+            static_cast<unsigned long long>(
+                m23probe12::CapturedCounter().load()),
+            static_cast<unsigned long long>(
+                m23probe12::ReleasedCounter().load()),
+            static_cast<unsigned long long>(
+                m23probe12::DetachedCounter().load()),
+            static_cast<long long>(m23probe12::LiveCount()),
+            static_cast<unsigned long long>(g_quarantineCalls),
+            static_cast<unsigned long long>(g_quarantineOccupiedAtEntry),
+            static_cast<unsigned long long>(g_quarantineDetachedResources),
+            m_gpuUnknown ? 1 : 0, m_quarantined ? 1 : 0,
+            m_listPoisoned ? 1 : 0);
+    }
+    catch (...)
+    {
+    }
+#else
+    (void)stage;
+#endif
+}
+
 void GameDx12FourVisual12::Shutdown(bool gpuCompletionConfirmed)
 {
-    if (m_gpuUnknown)
+    if (m_gpuUnknown || m_quarantined || m_listPoisoned)
+    {
+        QuarantineGpu();
+        LogProbe("shutdown");
         return;
+    }
     if (gpuCompletionConfirmed && m_uploadConfirmed && !m_passRecorded &&
         !m_passSubmitted)
     {
         ReleaseGpu();
+        LogProbe("shutdown");
         return;
     }
     if (m_uploadSubmitted || m_uploadConfirmed ||
@@ -1462,6 +1598,7 @@ void GameDx12FourVisual12::Shutdown(bool gpuCompletionConfirmed)
         m_rootSignature != nullptr || m_pipelineState != nullptr)
     {
         QuarantineGpu();
+        LogProbe("shutdown");
         return;
     }
     InvalidateStaging();
@@ -1470,6 +1607,7 @@ void GameDx12FourVisual12::Shutdown(bool gpuCompletionConfirmed)
     m_levelEpoch = 0;
     m_generation = 0;
     m_lastDrawUseFenceValue = 0;
+    LogProbe("shutdown");
 }
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE

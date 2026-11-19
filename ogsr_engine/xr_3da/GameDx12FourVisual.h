@@ -4,6 +4,7 @@
 
 #include "GameDx12ReadbackCoverage.h"
 #include "GameDx12VisualMask.h"
+#include "GameDx12M23Lifetime.h"
 #include "dx12fourvisualplan.h"
 #include "dx12objectconstants.h"
 #include "dx12xrayasset.h"
@@ -124,8 +125,8 @@ public:
     // confirmed, or after a recorded pass without completion.
     bool GpuCompletionUnknown() const noexcept
     {
-        return m_gpuUnknown || m_passRecorded || m_passSubmitted ||
-               (m_uploadSubmitted && !m_uploadConfirmed);
+        return m_gpuUnknown || m_quarantined || m_passRecorded ||
+               m_passSubmitted || (m_uploadSubmitted && !m_uploadConfirmed);
     }
 
     // Safe only when the owner confirms that no M23 GPU work remains.
@@ -152,10 +153,10 @@ public:
 private:
     struct SlotGpu12
     {
-        ComPtr<ID3D12Resource> vertexBuffer;
-        ComPtr<ID3D12Resource> indexBuffer;
-        ComPtr<ID3D12Resource> uploadVertex;
-        ComPtr<ID3D12Resource> uploadIndex;
+        M23Ptr12<ID3D12Resource> vertexBuffer;
+        M23Ptr12<ID3D12Resource> indexBuffer;
+        M23Ptr12<ID3D12Resource> uploadVertex;
+        M23Ptr12<ID3D12Resource> uploadIndex;
         D3D12_VERTEX_BUFFER_VIEW vertexView{};
         D3D12_INDEX_BUFFER_VIEW indexView{};
         XrayAssetData12 asset;
@@ -202,17 +203,18 @@ private:
     bool OnPassCompleted(uint64_t fenceValue, ID3D12Fence* fence,
                          ID3D12Device* device, std::string& reason);
     void AbortRecordedPass() noexcept;
-    void FailPassUnknown(const char* stage, std::string& reason);
+    void FailPassUnknown(const char* stage, std::string& reason) noexcept;
     void InvalidateStaging();
     void ReleaseGpu();
-    void QuarantineGpu();
+    void QuarantineGpu() noexcept;
+    void LogProbe(const char* stage) noexcept;
 
     SlotGpu12 m_slots[kSlotCount];
     fourvisual12::StagedTransform12 m_staged[kSlotCount];
 
-    ComPtr<ID3D12RootSignature> m_rootSignature;
-    ComPtr<ID3D12PipelineState> m_pipelineState;
-    ComPtr<ID3D12Resource> m_constants;
+    M23Ptr12<ID3D12RootSignature> m_rootSignature;
+    M23Ptr12<ID3D12PipelineState> m_pipelineState;
+    M23Ptr12<ID3D12Resource> m_constants;
     void* m_constantsMapped = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS m_frameCBVA = 0;
     D3D12_GPU_VIRTUAL_ADDRESS m_objectCBVA[kSlotCount] = {};
@@ -230,14 +232,17 @@ private:
     bool m_passRecorded = false;
     bool m_passSubmitted = false;
     bool m_gpuUnknown = false;
+    bool m_quarantined = false;
     bool m_listPoisoned = false;
+    bool m_shutdownProbeLogged = false;
+    bool m_unknownProbeLogged = false;
 
     uint32_t m_passSlotMask = 0;
     uint64_t m_passFenceValue = 0;
     // Captured only for the active submission; retained while completion is
     // unknown so resources cannot outlive owner identity checks.
-    ComPtr<ID3D12Fence> m_passFence;
-    ComPtr<ID3D12Device> m_passDevice;
+    M23Ptr12<ID3D12Fence> m_passFence;
+    M23Ptr12<ID3D12Device> m_passDevice;
     std::string m_lastError;
 };
 
