@@ -681,12 +681,14 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
     HRESULT hr = owner.allocator->Reset();
     if (FAILED(hr))
     {
+        m_listPoisoned = true;
         ReleaseGpu();
         return Fail(reason, "M23 upload allocator reset failed");
     }
     hr = owner.list->Reset(owner.allocator, nullptr);
     if (FAILED(hr))
     {
+        m_listPoisoned = true;
         ReleaseGpu();
         return Fail(reason, "M23 upload list reset failed");
     }
@@ -700,6 +702,7 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
     hr = owner.list->Close();
     if (FAILED(hr))
     {
+        m_listPoisoned = true;
         ReleaseGpu();
         return Fail(reason, "M23 upload list close failed");
     }
@@ -996,10 +999,16 @@ bool GameDx12FourVisual12::RunPass(
 
     HRESULT hr = owner.allocator->Reset();
     if (FAILED(hr))
+    {
+        m_listPoisoned = true;
         return Fail(reason, "M23 pass allocator reset failed");
+    }
     hr = owner.list->Reset(owner.allocator, nullptr);
     if (FAILED(hr))
+    {
+        m_listPoisoned = true;
         return Fail(reason, "M23 pass list reset failed");
+    }
 
     m_passRecorded = true;
     if (!offscreen.RecordBegin(owner.list, fourvisual12::kClearColor,

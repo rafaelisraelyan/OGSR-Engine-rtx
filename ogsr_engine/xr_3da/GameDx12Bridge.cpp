@@ -1519,6 +1519,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                     Msg("ph_dx12_m23: load failed reason='%s'",
                         reason.empty() ? "allocation or unknown failure"
                                        : reason.c_str());
+                    if (state.m23.ListPoisoned())
+                        DisableTerminal("m23 upload command list recovery");
                 }
                 else
                 {
