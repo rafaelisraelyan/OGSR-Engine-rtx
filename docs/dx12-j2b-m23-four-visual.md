@@ -5,6 +5,11 @@
 > изменялся. M1-R2 остаётся в статусе «опубликованные исправления, полная
 > независимая приёмка PENDING».
 >
+> **Обновление R1 (2026-11-20):** два P1 из независимого review исправлены
+> коммитами `2f8cf3596` и `3241ee5fd`; targeted fault/lifetime evidence и
+> probe-матрица — в `docs/dx12-j2b-m23-r1-corrective-report.md`. M23
+> по-прежнему не принят и не смержен; нужен focused Codex re-review.
+>
 > **Ветка:** `feature/j2b-m23-four-real-jupiter-draws`
 > **База (M1-R2 HEAD):** `2a0a35fb969b04a8e5519234ede63b639d908d4a`
 > **Реализация M23:** `88ebf0bef6c3d6072b316e361249f168fd302018`,
