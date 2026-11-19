@@ -135,6 +135,11 @@
       <AdditionalDependencies>lzo.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(OGSR_J2B_VFS_FAULT_INJECTION)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>OGSR_J2B_VFS_FAULT_INJECTION;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\3rd_party\Src\tracy\public\TracyClient.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

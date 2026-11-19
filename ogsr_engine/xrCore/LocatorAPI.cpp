@@ -12,6 +12,14 @@
 
 #include <filesystem>
 
+#ifdef OGSR_J2B_VFS_FAULT_INJECTION
+#include "tests/j2b_vfs_fault.h"
+
+#include <atomic>
+#include <new>
+#include <stdexcept>
+#endif
+
 namespace sqfs
 {
 #include <sqfs/super.h>
@@ -66,6 +74,61 @@ struct eq_fname_check
 
 XRCORE_API xr_vector<_open_file> g_open_files;
 
+#ifdef OGSR_J2B_VFS_FAULT_INJECTION
+namespace j2b_vfs_fault
+{
+namespace
+{
+std::atomic<FailureMode> g_failureMode{FailureMode::None};
+std::atomic<uint32_t> g_registrationAttempts{0};
+} // namespace
+
+void SetFailureMode(FailureMode mode) noexcept
+{
+    g_failureMode.store(mode, std::memory_order_relaxed);
+}
+
+void ClearFailure() noexcept
+{
+    g_failureMode.store(FailureMode::None, std::memory_order_relaxed);
+}
+
+uint32_t RegistrationAttempts() noexcept
+{
+    return g_registrationAttempts.load(std::memory_order_relaxed);
+}
+
+uint32_t ActiveReaderCount() noexcept
+{
+    uint32_t count = 0;
+    for (const _open_file& item : g_open_files)
+    {
+        if (item._reader != nullptr)
+            ++count;
+    }
+    return count;
+}
+
+uint32_t OpenFileSlots() noexcept
+{
+    return static_cast<uint32_t>(g_open_files.size());
+}
+
+bool MaybeFailRegistration()
+{
+    g_registrationAttempts.fetch_add(1, std::memory_order_relaxed);
+    const FailureMode mode = g_failureMode.load(std::memory_order_relaxed);
+    if (mode == FailureMode::None)
+        return false;
+    if (mode != FailureMode::PersistentBadAlloc)
+        g_failureMode.store(FailureMode::None, std::memory_order_relaxed);
+    if (mode == FailureMode::RuntimeError)
+        throw std::runtime_error("injected VFS registration failure");
+    throw std::bad_alloc();
+}
+} // namespace j2b_vfs_fault
+#endif
+
 void _check_open_file(const shared_str& _fname)
 {
     xr_vector<_open_file>::iterator it = std::find_if(g_open_files.begin(), g_open_files.end(), eq_fname_check(_fname));
@@ -78,10 +141,24 @@ _open_file& find_free_item(const shared_str& _fname)
     xr_vector<_open_file>::iterator it = std::find_if(g_open_files.begin(), g_open_files.end(), eq_fname_free(_fname));
     if (it == g_open_files.end())
     {
-        g_open_files.resize(g_open_files.size() + 1);
+#ifdef OGSR_J2B_VFS_FAULT_INJECTION
+        j2b_vfs_fault::MaybeFailRegistration();
+#endif
+        // Transactional insertion: the vector never keeps a partially
+        // initialised record if the filename assignment throws.
+        g_open_files.push_back(_open_file{});
         _open_file& _of = g_open_files.back();
-        _of._fn = _fname;
-        _of._used = 0;
+        try
+        {
+            _of._reader = nullptr;
+            _of._used = 0;
+            _of._fn = _fname;
+        }
+        catch (...)
+        {
+            g_open_files.pop_back();
+            throw;
+        }
         return _of;
     }
     return *it;
@@ -91,11 +168,26 @@ void setup_reader(CStreamReader* _r, _open_file& _of) { _of._stream_reader = _r;
 
 void setup_reader(IReader* _r, _open_file& _of) { _of._reader = _r; }
 
+struct OpenFileLockGuard
+{
+    explicit OpenFileLockGuard(xrCriticalSection& lock) : m_lock(lock)
+    {
+        m_lock.Enter();
+    }
+
+    ~OpenFileLockGuard() { m_lock.Leave(); }
+
+    OpenFileLockGuard(const OpenFileLockGuard&) = delete;
+    OpenFileLockGuard& operator=(const OpenFileLockGuard&) = delete;
+
+    xrCriticalSection& m_lock;
+};
+
 template <typename T>
 void _register_open_file(T* _r, LPCSTR _fname)
 {
     xrCriticalSection _lock;
-    _lock.Enter();
+    OpenFileLockGuard guard(_lock);
 
     shared_str f = _fname;
     _check_open_file(f);
@@ -103,21 +195,18 @@ void _register_open_file(T* _r, LPCSTR _fname)
     _open_file& _of = find_free_item(_fname);
     setup_reader(_r, _of);
     _of._used += 1;
-
-    _lock.Leave();
 }
 
 template <typename T>
 void _unregister_open_file(T* _r)
 {
     xrCriticalSection _lock;
-    _lock.Enter();
+    OpenFileLockGuard guard(_lock);
 
     xr_vector<_open_file>::iterator it = std::find_if(g_open_files.begin(), g_open_files.end(), eq_pointer<T>(_r));
     VERIFY(it != g_open_files.end());
     _open_file& _of = *it;
     _of._reader = nullptr;
-    _lock.Leave();
 }
 
 XRCORE_API void _dump_open_files(int mode)
@@ -1001,6 +1090,41 @@ bool CLocatorAPI::check_for_file(LPCSTR path, LPCSTR _fname, string_path& fname_
 }
 
 template <typename T>
+void DestroyOpenReader(T*& reader) noexcept;
+
+template <>
+void DestroyOpenReader<IReader>(IReader*& reader) noexcept
+{
+    if (reader == nullptr)
+        return;
+    IReader* current = reader;
+    reader = nullptr;
+    try
+    {
+        xr_delete(current);
+    }
+    catch (...)
+    {
+    }
+}
+
+template <>
+void DestroyOpenReader<CStreamReader>(CStreamReader*& reader) noexcept
+{
+    if (reader == nullptr)
+        return;
+    CStreamReader* current = reader;
+    reader = nullptr;
+    try
+    {
+        current->close();
+    }
+    catch (...)
+    {
+    }
+}
+
+template <typename T>
 T* CLocatorAPI::r_open_impl(LPCSTR path, LPCSTR _fname)
 {
     string_path fname;
@@ -1033,7 +1157,17 @@ T* CLocatorAPI::r_open_impl(LPCSTR path, LPCSTR _fname)
 
     if (m_Flags.test(flDumpFileActivity))
     {
-        _register_open_file(R, fname);
+        try
+        {
+            _register_open_file(R, fname);
+        }
+        catch (...)
+        {
+            // The reader exists but was never published to the tracking
+            // container. Release its mapping/OS handles before propagating.
+            DestroyOpenReader(R);
+            throw;
+        }
     }
 
     return (R);
