@@ -324,6 +324,9 @@ AcceptStatus12 AcceptBatch12(const BatchResult12& result,
     if (!result.ok || result.error.code != Error12::None ||
         result.stableHash == 0)
         return AcceptStatus12::NotReady;
+    if (result.error.text[0] != '\0' || result.instances == 0 ||
+        result.identity.levelSession == 0 || result.identity.levelEpoch == 0)
+        return AcceptStatus12::InvalidResult;
     if (live.levelSession == 0 || live.levelEpoch == 0)
         return AcceptStatus12::NotReady;
     if (result.identity.levelSession != live.levelSession)
@@ -331,8 +334,30 @@ AcceptStatus12 AcceptBatch12(const BatchResult12& result,
     if (result.identity.levelEpoch != live.levelEpoch)
         return AcceptStatus12::StaleEpoch;
     for (const Slot12& slot : result.slots)
-        if (!slot.valid)
+    {
+        if (!slot.valid || !slot.completed || !slot.readOk ||
+            !slot.converted || slot.readError != xraylevel12::ReadError::None ||
+            slot.error.code != Error12::None ||
+            slot.error.text[0] != '\0')
             return AcceptStatus12::InvalidResult;
+        if (slot.vertexCount == 0 || slot.indexCount == 0 ||
+            slot.asset.vertices.size() !=
+                static_cast<size_t>(slot.vertexCount) ||
+            slot.asset.indices.size() != static_cast<size_t>(slot.indexCount) ||
+            slot.asset.vertices.empty() || slot.asset.indices.empty())
+            return AcceptStatus12::InvalidResult;
+        if (slot.compactVbHash == 0 || slot.compactIbHash == 0 ||
+            slot.assetVbHash == 0 || slot.assetIbHash == 0)
+            return AcceptStatus12::InvalidResult;
+        if (slot.source.levelSession != result.identity.levelSession ||
+            slot.source.visualId == 0 ||
+            slot.instance.visualId != slot.source.visualId ||
+            slot.instance.sectorId != result.sectorId)
+            return AcceptStatus12::InvalidResult;
+        if (result.rootVisualId != 0 &&
+            slot.instance.rootVisualId != result.rootVisualId)
+            return AcceptStatus12::InvalidResult;
+    }
     return AcceptStatus12::Accepted;
 }
 

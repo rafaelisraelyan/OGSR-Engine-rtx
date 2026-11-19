@@ -113,6 +113,73 @@ int main(int argc, char** argv)
           j2bbatch12::AcceptBatch12(invalid, snapshot.identity) ==
               j2bbatch12::AcceptStatus12::InvalidResult);
 
+    const auto expectInvalid = [&](const char* name, auto&& mutate)
+    {
+        j2bbatch12::BatchResult12 mutated = batch;
+        mutate(mutated);
+        Check(name, j2bbatch12::AcceptBatch12(mutated, snapshot.identity) ==
+                        j2bbatch12::AcceptStatus12::InvalidResult);
+    };
+
+    expectInvalid("reject incomplete slot",
+                  [](auto& result) { result.slots[0].completed = false; });
+    expectInvalid("reject readOk=false",
+                  [](auto& result) { result.slots[0].readOk = false; });
+    expectInvalid("reject converted=false",
+                  [](auto& result) { result.slots[0].converted = false; });
+    expectInvalid("reject slot read error",
+                  [](auto& result)
+                  {
+                      result.slots[0].readError =
+                          xraylevel12::ReadError::EmptyLevelInput;
+                  });
+    expectInvalid("reject slot error code",
+                  [](auto& result)
+                  {
+                      result.slots[0].error.code =
+                          j2bbatch12::Error12::Convert;
+                      result.slots[0].error.text[0] = 'x';
+                  });
+    expectInvalid("reject slot error text",
+                  [](auto& result)
+                  { result.slots[0].error.text[0] = 'x'; });
+    expectInvalid("reject empty vertex payload",
+                  [](auto& result)
+                  { result.slots[0].asset.vertices.clear(); });
+    expectInvalid("reject empty index payload",
+                  [](auto& result)
+                  { result.slots[0].asset.indices.clear(); });
+    expectInvalid("reject vertex count mismatch",
+                  [](auto& result) { ++result.slots[0].vertexCount; });
+    expectInvalid("reject index count mismatch",
+                  [](auto& result) { ++result.slots[0].indexCount; });
+    expectInvalid("reject zero asset VB hash",
+                  [](auto& result) { result.slots[0].assetVbHash = 0; });
+    expectInvalid("reject zero asset IB hash",
+                  [](auto& result) { result.slots[0].assetIbHash = 0; });
+    expectInvalid("reject zero compact VB hash",
+                  [](auto& result)
+                  { result.slots[0].compactVbHash = 0; });
+    expectInvalid("reject zero compact IB hash",
+                  [](auto& result)
+                  { result.slots[0].compactIbHash = 0; });
+    expectInvalid("reject source visual mismatch",
+                  [](auto& result)
+                  { result.slots[0].source.visualId = 999; });
+    expectInvalid("reject instance visual mismatch",
+                  [](auto& result)
+                  { result.slots[0].instance.visualId = 999; });
+    expectInvalid("reject instance sector mismatch",
+                  [](auto& result)
+                  { result.slots[0].instance.sectorId = 999; });
+    expectInvalid("reject instance root mismatch",
+                  [](auto& result)
+                  { result.slots[0].instance.rootVisualId = 999; });
+    expectInvalid("reject result error text",
+                  [](auto& result) { result.error.text[0] = 'x'; });
+    expectInvalid("reject zero instance count",
+                  [](auto& result) { result.instances = 0; });
+
     Check("acceptance does not mutate result",
           batch.stableHash == originalHash && batch.slots[0].valid &&
               batch.slots[1].valid && batch.slots[2].valid &&
