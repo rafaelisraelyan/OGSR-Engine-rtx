@@ -55,6 +55,27 @@ bool CopyLevelName(char* dest, size_t capacity, const char* source) noexcept
     return source[i] == '\0';
 }
 
+size_t LevelPathLength(const char* path) noexcept
+{
+    if (path == nullptr)
+        return 0;
+    size_t length = std::strlen(path);
+    while (length > 0 &&
+           (path[length - 1] == '\\' || path[length - 1] == '/'))
+        --length;
+    return length;
+}
+
+bool SameLevelPath(const char* left, const char* right) noexcept
+{
+    if (left == nullptr || right == nullptr)
+        return false;
+    const size_t leftLength = LevelPathLength(left);
+    const size_t rightLength = LevelPathLength(right);
+    return leftLength == rightLength &&
+           _strnicmp(left, right, leftLength) == 0;
+}
+
 bool ReadVfsFile(const char* label, const char* name, uint64_t maxBytes,
                  std::vector<uint8_t>& bytes,
                  j2bbatch12::ErrorInfo12& error, double& openMs,
@@ -173,7 +194,7 @@ bool GameDx12J2ABatch_ReadSnapshot(const char* levelName,
                 "live level path is not available");
             return false;
         }
-        if (_stricmp(levelPath->m_Add, levelName) != 0)
+        if (!SameLevelPath(levelPath->m_Add, levelName))
         {
             j2bbatch12::SetErrorInfo2(
                 error, j2bbatch12::Error12::LevelMismatch,
@@ -208,7 +229,7 @@ bool GameDx12J2ABatch_ReadSnapshot(const char* levelName,
             return false;
         }
 
-        if (_stricmp(levelPath->m_Add, liveBefore) != 0)
+        if (!SameLevelPath(levelPath->m_Add, liveBefore))
         {
             j2bbatch12::SetErrorInfo(
                 error, j2bbatch12::Error12::LevelMismatch,
