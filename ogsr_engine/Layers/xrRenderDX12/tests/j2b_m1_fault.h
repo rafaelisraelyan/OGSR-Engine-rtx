@@ -21,4 +21,5 @@ void MaybeEnablePersistentOom(Point point);
 void BeforeSubmit(uint32_t index);
 bool SkipSubmit(uint32_t index);
 bool RejectSubmit(uint32_t index);
+bool MutateNoDrain();
 } // namespace j2b_m1_fault

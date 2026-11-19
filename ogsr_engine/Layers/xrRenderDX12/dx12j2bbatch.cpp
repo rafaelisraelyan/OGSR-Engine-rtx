@@ -552,6 +552,22 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
                     }
                     catch (const std::bad_alloc&)
                     {
+#if defined(OGSR_J2B_MUTATE_NO_DRAIN)
+                        if (j2b_m1_fault::MutateNoDrain())
+                        {
+                            // Mutation control: leak the group so neither the
+                            // explicit drain nor the destructor can hide an
+                            // early return. The observer must detect it.
+                            auto* leaked =
+                                new gr::jobs::JobGroup(std::move(group));
+                            (void)leaked;
+                            PublishFailure(result, candidate,
+                                           Error12::SubmitException,
+                                           "mutated no-drain",
+                                           Ms(totalStart));
+                            return false;
+                        }
+#endif
                         group.DrainNoThrow();
                         PublishFailure(result, candidate,
                                        Error12::SubmitException,

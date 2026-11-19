@@ -31,9 +31,22 @@ bool g_rejectSubmit = false;
 uint32_t g_rejectIndex = 0;
 thread_local bool g_failNextAllocation = false;
 std::atomic<bool> g_blockAfterRead{false};
-std::atomic<bool> g_releaseBlock{false};
+std::atomic<bool> g_allowWorkerComplete{false};
 std::atomic<bool> g_blockTimedOut{false};
-std::atomic<int> g_blockedCount{0};
+std::atomic<bool> g_workerStarted{false};
+std::atomic<bool> g_workerCompleted{false};
+std::atomic<bool> g_submitFaultArmed{false};
+std::atomic<bool> g_batchReturned{false};
+std::atomic<bool> g_observerSawPending{false};
+std::atomic<bool> g_observerReleased{false};
+std::atomic<bool> g_oracleFailed{false};
+std::atomic<uint64_t> g_eventSequence{0};
+std::atomic<uint64_t> g_workerStartSeq{0};
+std::atomic<uint64_t> g_submitArmedSeq{0};
+std::atomic<uint64_t> g_pendingSeq{0};
+std::atomic<uint64_t> g_releaseSeq{0};
+std::atomic<uint64_t> g_workerCompleteSeq{0};
+std::atomic<uint64_t> g_batchReturnSeq{0};
 std::atomic<bool> g_armSubmitFailure{false};
 std::mutex g_blockMutex;
 std::condition_variable g_blockCv;
@@ -101,14 +114,21 @@ void MaybeBlock(Point point)
 {
     if (point != Point::AfterRead || !g_blockAfterRead.load())
         return;
-    std::unique_lock lock(g_blockMutex);
-    g_blockedCount.fetch_add(1);
-    g_blockCv.notify_all();
-    if (!g_blockCv.wait_for(lock, std::chrono::seconds(5),
-                            []() { return g_releaseBlock.load(); }))
     {
-        g_blockTimedOut.store(true);
+        std::unique_lock lock(g_blockMutex);
+        g_workerStarted.store(true);
+        g_workerStartSeq.store(g_eventSequence.fetch_add(1) + 1);
+        g_blockCv.notify_all();
+        if (!g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                                []()
+                                { return g_allowWorkerComplete.load(); }))
+        {
+            g_blockTimedOut.store(true);
+        }
     }
+    g_workerCompleted.store(true);
+    g_workerCompleteSeq.store(g_eventSequence.fetch_add(1) + 1);
+    g_blockCv.notify_all();
 }
 
 void MaybeEnablePersistentOom(Point)
@@ -118,7 +138,12 @@ void MaybeEnablePersistentOom(Point)
 void BeforeSubmit(uint32_t index)
 {
     if (index == 1 && g_armSubmitFailure.exchange(false))
+    {
         g_failNextAllocation = true;
+        g_submitFaultArmed.store(true);
+        g_submitArmedSeq.store(g_eventSequence.fetch_add(1) + 1);
+        g_blockCv.notify_all();
+    }
 }
 
 bool SkipSubmit(uint32_t index)
@@ -129,6 +154,15 @@ bool SkipSubmit(uint32_t index)
 bool RejectSubmit(uint32_t index)
 {
     return g_rejectSubmit && index == g_rejectIndex;
+}
+
+bool MutateNoDrain()
+{
+#ifdef OGSR_J2B_MUTATE_NO_DRAIN
+    return true;
+#else
+    return false;
+#endif
 }
 } // namespace j2b_m1_fault
 
@@ -372,40 +406,95 @@ int main(int argc, char** argv)
           afterOomOk && afterOom.ok &&
               afterOom.stableHash == serial.stableHash);
 
-    // Real GR submit rejection: job 0 is accepted and blocked in a worker,
-    // job 1's JobGroup::Submit allocation fails, and the accepted job must be
-    // drained before the batch returns.
+    // Real GR submit rejection with a happens-before oracle:
+    //   worker started -> next Submit armed/failed -> observer proves the
+    //   batch is still pending -> observer releases worker -> worker completed
+    //   -> PrepareBatch returns. A mutation that leaks the group (no drain)
+    //   must make the oracle fail.
+    const bool expectMutation =
+        argc > 3 && std::strcmp(argv[3], "--expect-mutation") == 0;
     g_blockAfterRead.store(true);
-    g_releaseBlock.store(false);
+    g_allowWorkerComplete.store(false);
     g_blockTimedOut.store(false);
-    g_blockedCount.store(0);
+    g_workerStarted.store(false);
+    g_workerCompleted.store(false);
+    g_submitFaultArmed.store(false);
+    g_batchReturned.store(false);
+    g_observerSawPending.store(false);
+    g_observerReleased.store(false);
+    g_oracleFailed.store(false);
+    g_eventSequence.store(0);
+    g_workerStartSeq.store(0);
+    g_submitArmedSeq.store(0);
+    g_pendingSeq.store(0);
+    g_releaseSeq.store(0);
+    g_workerCompleteSeq.store(0);
+    g_batchReturnSeq.store(0);
     g_armSubmitFailure.store(true);
-    std::thread releaser(
+    std::thread observer(
         []()
         {
             std::unique_lock lock(g_blockMutex);
             g_blockCv.wait_for(lock, std::chrono::seconds(5),
-                               []() { return g_blockedCount.load() > 0; });
-            lock.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            g_releaseBlock.store(true);
+                               []() { return g_workerStarted.load(); });
+            g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                               []() { return g_submitFaultArmed.load(); });
+            if (g_batchReturned.load())
+                g_oracleFailed.store(true);
+            else
+                g_observerSawPending.store(true);
+            g_pendingSeq.store(g_eventSequence.fetch_add(1) + 1);
+            g_allowWorkerComplete.store(true);
+            g_observerReleased.store(true);
+            g_releaseSeq.store(g_eventSequence.fetch_add(1) + 1);
             g_blockCv.notify_all();
+            g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                               []() { return g_workerCompleted.load(); });
+            g_blockCv.wait_for(lock, std::chrono::seconds(5),
+                               []() { return g_batchReturned.load(); });
+            if (!g_workerCompleted.load() || !g_batchReturned.load())
+                g_oracleFailed.store(true);
         });
     j2bbatch12::BatchResult12 submitFailure;
     const bool submitFailureOk = j2bbatch12::PrepareBatch(
         snapshot, snapshot.identity, 129, 17431, visuals, &jobs, true,
         submitFailure, j2bbatch12::Limits12{});
-    releaser.join();
+    g_batchReturned.store(true);
+    g_batchReturnSeq.store(g_eventSequence.fetch_add(1) + 1);
+    g_blockCv.notify_all();
+    observer.join();
     g_blockAfterRead.store(false);
     g_armSubmitFailure.store(false);
+    const bool sequenceOk =
+        g_workerStartSeq.load() > 0 && g_submitArmedSeq.load() > 0 &&
+        g_workerStartSeq.load() < g_pendingSeq.load() &&
+        g_submitArmedSeq.load() < g_pendingSeq.load() &&
+        g_pendingSeq.load() < g_releaseSeq.load() &&
+        g_releaseSeq.load() < g_workerCompleteSeq.load() &&
+        g_workerCompleteSeq.load() < g_batchReturnSeq.load();
+    const bool normalOracle =
+        g_observerSawPending.load() && g_workerCompleted.load() &&
+        g_batchReturned.load() && !g_oracleFailed.load() && sequenceOk &&
+        !g_blockTimedOut.load();
+    if (expectMutation)
+    {
+        Check("mutation oracle detects early return",
+              g_oracleFailed.load() || !sequenceOk);
+    }
+    else
+    {
+        Check("observer proves batch pending before release",
+              g_observerSawPending.load() && sequenceOk);
+        Check("worker completion precedes batch return",
+              g_workerCompleted.load() && g_batchReturned.load() &&
+                  !g_oracleFailed.load());
+        Check("accepted GR job drained before return", normalOracle);
+    }
     Check("real GR submit rejection rejects batch",
           !submitFailureOk && !submitFailure.ok &&
               submitFailure.error.code ==
                   j2bbatch12::Error12::SubmitException &&
               AllSlotsEmpty(submitFailure));
-    Check("accepted GR job drained before return",
-          g_blockedCount.load() > 0 && g_releaseBlock.load() &&
-              !g_blockTimedOut.load());
 
     j2bbatch12::BatchResult12 afterSubmitFailure;
     const bool afterSubmitFailureOk = j2bbatch12::PrepareBatch(
