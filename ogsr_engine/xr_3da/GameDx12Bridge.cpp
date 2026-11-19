@@ -4,6 +4,7 @@
 #include "GameDx12BridgeDiagnostics.h"
 #include "GameDx12BridgeQuarantine.h"
 #include "GameDx12LevelGeometry.h"
+#include "GameDx12FourVisual.h"
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2APreparation.h"
 
@@ -87,9 +88,21 @@ struct BridgeStateData
     bool j2aPending = false;
     bool j2aAttempted = false;
     bool j2aEnabledLogged = false;
+    bool m23RequestedChecked = false;
+    bool m23Requested = false;
+    bool m23EnabledLogged = false;
+    bool m23Bound = false;
+    bool m23Attempted = false;
+    bool m23LevelMismatchLogged = false;
+    bool m23DelayLogged = false;
+    uint32_t m23FrameDelay = 0;
+    uint32_t m23FrameSkip = 0;
     char diagnosticLevelName[128]{};
+    char m23LevelName[128]{};
     uint64_t diagnosticLevelSession = 0;
     uint64_t diagnosticLevelEpoch = 0;
+    uint64_t m23LevelSession = 0;
+    uint64_t m23LevelEpoch = 0;
     DWORD ownerThreadId = 0;
 
     ComPtr<ID3D12Device> device;
@@ -105,6 +118,7 @@ struct BridgeStateData
     // frame preparation stay inactive until a full Jupiter payload provides a
     // validated visual placement.
     GameDx12LevelGeometry12 geometry;
+    GameDx12FourVisual12 m23;
     GameDx12OffscreenPass12 offscreen;
 
     uint64_t fenceValue = 0;
@@ -174,6 +188,22 @@ bool MatrixBitsRequested()
             std::strcmp(value, "0") != 0;
     }
     return state.matrixBitsRequested;
+}
+
+// F4.0-J2B-M23 opt-in switch. When set, the bridge binds the four-visual
+// registry instead of the J1 single-visual diagnostic, and the one-shot frame
+// records four real indexed draws plus four isolated identity passes.
+bool M23Requested()
+{
+    BridgeStateData& state = State();
+    if (!state.m23RequestedChecked)
+    {
+        state.m23RequestedChecked = true;
+        const char* value = std::getenv("OGSR_DX12_GAME_M23");
+        state.m23Requested =
+            value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+    return state.m23Requested;
 }
 
 bool ForceOverflow(const char* stage)
@@ -313,6 +343,66 @@ void RebindDiagnosticAfterDeviceReset(const char* stage)
         state.gpuUnknown ? 1 : 0, state.quarantined ? 1 : 0,
         state.geometry.IsDrawRecorded() ? 1 : 0,
         state.geometry.IsDrawSubmitted() ? 1 : 0);
+}
+
+// M23 reset-before-draw recovery. Mirrors the J1 R2B policy: the binding and
+// epoch may be renewed only for the same active level/session with a fully
+// uploaded registry and no consumed one-shot attempt. Reset-after-draw is
+// always refused.
+void RebindM23AfterDeviceReset(const char* stage)
+{
+    BridgeStateData& state = State();
+    const char* reason = nullptr;
+
+    if (state.state != BridgeState::Ready)
+        reason = "bridge is not ready";
+    else if (!state.levelActive)
+        reason = "level is not active";
+    else if (!state.m23Bound)
+        reason = "M23 level was not bound";
+    else if (_stricmp(state.levelName, state.m23LevelName) != 0)
+        reason = "level name mismatch";
+    else if (state.levelSession != state.m23LevelSession)
+        reason = "level session mismatch";
+    else if (!state.m23.IsLoaded())
+        reason = "M23 registry is not loaded";
+    else if (state.m23.LevelSession() != state.levelSession)
+        reason = "M23 registry session mismatch";
+    else if (state.m23.LevelEpoch() != state.captureEpoch)
+        reason = "M23 registry epoch was not advanced";
+    else if (state.m23.GpuCompletionUnknown())
+        reason = "M23 has unknown or in-flight GPU work";
+    else if (state.gpuUnknown || state.quarantined ||
+             state.objectsReleased)
+        reason = "bridge GPU state is unsafe";
+    else if (state.m23Attempted)
+        reason = "one-shot M23 attempt was already consumed";
+    else
+    {
+        const uint64_t previousEpoch = state.m23LevelEpoch;
+        state.m23LevelEpoch = state.captureEpoch;
+        Msg("ph_dx12_m23: rebound after %s level='%s' session=%llu "
+            "epoch=%llu previous_epoch=%llu generation=%llu",
+            stage != nullptr ? stage : "?", state.m23LevelName,
+            static_cast<unsigned long long>(state.levelSession),
+            static_cast<unsigned long long>(state.captureEpoch),
+            static_cast<unsigned long long>(previousEpoch),
+            static_cast<unsigned long long>(state.m23.Generation()));
+        return;
+    }
+
+    Msg("ph_dx12_m23: reset rebind refused stage='%s' reason='%s' "
+        "current_level='%s' session=%llu epoch=%llu bound_level='%s' "
+        "bound_session=%llu bound_epoch=%llu loaded=%d attempted=%d "
+        "gpu_unknown=%d quarantine=%d",
+        stage != nullptr ? stage : "?", reason, state.levelName,
+        static_cast<unsigned long long>(state.levelSession),
+        static_cast<unsigned long long>(state.captureEpoch),
+        state.m23LevelName,
+        static_cast<unsigned long long>(state.m23LevelSession),
+        static_cast<unsigned long long>(state.m23LevelEpoch),
+        state.m23.IsLoaded() ? 1 : 0, state.m23Attempted ? 1 : 0,
+        state.gpuUnknown ? 1 : 0, state.quarantined ? 1 : 0);
 }
 
 void ReleaseObjects()
@@ -1359,6 +1449,108 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
     state.diagnosticLevelMismatchLogged = false;
     state.diagnosticLevelName[0] = '\0';
 
+    state.m23Bound = false;
+    state.m23Attempted = false;
+    state.m23LevelSession = 0;
+    state.m23LevelEpoch = 0;
+    state.m23LevelMismatchLogged = false;
+    state.m23LevelName[0] = '\0';
+
+    if (M23Requested())
+    {
+        if (!state.m23EnabledLogged)
+        {
+            state.m23EnabledLogged = true;
+            Msg("ph_dx12_m23: enabled visuals=9,105,106,107");
+        }
+        state.m23FrameDelay = 0;
+        state.m23FrameSkip = 0;
+        state.m23DelayLogged = false;
+        const char* delayValue =
+            std::getenv("OGSR_DX12_GAME_M23_FRAME_DELAY");
+        if (delayValue != nullptr && delayValue[0] != '\0')
+        {
+            char* delayEnd = nullptr;
+            const unsigned long parsedDelay =
+                std::strtoul(delayValue, &delayEnd, 10);
+            if (delayEnd != delayValue && *delayEnd == '\0' &&
+                parsedDelay <= 100000ul)
+                state.m23FrameDelay = static_cast<uint32_t>(parsedDelay);
+            else
+                Msg("ph_dx12_m23: invalid OGSR_DX12_GAME_M23_FRAME_DELAY");
+        }
+        const char* requestedLevel =
+            std::getenv("OGSR_DX12_GAME_DIAGNOSTIC_LEVEL");
+        if (requestedLevel == nullptr || requestedLevel[0] == '\0')
+        {
+            Msg("ph_dx12_m23: skipped: OGSR_DX12_GAME_DIAGNOSTIC_LEVEL is "
+                "required");
+        }
+        else if (std::strlen(requestedLevel) >=
+                 sizeof(state.m23LevelName))
+        {
+            Msg("ph_dx12_m23: requested level name too long");
+        }
+        else
+        {
+            std::snprintf(state.m23LevelName, sizeof(state.m23LevelName),
+                          "%s", requestedLevel);
+            if (_stricmp(state.m23LevelName, state.levelName) != 0)
+            {
+                Msg("ph_dx12_m23: skipped: level='%s' requested='%s'",
+                    state.levelName, state.m23LevelName);
+            }
+            else
+            {
+                GameDx12FourVisualOwner12 owner;
+                owner.device = state.device.Get();
+                owner.queue = state.queue.Get();
+                owner.fence = state.fence.Get();
+                owner.fenceEvent = state.fenceEvent;
+                owner.allocator = state.allocator.Get();
+                owner.list = state.list.Get();
+                owner.fenceValue = &state.fenceValue;
+                std::string reason;
+                const bool loaded = state.m23.LoadFromVfs(
+                    owner, state.levelName, state.levelSession,
+                    state.captureEpoch, reason);
+                if (!loaded)
+                {
+                    Msg("ph_dx12_m23: load failed reason='%s'",
+                        reason.empty() ? "allocation or unknown failure"
+                                       : reason.c_str());
+                }
+                else
+                {
+                    state.m23Bound = true;
+                    state.m23LevelSession = state.levelSession;
+                    state.m23LevelEpoch = state.captureEpoch;
+                    Msg("ph_dx12_m23: bound level='%s' session=%llu "
+                        "epoch=%llu visuals=9,105,106,107",
+                        state.m23LevelName,
+                        static_cast<unsigned long long>(
+                            state.m23LevelSession),
+                        static_cast<unsigned long long>(
+                            state.m23LevelEpoch));
+                }
+                if (state.m23.GpuCompletionUnknown())
+                    QuarantineForGeometryUnknown("m23_level_ready");
+            }
+        }
+    }
+
+    // J1.2A diagnostic load path. R2A requires an explicit game-level
+    // selection so visual ID 9 cannot accidentally run on Zaton. The loaded
+    // geometry is bound to the current level name/session/epoch and is never
+    // reused after a level transition. M23 owns the frame when requested.
+    if (M23Requested())
+    {
+        state.diagnosticLevelBound = false;
+        state.diagnosticLevelName[0] = '\0';
+    }
+    else
+    {
+
     const char* geometryVisual =
         std::getenv("OGSR_DX12_GAME_GEOMETRY_VISUAL");
     if (geometryVisual != nullptr && geometryVisual[0] != '\0')
@@ -1433,6 +1625,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         }
     }
 
+    } // M23 / J1 diagnostic selection
+
     // F4.0-J2A opt-in CPU preparation. It runs once on the first validated
     // frame after level ready, when the real game camera is available. The
     // first prototype is intentionally limited to Jupiter.
@@ -1455,6 +1649,8 @@ void GameDx12Bridge_OnLevelTeardown()
         return;
     state.levelActive = false;
     state.diagnosticLevelBound = false;
+    state.m23Bound = false;
+    state.m23Attempted = false;
     state.j2aPending = false;
     state.j2aAttempted = false;
     if (ForceOverflow("teardown-epoch"))
@@ -1468,6 +1664,9 @@ void GameDx12Bridge_OnLevelTeardown()
     state.geometry.OnLevelTeardown(state.captureEpoch);
     if (state.geometry.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("level_teardown");
+    state.m23.OnLevelTeardown(state.captureEpoch);
+    if (state.m23.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("m23_level_teardown");
     Msg("ph_dx12_bridge: level teardown level='%s' session=%llu epoch=%llu",
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
@@ -1591,6 +1790,145 @@ void GameDx12Bridge_OnFrame()
             catch (...)
             {
             }
+        }
+    }
+
+    // F4.0-J2B-M23 owner-thread one-shot four-visual frame. It runs after the
+    // same real-camera validation as J1, records four real indexed draws in
+    // one list and then four isolated identity passes, and never repeats
+    // automatically for the same one-shot attempt.
+    if (M23Requested() && !state.m23Attempted && state.m23.IsLoaded())
+    {
+        const bool identityMatches =
+            state.m23Bound && state.levelActive &&
+            state.levelSession == state.m23LevelSession &&
+            state.captureEpoch == state.m23LevelEpoch &&
+            state.m23.LevelSession() == state.m23LevelSession &&
+            state.m23.LevelEpoch() == state.m23LevelEpoch &&
+            _stricmp(state.levelName, state.m23LevelName) == 0;
+        if (!identityMatches)
+        {
+            if (!state.m23LevelMismatchLogged)
+            {
+                state.m23LevelMismatchLogged = true;
+                Msg("ph_dx12_m23: frame blocked: level/session/epoch "
+                    "mismatch current='%s' session=%llu epoch=%llu "
+                    "bound='%s' session=%llu epoch=%llu",
+                    state.levelName,
+                    static_cast<unsigned long long>(state.levelSession),
+                    static_cast<unsigned long long>(state.captureEpoch),
+                    state.m23LevelName,
+                    static_cast<unsigned long long>(
+                        state.m23LevelSession),
+                    static_cast<unsigned long long>(state.m23LevelEpoch));
+            }
+        }
+        else
+        {
+            if (state.m23FrameSkip < state.m23FrameDelay)
+            {
+                ++state.m23FrameSkip;
+                if (!state.m23DelayLogged)
+                {
+                    state.m23DelayLogged = true;
+                    Msg("ph_dx12_m23: frame delayed frames=%u",
+                        state.m23FrameDelay);
+                }
+                return;
+            }
+            state.m23Attempted = true;
+
+            DirectX::XMFLOAT4X4 logicalViewProjection = {};            std::memcpy(&logicalViewProjection, fullTransform.m,
+                        sizeof(logicalViewProjection));
+            const float cameraPosition[3] = {
+                Device.vCameraPosition.x, Device.vCameraPosition.y,
+                Device.vCameraPosition.z};
+
+            wchar_t pngDirectory[1024] = {};
+            constexpr DWORD kPngDirectoryMax = 1024;
+            const DWORD pngLength = GetEnvironmentVariableW(
+                L"OGSR_DX12_GAME_M23_PNG_DIR", pngDirectory,
+                kPngDirectoryMax);
+            if (pngLength >= kPngDirectoryMax)
+            {
+                Msg("ph_dx12_m23: PNG directory too long "
+                    "(required=%lu max=%u)",
+                    static_cast<unsigned long>(pngLength),
+                    static_cast<unsigned>(kPngDirectoryMax));
+            }
+            const wchar_t* png =
+                pngLength > 0 && pngLength < kPngDirectoryMax
+                    ? pngDirectory
+                    : nullptr;
+
+            GameDx12FourVisualOwner12 owner;
+            owner.device = state.device.Get();
+            owner.queue = state.queue.Get();
+            owner.fence = state.fence.Get();
+            owner.fenceEvent = state.fenceEvent;
+            owner.allocator = state.allocator.Get();
+            owner.list = state.list.Get();
+            owner.fenceValue = &state.fenceValue;
+
+            GameDx12FourVisual12::Result12 m23Result;
+            std::string reason;
+            const bool rendered = state.m23.RenderDiagnostic(
+                owner, logicalViewProjection, cameraPosition,
+                state.offscreen, state.width, state.height, png,
+                &m23Result, reason);
+
+            if (rendered)
+            {
+                Msg("ph_dx12_m23: image gate PASS visuals=9,105,106,107 "
+                    "session=%llu epoch=%llu combined_fence=%llu "
+                    "last_draw_use_fence=%llu nonclear=%llu/%llu "
+                    "png_saved=%d",
+                    static_cast<unsigned long long>(
+                        state.levelSession),
+                    static_cast<unsigned long long>(
+                        state.captureEpoch),
+                    static_cast<unsigned long long>(
+                        m23Result.combinedFence),
+                    static_cast<unsigned long long>(
+                        m23Result.lastDrawUseFence),
+                    static_cast<unsigned long long>(
+                        m23Result.combinedCoverage.nonClearPixels),
+                    static_cast<unsigned long long>(
+                        m23Result.combinedCoverage.totalPixels),
+                    m23Result.pngSaved ? 1 : 0);
+            }
+            else if (m23Result.gpuCompleted)
+            {
+                Msg("ph_dx12_m23: GPU completion confirmed; image/PNG gate "
+                    "FAIL session=%llu epoch=%llu image_gate=%d "
+                    "nonclear=%llu/%llu png_saved=%d reason='%s'",
+                    static_cast<unsigned long long>(
+                        state.levelSession),
+                    static_cast<unsigned long long>(
+                        state.captureEpoch),
+                    m23Result.imageGatePass ? 1 : 0,
+                    static_cast<unsigned long long>(
+                        m23Result.combinedCoverage.nonClearPixels),
+                    static_cast<unsigned long long>(
+                        m23Result.combinedCoverage.totalPixels),
+                    m23Result.pngSaved ? 1 : 0,
+                    reason.empty() ? "unknown failure" : reason.c_str());
+            }
+            else
+            {
+                Msg("ph_dx12_m23: GPU completion NOT confirmed "
+                    "session=%llu epoch=%llu reason='%s'",
+                    static_cast<unsigned long long>(
+                        state.levelSession),
+                    static_cast<unsigned long long>(
+                        state.captureEpoch),
+                    reason.empty() ? "unknown failure" : reason.c_str());
+            }
+            EvaluateInfoQueue("m23");
+            if (state.m23.ListPoisoned())
+                DisableTerminal("m23 command list recovery");
+            if (!rendered && state.m23.GpuCompletionUnknown())
+                QuarantineForGeometryUnknown("m23_render");
         }
     }
 
@@ -1948,7 +2286,13 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         state.geometry.OnDeviceReset(state.captureEpoch);
         if (state.geometry.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("device_reset");
-        RebindDiagnosticAfterDeviceReset("device_reset");
+        state.m23.OnDeviceReset(state.captureEpoch);
+        if (state.m23.GpuCompletionUnknown())
+            QuarantineForGeometryUnknown("m23_device_reset");
+        if (M23Requested())
+            RebindM23AfterDeviceReset("device_reset");
+        else
+            RebindDiagnosticAfterDeviceReset("device_reset");
         if (state.j2aPending)
         {
             state.j2aPending = false;
@@ -1981,6 +2325,9 @@ void GameDx12Bridge_Shutdown()
 
     state.state = BridgeState::ShuttingDown;
     const bool ownerCompletionKnown = !state.gpuUnknown && !state.quarantined;
+    state.m23.Shutdown(ownerCompletionKnown);
+    if (state.m23.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("m23_shutdown");
     state.geometry.Shutdown(ownerCompletionKnown);
     if (state.geometry.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("shutdown");
