@@ -66,6 +66,33 @@ X-Ray — интересный движок не только с точки зр
 
 ---
 
+## Благодарности
+
+Этот проект существует благодаря многолетней работе сообщества X-Ray. Прежде всего мы благодарим **[GSC Game World](https://www.gsc-game.com/)** за S.T.A.L.K.E.R. и оригинальный движок, а также **[команду OGSR](https://github.com/OGSR/OGSR-Engine)** и всех её участников за развитие, модернизацию и открытые исходники OGSR-Engine. Именно их работа стала основой, на которой мы продолжаем экспериментировать с DirectX 12.
+
+Мы также хотим сохранить благодарности, опубликованные самой командой OGSR. Это разработчики и проекты, на работы которых опирается история движка. Список приведён **в оригинальном составе и порядке**, со ссылками из [официального README OGSR-Engine](https://github.com/OGSR/OGSR-Engine/blob/main/.github/README.md):
+
+* [Im-dex](https://github.com/Im-dex)
+* [SkyLoader](https://github.com/SkyLoaderr)
+* [Shoker](https://github.com/ShokerStlk)
+* [OpenXRay](https://github.com/OpenXRay/xray-16)
+* [vTurbine](https://github.com/vTurbine)
+* [solbjorn](https://github.com/solbjorn)
+* [abramcumner](https://github.com/abramcumner)
+* [ForserX](https://github.com/ForserX)
+* [Xottab-DUTY](https://github.com/Xottab-DUTY)
+* [morrey](https://github.com/morrey)
+* [S.T.A.L.K.E.R. Anomaly Engine](https://bitbucket.org/anomalymod/xray-monolith)
+* [X-Ray Engine by Alpet & KD](https://github.com/joye-ramone/xray_xp_dev)
+* [CoC-Xray](https://github.com/revolucas/CoC-Xray)
+* [SCREEN SPACE SHADERS](https://www.moddb.com/mods/stalker-anomaly/addons/screen-space-shaders)
+* [ENHANCED SHADERS AND COLOR GRADING](https://www.moddb.com/mods/stalker-anomaly/addons/enhanced-shaders-and-color-grading-for-151)
+* [Shader 3D Scopes](https://www.moddb.com/mods/stalker-anomaly/addons/shader-3d-scopes)
+
+Отдельное спасибо всем участникам сообщества S.T.A.L.K.E.R., которые годами исследовали возможности X-Ray, исправляли ошибки, делились наработками и создавали инструменты для других разработчиков. Мы ценим эту преемственность и стараемся сохранять указания на авторов и источники заимствованных решений.
+
+---
+
 ### О происхождении и лицензии
 
 OGSR RTX развивается на основе [OGSR-Engine](https://github.com/OGSR/OGSR-Engine) и X-Ray. Мы сохраняем авторство оригинального проекта и правообладателей используемых компонентов. Условия распространения определены файлом [LICENSE.md](LICENSE.md), включая **ограничение на коммерческое использование**; у сторонних библиотек и SDK могут быть дополнительные условия.
