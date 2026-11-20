@@ -3,6 +3,8 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace
@@ -84,7 +86,39 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
         if (FAILED(hr))
             return hr;
     }
-    return CreateTargets(owner.device, desc.Width, desc.Height);
+    hr = CreateTargets(owner.device, desc.Width, desc.Height);
+    if (FAILED(hr))
+        return hr;
+
+    const char* measure = std::getenv("OGSR_DX12_GAME_METRICS");
+    if (measure != nullptr && std::strcmp(measure, "1") == 0 &&
+        SUCCEEDED(owner.queue.GetTimestampFrequency(&m_timestampFrequency)) &&
+        m_timestampFrequency != 0)
+    {
+        D3D12_QUERY_HEAP_DESC query{};
+        query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query.Count = 2 * kFrameCount;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC readback{};
+        readback.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback.Width = query.Count * sizeof(uint64_t);
+        readback.Height = 1;
+        readback.DepthOrArraySize = 1;
+        readback.MipLevels = 1;
+        readback.SampleDesc.Count = 1;
+        readback.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(owner.device.CreateQueryHeap(&query, IID_PPV_ARGS(m_timingQueries.GetAddressOf()))) ||
+            FAILED(owner.device.CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &readback, D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(m_timingReadback.GetAddressOf()))))
+        {
+            m_timingQueries.Reset();
+            m_timingReadback.Reset();
+            Msg("ph_dx12_native: GPU timestamps unavailable");
+        }
+    }
+    return S_OK;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE GameDx12NativeFrame12::Rtv(uint32_t index) const noexcept
@@ -218,6 +252,23 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     HRESULT hr = Wait(owner, slot.fence);
     if (FAILED(hr))
         return hr;
+    if (m_timingQueries && slot.timingPending)
+    {
+        const SIZE_T offset = m_slot * 2 * sizeof(uint64_t);
+        const D3D12_RANGE range{offset, offset + 2 * sizeof(uint64_t)};
+        void* mapped = nullptr;
+        if (SUCCEEDED(m_timingReadback->Map(0, &range, &mapped)))
+        {
+            uint64_t ticks[2];
+            std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, sizeof(ticks));
+            if (ticks[1] >= ticks[0])
+                m_lastGpuMs = 1000.0 * static_cast<double>(ticks[1] - ticks[0]) /
+                              static_cast<double>(m_timestampFrequency);
+            const D3D12_RANGE noWrite{};
+            m_timingReadback->Unmap(0, &noWrite);
+        }
+        slot.timingPending = false;
+    }
     hr = slot.allocator->Reset();
     if (FAILED(hr))
         return hr;
@@ -225,6 +276,8 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     if (FAILED(hr))
         return hr;
     m_recording = true;
+    if (m_timingQueries)
+        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * m_slot);
 
     const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_PRESENT,
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -262,6 +315,13 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
         return E_FAIL;
     }
     auto& slot = m_slots[m_slot];
+    if (m_timingQueries)
+    {
+        const uint32_t query = 2 * m_slot;
+        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
+        slot.list->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                    query, 2, m_timingReadback.Get(), query * sizeof(uint64_t));
+    }
     const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                       D3D12_RESOURCE_STATE_PRESENT);
     slot.list->ResourceBarrier(1, &barrier);
@@ -280,6 +340,7 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
         return signal;
     }
     owner.fenceValue = slot.fence = value;
+    slot.timingPending = m_timingQueries != nullptr;
     const HRESULT hr = m_swapchain->Present(1, 0);
     if (hr == S_OK)
         ++m_presentCount;
@@ -300,6 +361,8 @@ void GameDx12NativeFrame12::Release() noexcept
     m_dsv.Reset();
     m_rtv.Reset();
     m_swapchain.Reset();
+    m_timingQueries.Reset();
+    m_timingReadback.Reset();
 }
 
 void GameDx12NativeFrame12::Quarantine() noexcept
@@ -317,6 +380,8 @@ void GameDx12NativeFrame12::Quarantine() noexcept
     m_dsv.Detach();
     m_rtv.Detach();
     m_swapchain.Detach();
+    m_timingQueries.Detach();
+    m_timingReadback.Detach();
 }
 
 #endif

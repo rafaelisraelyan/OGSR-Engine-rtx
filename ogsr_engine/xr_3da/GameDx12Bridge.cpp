@@ -31,6 +31,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -120,6 +121,7 @@ struct BridgeStateData
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12InfoQueue> infoQueue;
+    ComPtr<IDXGIAdapter3> nativeMemoryAdapter;
 
     // J1.2A owner-side geometry state. The bridge owns the device/queue/fence
     // and the adapter owns only the level registry/constants. Loading and
@@ -136,6 +138,8 @@ struct BridgeStateData
     uint64_t captureSequence = 0;
     uint64_t capturedFrames = 0;
     uint64_t rejectedFrames = 0;
+    uint64_t nativeScenePresents = 0;
+    std::chrono::steady_clock::time_point previousNativePresent{};
     uint64_t prePolicyStorageDenied = 0;
     uint64_t prePolicyRetrievalHidden = 0;
     uint32_t width = 0;
@@ -1015,6 +1019,8 @@ bool EnsureInitialized()
         state.state = BridgeState::Disabled;
         return false;
     }
+    if (state.nativeRequested)
+        adapter.As(&state.nativeMemoryAdapter);
 
     hr = ::D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
                              IID_PPV_ARGS(state.device.GetAddressOf()));
@@ -1466,11 +1472,19 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     const GameDx12NativeFrame12::Owner owner{
         *state.device.Get(), *state.queue.Get(), *state.fence.Get(),
         state.fenceEvent, state.fenceValue};
+    using FrameClock = std::chrono::steady_clock;
+    const auto elapsed = [](auto start, auto end)
+    {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    };
+    const auto start = FrameClock::now();
     GameDx12NativeFrame12::Recording recording;
     HRESULT hr = state.native.Begin(Device.m_hWnd, owner, recording);
+    const auto begin = FrameClock::now();
     if (hr == S_FALSE)
         return;
     uint32_t draws = 0;
+    GameDx12FourVisual12::NativeTimings12 timings;
     std::string reason;
     if (SUCCEEDED(hr) && state.m23Bound && state.m23.IsLoaded() &&
         state.m23.LevelSession() == state.levelSession &&
@@ -1490,7 +1504,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         try
         {
             if (!state.m23.RecordNativeFrame(recording.list, recording.slot, viewProjection,
-                                             position, draws, reason))
+                                             position, draws, timings, reason))
                 hr = E_FAIL;
         }
         catch (...)
@@ -1500,8 +1514,10 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         if (FAILED(hr))
             state.native.Cancel();
     }
+    const auto presentStart = FrameClock::now();
     if (SUCCEEDED(hr))
         hr = state.native.Present(owner);
+    const auto presentEnd = FrameClock::now();
     if (FAILED(hr))
     {
         state.nativeFailed = true;
@@ -1515,6 +1531,43 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         return;
     }
     const auto count = state.native.PresentCount();
+    if (hr == S_OK && draws != 0)
+    {
+        const uint64_t frames = ++state.nativeScenePresents;
+        const double frameMs = state.previousNativePresent == FrameClock::time_point{}
+            ? 0.0 : elapsed(state.previousNativePresent, presentEnd);
+        state.previousNativePresent = presentEnd;
+        static const bool detailed = []
+        {
+            const char* value = std::getenv("OGSR_DX12_GAME_METRICS");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (detailed && frames <= 480)
+        {
+            Msg("ph_dx12_metrics: frame=%llu mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
+                "snapshot_ms=%.6f serial_ms=%.6f parallel_ms=%.6f record_ms=%.6f "
+                "present_ms=%.6f gpu_ms=%.6f",
+                static_cast<unsigned long long>(frames), timings.mode, frameMs, elapsed(start, begin),
+                timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
+                elapsed(presentStart, presentEnd), state.native.LastGpuMilliseconds());
+        }
+        if (frames == 1 || frames == 30 || frames % 120 == 0)
+        {
+            DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+            if (state.nativeMemoryAdapter)
+                state.nativeMemoryAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                                                               &memory);
+            Msg("ph_dx12_gr: scene_present=%llu mode=%s draws=%u camera_hash=%016llX "
+                "position=(%.3f,%.3f,%.3f) snapshot_ms=%.6f serial_ms=%.6f parallel_ms=%.6f "
+                "record_ms=%.6f local_usage=%llu local_budget=%llu",
+                static_cast<unsigned long long>(frames), timings.mode, draws,
+                static_cast<unsigned long long>(state.lastMatrixHash),
+                Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
+                timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
+                static_cast<unsigned long long>(memory.CurrentUsage),
+                static_cast<unsigned long long>(memory.Budget));
+        }
+    }
     if (hr == S_OK && (count == 1 || count == 30 || count % 120 == 0))
         Msg("ph_dx12_native: Present=%llu scene_draws=%u fence=%llu window=%ux%u camera_hash=%016llX",
             static_cast<unsigned long long>(count), draws,
@@ -1566,6 +1619,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
     state.rejectedFrames = 0;
     state.cameraLogged = false;
     state.nativeGameplayStarted = false;
+    state.nativeScenePresents = 0;
+    state.previousNativePresent = {};
     state.levelActive = true;
     std::snprintf(state.levelName, sizeof(state.levelName), "%s",
                   levelName && levelName[0] ? levelName : "?");

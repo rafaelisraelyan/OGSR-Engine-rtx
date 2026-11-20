@@ -452,8 +452,11 @@ void CHW::UpdateWindowProps(HWND m_hWnd) const
     LONG_PTR dwWindowStyle{};
 
     // Set window properties depending on what mode were in.
+    const bool nativeViewport = GameDx12Bridge_NativeRequested(Core.Params);
     static const bool bBordersMode = !!strstr(Core.Params, "-draw_borders");
-    if (bBordersMode)
+    if (nativeViewport)
+        dwWindowStyle = WS_OVERLAPPEDWINDOW;
+    else if (bBordersMode)
         dwWindowStyle |= WS_BORDER | WS_DLGFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 
     SetWindowLongPtr(m_hWnd, GWL_STYLE, dwWindowStyle);
@@ -494,7 +497,7 @@ void CHW::UpdateWindowProps(HWND m_hWnd) const
         SetRect(&m_rcWindowBounds, 0, 0, dxgi_mode_desc.Width, dxgi_mode_desc.Height);
     }
 
-    if (bBordersMode)
+    if (bBordersMode || nativeViewport)
         AdjustWindowRect(&m_rcWindowBounds, DWORD(dwWindowStyle), FALSE);
 
     SetWindowPos(m_hWnd, HWND_NOTOPMOST

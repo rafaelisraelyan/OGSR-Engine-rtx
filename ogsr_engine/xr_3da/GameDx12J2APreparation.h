@@ -3,6 +3,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include <DirectXMath.h>
+#include "dx12renderprep.h"
 
 #include <cstdint>
 #include <string>
@@ -80,5 +81,12 @@ bool GameDx12J2A_RunForBridge(const char* levelName, uint64_t levelSession,
                               const DirectX::XMFLOAT4X4& projection,
                               GameDx12J2AResult12& result) noexcept;
 void GameDx12J2A_Shutdown();
+
+// Общий GR pool линии DX12. Снимок уже принадлежит вызывающей стороне.
+bool GameDx12J2A_PrepareSceneFrame(
+    const renderprep12::RenderSceneSnapshot12& snapshot, uint64_t generation,
+    renderprep12::Mode mode, std::span<const renderprep12::Resource12> resources,
+    renderprep12::PreparedFrame12& frame, renderprep12::VisibilityTimings12& timings,
+    bool& serialFallback, std::string& reason);
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE

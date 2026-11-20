@@ -5,6 +5,7 @@
 
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2ABatch.h"
+#include "GameDx12J2APreparation.h"
 #include "GameDx12NativeFrame.h"
 #include "GameDx12M23Fault.h"
 #include "dx12j2bbatch.h"
@@ -12,6 +13,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1137,9 +1139,80 @@ void GameDx12FourVisual12::InvalidateStaging()
         m_staged[slot] = {};
 }
 
+bool GameDx12FourVisual12::PrepareNativeVisibility(
+    const DirectX::XMFLOAT4X4& camera, NativeTimings12& timings, std::string& reason)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    const uint32_t catalogGeneration = static_cast<uint32_t>(m_generation) | 1u;
+    std::array<renderprep12::Object12, kSceneCapacity> objects{};
+    std::array<renderprep12::Resource12, kSceneCapacity * 2 + 1> resources{};
+    size_t resourceCount = 0;
+    DirectX::XMFLOAT4X4 world;
+    DirectX::XMStoreFloat4x4(&world, DirectX::XMMatrixIdentity());
+    const renderprep12::Resource12 pipeline{0x30000, catalogGeneration};
+    resources[resourceCount++] = pipeline;
+    for (size_t index = 0; index < m_worldInstances.size(); ++index)
+    {
+        const auto& instance = m_worldInstances[index];
+        const auto& source = m_slots[instance.sourceIndex];
+        if (source.generation != m_generation || source.visualId != instance.identity.visualId)
+            return Fail(reason, "B4 stale geometry source");
+        auto& object = objects[index];
+        object.id = index + 1;
+        object.indexCount = source.indexCount;
+        object.world = world;
+        object.minimum = source.asset.minimum;
+        object.maximum = source.asset.maximum;
+        object.sphere = source.asset.sphere;
+        object.visibility.sectorId = instance.identity.sectorId;
+        object.visual = {0x10000u + instance.sourceIndex, catalogGeneration};
+        object.material = {0x20000u + source.textureIndex, catalogGeneration};
+        object.pso = pipeline;
+        resources[resourceCount++] = object.visual;
+        resources[resourceCount++] = object.material;
+    }
+    const renderprep12::RenderSceneSnapshot12 snapshot(
+        camera, {objects.data(), m_worldInstances.size()}, m_generation);
+    timings.snapshotMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+
+    static const renderprep12::Mode selected = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_GR");
+        if (value != nullptr && std::strcmp(value, "parallel") == 0)
+            return renderprep12::Mode::Parallel;
+        if (value != nullptr && std::strcmp(value, "verify") == 0)
+            return renderprep12::Mode::Verify;
+        return renderprep12::Mode::Serial;
+    }();
+    renderprep12::PreparedFrame12 prepared;
+    renderprep12::VisibilityTimings12 times;
+    if (!GameDx12J2A_PrepareSceneFrame(snapshot, m_generation, selected,
+           {resources.data(), resourceCount}, prepared, times, timings.serialFallback, reason))
+        return false;
+    timings.mode = timings.serialFallback ? "serial-fallback" :
+                   selected == renderprep12::Mode::Parallel ? "parallel" :
+                   selected == renderprep12::Mode::Verify ? "verify" : "serial";
+    timings.serialMs = times.serial.total;
+    timings.parallelMs = times.parallel.total;
+    if (prepared.generation != m_generation || prepared.packets.size() > kSceneCapacity)
+        return Fail(reason, "B4 invalid frame generation or draw budget");
+    for (const auto& packet : prepared.packets)
+    {
+        const uint64_t id = packet.object.id;
+        if (id == 0 || id > m_worldInstances.size())
+            return Fail(reason, "B4 invalid instance ID");
+        const uint32_t sourceIndex = m_worldInstances[id - 1].sourceIndex;
+        if (packet.object.visual != renderprep12::Resource12{0x10000u + sourceIndex, catalogGeneration})
+            return Fail(reason, "B4 invalid packet geometry binding");
+        m_visibleSources[m_visibleCount++] = sourceIndex;
+    }
+    return true;
+}
+
 bool GameDx12FourVisual12::PrepareStaging(
     const DirectX::XMFLOAT4X4& logicalViewProjection,
-    const float cameraPosition[3], std::string& reason)
+    const float cameraPosition[3], std::string& reason, NativeTimings12* nativeTimings)
 {
     InvalidateStaging();
     if (!FiniteMatrix(logicalViewProjection))
@@ -1154,31 +1227,39 @@ bool GameDx12FourVisual12::PrepareStaging(
 
     if (!m_worldInstances.empty())
     {
-        const auto viewProjection = DirectX::XMLoadFloat4x4(&logicalViewProjection);
-        for (const auto& instance : m_worldInstances)
+        if (nativeTimings != nullptr)
         {
-            const auto& bounds = m_slots[instance.sourceIndex].asset;
-            unsigned outside = 0x3f;
-            for (unsigned corner = 0; corner < 8 && outside != 0; ++corner)
+            if (!PrepareNativeVisibility(logicalViewProjection, *nativeTimings, reason))
+                return false;
+        }
+        else
+        {
+            const auto viewProjection = DirectX::XMLoadFloat4x4(&logicalViewProjection);
+            for (const auto& instance : m_worldInstances)
             {
-                const auto point = DirectX::XMVectorSet(
-                    corner & 1 ? bounds.maximum.x : bounds.minimum.x,
-                    corner & 2 ? bounds.maximum.y : bounds.minimum.y,
-                    corner & 4 ? bounds.maximum.z : bounds.minimum.z, 1.0f);
-                DirectX::XMFLOAT4 clip;
-                DirectX::XMStoreFloat4(&clip, DirectX::XMVector4Transform(point, viewProjection));
-                // Отбрасываем AABB, только если все углы снаружи одной плоскости D3D.
-                unsigned mask = 0;
-                if (clip.x < -clip.w) mask |= 1;
-                if (clip.x > clip.w) mask |= 2;
-                if (clip.y < -clip.w) mask |= 4;
-                if (clip.y > clip.w) mask |= 8;
-                if (clip.z < 0) mask |= 16;
-                if (clip.z > clip.w) mask |= 32;
-                outside &= mask;
+                const auto& bounds = m_slots[instance.sourceIndex].asset;
+                unsigned outside = 0x3f;
+                for (unsigned corner = 0; corner < 8 && outside != 0; ++corner)
+                {
+                    const auto point = DirectX::XMVectorSet(
+                        corner & 1 ? bounds.maximum.x : bounds.minimum.x,
+                        corner & 2 ? bounds.maximum.y : bounds.minimum.y,
+                        corner & 4 ? bounds.maximum.z : bounds.minimum.z, 1.0f);
+                    DirectX::XMFLOAT4 clip;
+                    DirectX::XMStoreFloat4(&clip, DirectX::XMVector4Transform(point, viewProjection));
+                    // Отбрасываем AABB, только если все углы снаружи одной плоскости D3D.
+                    unsigned mask = 0;
+                    if (clip.x < -clip.w) mask |= 1;
+                    if (clip.x > clip.w) mask |= 2;
+                    if (clip.y < -clip.w) mask |= 4;
+                    if (clip.y > clip.w) mask |= 8;
+                    if (clip.z < 0) mask |= 16;
+                    if (clip.z > clip.w) mask |= 32;
+                    outside &= mask;
+                }
+                if (outside == 0)
+                    m_visibleSources[m_visibleCount++] = instance.sourceIndex;
             }
-            if (outside == 0)
-                m_visibleSources[m_visibleCount++] = instance.sourceIndex;
         }
         DirectX::XMFLOAT4X4 world;
         DirectX::XMStoreFloat4x4(&world, DirectX::XMMatrixIdentity());
@@ -1340,7 +1421,7 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
 bool GameDx12FourVisual12::RecordNativeFrame(
     ID3D12GraphicsCommandList* list, uint32_t frameSlot,
     const DirectX::XMFLOAT4X4& logicalViewProjection, const float cameraPosition[3],
-    uint32_t& drawCount, std::string& reason)
+    uint32_t& drawCount, NativeTimings12& timings, std::string& reason)
 {
     drawCount = 0;
     if (frameSlot >= GameDx12NativeFrame12::kFrameCount || !m_loaded ||
@@ -1348,9 +1429,13 @@ bool GameDx12FourVisual12::RecordNativeFrame(
         return Fail(reason, "B3 scene unavailable");
     // Native frame владеет ожиданием fence этого слота до вызова.
     m_frameConstantOffset = (static_cast<uint64_t>(frameSlot) + 1) * kConstantsBytes;
-    if (!PrepareStaging(logicalViewProjection, cameraPosition, reason) ||
-        !RecordDraws(list, (1u << kSlotCount) - 1u, true, reason))
+    if (!PrepareStaging(logicalViewProjection, cameraPosition, reason, &timings))
         return false;
+    const auto recordStart = std::chrono::steady_clock::now();
+    if (!RecordDraws(list, (1u << kSlotCount) - 1u, true, reason))
+        return false;
+    timings.recordMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - recordStart).count();
     drawCount = m_visibleCount;
     return true;
 }

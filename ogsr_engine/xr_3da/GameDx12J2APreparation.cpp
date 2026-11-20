@@ -825,6 +825,48 @@ bool GameDx12J2A_RunForBridge(const char* levelName, uint64_t levelSession,
     return true;
 }
 
+bool GameDx12J2A_PrepareSceneFrame(
+    const renderprep12::RenderSceneSnapshot12& snapshot, uint64_t generation,
+    renderprep12::Mode mode, std::span<const renderprep12::Resource12> resources,
+    renderprep12::PreparedFrame12& frame, renderprep12::VisibilityTimings12& timings,
+    bool& serialFallback, std::string& reason)
+{
+    frame = {};
+    timings = {};
+    serialFallback = false;
+    try
+    {
+        if (mode != renderprep12::Mode::Serial && !EnsureJobs(reason))
+        {
+            serialFallback = true;
+            mode = renderprep12::Mode::Serial;
+        }
+        if (mode == renderprep12::Mode::Parallel)
+        {
+            try
+            {
+                frame = renderprep12::PrepareVisible(snapshot, generation, mode,
+                                                     &g_j2aJobs, timings, resources);
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                reason = error.what();
+                serialFallback = true;
+                mode = renderprep12::Mode::Serial;
+            }
+        }
+        frame = renderprep12::PrepareVisible(snapshot, generation, mode,
+            mode == renderprep12::Mode::Serial ? nullptr : &g_j2aJobs, timings, resources);
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        reason = error.what();
+        return false;
+    }
+}
+
 void GameDx12J2A_Shutdown()
 {
     if (g_j2aJobsReady)

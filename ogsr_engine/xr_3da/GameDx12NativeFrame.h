@@ -45,6 +45,7 @@ public:
     bool CompletionUnknown() const noexcept { return m_unknown; }
     bool IsInitialized() const noexcept { return m_swapchain != nullptr; }
     uint64_t PresentCount() const noexcept { return m_presentCount; }
+    double LastGpuMilliseconds() const noexcept { return m_lastGpuMs; }
     void Release() noexcept;
     void Quarantine() noexcept;
 
@@ -57,6 +58,7 @@ private:
         Ptr<ID3D12CommandAllocator> allocator;
         Ptr<ID3D12GraphicsCommandList> list;
         uint64_t fence = 0;
+        bool timingPending = false;
     };
 
     HRESULT Wait(const Owner& owner, uint64_t value) noexcept;
@@ -69,6 +71,10 @@ private:
     Ptr<ID3D12DescriptorHeap> m_rtv;
     Ptr<ID3D12DescriptorHeap> m_dsv;
     Ptr<ID3D12Resource> m_depth;
+    Ptr<ID3D12QueryHeap> m_timingQueries;
+    Ptr<ID3D12Resource> m_timingReadback;
+    uint64_t m_timestampFrequency = 0;
+    double m_lastGpuMs = 0;
     uint32_t m_rtvStride = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;

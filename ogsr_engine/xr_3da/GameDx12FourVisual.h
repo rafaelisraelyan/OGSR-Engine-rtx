@@ -129,10 +129,19 @@ public:
                           Result12* result,
                           std::string& reason);
 
+    struct NativeTimings12
+    {
+        double snapshotMs = 0;
+        double serialMs = 0;
+        double parallelMs = 0;
+        double recordMs = 0;
+        const char* mode = "serial";
+        bool serialFallback = false;
+    };
     bool RecordNativeFrame(ID3D12GraphicsCommandList* list, uint32_t frameSlot,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
                            const float cameraPosition[3], uint32_t& drawCount,
-                           std::string& reason);
+                           NativeTimings12& timings, std::string& reason);
 
     void OnLevelTeardown(uint64_t nextEpoch);
     void OnDeviceReset(uint64_t nextEpoch);
@@ -206,7 +215,10 @@ private:
                                ID3D12GraphicsCommandList* list,
                                std::string& reason);
     bool PrepareStaging(const DirectX::XMFLOAT4X4& logicalViewProjection,
-                        const float cameraPosition[3], std::string& reason);
+                        const float cameraPosition[3], std::string& reason,
+                        NativeTimings12* nativeTimings = nullptr);
+    bool PrepareNativeVisibility(const DirectX::XMFLOAT4X4& camera,
+                                 NativeTimings12& timings, std::string& reason);
     bool RecordDraws(ID3D12GraphicsCommandList* list, uint32_t slotMask,
                      bool combined, std::string& reason);
     struct PassResult12
