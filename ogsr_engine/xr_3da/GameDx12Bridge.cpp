@@ -1444,6 +1444,30 @@ bool GameDx12Bridge_UsesNativeViewport()
     return State().nativeRequested;
 }
 
+void GameDx12Bridge_ApplyNativeVideoMode(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0 || width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+    {
+        Msg("ph_dx12_native: invalid video mode %ux%u", width, height);
+        return;
+    }
+    // Размеры игровой камеры остаются привязаны к ресурсам R4.
+    // DX12 пересоздаёт цели кадра по новому размеру клиентской области.
+    GameDx12Bridge_OnDeviceReset(Device.dwWidth, Device.dwHeight);
+    if (State().state != BridgeState::Ready)
+        return;
+    const HWND window = Device.m_hWnd;
+    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    const auto style = static_cast<DWORD>(GetWindowLongPtr(window, GWL_STYLE));
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtr(window, GWL_EXSTYLE));
+    if (!AdjustWindowRectEx(&rect, style, FALSE, exStyle) ||
+        !SetWindowPos(window, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+        Msg("ph_dx12_native: could not apply video mode %ux%u error=%lu",
+            width, height, GetLastError());
+}
+
 namespace
 {
 bool DrainNative(BridgeStateData& state, const char* stage)
@@ -2566,9 +2590,8 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
             Msg("ph_dx12_j2a: pending preparation invalidated by device reset");
         }
     }
-    Msg("ph_dx12_bridge: device reset width=%u height=%u epoch=%llu "
-        "(offscreen target resized on next diagnostic)",
-        width, height,
+    Msg("ph_dx12_bridge: device reset mode=%s width=%u height=%u epoch=%llu",
+        state.nativeRequested ? "native" : "diagnostic", width, height,
         static_cast<unsigned long long>(state.captureEpoch));
 }
 

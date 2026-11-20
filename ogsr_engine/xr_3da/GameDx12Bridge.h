@@ -30,6 +30,7 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height);
 void GameDx12Bridge_Shutdown();
 bool GameDx12Bridge_CreateNativeViewport();
 bool GameDx12Bridge_UsesNativeViewport();
+void GameDx12Bridge_ApplyNativeVideoMode(uint32_t width, uint32_t height);
 
 bool GameDx12Bridge_IsEnabled();
 
@@ -64,6 +65,7 @@ inline void GameDx12Bridge_OnDeviceReset(uint32_t, uint32_t) {}
 inline void GameDx12Bridge_Shutdown() {}
 inline bool GameDx12Bridge_CreateNativeViewport() { return true; }
 inline bool GameDx12Bridge_UsesNativeViewport() { return false; }
+inline void GameDx12Bridge_ApplyNativeVideoMode(uint32_t, uint32_t) {}
 inline bool GameDx12Bridge_IsEnabled() { return false; }
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE

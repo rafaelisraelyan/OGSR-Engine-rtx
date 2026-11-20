@@ -6,6 +6,7 @@
 #include "xr_IOConsole.h"
 #include "xr_input.h"
 #include "GameDx12Bridge.h"
+#include "defines.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
 #include "GameCameraCaptureAdapter.h"
 #endif
@@ -66,6 +67,14 @@ extern void unregister_reshade();
 void CRenderDevice::Reset(bool precache)
 {
     ZoneScoped;
+
+    if (GameDx12Bridge_UsesNativeViewport())
+    {
+        // R4 хранит ресурсы игровой логики, но не владеет выводом.
+        // vid_restart меняет только размер нативного viewport.
+        GameDx12Bridge_ApplyNativeVideoMode(psCurrentVidMode[0], psCurrentVidMode[1]);
+        return;
+    }
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
     B2CameraCapture_OnDeviceResetBegin();
