@@ -1,11 +1,28 @@
-# OGSR-Engine — документация форка
+# OGSR RTX — инженерная документация
+
+> **Актуализация: 20 ноября 2026.** Это указатель к историческому аудиту OGSR/CoP и к новым экспериментальным направлениям. **Рендер `prypiat` по умолчанию — DX11/R4**. В локальной, ещё не опубликованной feature-ветке F4.0-B проверен **ограниченный игровой DX12 vertical slice** (native Present, реальные текстурированные Jupiter visuals, 30 последовательных кадров, GR, Debug Layer/GBV), итог independent review **PASS WITH NOTES**. Это **не** готовая карта, DXR или разрешённый merge.
+
+**Начните с [главной страницы проекта](../README.md) и [актуального roadmap](08-roadmap.md).** Для новых ошибок используйте [GitHub Issues](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues); первоначальный [аудит известных проблем](07-known-issues.md) сохранён как исторический источник.
+
+## Навигация
+
+| Раздел | Материалы |
+|:--|:--|
+| **Проект и прогресс** | [Главный README](../README.md) · [Roadmap](08-roadmap.md) · [Issues](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues) |
+| **Основа X-Ray** | [Архитектура](01-architecture.md) · [R4 renderer](02-renderer.md) · [Сборка](03-build-and-dependencies.md) |
+| **DX12 / DXR** | [DX12 ADR](dx12-architecture-adr.md) · [F3.6 asset bridge](dx12-f3-6a-xray-asset-bridge.md) · [Официальные reference](09-dx12-port-references.md) · [DXR feasibility](06-rtx-feasibility.md) |
+| **Параллельные направления** | [PhysX portability ADR](physics-portability-adr.md) · [Облака — visual target](dx12-v-cloud-visual-target.md) · [Погодные переходы](dx12-v-scientific-cloud-taxonomy-and-transitions.md) |
+
+---
+
+## Исторический аудит CoP (исходные документы)
 
 Документация написана по результатам полного разбора исходников
 `OGSR/OGSR-Engine` и **перепроверена против ветки `main_cop_cs`
 (Call of Pripyat)** на коммите `9d0021ce6`.
 
 Все номера строк в документах проверены файл за файлом против кода.
-Пометки ⚠️ markют места, где наша SoC-оценка была неверна или устарела.
+Пометки ⚠️ отмечают места, где наша SoC-оценка была неверна или устарела.
 
 | Документ | О чём |
 |---|---|
@@ -16,14 +33,13 @@
 | [05-upscaling-current-state.md](05-upscaling-current-state.md) | DLSS и FSR 3 построчно, с цитатами кода |
 | [06-rtx-feasibility.md](06-rtx-feasibility.md) | **Главный документ: что можно и что нельзя сделать с RTX в DX11** |
 | [07-known-issues.md](07-known-issues.md) | Найденные проблемы (A–H) + «что проверено и не проблема» |
-| [08-roadmap.md](08-roadmap.md) | Этапы A–E с критериями приёмки и откатом |
+| [08-roadmap.md](08-roadmap.md) | Единая дорожная карта DX11, DX12/DXR, PhysX и облаков, гейты и история решений |
 | [09-dx12-port-references.md](09-dx12-port-references.md) | Официальные ресурсы DX12/DXR и привязка к этапам дорожной карты |
 
 ## TL;DR по RTX
 
-Движок — **чистый DirectX 11**. Аппаратный ray tracing (DXR/RT cores) в D3D11
-не существует в принципе, поэтому «просто включить RTX» невозможно без порта
-рендерера на DirectX 12. Порт — это по сути новый рендерер (424 HLSL-файла,
+Исторически основная ветка использует **DirectX 11/R4**; первый игровой DX12 vertical slice уже проверен отдельно, **но ещё не интегрирован в `prypiat`**. Аппаратный ray tracing (DXR/RT cores) в D3D11
+не существует в принципе, поэтому «просто включить RTX» невозможно без нативного DX12/DXR-рендерера. Порт — это по сути новый рендерер (424 HLSL-файла,
 `CBackend`, `StateManager`, FidelityFX DX12 backend).
 
 При этом в SDK NVIDIA DLSS **310.9.1** присутствуют точки входа `NVSDK_NGX_D3D11_*`
