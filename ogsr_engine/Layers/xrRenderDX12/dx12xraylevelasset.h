@@ -13,4 +13,5 @@
 // allowed to create GPU resources.
 bool BuildXrayLevelAsset12(const xraylevel12::Geometry& geometry,
                            XrayAssetData12& asset,
-                           const char** reason);
+                           const char** reason,
+                           std::span<const uint8_t> materialLevel = {});

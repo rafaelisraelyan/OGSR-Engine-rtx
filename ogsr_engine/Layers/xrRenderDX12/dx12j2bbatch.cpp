@@ -121,7 +121,7 @@ bool SameVisuals(const std::array<uint32_t, kTargetVisualCount>& visuals) noexce
 
 bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
                  const InstanceKey12& instance, const Limits12& limits,
-                 Slot12& slot)
+                 Slot12& slot, std::span<const uint8_t> materialLevel = {})
 {
 #if defined(OGSR_J2B_CPU_FAULT_INJECTION)
     j2b_m1_fault::MaybeEnablePersistentOom(
@@ -178,7 +178,7 @@ bool ConvertSlot(const Snapshot12& snapshot, uint32_t visualId,
     const char* convertReason = nullptr;
     const Clock::time_point convertStart = Clock::now();
     const bool converted = BuildXrayLevelAsset12(geometry, asset,
-                                                  &convertReason);
+                                                 &convertReason, materialLevel);
     slot.convertMs = Ms(convertStart);
     if (!converted)
     {
@@ -763,7 +763,8 @@ bool PrepareSceneSector(const Snapshot12& snapshot, const Identity12& expected,
             }
 
             Slot12 slot;
-            if (!ConvertSlot(snapshot, leaf.visualId, instance, limits, slot))
+            if (!ConvertSlot(snapshot, leaf.visualId, instance, limits, slot,
+                             snapshot.levelBytes))
             {
                 if (slot.readError != xraylevel12::ReadError::UnsupportedDeclaration &&
                     slot.readError != xraylevel12::ReadError::UnsupportedDeclarationElement)

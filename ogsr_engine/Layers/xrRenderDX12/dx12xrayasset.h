@@ -4,6 +4,7 @@
 #include "dx12renderprep.h"
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,8 @@ bool LoadXrayOgf12(const std::wstring& path,
 bool LoadXrayDds12(const std::wstring& path,
                    XrayTextureData12& texture,
                    const char** reason);
+bool DecodeXrayDds12(std::span<const uint8_t> file,
+                     XrayTextureData12& texture, const char** reason);
 
 // CPU-only validation used both by the DDS loader and by the owner-side GPU
 // upload. It checks actual source bytes, BC1 mip geometry and copy footprints

@@ -8,6 +8,7 @@
 
 #include "dx12scopeguard.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <new>
@@ -79,12 +80,12 @@ bool SameLevelPath(const char* left, const char* right) noexcept
 bool ReadVfsFile(const char* label, const char* name, uint64_t maxBytes,
                  std::vector<uint8_t>& bytes,
                  j2bbatch12::ErrorInfo12& error, double& openMs,
-                 double& copyMs) noexcept
+                 double& copyMs, const char* alias = fsgame::level) noexcept
 {
     try
     {
         const Clock::time_point openStart = Clock::now();
-        IReader* reader = FS.r_open(fsgame::level, name);
+        IReader* reader = FS.r_open(alias, name);
         openMs += Ms(openStart);
         if (reader == nullptr)
         {
@@ -149,9 +150,95 @@ bool ReadVfsFile(const char* label, const char* name, uint64_t maxBytes,
     }
     return false;
 }
+
+bool BinaryAlphaFromThm(const std::vector<uint8_t>& bytes,
+                        const XrayTextureData12& dds) noexcept
+{
+    const auto word = [&](size_t offset)
+    {
+        uint32_t value;
+        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+        return value;
+    };
+    for (size_t offset = 0; bytes.size() - offset >= 8;)
+    {
+        const uint32_t chunk = word(offset);
+        const uint32_t size = word(offset + 4);
+        offset += 8;
+        if (size > bytes.size() - offset)
+            return false;
+        if (chunk == 0x812 && size >= 32)
+            return word(offset + 24) == dds.width && word(offset + 28) == dds.height &&
+                   (word(offset) == 1 || (word(offset + 4) & 2) != 0);
+        offset += size;
+    }
+    return false;
+}
 } // namespace
 
 extern bool OnMainThread();
+
+void GameDx12J2ABatch_ReadTextures(
+    const j2bbatch12::SceneBatch12& scene,
+    std::vector<GameDx12SceneTexture12>& textures) noexcept
+{
+    textures.clear();
+    constexpr size_t maxTextureBytes = 4u * 1024u * 1024u;
+    constexpr size_t maxSceneBytes = 16u * 1024u * 1024u;
+    size_t totalBytes = 0;
+    try
+    {
+        if (!OnMainThread())
+            return;
+        for (const auto& source : scene.sources)
+        {
+            const auto& name = source.asset.textureName;
+            if (name.empty() || name.size() > 180 || name.front() == '\\' ||
+                name.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.\\") != std::string::npos ||
+                name.find("..") != std::string::npos)
+                continue;
+            if (std::any_of(textures.begin(), textures.end(), [&](const auto& texture)
+                { return _stricmp(texture.name.c_str(), name.c_str()) == 0; }))
+                continue;
+
+            auto& entry = textures.emplace_back();
+            entry.name = name;
+            const std::string ddsName = name + ".dds";
+            double openMs = 0.0;
+            double copyMs = 0.0;
+            j2bbatch12::ErrorInfo12 error;
+            std::vector<uint8_t> bytes;
+            const char* reason = "texture budget exhausted";
+            const size_t limit = (std::min)(maxTextureBytes, maxSceneBytes - totalBytes);
+            if (limit == 0 ||
+                (!ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs) &&
+                 !ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs,
+                              fsgame::game_textures)) ||
+                !DecodeXrayDds12(bytes, entry.dds, &reason))
+            {
+                entry.dds = {};
+                Msg("ph_dx12_b2: texture fallback name='%s' reason='%s'",
+                    name.c_str(), error.code != j2bbatch12::Error12::None
+                        ? error.text : reason);
+                continue;
+            }
+            totalBytes += entry.dds.data.size();
+            const std::string thmName = name + ".thm";
+            std::vector<uint8_t> thm;
+            if (ReadVfsFile("THM", thmName.c_str(), 16384, thm, error, openMs, copyMs,
+                            fsgame::game_textures))
+                entry.alphaTest = BinaryAlphaFromThm(thm, entry.dds);
+            Msg("ph_dx12_b2: texture name='%s' bc1_srgb=%ux%u mips=%u alpha_thm=%d",
+                name.c_str(), entry.dds.width, entry.dds.height, entry.dds.mipCount,
+                entry.alphaTest ? 1 : 0);
+        }
+    }
+    catch (...)
+    {
+        textures.clear();
+    }
+}
 
 bool GameDx12J2ABatch_ReadSnapshot(const char* levelName,
                                   const j2bbatch12::Identity12& identity,

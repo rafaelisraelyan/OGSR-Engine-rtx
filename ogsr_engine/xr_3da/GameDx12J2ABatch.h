@@ -4,6 +4,17 @@
 
 #include "dx12j2bbatch.h"
 
+struct GameDx12SceneTexture12
+{
+    std::string name;
+    XrayTextureData12 dds;
+    bool alphaTest = false;
+};
+
+void GameDx12J2ABatch_ReadTextures(
+    const j2bbatch12::SceneBatch12& scene,
+    std::vector<GameDx12SceneTexture12>& textures) noexcept;
+
 // Engine-side owner adapter. VFS access happens here on the owner thread; the
 // CPU batch core receives only the immutable Snapshot12. No GPU resource is
 // created.

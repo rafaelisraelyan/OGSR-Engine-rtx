@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xraylevel12
@@ -21,6 +22,7 @@ constexpr uint32_t kOgfFastPath = 22;
 constexpr uint32_t kMtNormal = 0;
 
 constexpr uint32_t kLevelVisualsChunk = 3;
+constexpr uint32_t kLevelShadersChunk = 2;
 constexpr uint32_t kLevelVertexChunk = 9;
 constexpr uint32_t kLevelIndexChunk = 10;
 
@@ -188,6 +190,11 @@ struct Geometry
     bool empty() const noexcept { return vertex_bytes.empty() && indices.empty(); }
     void clear() noexcept;
 };
+
+// Запись R4 вида shader/texture[,texture...]. Представление заимствует
+// память исходного level и действует, пока живёт неизменяемый snapshot.
+std::string_view FindShaderBinding(std::span<const uint8_t> level,
+                                   uint32_t shaderId) noexcept;
 
 // Читает один shared-container MT_NORMAL visual из переданных байтов level
 // и level.geom.

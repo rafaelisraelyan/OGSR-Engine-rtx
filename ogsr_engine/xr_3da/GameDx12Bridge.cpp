@@ -1542,9 +1542,16 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                                  snapshot, expected, jupiterSector, scene, limits))
                         reason = scene.error.text;
                     else
+                    {
+                        const char* materialMode = std::getenv("OGSR_DX12_GAME_B2_TEXTURES");
+                        const bool textured = materialMode != nullptr && std::strcmp(materialMode, "1") == 0;
+                        std::vector<GameDx12SceneTexture12> textures;
+                        if (textured)
+                            GameDx12J2ABatch_ReadTextures(scene, textures);
                         loaded = state.m23.LoadScene(
                             owner, state.levelName, {state.levelSession, state.captureEpoch},
-                            std::move(scene), reason);
+                            std::move(scene), textured ? &textures : nullptr, reason);
+                    }
                 }
                 else
                 {

@@ -34,7 +34,8 @@ float ReadPosition(const xraylevel12::Geometry& geometry, uint32_t vertex,
 
 bool BuildXrayLevelAsset12(const xraylevel12::Geometry& geometry,
                            XrayAssetData12& asset,
-                           const char** reason)
+                           const char** reason,
+                           std::span<const uint8_t> materialLevel)
 {
     asset = {};
     if (geometry.vertex_stride != 32)
@@ -109,16 +110,34 @@ bool BuildXrayLevelAsset12(const xraylevel12::Geometry& geometry,
     try
     {
         candidate.vertices.resize(geometry.vertex_count);
+        const bool decodeMaterial = !materialLevel.empty();
         for (uint32_t i = 0; i < geometry.vertex_count; ++i)
         {
             XrayVertex12& vertex = candidate.vertices[i];
             vertex.position = {ReadPosition(geometry, i, 0),
                                ReadPosition(geometry, i, 1),
                                ReadPosition(geometry, i, 2)};
-            // Flat-fallback material: the existing X-Ray PS samples only the
-            // texture, so normal/UV are placeholders, not decoded source data.
-            vertex.normal = {0.0f, 0.0f, 1.0f};
-            vertex.uv = {0.0f, 0.0f};
+            if (decodeMaterial)
+            {
+                const uint8_t* packed = geometry.vertex_bytes.data() +
+                    static_cast<size_t>(i) * geometry.vertex_stride;
+                // R4 получает D3DCOLOR как RGBA в порядке байтов, затем
+                // выполняет .bgra и unpack_bx2. Альфа T/B дополняет SHORT2 UV.
+                constexpr float normalScale = 2.0f / 255.0f;
+                vertex.normal = {packed[14] * normalScale - 1.0f,
+                                 packed[13] * normalScale - 1.0f,
+                                 packed[12] * normalScale - 1.0f};
+                int16_t uv[2];
+                std::memcpy(uv, packed + 28, sizeof(uv));
+                constexpr float uvScale = 32.0f / 32768.0f;
+                vertex.uv = {(uv[0] + packed[19] / 255.0f) * uvScale,
+                             (uv[1] + packed[23] / 255.0f) * uvScale};
+            }
+            else
+            {
+                vertex.normal = {0.0f, 0.0f, 1.0f};
+                vertex.uv = {0.0f, 0.0f};
+            }
         }
         candidate.indices = geometry.indices;
         candidate.minimum = {geometry.bounds.minimum[0],
@@ -131,8 +150,22 @@ bool BuildXrayLevelAsset12(const xraylevel12::Geometry& geometry,
                                    geometry.sphere.center[1],
                                    geometry.sphere.center[2]};
         candidate.sphere.radius = geometry.sphere.radius;
-        candidate.textureName = "jupiter_level_visual";
-        candidate.shaderName = "flat_color";
+        if (decodeMaterial)
+        {
+            const auto binding = xraylevel12::FindShaderBinding(materialLevel, geometry.shader_id);
+            const size_t slash = binding.find('/');
+            if (slash != binding.npos)
+            {
+                const auto textures = binding.substr(slash + 1);
+                candidate.shaderName = binding.substr(0, slash);
+                candidate.textureName = textures.substr(0, textures.find(','));
+            }
+        }
+        else
+        {
+            candidate.textureName = "jupiter_level_visual";
+            candidate.shaderName = "flat_color";
+        }
     }
     catch (const std::bad_alloc&)
     {

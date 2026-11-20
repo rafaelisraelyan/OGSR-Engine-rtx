@@ -447,6 +447,13 @@ bool LoadXrayDds12(const std::wstring& path, XrayTextureData12& texture,
     std::vector<uint8_t> file;
     if (!ReadBytes(path, file, 64u * 1024u * 1024u, reason))
         return false;
+    return DecodeXrayDds12(file, texture, reason);
+}
+
+bool DecodeXrayDds12(std::span<const uint8_t> file,
+                     XrayTextureData12& texture, const char** reason)
+{
+    texture = {};
     if (file.size() < 128 || ReadU32(file.data()) != kDdsMagic)
         return Fail(reason, "invalid DDS magic");
     if (ReadU32(file.data() + 4) != kDdsHeaderSize)

@@ -21,6 +21,7 @@
 using Microsoft::WRL::ComPtr;
 
 class GameDx12OffscreenPass12;
+struct GameDx12SceneTexture12;
 
 namespace j2bbatch12
 {
@@ -109,7 +110,9 @@ public:
                        std::string& reason);
     bool LoadScene(const GameDx12FourVisualOwner12& owner,
                    const char* levelName, const j2bbatch12::Identity12& live,
-                   j2bbatch12::SceneBatch12&& scene, std::string& reason);
+                   j2bbatch12::SceneBatch12&& scene,
+                   const std::vector<GameDx12SceneTexture12>* textures,
+                   std::string& reason);
 
     // Owner-thread one-shot diagnostic. Records and submits the combined
     // four-draw pass, then four isolated passes, reading back and saving PNGs
@@ -171,6 +174,8 @@ private:
         uint32_t visualId = 0;
         uint32_t vertexCount = 0;
         uint32_t indexCount = 0;
+        uint32_t textureIndex = 0;
+        bool alphaTest = false;
         uint64_t generation = 0;
     };
 
@@ -185,7 +190,11 @@ private:
                  std::string& reason);
     bool UploadGeometry(const GameDx12FourVisualOwner12& owner,
                         const char* levelName, const j2bbatch12::Identity12& live,
-                        std::string& reason);
+                        std::string& reason,
+                        const std::vector<GameDx12SceneTexture12>* textures = nullptr);
+    bool CreateSceneTextures(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                             const std::vector<GameDx12SceneTexture12>& textures,
+                             std::string& reason);
     bool CreatePipeline(ID3D12Device* device, std::string& reason);
     bool CreateConstants(ID3D12Device* device, std::string& reason);
     bool CreateGeometryBuffers(ID3D12Device* device,
@@ -234,6 +243,17 @@ private:
     uint32_t m_visibleSources[kSceneCapacity] = {};
     uint32_t m_visibleCount = 0;
     fourvisual12::StagedTransform12 m_staged[kSlotCount];
+
+    struct TextureGpu12
+    {
+        M23Ptr12<ID3D12Resource> image;
+        M23Ptr12<ID3D12Resource> upload;
+    };
+    TextureGpu12 m_textures[kSceneCapacity + 1];
+    M23Ptr12<ID3D12DescriptorHeap> m_textureHeap;
+    UINT m_textureDescriptorSize = 0;
+    uint32_t m_materialView = 0;
+    bool m_textured = false;
 
     M23Ptr12<ID3D12RootSignature> m_rootSignature;
     M23Ptr12<ID3D12PipelineState> m_pipelineState;

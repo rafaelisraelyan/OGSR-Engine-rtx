@@ -811,6 +811,35 @@ ReadError ParseAndPublish(std::span<const uint8_t> level,
 }
 } // namespace
 
+std::string_view FindShaderBinding(std::span<const uint8_t> level,
+                                   uint32_t shaderId) noexcept
+{
+    if (shaderId == 0)
+        return {};
+    Chunk shaders;
+    std::string reason;
+    if (FindUniqueChunk(level, kLevelShadersChunk, shaders, reason) != ReadError::None ||
+        shaders.size < sizeof(uint32_t))
+        return {};
+    uint32_t count = 0;
+    if (!ReadU32(level, shaders.payload, count) || shaderId >= count ||
+        count > shaders.size - sizeof(uint32_t))
+        return {};
+
+    const char* current = reinterpret_cast<const char*>(level.data() + shaders.payload + 4);
+    const char* end = reinterpret_cast<const char*>(level.data() + shaders.payload + shaders.size);
+    for (uint32_t index = 0; index <= shaderId; ++index)
+    {
+        const char* terminator = std::find(current, end, '\0');
+        if (terminator == end)
+            break;
+        if (index == shaderId)
+            return {current, static_cast<size_t>(terminator - current)};
+        current = terminator + 1;
+    }
+    return {};
+}
+
 void Geometry::clear() noexcept
 {
     *this = Geometry{};

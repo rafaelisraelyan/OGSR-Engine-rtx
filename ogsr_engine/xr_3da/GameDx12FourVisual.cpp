@@ -4,6 +4,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include "GameDx12OffscreenPass.h"
+#include "GameDx12J2ABatch.h"
 #include "GameDx12M23Fault.h"
 #include "dx12j2bbatch.h"
 
@@ -33,6 +34,8 @@ struct FourVisualQuarantine12
 {
     bool occupied = false;
     IUnknown* slots[GameDx12FourVisual12::kSceneCapacity][4] = {};
+    IUnknown* textures[GameDx12FourVisual12::kSceneCapacity + 1][2] = {};
+    IUnknown* textureHeap = nullptr;
     IUnknown* constants = nullptr;
     IUnknown* rootSignature = nullptr;
     IUnknown* pipelineState = nullptr;
@@ -231,6 +234,8 @@ struct VSInput
 struct VSOutput
 {
     float4 position : SV_Position;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
 };
 
 cbuffer FrameCB : register(b0)
@@ -249,6 +254,8 @@ VSOutput main(VSInput input)
     VSOutput output;
     output.position = mul(mul(float4(input.position, 1.0f), World),
                           ViewProjection);
+    output.normal = input.normal;
+    output.uv = input.uv;
     return output;
 }
 )";
@@ -266,6 +273,44 @@ cbuffer ObjectCB : register(b1)
 float4 main() : SV_Target
 {
     return Tint;
+}
+)";
+
+constexpr const char* kScenePixelShader = R"(
+Texture2D BaseColor : register(t0);
+SamplerState BaseSampler : register(s0);
+cbuffer MaterialCB : register(b2)
+{
+    uint TextureMode;
+    uint MaterialId;
+    uint ViewMode;
+};
+
+struct PSInput
+{
+    float4 position : SV_Position;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
+};
+
+float4 main(PSInput input) : SV_Target
+{
+    const float3 n = input.normal * rsqrt(max(dot(input.normal, input.normal), 0.00001));
+    float4 baseColor = float4(1, 0, 1, 1);
+    if (TextureMode != 0)
+        baseColor = BaseColor.Sample(BaseSampler, input.uv);
+    if (TextureMode == 2)
+        clip(baseColor.a - 0.5);
+    if (ViewMode == 1)
+        return float4(frac((MaterialId + 1) * float3(0.618, 0.381, 0.173)), 1);
+    if (ViewMode == 2)
+        return float4(frac(input.uv), saturate(n.y * 0.5 + 0.5), 1);
+    if (ViewMode == 3)
+        return TextureMode == 0 ? float4(1, 0, 1, 1) : float4(0, 0, 0, 1);
+    const float light = 0.48 + 0.52 * saturate(dot(n, normalize(float3(-0.4, 0.8, 0.3))));
+    const float3 diffuseLinear = saturate(baseColor.rgb * light);
+    return float4(max(min(12.92 * diffuseLinear, 0.04045),
+                      1.055 * pow(diffuseLinear, 1.0 / 2.4) - 0.055), 1);
 }
 )";
 
@@ -325,7 +370,7 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
     else
         m_cullMode = D3D12_CULL_MODE_BACK;
 
-    D3D12_ROOT_PARAMETER parameters[2] = {};
+    D3D12_ROOT_PARAMETER parameters[4] = {};
     for (uint32_t i = 0; i < 2; ++i)
     {
         parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -334,8 +379,28 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
         parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 2;
+    D3D12_DESCRIPTOR_RANGE textureRange = {};
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 1;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &textureRange;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[3].Constants.ShaderRegister = 2;
+    parameters[3].Constants.Num32BitValues = 4;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rootDesc.NumParameters = m_textured ? 4u : 2u;
     rootDesc.pParameters = parameters;
+    rootDesc.NumStaticSamplers = m_textured ? 1u : 0u;
+    rootDesc.pStaticSamplers = m_textured ? &sampler : nullptr;
     rootDesc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -361,7 +426,8 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
     std::string compileReason;
     if (!CompileShader(kM23VertexShader, "main", "vs_5_0", &vertexShader,
                        compileReason) ||
-        !CompileShader(kM23PixelShader, "main", "ps_5_0", &pixelShader,
+        !CompileShader(m_textured ? kScenePixelShader : kM23PixelShader,
+                       "main", "ps_5_0", &pixelShader,
                        compileReason))
         return Fail(reason, "M23 shader compile failed: " + compileReason);
 
@@ -402,7 +468,11 @@ bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
     hr = device->CreateGraphicsPipelineState(
         &desc, IID_PPV_ARGS(m_pipelineState.GetAddressOf()));
     if (FAILED(hr))
+    {
+        Msg("ph_dx12_m23: CreateGraphicsPipelineState hr=0x%08X",
+            static_cast<unsigned>(hr));
         return Fail(reason, "M23 graphics pipeline creation failed");
+    }
     m23probe12::MarkCreated();
 
     Msg("ph_dx12_m23: pipeline ready rt=R8G8B8A8_UNORM depth=D32_FLOAT "
@@ -762,7 +832,7 @@ bool GameDx12FourVisual12::LoadFromBatchImpl(
 bool GameDx12FourVisual12::LoadScene(
     const GameDx12FourVisualOwner12& owner, const char* levelName,
     const j2bbatch12::Identity12& live, j2bbatch12::SceneBatch12&& scene,
-    std::string& reason)
+    const std::vector<GameDx12SceneTexture12>* textures, std::string& reason)
 {
     try
     {
@@ -771,7 +841,8 @@ bool GameDx12FourVisual12::LoadScene(
         if (live.levelSession == 0 || live.levelEpoch == 0 || scene.identity != live ||
             scene.error.code != j2bbatch12::Error12::None ||
             scene.sources.empty() || scene.sources.size() > kSceneCapacity ||
-            scene.instances.empty() || scene.instances.size() > kSceneCapacity)
+            scene.instances.empty() || scene.instances.size() > kSceneCapacity ||
+            (textures && textures->size() > kSceneCapacity))
             return Fail(reason, "B1 invalid scene batch");
         for (const auto& instance : scene.instances)
         {
@@ -789,6 +860,7 @@ bool GameDx12FourVisual12::LoadScene(
         }
 
         m_generation = NextGeneration(live.levelSession, live.levelEpoch, 0);
+        m_textured = textures != nullptr;
         m_sourceCount = static_cast<uint32_t>(scene.sources.size());
         for (uint32_t index = 0; index < m_sourceCount; ++index)
         {
@@ -804,7 +876,7 @@ bool GameDx12FourVisual12::LoadScene(
         Msg("ph_dx12_b1: sources=%u instances=%zu unsupported=%u asset_bytes=%llu",
             m_sourceCount, m_worldInstances.size(), scene.unsupportedInstances,
             static_cast<unsigned long long>(scene.assetBytes));
-        return UploadGeometry(owner, levelName, live, reason);
+        return UploadGeometry(owner, levelName, live, reason, textures);
     }
     catch (...)
     {
@@ -814,7 +886,8 @@ bool GameDx12FourVisual12::LoadScene(
 
 bool GameDx12FourVisual12::UploadGeometry(
     const GameDx12FourVisualOwner12& owner, const char* levelName,
-    const j2bbatch12::Identity12& live, std::string& reason)
+    const j2bbatch12::Identity12& live, std::string& reason,
+    const std::vector<GameDx12SceneTexture12>* textures)
 {
     const uint64_t levelSession = live.levelSession;
     const uint64_t levelEpoch = live.levelEpoch;
@@ -847,7 +920,8 @@ bool GameDx12FourVisual12::UploadGeometry(
     M23RecordingGuard12 recording(owner.list, m_listPoisoned,
                                   m_lastRecordingClosed,
                                   "close-failure");
-    if (!CreateGeometryBuffers(owner.device, owner.list, reason))
+    if (!CreateGeometryBuffers(owner.device, owner.list, reason) ||
+        (textures && !CreateSceneTextures(owner.device, owner.list, *textures, reason)))
     {
         const bool closed = recording.Abandon();
         Msg("ph_dx12_m23: upload recording failed list_closed=%d "
@@ -910,6 +984,8 @@ bool GameDx12FourVisual12::UploadGeometry(
     m_uploadFenceValue = expected;
     m_uploadConfirmed = true;
     m_uploadSubmitted = false;
+    for (auto& texture : m_textures)
+        texture.upload.Reset();
     m_loaded = true;
     m_levelSession = levelSession;
     m_levelEpoch = levelEpoch;
@@ -919,6 +995,135 @@ bool GameDx12FourVisual12::UploadGeometry(
         static_cast<unsigned long long>(levelEpoch), m_sourceCount,
         static_cast<unsigned long long>(m_uploadFenceValue),
         static_cast<unsigned long long>(m_generation));
+    return true;
+}
+
+bool GameDx12FourVisual12::CreateSceneTextures(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list,
+    const std::vector<GameDx12SceneTexture12>& textures, std::string& reason)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors = static_cast<UINT>(textures.size() + 1);
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(m_textureHeap.GetAddressOf()))))
+        return Fail(reason, "B2 descriptor heap allocation failed");
+    m23probe12::MarkCreated();
+    m_textureDescriptorSize = device->GetDescriptorHandleIncrementSize(heap.Type);
+
+    auto cpu = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_BC1_UNORM_SRGB;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(nullptr, &srv, cpu);
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    constexpr UINT64 uploadBudget = 32ull * 1024 * 1024;
+    UINT64 usedUpload = 0;
+
+    for (uint32_t index = 0; index < textures.size(); ++index)
+    {
+        cpu.ptr += m_textureDescriptorSize;
+        const auto& source = textures[index];
+        const auto& dds = source.dds;
+        if (dds.data.empty())
+            continue;
+        const char* copyReason = nullptr;
+        if (!ValidateXrayTextureSource(dds, &copyReason) || dds.format != DXGI_FORMAT_BC1_UNORM)
+            return Fail(reason, "B2 invalid BC1 source");
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = dds.width;
+        desc.Height = dds.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = static_cast<UINT16>(dds.mipCount);
+        desc.Format = dds.format;
+        desc.SampleDesc.Count = 1;
+
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layout(dds.mipCount);
+        std::vector<UINT> rows(dds.mipCount);
+        std::vector<UINT64> rowBytes(dds.mipCount);
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&desc, 0, dds.mipCount, 0, layout.data(),
+                                      rows.data(), rowBytes.data(), &bytes);
+        if (!ValidateXrayTextureCopy(dds, layout.data(), rows.data(), rowBytes.data(),
+                                     dds.mipCount, bytes, &copyReason))
+            return Fail(reason, copyReason);
+        if (bytes > uploadBudget - usedUpload)
+        {
+            Msg("ph_dx12_b2: texture fallback name='%s' reason='upload budget'", source.name.c_str());
+            continue;
+        }
+        usedUpload += bytes;
+
+        auto& texture = m_textures[index + 1];
+        desc.Format = DXGI_FORMAT_BC1_TYPELESS;
+        if (FAILED(device->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(texture.image.GetAddressOf()))))
+            return Fail(reason, "B2 texture allocation failed");
+        m23probe12::MarkCreated();
+        const auto uploadDesc = BufferDesc(bytes);
+        if (FAILED(device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(texture.upload.GetAddressOf()))))
+            return Fail(reason, "B2 texture upload allocation failed");
+        m23probe12::MarkCreated();
+        const D3D12_RANGE noRead{};
+        void* mapped = nullptr;
+        if (FAILED(texture.upload->Map(0, &noRead, &mapped)))
+            return Fail(reason, "B2 texture upload mapping failed");
+        for (uint32_t mip = 0; mip < dds.mipCount; ++mip)
+        {
+            const auto& level = dds.mips[mip];
+            for (UINT row = 0; row < rows[mip]; ++row)
+                std::memcpy(static_cast<uint8_t*>(mapped) + layout[mip].Offset +
+                                static_cast<UINT64>(row) * layout[mip].Footprint.RowPitch,
+                            dds.data.data() + level.dataOffset +
+                                static_cast<UINT64>(row) * level.rowPitch,
+                            level.rowPitch);
+        }
+        texture.upload->Unmap(0, nullptr);
+        for (uint32_t mip = 0; mip < dds.mipCount; ++mip)
+        {
+            D3D12_TEXTURE_COPY_LOCATION from{};
+            from.pResource = texture.upload.Get();
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = layout[mip];
+            D3D12_TEXTURE_COPY_LOCATION into{};
+            into.pResource = texture.image.Get();
+            into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            into.SubresourceIndex = mip;
+            list->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = texture.image.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        list->ResourceBarrier(1, &barrier);
+
+        srv.Texture2D.MipLevels = dds.mipCount;
+        device->CreateShaderResourceView(texture.image.Get(), &srv, cpu);
+        for (uint32_t slot = 0; slot < m_sourceCount; ++slot)
+        {
+            auto& geometry = m_slots[slot];
+            if (_stricmp(source.name.c_str(), geometry.asset.textureName.c_str()) != 0)
+                continue;
+            geometry.textureIndex = index + 1;
+            geometry.alphaTest = source.alphaTest &&
+                geometry.asset.shaderName.find("aref") != std::string::npos;
+            Msg("ph_dx12_b2: visual=%u material=%u texture='%s' shader='%s' alpha_test=%d",
+                geometry.visualId, slot, source.name.c_str(),
+                geometry.asset.shaderName.c_str(), geometry.alphaTest ? 1 : 0);
+        }
+    }
     return true;
 }
 
@@ -1079,11 +1284,26 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (!m_worldInstances.empty())
     {
+        if (m_textured)
+        {
+            ID3D12DescriptorHeap* heaps[]{m_textureHeap.Get()};
+            list->SetDescriptorHeaps(1, heaps);
+        }
         list->SetGraphicsRootConstantBufferView(0, m_frameCBVA);
         list->SetGraphicsRootConstantBufferView(1, m_objectCBVA[0]);
         for (uint32_t visible = 0; visible < m_visibleCount; ++visible)
         {
             const SlotGpu12& source = m_slots[m_visibleSources[visible]];
+            if (m_textured)
+            {
+                auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+                gpu.ptr += static_cast<UINT64>(source.textureIndex) * m_textureDescriptorSize;
+                list->SetGraphicsRootDescriptorTable(2, gpu);
+                const uint32_t mode = source.textureIndex == 0 ? 0u :
+                                      (source.alphaTest ? 2u : 1u);
+                const uint32_t material[]{mode, m_visibleSources[visible], m_materialView, 0};
+                list->SetGraphicsRoot32BitConstants(3, 4, material, 0);
+            }
             list->IASetVertexBuffers(0, 1, &source.vertexView);
             list->IASetIndexBuffer(&source.indexView);
             list->DrawIndexedInstanced(source.indexCount, 1, 0, 0, 0);
@@ -1469,8 +1689,11 @@ bool GameDx12FourVisual12::RenderDiagnosticImpl(
     if (!m_worldInstances.empty())
     {
         const std::wstring path = wantPng
-            ? JoinPath(pngDirectory, L"b1_jupiter_world.png") : std::wstring{};
+            ? JoinPath(pngDirectory, m_textured ? L"b2_jupiter_textured.png"
+                                               : L"b1_jupiter_world.png")
+            : std::wstring{};
         PassResult12 pass;
+        m_materialView = 0;
         const bool completed = RunPass(owner, offscreen,
             (1u << kSlotCount) - 1u, true, wantPng, path.c_str(), pass, reason);
         result->gpuCompleted = pass.gpuConfirmed;
@@ -1480,6 +1703,37 @@ bool GameDx12FourVisual12::RenderDiagnosticImpl(
         result->combinedDrawCount = completed ? m_visibleCount : 0;
         result->pngSaved = completed && wantPng;
         result->imageGatePass = completed && pass.coverage.nonClearPixels > 0;
+        if (m_textured && result->imageGatePass)
+        {
+            uint32_t texturedDraws = 0;
+            for (uint32_t i = 0; i < m_visibleCount; ++i)
+                texturedDraws += m_slots[m_visibleSources[i]].textureIndex != 0;
+            Msg("ph_dx12_b2: frame textured_draws=%u fallback_draws=%u fence=%llu",
+                texturedDraws, m_visibleCount - texturedDraws,
+                static_cast<unsigned long long>(pass.fence));
+            result->imageGatePass = texturedDraws != 0;
+            if (result->imageGatePass && wantPng)
+            {
+                const wchar_t* const names[] = {
+                    L"b2_jupiter_material_ids.png", L"b2_jupiter_uv_normals.png",
+                    L"b2_jupiter_unsupported_mask.png"};
+                for (uint32_t i = 0; i < 3; ++i)
+                {
+                    m_materialView = i + 1;
+                    PassResult12 view;
+                    const std::wstring debugPath = JoinPath(pngDirectory, names[i]);
+                    if (!RunPass(owner, offscreen, (1u << kSlotCount) - 1u, true,
+                                 true, debugPath.c_str(), view, reason))
+                    {
+                        result->gpuCompleted = view.gpuConfirmed;
+                        result->imageGatePass = false;
+                        return false;
+                    }
+                    result->lastDrawUseFence = view.fence;
+                }
+                m_materialView = 0;
+            }
+        }
         return result->imageGatePass;
     }
     std::wstring combinedPath;
@@ -1705,6 +1959,10 @@ void GameDx12FourVisual12::ReleaseGpu()
     m_constants.Reset();
     m_rootSignature.Reset();
     m_pipelineState.Reset();
+    m_textureHeap.Reset();
+    for (auto& texture : m_textures)
+        texture = {};
+    m_textured = false;
     for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_slots[slot] = SlotGpu12{};
     InvalidateStaging();
@@ -1753,6 +2011,12 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
             DetachToQuarantine(g_fourVisualQuarantine.slots[slot][3],
                                m_slots[slot].uploadIndex);
         }
+        for (uint32_t i = 0; i <= kSceneCapacity; ++i)
+        {
+            DetachToQuarantine(g_fourVisualQuarantine.textures[i][0], m_textures[i].image);
+            DetachToQuarantine(g_fourVisualQuarantine.textures[i][1], m_textures[i].upload);
+        }
+        DetachToQuarantine(g_fourVisualQuarantine.textureHeap, m_textureHeap);
         DetachToQuarantine(g_fourVisualQuarantine.constants, m_constants);
         DetachToQuarantine(g_fourVisualQuarantine.rootSignature,
                            m_rootSignature);
@@ -1773,6 +2037,12 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
             DetachAndDrop(m_slots[slot].uploadVertex);
             DetachAndDrop(m_slots[slot].uploadIndex);
         }
+        for (auto& texture : m_textures)
+        {
+            DetachAndDrop(texture.image);
+            DetachAndDrop(texture.upload);
+        }
+        DetachAndDrop(m_textureHeap);
         DetachAndDrop(m_constants);
         DetachAndDrop(m_rootSignature);
         DetachAndDrop(m_pipelineState);
@@ -1794,6 +2064,7 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
     m_passSlotMask = 0;
     m_passFenceValue = 0;
     m_worldInstances.clear();
+    m_textured = false;
     m_sourceCount = 0;
     m_levelSession = 0;
     m_levelEpoch = 0;
