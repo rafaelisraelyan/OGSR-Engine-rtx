@@ -703,6 +703,100 @@ bool PrepareBatchImpl(const Snapshot12& snapshot, const Identity12& expected,
     }
 }
 
+bool PrepareSceneSector(const Snapshot12& snapshot, const Identity12& expected,
+                        uint32_t sectorId, SceneBatch12& result,
+                        const Limits12& limits) noexcept
+{
+    result = {};
+    const auto fail = [&](Error12 code, const char* reason)
+    {
+        SetErrorInfo(result.error, code, reason);
+        return false;
+    };
+    try
+    {
+        if (expected.levelSession == 0 || expected.levelEpoch == 0 ||
+            snapshot.identity != expected)
+            return fail(Error12::InvalidIdentity, "snapshot session/epoch mismatch");
+        if (snapshot.levelBytes.empty() || snapshot.geomBytes.empty())
+            return fail(Error12::EmptyInput, "empty snapshot input");
+        if (snapshot.levelBytes.size() > limits.maxLevelBytes ||
+            snapshot.geomBytes.size() > limits.maxGeomBytes)
+            return fail(Error12::InputLimit, "snapshot exceeds input byte limit");
+
+        levelhierarchy12::LevelHierarchy hierarchy;
+        std::string reason;
+        if (!levelhierarchy12::Parse(snapshot.levelBytes, hierarchy, reason))
+            return fail(Error12::HierarchyParse, reason.c_str());
+        std::vector<levelhierarchy12::LeafInstance> leaves;
+        levelhierarchy12::CollectStats stats;
+        const levelhierarchy12::CollectBudget budget{
+            limits.maxInstances, limits.maxNodeVisits, limits.maxEdgeVisits};
+        if (levelhierarchy12::CollectSectorLeaves(
+                hierarchy, sectorId, budget, leaves, stats, reason) !=
+            levelhierarchy12::CollectStatus::Complete)
+            return fail(Error12::SectorCollect, reason.c_str());
+
+        SceneBatch12 candidate;
+        candidate.identity = expected;
+        candidate.instances.reserve(leaves.size());
+        std::vector<uint32_t> unsupportedVisuals;
+        for (const auto& leaf : leaves)
+        {
+            const InstanceKey12 instance{
+                leaf.sectorIndex, leaf.rootVisualId, leaf.referenceOrdinal,
+                leaf.visualId};
+            const auto source = std::find_if(
+                candidate.sources.begin(), candidate.sources.end(),
+                [&](const Slot12& slot) { return slot.source.visualId == leaf.visualId; });
+            if (source != candidate.sources.end())
+            {
+                candidate.instances.push_back({
+                    instance, static_cast<uint32_t>(source - candidate.sources.begin())});
+                continue;
+            }
+            if (std::find(unsupportedVisuals.begin(), unsupportedVisuals.end(),
+                          leaf.visualId) != unsupportedVisuals.end())
+            {
+                ++candidate.unsupportedInstances;
+                continue;
+            }
+
+            Slot12 slot;
+            if (!ConvertSlot(snapshot, leaf.visualId, instance, limits, slot))
+            {
+                if (slot.readError != xraylevel12::ReadError::UnsupportedDeclaration &&
+                    slot.readError != xraylevel12::ReadError::UnsupportedDeclarationElement)
+                    return fail(slot.error.code, slot.error.text);
+                unsupportedVisuals.push_back(leaf.visualId);
+                ++candidate.unsupportedInstances;
+                continue;
+            }
+            const uint64_t bytes =
+                static_cast<uint64_t>(slot.vertexCount) * sizeof(XrayVertex12) +
+                static_cast<uint64_t>(slot.indexCount) * sizeof(uint16_t);
+            if (bytes > limits.maxTotalAssetBytes - candidate.assetBytes)
+                return fail(Error12::TotalAssetLimit, "scene sector exceeds asset byte limit");
+            candidate.assetBytes += bytes;
+            candidate.instances.push_back(
+                {instance, static_cast<uint32_t>(candidate.sources.size())});
+            candidate.sources.push_back(std::move(slot));
+        }
+        if (candidate.instances.empty())
+            return fail(Error12::MissingVisual, "scene sector has no supported geometry");
+        result = std::move(candidate);
+        return true;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return fail(Error12::AllocationFailure, "scene sector allocation failed");
+    }
+    catch (...)
+    {
+        return fail(Error12::Exception, "scene sector preparation failed");
+    }
+}
+
 bool PrepareBatch(const Snapshot12& snapshot, const Identity12& expected,
                   uint32_t sectorId, uint32_t rootVisualId,
                   const std::array<uint32_t, kTargetVisualCount>& visuals,

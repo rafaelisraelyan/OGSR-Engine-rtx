@@ -24,7 +24,7 @@ namespace
 constexpr uint32_t kVertexStride = 32;
 constexpr uint64_t kConstantsBytes =
     dx12object12::kObjectConstantsOffset +
-    static_cast<uint64_t>(fourvisual12::kSlotCount) *
+    static_cast<uint64_t>(GameDx12FourVisual12::kSceneCapacity) *
         dx12object12::kObjectConstantsSize;
 
 // Process-lifetime quarantine. Raw pointers only: nothing here is released and
@@ -32,7 +32,7 @@ constexpr uint64_t kConstantsBytes =
 struct FourVisualQuarantine12
 {
     bool occupied = false;
-    IUnknown* slots[fourvisual12::kSlotCount][4] = {};
+    IUnknown* slots[GameDx12FourVisual12::kSceneCapacity][4] = {};
     IUnknown* constants = nullptr;
     IUnknown* rootSignature = nullptr;
     IUnknown* pipelineState = nullptr;
@@ -439,7 +439,7 @@ bool GameDx12FourVisual12::CreateConstants(ID3D12Device* device,
     }
     std::memset(m_constantsMapped, 0, static_cast<size_t>(kConstantsBytes));
     m_frameCBVA = m_constants->GetGPUVirtualAddress();
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < m_sourceCount; ++slot)
     {
         m_objectCBVA[slot] =
             m_frameCBVA + dx12object12::ObjectConstantsOffset(slot);
@@ -459,12 +459,12 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
     D3D12_HEAP_PROPERTIES uploadHeap = {};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
-    D3D12_RESOURCE_BARRIER barriers[kSlotCount * 2] = {};
+    D3D12_RESOURCE_BARRIER barriers[kSceneCapacity * 2] = {};
     uint32_t barrierCount = 0;
     uint64_t vertexBytesTotal = 0;
     uint64_t indexBytesTotal = 0;
 
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < m_sourceCount; ++slot)
     {
         SlotGpu12& gpu = m_slots[slot];
         const uint64_t vertexBytes =
@@ -581,18 +581,18 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
         gpu.indexView.SizeInBytes = static_cast<UINT>(indexBytes);
         gpu.indexView.Format = DXGI_FORMAT_R16_UINT;
     }
-    if (barrierCount != kSlotCount * 2)
+    if (barrierCount != m_sourceCount * 2)
         return Fail(reason, "M23 geometry barrier count mismatch");
     list->ResourceBarrier(barrierCount, barriers);
 
     // Distinct, non-zero GPU handles are a hard part of the contribution
     // contract: one asset cannot silently alias another.
-    for (uint32_t a = 0; a < kSlotCount; ++a)
+    for (uint32_t a = 0; a < m_sourceCount; ++a)
     {
         if (m_slots[a].vertexView.BufferLocation == 0 ||
             m_slots[a].indexView.BufferLocation == 0)
             return Fail(reason, "M23 geometry handle is null");
-        for (uint32_t b = a + 1; b < kSlotCount; ++b)
+        for (uint32_t b = a + 1; b < m_sourceCount; ++b)
         {
             if (m_slots[a].vertexView.BufferLocation ==
                     m_slots[b].vertexView.BufferLocation ||
@@ -666,12 +666,10 @@ bool GameDx12FourVisual12::HandleLoadException(std::string& reason) noexcept
     return false;
 }
 
-bool GameDx12FourVisual12::LoadFromBatchImpl(
+bool GameDx12FourVisual12::CanLoad(
     const GameDx12FourVisualOwner12& owner, const char* levelName,
-    const j2bbatch12::Identity12& live, j2bbatch12::BatchResult12& batch,
     std::string& reason)
 {
-    static_assert(kSlotCount == j2bbatch12::kTargetVisualCount);
     m_lastError.clear();
     if (owner.device == nullptr || owner.queue == nullptr ||
         owner.fence == nullptr || owner.fenceEvent == nullptr ||
@@ -689,6 +687,17 @@ bool GameDx12FourVisual12::LoadFromBatchImpl(
         return Fail(reason, "M23 registry is already loaded");
     if (*owner.fenceValue == std::numeric_limits<uint64_t>::max())
         return Fail(reason, "M23 owner fence overflow");
+    return true;
+}
+
+bool GameDx12FourVisual12::LoadFromBatchImpl(
+    const GameDx12FourVisualOwner12& owner, const char* levelName,
+    const j2bbatch12::Identity12& live, j2bbatch12::BatchResult12& batch,
+    std::string& reason)
+{
+    static_assert(kSlotCount == j2bbatch12::kTargetVisualCount);
+    if (!CanLoad(owner, levelName, reason))
+        return false;
     if (!fourvisual12::ValidatePlan12(fourvisual12::kPlan, kSlotCount,
                                       reason))
         return Fail(reason, "M23 plan rejected");
@@ -746,6 +755,69 @@ bool GameDx12FourVisual12::LoadFromBatchImpl(
             gpu.asset.sphere.radius);
     }
 
+    m_sourceCount = kSlotCount;
+    return UploadGeometry(owner, levelName, live, reason);
+}
+
+bool GameDx12FourVisual12::LoadScene(
+    const GameDx12FourVisualOwner12& owner, const char* levelName,
+    const j2bbatch12::Identity12& live, j2bbatch12::SceneBatch12&& scene,
+    std::string& reason)
+{
+    try
+    {
+        if (!CanLoad(owner, levelName, reason))
+            return false;
+        if (live.levelSession == 0 || live.levelEpoch == 0 || scene.identity != live ||
+            scene.error.code != j2bbatch12::Error12::None ||
+            scene.sources.empty() || scene.sources.size() > kSceneCapacity ||
+            scene.instances.empty() || scene.instances.size() > kSceneCapacity)
+            return Fail(reason, "B1 invalid scene batch");
+        for (const auto& instance : scene.instances)
+        {
+            if (instance.sourceIndex >= scene.sources.size() ||
+                scene.sources[instance.sourceIndex].source.visualId != instance.identity.visualId)
+                return Fail(reason, "B1 invalid scene instance source");
+        }
+        for (const auto& source : scene.sources)
+        {
+            if (!source.valid || source.source.levelSession != live.levelSession ||
+                source.vertexCount == 0 || source.indexCount == 0 ||
+                source.asset.vertices.size() != source.vertexCount ||
+                source.asset.indices.size() != source.indexCount)
+                return Fail(reason, "B1 invalid scene source");
+        }
+
+        m_generation = NextGeneration(live.levelSession, live.levelEpoch, 0);
+        m_sourceCount = static_cast<uint32_t>(scene.sources.size());
+        for (uint32_t index = 0; index < m_sourceCount; ++index)
+        {
+            auto& source = scene.sources[index];
+            auto& gpu = m_slots[index];
+            gpu.asset = std::move(source.asset);
+            gpu.visualId = source.source.visualId;
+            gpu.vertexCount = source.vertexCount;
+            gpu.indexCount = source.indexCount;
+            gpu.generation = m_generation;
+        }
+        m_worldInstances = std::move(scene.instances);
+        Msg("ph_dx12_b1: sources=%u instances=%zu unsupported=%u asset_bytes=%llu",
+            m_sourceCount, m_worldInstances.size(), scene.unsupportedInstances,
+            static_cast<unsigned long long>(scene.assetBytes));
+        return UploadGeometry(owner, levelName, live, reason);
+    }
+    catch (...)
+    {
+        return HandleLoadException(reason);
+    }
+}
+
+bool GameDx12FourVisual12::UploadGeometry(
+    const GameDx12FourVisualOwner12& owner, const char* levelName,
+    const j2bbatch12::Identity12& live, std::string& reason)
+{
+    const uint64_t levelSession = live.levelSession;
+    const uint64_t levelEpoch = live.levelEpoch;
     if (!CreatePipeline(owner.device, reason))
     {
         ReleaseGpu();
@@ -844,7 +916,7 @@ bool GameDx12FourVisual12::LoadFromBatchImpl(
     Msg("ph_dx12_m23: upload complete level='%s' session=%llu epoch=%llu "
         "slots=%u upload_fence=%llu generation=%llu",
         levelName, static_cast<unsigned long long>(levelSession),
-        static_cast<unsigned long long>(levelEpoch), kSlotCount,
+        static_cast<unsigned long long>(levelEpoch), m_sourceCount,
         static_cast<unsigned long long>(m_uploadFenceValue),
         static_cast<unsigned long long>(m_generation));
     return true;
@@ -853,6 +925,7 @@ bool GameDx12FourVisual12::LoadFromBatchImpl(
 void GameDx12FourVisual12::InvalidateStaging()
 {
     m_stagingPrepared = false;
+    m_visibleCount = 0;
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
         m_staged[slot] = {};
 }
@@ -870,6 +943,47 @@ bool GameDx12FourVisual12::PrepareStaging(
     const DirectX::XMFLOAT4X4 shaderCamera =
         Transpose(logicalViewProjection);
     std::memcpy(m_constantsMapped, &shaderCamera, sizeof(shaderCamera));
+
+    if (!m_worldInstances.empty())
+    {
+        const auto viewProjection = DirectX::XMLoadFloat4x4(&logicalViewProjection);
+        for (const auto& instance : m_worldInstances)
+        {
+            const auto& bounds = m_slots[instance.sourceIndex].asset;
+            unsigned outside = 0x3f;
+            for (unsigned corner = 0; corner < 8 && outside != 0; ++corner)
+            {
+                const auto point = DirectX::XMVectorSet(
+                    corner & 1 ? bounds.maximum.x : bounds.minimum.x,
+                    corner & 2 ? bounds.maximum.y : bounds.minimum.y,
+                    corner & 4 ? bounds.maximum.z : bounds.minimum.z, 1.0f);
+                DirectX::XMFLOAT4 clip;
+                DirectX::XMStoreFloat4(&clip, DirectX::XMVector4Transform(point, viewProjection));
+                // Отбрасываем AABB, только если все углы снаружи одной плоскости D3D.
+                unsigned mask = 0;
+                if (clip.x < -clip.w) mask |= 1;
+                if (clip.x > clip.w) mask |= 2;
+                if (clip.y < -clip.w) mask |= 4;
+                if (clip.y > clip.w) mask |= 8;
+                if (clip.z < 0) mask |= 16;
+                if (clip.z > clip.w) mask |= 32;
+                outside &= mask;
+            }
+            if (outside == 0)
+                m_visibleSources[m_visibleCount++] = instance.sourceIndex;
+        }
+        DirectX::XMFLOAT4X4 world;
+        DirectX::XMStoreFloat4x4(&world, DirectX::XMMatrixIdentity());
+        dx12object12::ObjectConstants12 constants{};
+        if (!dx12object12::BuildObjectConstants12(
+                world, {0.8f, 0.8f, 0.8f, 1.0f}, constants))
+            return Fail(reason, "B1 object constants rejected");
+        std::memcpy(static_cast<uint8_t*>(m_constantsMapped) +
+                        dx12object12::ObjectConstantsOffset(0),
+                    &constants, sizeof(constants));
+        m_stagingPrepared = true;
+        return true;
+    }
 
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
     {
@@ -963,6 +1077,19 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
     list->SetGraphicsRootSignature(m_rootSignature.Get());
     list->SetPipelineState(m_pipelineState.Get());
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (!m_worldInstances.empty())
+    {
+        list->SetGraphicsRootConstantBufferView(0, m_frameCBVA);
+        list->SetGraphicsRootConstantBufferView(1, m_objectCBVA[0]);
+        for (uint32_t visible = 0; visible < m_visibleCount; ++visible)
+        {
+            const SlotGpu12& source = m_slots[m_visibleSources[visible]];
+            list->IASetVertexBuffers(0, 1, &source.vertexView);
+            list->IASetIndexBuffer(&source.indexView);
+            list->DrawIndexedInstanced(source.indexCount, 1, 0, 0, 0);
+        }
+        return true;
+    }
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
     {
         if ((slotMask & (1u << slot)) == 0)
@@ -1339,6 +1466,22 @@ bool GameDx12FourVisual12::RenderDiagnosticImpl(
 
     const bool wantPng =
         pngDirectory != nullptr && pngDirectory[0] != L'\0';
+    if (!m_worldInstances.empty())
+    {
+        const std::wstring path = wantPng
+            ? JoinPath(pngDirectory, L"b1_jupiter_world.png") : std::wstring{};
+        PassResult12 pass;
+        const bool completed = RunPass(owner, offscreen,
+            (1u << kSlotCount) - 1u, true, wantPng, path.c_str(), pass, reason);
+        result->gpuCompleted = pass.gpuConfirmed;
+        result->combinedFence = pass.fence;
+        result->lastDrawUseFence = m_lastDrawUseFenceValue;
+        result->combinedCoverage = pass.coverage;
+        result->combinedDrawCount = completed ? m_visibleCount : 0;
+        result->pngSaved = completed && wantPng;
+        result->imageGatePass = completed && pass.coverage.nonClearPixels > 0;
+        return result->imageGatePass;
+    }
     std::wstring combinedPath;
     std::wstring isolatedPath[kSlotCount];
     if (wantPng)
@@ -1515,8 +1658,10 @@ void GameDx12FourVisual12::OnLevelTeardown(uint64_t nextEpoch)
         ReleaseGpu();
         return;
     }
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_slots[slot] = SlotGpu12{};
+    m_worldInstances.clear();
+    m_sourceCount = 0;
     m_levelSession = 0;
     m_generation = 0;
 }
@@ -1543,7 +1688,7 @@ void GameDx12FourVisual12::OnDeviceReset(uint64_t nextEpoch)
                                       m_generation);
     else
         m_generation = 0;
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_slots[slot].generation = m_generation;
 }
 
@@ -1560,7 +1705,7 @@ void GameDx12FourVisual12::ReleaseGpu()
     m_constants.Reset();
     m_rootSignature.Reset();
     m_pipelineState.Reset();
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_slots[slot] = SlotGpu12{};
     InvalidateStaging();
     m_passFence.Reset();
@@ -1574,11 +1719,13 @@ void GameDx12FourVisual12::ReleaseGpu()
     m_uploadFenceValue = 0;
     m_lastDrawUseFenceValue = 0;
     m_loaded = false;
+    m_worldInstances.clear();
+    m_sourceCount = 0;
     m_levelSession = 0;
     m_levelEpoch = 0;
     m_generation = 0;
     m_frameCBVA = 0;
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_objectCBVA[slot] = 0;
 }
 
@@ -1595,7 +1742,7 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
     if (!occupiedAtEntry)
     {
         g_fourVisualQuarantine.occupied = true;
-        for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+        for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         {
             DetachToQuarantine(g_fourVisualQuarantine.slots[slot][0],
                                m_slots[slot].vertexBuffer);
@@ -1619,7 +1766,7 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
         // The process-lifetime quarantine is already occupied. Drop the
         // references without Release: intentionally leaked until exit, never
         // released while completion is unknown.
-        for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+        for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         {
             DetachAndDrop(m_slots[slot].vertexBuffer);
             DetachAndDrop(m_slots[slot].indexBuffer);
@@ -1633,7 +1780,7 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
         DetachAndDrop(m_passDevice);
     }
 
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_slots[slot] = SlotGpu12{};
     InvalidateStaging();
     m_loaded = false;
@@ -1646,11 +1793,13 @@ void GameDx12FourVisual12::QuarantineGpu() noexcept
     m_passSubmitted = false;
     m_passSlotMask = 0;
     m_passFenceValue = 0;
+    m_worldInstances.clear();
+    m_sourceCount = 0;
     m_levelSession = 0;
     m_levelEpoch = 0;
     m_generation = 0;
     m_frameCBVA = 0;
-    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    for (uint32_t slot = 0; slot < kSceneCapacity; ++slot)
         m_objectCBVA[slot] = 0;
 }
 
@@ -1726,6 +1875,8 @@ void GameDx12FourVisual12::Shutdown(bool gpuCompletionConfirmed)
     }
     InvalidateStaging();
     m_loaded = false;
+    m_worldInstances.clear();
+    m_sourceCount = 0;
     m_levelSession = 0;
     m_levelEpoch = 0;
     m_generation = 0;

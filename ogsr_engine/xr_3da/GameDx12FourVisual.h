@@ -6,6 +6,7 @@
 #include "GameDx12VisualMask.h"
 #include "GameDx12M23Lifetime.h"
 #include "dx12fourvisualplan.h"
+#include "dx12j2bbatch.h"
 #include "dx12objectconstants.h"
 #include "dx12xrayasset.h"
 
@@ -61,6 +62,7 @@ class GameDx12FourVisual12
 public:
     static constexpr DWORD kFenceTimeoutMs = 10000;
     static constexpr uint32_t kSlotCount = fourvisual12::kSlotCount;
+    static constexpr uint32_t kSceneCapacity = 64;
 
     struct SlotResult12
     {
@@ -105,6 +107,9 @@ public:
                        const j2bbatch12::Identity12& live,
                        j2bbatch12::BatchResult12&& batch,
                        std::string& reason);
+    bool LoadScene(const GameDx12FourVisualOwner12& owner,
+                   const char* levelName, const j2bbatch12::Identity12& live,
+                   j2bbatch12::SceneBatch12&& scene, std::string& reason);
 
     // Owner-thread one-shot diagnostic. Records and submits the combined
     // four-draw pass, then four isolated passes, reading back and saving PNGs
@@ -176,6 +181,11 @@ private:
                            const j2bbatch12::Identity12& live,
                            j2bbatch12::BatchResult12& batch,
                            std::string& reason);
+    bool CanLoad(const GameDx12FourVisualOwner12& owner, const char* levelName,
+                 std::string& reason);
+    bool UploadGeometry(const GameDx12FourVisualOwner12& owner,
+                        const char* levelName, const j2bbatch12::Identity12& live,
+                        std::string& reason);
     bool CreatePipeline(ID3D12Device* device, std::string& reason);
     bool CreateConstants(ID3D12Device* device, std::string& reason);
     bool CreateGeometryBuffers(ID3D12Device* device,
@@ -218,7 +228,11 @@ private:
     bool HandleLoadException(std::string& reason) noexcept;
     void LogProbe(const char* stage) noexcept;
 
-    SlotGpu12 m_slots[kSlotCount];
+    SlotGpu12 m_slots[kSceneCapacity];
+    uint32_t m_sourceCount = 0;
+    std::vector<j2bbatch12::SceneInstance12> m_worldInstances;
+    uint32_t m_visibleSources[kSceneCapacity] = {};
+    uint32_t m_visibleCount = 0;
     fourvisual12::StagedTransform12 m_staged[kSlotCount];
 
     M23Ptr12<ID3D12RootSignature> m_rootSignature;
@@ -226,7 +240,7 @@ private:
     M23Ptr12<ID3D12Resource> m_constants;
     void* m_constantsMapped = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS m_frameCBVA = 0;
-    D3D12_GPU_VIRTUAL_ADDRESS m_objectCBVA[kSlotCount] = {};
+    D3D12_GPU_VIRTUAL_ADDRESS m_objectCBVA[kSceneCapacity] = {};
 
     uint32_t m_cullMode = D3D12_CULL_MODE_BACK;
     uint64_t m_levelSession = 0;

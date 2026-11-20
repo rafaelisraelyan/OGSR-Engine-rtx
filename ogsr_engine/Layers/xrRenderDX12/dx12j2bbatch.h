@@ -174,6 +174,28 @@ struct BatchResult12
     ErrorInfo12 error{};
 };
 
+struct SceneInstance12
+{
+    InstanceKey12 identity{};
+    uint32_t sourceIndex = 0;
+};
+
+struct SceneBatch12
+{
+    Identity12 identity{};
+    std::vector<Slot12> sources;
+    std::vector<SceneInstance12> instances;
+    uint32_t unsupportedInstances = 0;
+    uint64_t assetBytes = 0;
+    ErrorInfo12 error{};
+};
+
+// Подготавливает один сектор целиком в пределах лимитов. Неподдерживаемые
+// объявления исключаются из набора, повреждённые данные отклоняют весь набор.
+bool PrepareSceneSector(const Snapshot12& snapshot, const Identity12& expected,
+                        uint32_t sectorId, SceneBatch12& result,
+                        const Limits12& limits) noexcept;
+
 enum class AcceptStatus12 : uint32_t
 {
     Accepted = 0,

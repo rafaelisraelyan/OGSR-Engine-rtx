@@ -208,6 +208,12 @@ bool M23Requested()
     return state.m23Requested;
 }
 
+bool B1WorldRequested()
+{
+    const char* value = std::getenv("OGSR_DX12_GAME_B1_WORLD");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 bool ForceOverflow(const char* stage)
 {
     const char* value =
@@ -1518,23 +1524,41 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                 for (size_t slot = 0; slot < visuals.size(); ++slot)
                     visuals[slot] = fourvisual12::kPlan[slot].visualId;
 
-                j2bbatch12::BatchResult12 batch;
                 const j2bbatch12::Identity12 expected{
                     state.levelSession, state.captureEpoch};
-                const bool prepared = GameDx12J2ABatch_PrepareFromVfs(
-                    state.levelName, expected, jupiterSector, jupiterRootVisual,
-                    visuals, nullptr, false, batch, j2bbatch12::Limits12{});
-                const j2bbatch12::Identity12 live{
-                    state.levelSession, state.captureEpoch};
                 std::string reason;
-                if (!prepared)
+                const bool world = B1WorldRequested();
+                bool loaded = false;
+                const j2bbatch12::Limits12 limits{};
+                if (world)
                 {
-                    Msg("ph_dx12_m23: load failed CPU batch error=%u reason='%s'",
-                        static_cast<unsigned>(batch.error.code), batch.error.text);
+                    j2bbatch12::Snapshot12 snapshot;
+                    j2bbatch12::ErrorInfo12 error;
+                    j2bbatch12::SceneBatch12 scene;
+                    if (!GameDx12J2ABatch_ReadSnapshot(
+                            state.levelName, expected, snapshot, limits, error))
+                        reason = error.text;
+                    else if (!j2bbatch12::PrepareSceneSector(
+                                 snapshot, expected, jupiterSector, scene, limits))
+                        reason = scene.error.text;
+                    else
+                        loaded = state.m23.LoadScene(
+                            owner, state.levelName, {state.levelSession, state.captureEpoch},
+                            std::move(scene), reason);
                 }
-                else if (!state.m23.LoadFromBatch(
-                             owner, state.levelName, live, std::move(batch),
-                             reason))
+                else
+                {
+                    j2bbatch12::BatchResult12 batch;
+                    if (!GameDx12J2ABatch_PrepareFromVfs(
+                            state.levelName, expected, jupiterSector, jupiterRootVisual,
+                            visuals, nullptr, false, batch, limits))
+                        reason = batch.error.text;
+                    else
+                        loaded = state.m23.LoadFromBatch(
+                            owner, state.levelName, {state.levelSession, state.captureEpoch},
+                            std::move(batch), reason);
+                }
+                if (!loaded)
                 {
                     Msg("ph_dx12_m23: load failed reason='%s'",
                         reason.empty() ? "allocation or unknown failure"
@@ -1549,12 +1573,13 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                     state.m23LevelSession = state.levelSession;
                     state.m23LevelEpoch = state.captureEpoch;
                     Msg("ph_dx12_m23: bound level='%s' session=%llu "
-                        "epoch=%llu visuals=9,105,106,107",
+                        "epoch=%llu mode=%s",
                         state.m23LevelName,
                         static_cast<unsigned long long>(
                             state.m23LevelSession),
                         static_cast<unsigned long long>(
-                            state.m23LevelEpoch));
+                            state.m23LevelEpoch),
+                        world ? "world" : "four-visual");
                 }
                 if (!state.gpuUnknown && !state.quarantined &&
                     state.m23.GpuCompletionUnknown())
@@ -1903,10 +1928,11 @@ void GameDx12Bridge_OnFrame()
 
             if (rendered)
             {
-                Msg("ph_dx12_m23: image gate PASS visuals=9,105,106,107 "
+                Msg("ph_dx12_m23: image gate PASS draws=%u "
                     "session=%llu epoch=%llu combined_fence=%llu "
                     "last_draw_use_fence=%llu nonclear=%llu/%llu "
                     "png_saved=%d",
+                    m23Result.combinedDrawCount,
                     static_cast<unsigned long long>(
                         state.levelSession),
                     static_cast<unsigned long long>(
