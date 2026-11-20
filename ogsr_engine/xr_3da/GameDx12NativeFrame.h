@@ -32,6 +32,12 @@ public:
         uint64_t& fenceValue;
     };
 
+    struct GpuTiming
+    {
+        uint64_t present = 0;
+        double milliseconds = 0;
+    };
+
     GameDx12NativeFrame12() = default;
     GameDx12NativeFrame12(const GameDx12NativeFrame12&) = delete;
     GameDx12NativeFrame12& operator=(const GameDx12NativeFrame12&) = delete;
@@ -39,13 +45,13 @@ public:
 
     HRESULT Initialize(HWND window, IDXGIFactory2& factory, const Owner& owner);
     HRESULT Begin(HWND window, const Owner& owner, Recording& recording);
-    HRESULT Present(const Owner& owner);
+    HRESULT Present(const Owner& owner, bool sceneDrawn);
     HRESULT Cancel() noexcept;
     HRESULT Drain(const Owner& owner) noexcept;
     bool CompletionUnknown() const noexcept { return m_unknown; }
     bool IsInitialized() const noexcept { return m_swapchain != nullptr; }
     uint64_t PresentCount() const noexcept { return m_presentCount; }
-    double LastGpuMilliseconds() const noexcept { return m_lastGpuMs; }
+    const GpuTiming& LastGpuTiming() const noexcept { return m_lastGpuTiming; }
     void Release() noexcept;
     void Quarantine() noexcept;
 
@@ -58,7 +64,7 @@ private:
         Ptr<ID3D12CommandAllocator> allocator;
         Ptr<ID3D12GraphicsCommandList> list;
         uint64_t fence = 0;
-        bool timingPending = false;
+        uint64_t timingPresent = 0;
     };
 
     HRESULT Wait(const Owner& owner, uint64_t value) noexcept;
@@ -74,7 +80,7 @@ private:
     Ptr<ID3D12QueryHeap> m_timingQueries;
     Ptr<ID3D12Resource> m_timingReadback;
     uint64_t m_timestampFrequency = 0;
-    double m_lastGpuMs = 0;
+    GpuTiming m_lastGpuTiming;
     uint32_t m_rtvStride = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;

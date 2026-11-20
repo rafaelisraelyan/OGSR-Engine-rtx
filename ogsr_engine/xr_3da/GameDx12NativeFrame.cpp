@@ -230,6 +230,7 @@ HRESULT GameDx12NativeFrame12::Resize(const Owner& owner, uint32_t width, uint32
 HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording& recording)
 {
     recording = {};
+    m_lastGpuTiming = {};
     if (!m_swapchain || !m_depth || m_unknown || m_recording)
         return E_FAIL;
     RECT rect{};
@@ -252,7 +253,7 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     HRESULT hr = Wait(owner, slot.fence);
     if (FAILED(hr))
         return hr;
-    if (m_timingQueries && slot.timingPending)
+    if (m_timingQueries && slot.timingPresent != 0)
     {
         const SIZE_T offset = m_slot * 2 * sizeof(uint64_t);
         const D3D12_RANGE range{offset, offset + 2 * sizeof(uint64_t)};
@@ -262,12 +263,15 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
             uint64_t ticks[2];
             std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, sizeof(ticks));
             if (ticks[1] >= ticks[0])
-                m_lastGpuMs = 1000.0 * static_cast<double>(ticks[1] - ticks[0]) /
-                              static_cast<double>(m_timestampFrequency);
+            {
+                m_lastGpuTiming.present = slot.timingPresent;
+                m_lastGpuTiming.milliseconds = 1000.0 * static_cast<double>(ticks[1] - ticks[0]) /
+                                               static_cast<double>(m_timestampFrequency);
+            }
             const D3D12_RANGE noWrite{};
             m_timingReadback->Unmap(0, &noWrite);
         }
-        slot.timingPending = false;
+        slot.timingPresent = 0;
     }
     hr = slot.allocator->Reset();
     if (FAILED(hr))
@@ -305,7 +309,7 @@ HRESULT GameDx12NativeFrame12::Cancel() noexcept
     return m_slots[m_slot].list->Close();
 }
 
-HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
+HRESULT GameDx12NativeFrame12::Present(const Owner& owner, bool sceneDrawn)
 {
     if (!m_recording || m_unknown)
         return E_FAIL;
@@ -315,7 +319,7 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
         return E_FAIL;
     }
     auto& slot = m_slots[m_slot];
-    if (m_timingQueries)
+    if (m_timingQueries && sceneDrawn)
     {
         const uint32_t query = 2 * m_slot;
         slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
@@ -340,10 +344,13 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
         return signal;
     }
     owner.fenceValue = slot.fence = value;
-    slot.timingPending = m_timingQueries != nullptr;
     const HRESULT hr = m_swapchain->Present(1, 0);
     if (hr == S_OK)
+    {
         ++m_presentCount;
+        if (m_timingQueries && sceneDrawn)
+            slot.timingPresent = m_presentCount;
+    }
     return hr;
 }
 

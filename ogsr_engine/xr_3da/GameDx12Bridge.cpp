@@ -1545,7 +1545,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     const auto presentStart = FrameClock::now();
     if (SUCCEEDED(hr))
-        hr = state.native.Present(owner);
+        hr = state.native.Present(owner, draws != 0);
     const auto presentEnd = FrameClock::now();
     if (FAILED(hr))
     {
@@ -1573,12 +1573,15 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         }();
         if (detailed && frames <= 480)
         {
-            Msg("ph_dx12_metrics: frame=%llu mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
+            const auto& gpu = state.native.LastGpuTiming();
+            Msg("ph_dx12_metrics: frame=%llu present=%llu fence=%llu slot=%u mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
                 "snapshot_ms=%.6f serial_ms=%.6f parallel_ms=%.6f record_ms=%.6f "
-                "present_ms=%.6f gpu_ms=%.6f",
-                static_cast<unsigned long long>(frames), timings.mode, frameMs, elapsed(start, begin),
+                "present_ms=%.6f gpu_present=%llu gpu_ms=%.6f",
+                static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(state.fenceValue), recording.slot,
+                timings.mode, frameMs, elapsed(start, begin),
                 timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
-                elapsed(presentStart, presentEnd), state.native.LastGpuMilliseconds());
+                elapsed(presentStart, presentEnd), static_cast<unsigned long long>(gpu.present), gpu.milliseconds);
         }
         if (frames == 1 || frames == 30 || frames % 120 == 0)
         {

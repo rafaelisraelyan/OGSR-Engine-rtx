@@ -18,6 +18,7 @@
 #include "DiscordRPC.hpp"
 #include "Render.h"
 #include "splash.h"
+#include "GameDx12BridgeCommandLine.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
 #include "GameCameraCaptureAdapter.h"
 #endif
@@ -215,9 +216,14 @@ void Startup()
 
     // ...command line for auto start
     {
-        LPCSTR pStartup = strstr(Core.Params, "-start ");
+        LPCSTR pStartup = GameDx12Bridge_NativeStartupCommand(Core.Params);
+        if (!pStartup)
+        {
+            const char* start = strstr(Core.Params, "-start ");
+            pStartup = start ? start + 1 : nullptr;
+        }
         if (pStartup)
-            Console->Execute(pStartup + 1);
+            Console->Execute(pStartup);
     }
     {
         LPCSTR pStartup = strstr(Core.Params, "-load ");
