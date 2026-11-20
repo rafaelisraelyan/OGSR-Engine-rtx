@@ -1123,9 +1123,15 @@ bool GameDx12FourVisual12::CreateSceneTextures(
             auto& geometry = m_slots[slot];
             if (_stricmp(source.name.c_str(), geometry.asset.textureName.c_str()) != 0)
                 continue;
+            const bool cutout = geometry.asset.shaderName.find("aref") != std::string::npos;
+            if (cutout && !source.alphaTest)
+            {
+                Msg("ph_dx12_b2: visual=%u material=%u texture='%s' fallback=missing_cutout_metadata",
+                    geometry.visualId, slot, source.name.c_str());
+                continue;
+            }
             geometry.textureIndex = index + 1;
-            geometry.alphaTest = source.alphaTest &&
-                geometry.asset.shaderName.find("aref") != std::string::npos;
+            geometry.alphaTest = cutout;
             Msg("ph_dx12_b2: visual=%u material=%u texture='%s' shader='%s' alpha_test=%d",
                 geometry.visualId, slot, source.name.c_str(),
                 geometry.asset.shaderName.c_str(), geometry.alphaTest ? 1 : 0);
