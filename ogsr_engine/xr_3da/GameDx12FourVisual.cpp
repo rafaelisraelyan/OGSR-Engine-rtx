@@ -1038,8 +1038,10 @@ bool GameDx12FourVisual12::CreateSceneTextures(
         if (dds.data.empty())
             continue;
         const char* copyReason = nullptr;
-        if (!ValidateXrayTextureSource(dds, &copyReason) || dds.format != DXGI_FORMAT_BC1_UNORM)
-            return Fail(reason, "B2 invalid BC1 source");
+        const bool bc3 = dds.format == DXGI_FORMAT_BC3_UNORM;
+        if (!ValidateXrayTextureSource(dds, &copyReason) ||
+            (!bc3 && dds.format != DXGI_FORMAT_BC1_UNORM))
+            return Fail(reason, "B2 invalid compressed texture source");
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = dds.width;
@@ -1066,7 +1068,7 @@ bool GameDx12FourVisual12::CreateSceneTextures(
         usedUpload += bytes;
 
         auto& texture = m_textures[index + 1];
-        desc.Format = DXGI_FORMAT_BC1_TYPELESS;
+        desc.Format = bc3 ? DXGI_FORMAT_BC3_TYPELESS : DXGI_FORMAT_BC1_TYPELESS;
         if (FAILED(device->CreateCommittedResource(
                 &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
                 nullptr, IID_PPV_ARGS(texture.image.GetAddressOf()))))
@@ -1113,6 +1115,7 @@ bool GameDx12FourVisual12::CreateSceneTextures(
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         list->ResourceBarrier(1, &barrier);
 
+        srv.Format = bc3 ? DXGI_FORMAT_BC3_UNORM_SRGB : DXGI_FORMAT_BC1_UNORM_SRGB;
         srv.Texture2D.MipLevels = dds.mipCount;
         device->CreateShaderResourceView(texture.image.Get(), &srv, cpu);
         for (uint32_t slot = 0; slot < m_sourceCount; ++slot)

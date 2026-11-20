@@ -1756,12 +1756,18 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                 const j2bbatch12::Limits12 limits{};
                 if (world)
                 {
+                    uint32_t sector = jupiterSector;
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+                    const char* alphaProbe = std::getenv("OGSR_DX12_GAME_B2_ALPHA_PROBE");
+                    if (state.nativeRequested && alphaProbe && std::strcmp(alphaProbe, "1") == 0)
+                        sector = 130;
+#endif
                     j2bbatch12::Snapshot12 snapshot;
                     j2bbatch12::SceneBatch12 scene;
                     const bool read = GameDx12J2ABatch_ReadSnapshot(
                         state.levelName, expected, snapshot, limits, cpuError);
                     const bool prepared = read && j2bbatch12::PrepareSceneSector(
-                        snapshot, expected, jupiterSector, scene, limits);
+                        snapshot, expected, sector, scene, limits);
                     if (read && !prepared)
                         cpuError = scene.error;
                     if (prepared)

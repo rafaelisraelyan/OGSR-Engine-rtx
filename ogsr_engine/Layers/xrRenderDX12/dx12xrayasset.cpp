@@ -297,9 +297,10 @@ bool ComputeTextureMipLayout(DXGI_FORMAT format, uint32_t width,
         return false;
     uint64_t pitch = 0;
     uint64_t rowCount = 0;
-    if (format == DXGI_FORMAT_BC1_UNORM)
+    if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC3_UNORM)
     {
-        pitch = (static_cast<uint64_t>(width) + 3ull) / 4ull * 8ull;
+        const uint64_t blockBytes = format == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+        pitch = (static_cast<uint64_t>(width) + 3ull) / 4ull * blockBytes;
         rowCount = (static_cast<uint64_t>(height) + 3ull) / 4ull;
     }
     else if (format == DXGI_FORMAT_R8G8B8A8_UNORM)
@@ -345,6 +346,7 @@ bool ValidateXrayTextureSource(const XrayTextureData12& texture,
         texture.mipCount > MaximumMipCount(texture.width, texture.height))
         return Fail(reason, "invalid DDS dimensions/mips");
     if (texture.format != DXGI_FORMAT_BC1_UNORM &&
+        texture.format != DXGI_FORMAT_BC3_UNORM &&
         texture.format != DXGI_FORMAT_R8G8B8A8_UNORM)
         return Fail(reason, "unsupported DDS texture format");
 
@@ -401,11 +403,13 @@ bool ValidateXrayTextureCopy(const XrayTextureData12& texture,
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& layout = layouts[mip];
         // D3D12 reports BC footprints on block boundaries; sub-4 mips are
         // represented by one 4x4 block, not by their logical 2x2/1x1 size.
+        const bool compressed = texture.format == DXGI_FORMAT_BC1_UNORM ||
+                                texture.format == DXGI_FORMAT_BC3_UNORM;
         const uint32_t footprintWidth =
-            texture.format == DXGI_FORMAT_BC1_UNORM
+            compressed
                 ? ((mipWidth + 3u) / 4u) * 4u : mipWidth;
         const uint32_t footprintHeight =
-            texture.format == DXGI_FORMAT_BC1_UNORM
+            compressed
                 ? ((mipHeight + 3u) / 4u) * 4u : mipHeight;
         if (layout.Footprint.Format != texture.format ||
             layout.Footprint.Width != footprintWidth ||
@@ -451,7 +455,7 @@ bool LoadXrayDds12(const std::wstring& path, XrayTextureData12& texture,
 }
 
 bool DecodeXrayDds12(std::span<const uint8_t> file,
-                     XrayTextureData12& texture, const char** reason)
+                     XrayTextureData12& texture, const char** reason, bool allowBc3)
 {
     texture = {};
     if (file.size() < 128 || ReadU32(file.data()) != kDdsMagic)
@@ -479,9 +483,14 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
         return Fail(reason, "DDS volume textures are unsupported");
     if ((pixelFlags & kDdpfFourCC) == 0)
         return Fail(reason, "DDS pixel format is not FOURCC");
-    if (ReadU32(file.data() + 76) != 32 ||
-        std::memcmp(file.data() + 84, "DXT1", 4) != 0)
-        return Fail(reason, "DDS is not legacy BC1/DXT1");
+    const auto* fourcc = file.data() + 84;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    if (std::memcmp(fourcc, "DXT1", 4) == 0)
+        format = DXGI_FORMAT_BC1_UNORM;
+    else if (allowBc3 && std::memcmp(fourcc, "DXT5", 4) == 0)
+        format = DXGI_FORMAT_BC3_UNORM;
+    if (ReadU32(file.data() + 76) != 32 || format == DXGI_FORMAT_UNKNOWN)
+        return Fail(reason, "DDS has an unsupported legacy FOURCC");
     if ((caps & kDdscapsTexture) == 0)
         return Fail(reason, "DDS is not a texture");
     if (caps2 & (kDdscaps2CubeMapMask | kDdscaps2Volume))
@@ -494,7 +503,7 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
     texture.width = width;
     texture.height = height;
     texture.mipCount = mipCount;
-    texture.format = DXGI_FORMAT_BC1_UNORM;
+    texture.format = format;
     texture.mips.reserve(mipCount);
 
     const uint64_t payloadBytes = file.size() - 128ull;
@@ -506,7 +515,7 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
         XrayTextureMip12 info{};
         uint32_t rows = 0;
         uint32_t dataSize = 0;
-        if (!ComputeTextureMipLayout(DXGI_FORMAT_BC1_UNORM, mipWidth,
+        if (!ComputeTextureMipLayout(format, mipWidth,
                                      mipHeight, info.rowPitch, rows, dataSize))
             return Fail(reason, "DDS mip geometry overflow");
         info.width = mipWidth;

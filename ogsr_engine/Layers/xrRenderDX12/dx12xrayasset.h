@@ -64,12 +64,12 @@ bool LoadXrayOgf12(const std::wstring& path,
                    XrayAssetData12& asset,
                    const char** reason);
 
-// Supported DDS subset: BC1/DXT1, 2D, one array slice, optional mip chain.
+// Supported DDS subset: BC1/DXT1, with optional BC3/DXT5 for the game bridge.
 bool LoadXrayDds12(const std::wstring& path,
                    XrayTextureData12& texture,
                    const char** reason);
 bool DecodeXrayDds12(std::span<const uint8_t> file,
-                     XrayTextureData12& texture, const char** reason);
+                     XrayTextureData12& texture, const char** reason, bool allowBc3 = false);
 
 // CPU-only validation used both by the DDS loader and by the owner-side GPU
 // upload. It checks actual source bytes, BC1 mip geometry and copy footprints

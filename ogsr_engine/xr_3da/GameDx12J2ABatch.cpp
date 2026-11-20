@@ -168,8 +168,17 @@ bool BinaryAlphaFromThm(const std::vector<uint8_t>& bytes,
         if (size > bytes.size() - offset)
             return false;
         if (chunk == 0x812 && size >= 32)
+        {
+            constexpr uint32_t binaryAlphaFlag = 1u << 1;
+            constexpr uint32_t hasAlphaFlag = 1u << 25;
+            const uint32_t format = word(offset);
+            const uint32_t flags = word(offset + 4);
+            const bool alpha = dds.format == DXGI_FORMAT_BC3_UNORM
+                ? format == 3 && (flags & (binaryAlphaFlag | hasAlphaFlag)) != 0
+                : format == 1 || (flags & binaryAlphaFlag) != 0;
             return word(offset + 24) == dds.width && word(offset + 28) == dds.height &&
-                   (word(offset) == 1 || (word(offset + 4) & 2) != 0);
+                   alpha;
+        }
         offset += size;
     }
     return false;
@@ -215,7 +224,7 @@ void GameDx12J2ABatch_ReadTextures(
                 (!ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs) &&
                  !ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs,
                               fsgame::game_textures)) ||
-                !DecodeXrayDds12(bytes, entry.dds, &reason))
+                !DecodeXrayDds12(bytes, entry.dds, &reason, true))
             {
                 entry.dds = {};
                 Msg("ph_dx12_b2: texture fallback name='%s' reason='%s'",
@@ -229,8 +238,9 @@ void GameDx12J2ABatch_ReadTextures(
             if (ReadVfsFile("THM", thmName.c_str(), 16384, thm, error, openMs, copyMs,
                             fsgame::game_textures))
                 entry.alphaTest = BinaryAlphaFromThm(thm, entry.dds);
-            Msg("ph_dx12_b2: texture name='%s' bc1_srgb=%ux%u mips=%u alpha_thm=%d",
-                name.c_str(), entry.dds.width, entry.dds.height, entry.dds.mipCount,
+            Msg("ph_dx12_b2: texture name='%s' %s=%ux%u mips=%u alpha_thm=%d",
+                name.c_str(), entry.dds.format == DXGI_FORMAT_BC3_UNORM ? "bc3_srgb" : "bc1_srgb",
+                entry.dds.width, entry.dds.height, entry.dds.mipCount,
                 entry.alphaTest ? 1 : 0);
         }
     }
