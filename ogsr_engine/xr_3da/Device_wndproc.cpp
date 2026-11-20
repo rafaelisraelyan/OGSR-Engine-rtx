@@ -33,7 +33,10 @@ bool CRenderDevice::on_message(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
     }
     case WM_CLOSE: {
         if (GameDx12Bridge_UsesNativeViewport())
+        {
+            Engine.Event.Defer("KERNEL:disconnect");
             Engine.Event.Defer("KERNEL:quit");
+        }
         result = 0;
         return (true);
     }
