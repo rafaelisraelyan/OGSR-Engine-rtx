@@ -9,10 +9,12 @@
 #include "GameDx12NativeFrame.h"
 #include "GameDx12M23Fault.h"
 #include "dx12j2bbatch.h"
+#include "../Layers/xrRender/xrRender_console.h"
 
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -287,6 +289,7 @@ cbuffer MaterialCB : register(b2)
     uint TextureMode;
     uint MaterialId;
     uint ViewMode;
+    float AlphaThreshold;
 };
 
 struct PSInput
@@ -303,7 +306,7 @@ float4 main(PSInput input) : SV_Target
     if (TextureMode != 0)
         baseColor = BaseColor.Sample(BaseSampler, input.uv);
     if (TextureMode == 2)
-        clip(baseColor.a - 0.5);
+        clip(baseColor.a - AlphaThreshold);
     if (ViewMode == 1)
         return float4(frac((MaterialId + 1) * float3(0.618, 0.381, 0.173)), 1);
     if (ViewMode == 2)
@@ -1393,7 +1396,8 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
                 list->SetGraphicsRootDescriptorTable(2, gpu);
                 const uint32_t mode = source.textureIndex == 0 ? 0u :
                                       (source.alphaTest ? 2u : 1u);
-                const uint32_t material[]{mode, m_visibleSources[visible], m_materialView, 0};
+                const uint32_t material[]{mode, m_visibleSources[visible], m_materialView,
+                                          std::bit_cast<uint32_t>(ps_r_alphatest_threshold)};
                 list->SetGraphicsRoot32BitConstants(3, 4, material, 0);
             }
             list->IASetVertexBuffers(0, 1, &source.vertexView);
