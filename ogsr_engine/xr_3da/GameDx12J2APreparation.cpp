@@ -831,6 +831,8 @@ bool GameDx12J2A_PrepareSceneFrame(
     renderprep12::PreparedFrame12& frame, renderprep12::VisibilityTimings12& timings,
     bool& serialFallback, std::string& reason)
 {
+    // Для короткого нативного сектора default grain=128 даёт одну задачу.
+    constexpr size_t sceneGrain = 2;
     frame = {};
     timings = {};
     serialFallback = false;
@@ -846,7 +848,7 @@ bool GameDx12J2A_PrepareSceneFrame(
             try
             {
                 frame = renderprep12::PrepareVisible(snapshot, generation, mode,
-                                                     &g_j2aJobs, timings, resources);
+                                                     &g_j2aJobs, timings, resources, sceneGrain);
                 return true;
             }
             catch (const std::exception& error)
@@ -857,7 +859,7 @@ bool GameDx12J2A_PrepareSceneFrame(
             }
         }
         frame = renderprep12::PrepareVisible(snapshot, generation, mode,
-            mode == renderprep12::Mode::Serial ? nullptr : &g_j2aJobs, timings, resources);
+            mode == renderprep12::Mode::Serial ? nullptr : &g_j2aJobs, timings, resources, sceneGrain);
         return true;
     }
     catch (const std::exception& error)

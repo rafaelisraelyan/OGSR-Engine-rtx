@@ -271,7 +271,7 @@ bool VisibleWorld(const DrawPacket12& packet, const DirectX::XMFLOAT4X4& camera)
 }
 PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t liveGeneration,
     Mode mode, gr::jobs::JobSystem* jobs, VisibilityTimings12& timings,
-    std::span<const Resource12> extraResources) {
+    std::span<const Resource12> extraResources, size_t blockSize) {
     timings={};
     if (!liveGeneration || snapshot.Generation()!=liveGeneration || !Finite(snapshot.Camera()))
         throw std::invalid_argument("invalid visibility snapshot");
@@ -281,7 +281,7 @@ PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12& snapshot, uint64_t l
         throw std::runtime_error("visibility requires running JobSystem");
     const size_t count=snapshot.Objects().size();
     if (count>UINT32_MAX) throw std::length_error("visibility count overflow");
-    constexpr size_t blockSize=128;
+    if (blockSize==0 || blockSize>128) throw std::invalid_argument("invalid visibility block size");
     const size_t blocks=count/blockSize+(count%blockSize!=0);
     const auto run=[&](bool parallel, VisibilityPhases12& time) {
         const auto start=Clock::now();

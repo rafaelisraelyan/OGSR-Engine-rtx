@@ -83,7 +83,7 @@ struct VisibilityTimings12 { VisibilityPhases12 serial{}, parallel{}; };
 // Все стадии завершены до возврата; при исключении кадр не публикуется.
 PreparedFrame12 PrepareVisible(const RenderSceneSnapshot12&, uint64_t liveGeneration,
     Mode, gr::jobs::JobSystem*, VisibilityTimings12&,
-    std::span<const Resource12> extraResources = {});
+    std::span<const Resource12> extraResources = {}, size_t blockSize = 128);
 bool RunTests();
 bool RunRepresentativeTests();
 bool RunVisibilityTests();

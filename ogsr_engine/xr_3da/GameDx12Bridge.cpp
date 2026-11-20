@@ -186,9 +186,14 @@ bool RuntimeRequested()
         state.nativeRequested = GameDx12Bridge_NativeRequested(Core.Params);
         state.runtimeRequested = state.nativeRequested ||
             GameDx12Bridge_HasExactCommandLineFlag(Core.Params, kRuntimeFlag);
-        if (!state.nativeRequested && state.runtimeRequested &&
+        if (!state.nativeRequested &&
             GameDx12Bridge_HasExactCommandLineFlag(Core.Params, "-dx12_native_game"))
-            Msg("ph_dx12_native: conflicting flags, using R4 diagnostic mode");
+        {
+            if (state.runtimeRequested)
+                Msg("ph_dx12_native: conflicting flags, using R4 diagnostic mode");
+            else
+                Msg("ph_dx12_native: preview requires -start with a Jupiter save; using R4");
+        }
     }
     return state.runtimeRequested;
 }
@@ -1738,21 +1743,21 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                 const j2bbatch12::Identity12 expected{
                     state.levelSession, state.captureEpoch};
                 std::string reason;
+                j2bbatch12::ErrorInfo12 cpuError;
                 const bool world = B1WorldRequested();
                 bool loaded = false;
                 const j2bbatch12::Limits12 limits{};
                 if (world)
                 {
                     j2bbatch12::Snapshot12 snapshot;
-                    j2bbatch12::ErrorInfo12 error;
                     j2bbatch12::SceneBatch12 scene;
-                    if (!GameDx12J2ABatch_ReadSnapshot(
-                            state.levelName, expected, snapshot, limits, error))
-                        reason = error.text;
-                    else if (!j2bbatch12::PrepareSceneSector(
-                                 snapshot, expected, jupiterSector, scene, limits))
-                        reason = scene.error.text;
-                    else
+                    const bool read = GameDx12J2ABatch_ReadSnapshot(
+                        state.levelName, expected, snapshot, limits, cpuError);
+                    const bool prepared = read && j2bbatch12::PrepareSceneSector(
+                        snapshot, expected, jupiterSector, scene, limits);
+                    if (read && !prepared)
+                        cpuError = scene.error;
+                    if (prepared)
                     {
                         const char* materialMode = std::getenv("OGSR_DX12_GAME_B2_TEXTURES");
                         const bool textured = state.nativeRequested ||
@@ -1771,7 +1776,7 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                     if (!GameDx12J2ABatch_PrepareFromVfs(
                             state.levelName, expected, jupiterSector, jupiterRootVisual,
                             visuals, nullptr, false, batch, limits))
-                        reason = batch.error.text;
+                        cpuError = batch.error;
                     else
                         loaded = state.m23.LoadFromBatch(
                             owner, state.levelName, {state.levelSession, state.captureEpoch},
@@ -1779,9 +1784,10 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                 }
                 if (!loaded)
                 {
+                    const char* failure = cpuError.code != j2bbatch12::Error12::None
+                        ? cpuError.text : reason.c_str();
                     Msg("ph_dx12_m23: load failed reason='%s'",
-                        reason.empty() ? "allocation or unknown failure"
-                                       : reason.c_str());
+                        failure[0] != '\0' ? failure : "allocation or unknown failure");
                     if (state.m23.ListPoisoned())
                         QuarantineForGeometryUnknown(
                             "m23_upload_list_poisoned");
