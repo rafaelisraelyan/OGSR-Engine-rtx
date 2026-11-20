@@ -2,7 +2,7 @@
 
 > **Актуализация: 20 ноября 2026.** Это указатель к историческому аудиту OGSR/CoP и к новым экспериментальным направлениям. **Рендер `prypiat` по умолчанию — DX11/R4**. В локальной, ещё не опубликованной feature-ветке F4.0-B проверен **ограниченный игровой DX12 vertical slice** (native Present, реальные текстурированные Jupiter visuals, 30 последовательных кадров, GR, Debug Layer/GBV), итог independent review **PASS WITH NOTES**. Это **не** готовая карта, DXR или разрешённый merge.
 
-**Начните с [главной страницы проекта](../README.md) и [актуального roadmap](08-roadmap.md).** Для новых ошибок используйте [GitHub Issues](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues); первоначальный [аудит известных проблем](07-known-issues.md) сохранён как исторический источник.
+**Начните с [главной страницы проекта](../README.md) и [актуального roadmap](08-roadmap.md).** **Следующий F4.1 — Full Static Jupiter Scene:** автоматическая загрузка полной статической карты Jupiter без ручного отбора объектов; статус **PLANNED / NOT RUN** (см. roadmap). Для новых ошибок используйте [GitHub Issues](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues); первоначальный [аудит известных проблем](07-known-issues.md) сохранён как исторический источник.
 
 ## Навигация
 
