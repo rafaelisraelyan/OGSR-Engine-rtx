@@ -4,6 +4,7 @@
 #include "stdafx.h"
 
 #include "../xrRender/HW.h"
+#include "../../xr_3da/GameDx12BridgeCommandLine.h"
 #include "../../xr_3da/XR_IOConsole.h"
 #include "../../xr_3da/xr_input.h"
 #include "../../Include/xrAPI/xrAPI.h"
@@ -195,7 +196,20 @@ void CHW::CreateDevice(HWND m_hWnd)
         R_ASSERT(SUCCEEDED(R));
     }
 
-    CreateSwapChain2(m_hWnd);
+    if (GameDx12Bridge_NativeRequested(Core.Params))
+    {
+        SelectResolution(m_ChainDesc.BufferDesc.Width, m_ChainDesc.BufferDesc.Height);
+        m_ChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        m_ChainDesc.SampleDesc.Count = 1;
+        m_ChainDesc.OutputWindow = m_hWnd;
+        m_ChainDesc.Windowed = TRUE;
+        UpdateWindowProps(m_hWnd);
+        Msg("ph_dx12_native: R4 resource device initialized without swapchain");
+    }
+    else
+    {
+        CreateSwapChain2(m_hWnd);
+    }
 
     //// https://habr.com/ru/post/308980/
     //IDXGIDevice1* pDeviceDXGI = nullptr;
@@ -327,10 +341,16 @@ void CHW::ResetDevice(HWND m_hWnd)
 
     SelectResolution(desc.Width, desc.Height);
 
-    CHK_DX(m_pSwapChain->ResizeTarget(&desc));
-    CHK_DX(m_pSwapChain->ResizeBuffers(cd.BufferCount, desc.Width, desc.Height, desc.Format, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
-
-    SetFullscreenState(psDeviceFlags.test(rsFullscreen));
+    if (m_pSwapChain)
+    {
+        CHK_DX(m_pSwapChain->ResizeTarget(&desc));
+        CHK_DX(m_pSwapChain->ResizeBuffers(cd.BufferCount, desc.Width, desc.Height, desc.Format, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
+        SetFullscreenState(psDeviceFlags.test(rsFullscreen));
+    }
+    else
+    {
+        UpdateWindowProps(m_hWnd);
+    }
 
     Device.ShowMainWindow();
 
@@ -375,6 +395,8 @@ bool CHW::ThisInstanceIsGlobal() const
 
 void CHW::WaitOnSwapChain() const 
 { 
+    if (!m_pSwapChain)
+        return;
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
 
     /*

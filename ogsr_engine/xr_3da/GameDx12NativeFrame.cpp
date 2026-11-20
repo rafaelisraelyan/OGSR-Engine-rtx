@@ -1,0 +1,322 @@
+#include "stdafx.h"
+#include "GameDx12NativeFrame.h"
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+
+#include <limits>
+
+namespace
+{
+constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT depthFormat = DXGI_FORMAT_D32_FLOAT;
+constexpr DWORD fenceTimeoutMs = 10000;
+
+D3D12_RESOURCE_BARRIER ColorBarrier(ID3D12Resource* resource,
+                                   D3D12_RESOURCE_STATES before,
+                                   D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          before, after};
+    return barrier;
+}
+}
+
+GameDx12NativeFrame12::~GameDx12NativeFrame12()
+{
+    Release();
+}
+
+HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
+                                         const Owner& owner)
+{
+    RECT rect{};
+    if (m_swapchain || m_unknown || !window || !GetClientRect(window, &rect) ||
+        rect.right <= rect.left || rect.bottom <= rect.top)
+        return E_INVALIDARG;
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = static_cast<UINT>(rect.right - rect.left);
+    desc.Height = static_cast<UINT>(rect.bottom - rect.top);
+    desc.Format = colorFormat;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = kFrameCount;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain;
+    HRESULT hr = factory.CreateSwapChainForHwnd(&owner.queue, window, &desc, nullptr,
+                                                nullptr, swapchain.GetAddressOf());
+    if (FAILED(hr))
+        return hr;
+    hr = factory.MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+    if (FAILED(hr))
+        return hr;
+    hr = swapchain.As(&m_swapchain);
+    if (FAILED(hr))
+        return hr;
+    D3D12_DESCRIPTOR_HEAP_DESC descriptors{};
+    descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    descriptors.NumDescriptors = kFrameCount;
+    hr = owner.device.CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(m_rtv.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+    m_rtvStride = owner.device.GetDescriptorHandleIncrementSize(descriptors.Type);
+    descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    descriptors.NumDescriptors = 1;
+    hr = owner.device.CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(m_dsv.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+    for (auto& slot : m_slots)
+    {
+        hr = owner.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   IID_PPV_ARGS(slot.allocator.GetAddressOf()));
+        if (FAILED(hr))
+            return hr;
+        hr = owner.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             slot.allocator.Get(), nullptr,
+                                             IID_PPV_ARGS(slot.list.GetAddressOf()));
+        if (FAILED(hr))
+            return hr;
+        hr = slot.list->Close();
+        if (FAILED(hr))
+            return hr;
+    }
+    return CreateTargets(owner.device, desc.Width, desc.Height);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE GameDx12NativeFrame12::Rtv(uint32_t index) const noexcept
+{
+    auto handle = m_rtv->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * m_rtvStride;
+    return handle;
+}
+
+HRESULT GameDx12NativeFrame12::CreateTargets(ID3D12Device& device,
+                                            uint32_t width, uint32_t height)
+{
+    for (uint32_t index = 0; index < kFrameCount; ++index)
+    {
+        auto& slot = m_slots[index];
+        const HRESULT hr = m_swapchain->GetBuffer(index, IID_PPV_ARGS(slot.color.GetAddressOf()));
+        if (FAILED(hr))
+            return hr;
+        device.CreateRenderTargetView(slot.color.Get(), nullptr, Rtv(index));
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC depth{};
+    depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depth.Width = width;
+    depth.Height = height;
+    depth.DepthOrArraySize = 1;
+    depth.MipLevels = 1;
+    depth.Format = depthFormat;
+    depth.SampleDesc.Count = 1;
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = depthFormat;
+    clear.DepthStencil.Depth = 1.0f;
+    const HRESULT hr = device.CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &depth, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &clear, IID_PPV_ARGS(m_depth.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+    device.CreateDepthStencilView(m_depth.Get(), nullptr, m_dsv->GetCPUDescriptorHandleForHeapStart());
+    m_width = width;
+    m_height = height;
+    return S_OK;
+}
+
+HRESULT GameDx12NativeFrame12::Wait(const Owner& owner, uint64_t value) noexcept
+{
+    if (value == 0)
+        return S_OK;
+    HRESULT hr = S_OK;
+    if (owner.fence.GetCompletedValue() < value)
+    {
+        hr = owner.fence.SetEventOnCompletion(value, owner.event);
+        if (SUCCEEDED(hr) && WaitForSingleObject(owner.event, fenceTimeoutMs) != WAIT_OBJECT_0)
+            hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
+    if (SUCCEEDED(hr))
+        hr = owner.device.GetDeviceRemovedReason();
+    if (SUCCEEDED(hr) && owner.fence.GetCompletedValue() < value)
+        hr = E_FAIL;
+    if (FAILED(hr))
+        m_unknown = true;
+    return hr;
+}
+
+HRESULT GameDx12NativeFrame12::Drain(const Owner& owner) noexcept
+{
+    if (m_unknown || m_recording)
+        return E_FAIL;
+    if (!m_submitted)
+        return S_OK;
+    if (owner.fenceValue == (std::numeric_limits<uint64_t>::max)())
+    {
+        m_unknown = true;
+        return E_FAIL;
+    }
+    const uint64_t barrier = owner.fenceValue + 1;
+    const HRESULT hr = owner.queue.Signal(&owner.fence, barrier);
+    if (FAILED(hr))
+    {
+        m_unknown = true;
+        return hr;
+    }
+    owner.fenceValue = barrier;
+    const HRESULT complete = Wait(owner, barrier);
+    if (SUCCEEDED(complete))
+    {
+        m_submitted = false;
+        for (auto& slot : m_slots)
+            slot.fence = 0;
+    }
+    return complete;
+}
+
+HRESULT GameDx12NativeFrame12::Resize(const Owner& owner, uint32_t width, uint32_t height)
+{
+    HRESULT hr = Drain(owner);
+    if (FAILED(hr))
+        return hr;
+    m_depth.Reset();
+    for (auto& slot : m_slots)
+        slot.color.Reset();
+    hr = m_swapchain->ResizeBuffers(kFrameCount, width, height, colorFormat, 0);
+    if (FAILED(hr))
+        return hr;
+    return CreateTargets(owner.device, width, height);
+}
+
+HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording& recording)
+{
+    recording = {};
+    if (!m_swapchain || !m_depth || m_unknown || m_recording)
+        return E_FAIL;
+    RECT rect{};
+    if (IsIconic(window) || !GetClientRect(window, &rect) ||
+        rect.right <= rect.left || rect.bottom <= rect.top)
+        return S_FALSE;
+    const auto width = static_cast<uint32_t>(rect.right - rect.left);
+    const auto height = static_cast<uint32_t>(rect.bottom - rect.top);
+    if (width != m_width || height != m_height)
+    {
+        const HRESULT hr = Resize(owner, width, height);
+        if (FAILED(hr))
+            return hr;
+    }
+
+    m_slot = m_swapchain->GetCurrentBackBufferIndex();
+    if (m_slot >= kFrameCount)
+        return E_FAIL;
+    auto& slot = m_slots[m_slot];
+    HRESULT hr = Wait(owner, slot.fence);
+    if (FAILED(hr))
+        return hr;
+    hr = slot.allocator->Reset();
+    if (FAILED(hr))
+        return hr;
+    hr = slot.list->Reset(slot.allocator.Get(), nullptr);
+    if (FAILED(hr))
+        return hr;
+    m_recording = true;
+
+    const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+    slot.list->ResourceBarrier(1, &barrier);
+    const auto rtv = Rtv(m_slot);
+    const auto dsv = m_dsv->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width),
+                                 static_cast<float>(height), 0.0f, 1.0f};
+    const D3D12_RECT area{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    constexpr float clear[]{0.03f, 0.05f, 0.09f, 1.0f};
+    slot.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    slot.list->RSSetViewports(1, &viewport);
+    slot.list->RSSetScissorRects(1, &area);
+    slot.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    slot.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    recording = {slot.list.Get(), m_slot, width, height};
+    return S_OK;
+}
+
+HRESULT GameDx12NativeFrame12::Cancel() noexcept
+{
+    if (!m_recording)
+        return S_FALSE;
+    m_recording = false;
+    return m_slots[m_slot].list->Close();
+}
+
+HRESULT GameDx12NativeFrame12::Present(const Owner& owner)
+{
+    if (!m_recording || m_unknown)
+        return E_FAIL;
+    if (owner.fenceValue == (std::numeric_limits<uint64_t>::max)())
+    {
+        Cancel();
+        return E_FAIL;
+    }
+    auto& slot = m_slots[m_slot];
+    const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_PRESENT);
+    slot.list->ResourceBarrier(1, &barrier);
+    const HRESULT close = Cancel();
+    if (FAILED(close))
+        return close;
+
+    m_submitted = true;
+    ID3D12CommandList* lists[]{slot.list.Get()};
+    owner.queue.ExecuteCommandLists(1, lists);
+    const uint64_t value = owner.fenceValue + 1;
+    const HRESULT signal = owner.queue.Signal(&owner.fence, value);
+    if (FAILED(signal))
+    {
+        m_unknown = true;
+        return signal;
+    }
+    owner.fenceValue = slot.fence = value;
+    const HRESULT hr = m_swapchain->Present(1, 0);
+    if (hr == S_OK)
+        ++m_presentCount;
+    return hr;
+}
+
+void GameDx12NativeFrame12::Release() noexcept
+{
+    if (m_unknown || m_submitted)
+    {
+        Quarantine();
+        return;
+    }
+    Cancel();
+    for (auto& slot : m_slots)
+        slot = {};
+    m_depth.Reset();
+    m_dsv.Reset();
+    m_rtv.Reset();
+    m_swapchain.Reset();
+}
+
+void GameDx12NativeFrame12::Quarantine() noexcept
+{
+    // Fence без подтверждения: ссылки живут до завершения процесса.
+    m_unknown = true;
+    m_recording = false;
+    for (auto& slot : m_slots)
+    {
+        slot.color.Detach();
+        slot.allocator.Detach();
+        slot.list.Detach();
+    }
+    m_depth.Detach();
+    m_dsv.Detach();
+    m_rtv.Detach();
+    m_swapchain.Detach();
+}
+
+#endif

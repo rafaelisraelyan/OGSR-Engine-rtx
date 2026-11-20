@@ -5,6 +5,7 @@
 
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2ABatch.h"
+#include "GameDx12NativeFrame.h"
 #include "GameDx12M23Fault.h"
 #include "dx12j2bbatch.h"
 
@@ -490,7 +491,8 @@ bool GameDx12FourVisual12::CreateConstants(ID3D12Device* device,
 
     D3D12_HEAP_PROPERTIES uploadHeap = {};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    const D3D12_RESOURCE_DESC desc = BufferDesc(kConstantsBytes);
+    const D3D12_RESOURCE_DESC desc = BufferDesc(
+        kConstantsBytes * (1 + GameDx12NativeFrame12::kFrameCount));
     HRESULT hr = device->CreateCommittedResource(
         &uploadHeap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -1147,7 +1149,8 @@ bool GameDx12FourVisual12::PrepareStaging(
 
     const DirectX::XMFLOAT4X4 shaderCamera =
         Transpose(logicalViewProjection);
-    std::memcpy(m_constantsMapped, &shaderCamera, sizeof(shaderCamera));
+    auto* frameConstants = static_cast<uint8_t*>(m_constantsMapped) + m_frameConstantOffset;
+    std::memcpy(frameConstants, &shaderCamera, sizeof(shaderCamera));
 
     if (!m_worldInstances.empty())
     {
@@ -1183,8 +1186,7 @@ bool GameDx12FourVisual12::PrepareStaging(
         if (!dx12object12::BuildObjectConstants12(
                 world, {0.8f, 0.8f, 0.8f, 1.0f}, constants))
             return Fail(reason, "B1 object constants rejected");
-        std::memcpy(static_cast<uint8_t*>(m_constantsMapped) +
-                        dx12object12::ObjectConstantsOffset(0),
+        std::memcpy(frameConstants + dx12object12::ObjectConstantsOffset(0),
                     &constants, sizeof(constants));
         m_stagingPrepared = true;
         return true;
@@ -1289,8 +1291,8 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
             ID3D12DescriptorHeap* heaps[]{m_textureHeap.Get()};
             list->SetDescriptorHeaps(1, heaps);
         }
-        list->SetGraphicsRootConstantBufferView(0, m_frameCBVA);
-        list->SetGraphicsRootConstantBufferView(1, m_objectCBVA[0]);
+        list->SetGraphicsRootConstantBufferView(0, m_frameCBVA + m_frameConstantOffset);
+        list->SetGraphicsRootConstantBufferView(1, m_objectCBVA[0] + m_frameConstantOffset);
         for (uint32_t visible = 0; visible < m_visibleCount; ++visible)
         {
             const SlotGpu12& source = m_slots[m_visibleSources[visible]];
@@ -1332,6 +1334,24 @@ bool GameDx12FourVisual12::RecordDraws(ID3D12GraphicsCommandList* list,
                 gpu.indexView.BufferLocation),
             static_cast<unsigned long long>(m_objectCBVA[slot]));
     }
+    return true;
+}
+
+bool GameDx12FourVisual12::RecordNativeFrame(
+    ID3D12GraphicsCommandList* list, uint32_t frameSlot,
+    const DirectX::XMFLOAT4X4& logicalViewProjection, const float cameraPosition[3],
+    uint32_t& drawCount, std::string& reason)
+{
+    drawCount = 0;
+    if (frameSlot >= GameDx12NativeFrame12::kFrameCount || !m_loaded ||
+        !m_uploadConfirmed || m_worldInstances.empty() || m_gpuUnknown)
+        return Fail(reason, "B3 scene unavailable");
+    // Native frame владеет ожиданием fence этого слота до вызова.
+    m_frameConstantOffset = (static_cast<uint64_t>(frameSlot) + 1) * kConstantsBytes;
+    if (!PrepareStaging(logicalViewProjection, cameraPosition, reason) ||
+        !RecordDraws(list, (1u << kSlotCount) - 1u, true, reason))
+        return false;
+    drawCount = m_visibleCount;
     return true;
 }
 
@@ -1659,6 +1679,7 @@ bool GameDx12FourVisual12::RenderDiagnosticImpl(
     if (result == nullptr)
         result = &localResult;
     *result = {};
+    m_frameConstantOffset = 0;
 
     m_lastError.clear();
     if (!m_loaded || !m_uploadConfirmed || m_gpuUnknown)

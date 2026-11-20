@@ -2,6 +2,7 @@
 
 #include "../Include/xrRender/DrawUtils.h"
 #include "render.h"
+#include "GameDx12Bridge.h"
 
 void CRenderDevice::_SetupStates()
 {
@@ -58,6 +59,8 @@ void CRenderDevice::Create()
     fFOV = 90.f;
     fASPECT = 1.f;
     m_pRender->Create(m_hWnd, dwWidth, dwHeight, fWidth_2, fHeight_2);
+    CHECK_OR_EXIT(GameDx12Bridge_CreateNativeViewport(),
+                  "Native DirectX 12 initialization failed. Restart without -dx12_native_game.");
  
     _Create();
 

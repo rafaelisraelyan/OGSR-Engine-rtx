@@ -4,6 +4,7 @@
 #include "GameDx12BridgeDiagnostics.h"
 #include "GameDx12BridgeQuarantine.h"
 #include "GameDx12LevelGeometry.h"
+#include "GameDx12NativeFrame.h"
 #include "GameDx12FourVisual.h"
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2ABatch.h"
@@ -15,6 +16,8 @@
 #endif
 
 #include "igame_level.h"
+#include "IGame_Persistent.h"
+#include "XR_IOConsole.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
@@ -65,6 +68,9 @@ struct BridgeStateData
     BridgeState state = BridgeState::Uninitialized;
     bool runtimeRequested = false;
     bool runtimeChecked = false;
+    bool nativeRequested = false;
+    bool nativeFailed = false;
+    bool nativeGameplayStarted = false;
     bool disabledLogged = false;
     bool gpuWorkSubmitted = false;
     bool gpuUnknown = false;
@@ -122,6 +128,7 @@ struct BridgeStateData
     GameDx12LevelGeometry12 geometry;
     GameDx12FourVisual12 m23;
     GameDx12OffscreenPass12 offscreen;
+    GameDx12NativeFrame12 native;
 
     uint64_t fenceValue = 0;
     uint64_t levelSession = 0;
@@ -172,8 +179,12 @@ bool RuntimeRequested()
     if (!state.runtimeChecked)
     {
         state.runtimeChecked = true;
-        state.runtimeRequested =
+        state.nativeRequested = GameDx12Bridge_NativeRequested(Core.Params);
+        state.runtimeRequested = state.nativeRequested ||
             GameDx12Bridge_HasExactCommandLineFlag(Core.Params, kRuntimeFlag);
+        if (!state.nativeRequested && state.runtimeRequested &&
+            GameDx12Bridge_HasExactCommandLineFlag(Core.Params, "-dx12_native_game"))
+            Msg("ph_dx12_native: conflicting flags, using R4 diagnostic mode");
     }
     return state.runtimeRequested;
 }
@@ -205,13 +216,13 @@ bool M23Requested()
         state.m23Requested =
             value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
-    return state.m23Requested;
+    return state.m23Requested || state.nativeRequested;
 }
 
 bool B1WorldRequested()
 {
     const char* value = std::getenv("OGSR_DX12_GAME_B1_WORLD");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return State().nativeRequested || (value != nullptr && std::strcmp(value, "1") == 0);
 }
 
 bool ForceOverflow(const char* stage)
@@ -269,6 +280,8 @@ void QuarantineObjects()
 void QuarantineForGeometryUnknown(const char* stage)
 {
     BridgeStateData& state = State();
+    if (state.nativeRequested)
+        state.native.Quarantine();
     Msg("ph_dx12_bridge: geometry GPU completion unknown at stage='%s'; "
         "bridge ownership must be retained", stage != nullptr ? stage : "?");
     if (!state.objectsReleased)
@@ -425,6 +438,7 @@ void ReleaseObjects()
     }
 
     state.objectsReleased = true;
+    state.native.Release();
     state.offscreen.Release();
     state.infoQueue.Reset();
     state.list.Reset();
@@ -1392,6 +1406,123 @@ void RunJ2BBatchRuntimeProbe(const char* levelName, uint64_t session,
 }
 #endif
 
+bool GameDx12Bridge_CreateNativeViewport()
+{
+    if (!RuntimeRequested() || !State().nativeRequested)
+        return true;
+    if (!EnsureOwnerThread("native_create") || !EnsureInitialized())
+        return false;
+    BridgeStateData& state = State();
+    ComPtr<IDXGIFactory2> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()));
+    if (SUCCEEDED(hr))
+    {
+        const GameDx12NativeFrame12::Owner owner{
+            *state.device.Get(), *state.queue.Get(), *state.fence.Get(),
+            state.fenceEvent, state.fenceValue};
+        hr = state.native.Initialize(Device.m_hWnd, *factory.Get(), owner);
+    }
+    if (FAILED(hr))
+    {
+        Msg("ph_dx12_native: initialization failed hr=0x%08X", static_cast<unsigned>(hr));
+        ReleaseObjects();
+        state.state = BridgeState::Disabled;
+        return false;
+    }
+    Msg("ph_dx12_native: DX12 owns game HWND and swapchain");
+    return true;
+}
+
+bool GameDx12Bridge_UsesNativeViewport()
+{
+    return State().nativeRequested;
+}
+
+namespace
+{
+bool DrainNative(BridgeStateData& state, const char* stage)
+{
+    if (state.native.CompletionUnknown())
+        return false;
+    if (!state.native.IsInitialized())
+        return true;
+    const GameDx12NativeFrame12::Owner owner{
+        *state.device.Get(), *state.queue.Get(), *state.fence.Get(),
+        state.fenceEvent, state.fenceValue};
+    const HRESULT hr = state.native.Drain(owner);
+    if (SUCCEEDED(hr))
+        return true;
+    Msg("ph_dx12_native: drain failed stage=%s hr=0x%08X",
+        stage, static_cast<unsigned>(hr));
+    state.m23.Shutdown(false);
+    QuarantineForGeometryUnknown(stage);
+    return false;
+}
+
+void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
+{
+    if (state.nativeFailed)
+        return;
+    const GameDx12NativeFrame12::Owner owner{
+        *state.device.Get(), *state.queue.Get(), *state.fence.Get(),
+        state.fenceEvent, state.fenceValue};
+    GameDx12NativeFrame12::Recording recording;
+    HRESULT hr = state.native.Begin(Device.m_hWnd, owner, recording);
+    if (hr == S_FALSE)
+        return;
+    uint32_t draws = 0;
+    std::string reason;
+    if (SUCCEEDED(hr) && state.m23Bound && state.m23.IsLoaded() &&
+        state.m23.LevelSession() == state.levelSession &&
+        state.m23.LevelEpoch() == state.captureEpoch)
+    {
+        DirectX::XMFLOAT4X4 viewProjection;
+        std::memcpy(&viewProjection, fullTransform.m, sizeof(viewProjection));
+        if (recording.width != state.width || recording.height != state.height)
+        {
+            const float sourceAspect = static_cast<float>(state.width) / state.height;
+            const float clientAspect = static_cast<float>(recording.width) / recording.height;
+            for (auto& row : viewProjection.m)
+                row[0] *= sourceAspect / clientAspect;
+        }
+        const float position[]{Device.vCameraPosition.x, Device.vCameraPosition.y,
+                               Device.vCameraPosition.z};
+        try
+        {
+            if (!state.m23.RecordNativeFrame(recording.list, recording.slot, viewProjection,
+                                             position, draws, reason))
+                hr = E_FAIL;
+        }
+        catch (...)
+        {
+            hr = E_FAIL;
+        }
+        if (FAILED(hr))
+            state.native.Cancel();
+    }
+    if (SUCCEEDED(hr))
+        hr = state.native.Present(owner);
+    if (FAILED(hr))
+    {
+        state.nativeFailed = true;
+        Msg("ph_dx12_native: frame blocked hr=0x%08X reason='%s'; restart to select R4",
+            static_cast<unsigned>(hr), reason.c_str());
+        if (state.native.CompletionUnknown())
+        {
+            state.m23.Shutdown(false);
+            QuarantineForGeometryUnknown("native_frame");
+        }
+        return;
+    }
+    const auto count = state.native.PresentCount();
+    if (hr == S_OK && (count == 1 || count == 30 || count % 120 == 0))
+        Msg("ph_dx12_native: Present=%llu scene_draws=%u fence=%llu window=%ux%u camera_hash=%016llX",
+            static_cast<unsigned long long>(count), draws,
+            static_cast<unsigned long long>(state.fenceValue), recording.width, recording.height,
+            static_cast<unsigned long long>(state.lastMatrixHash));
+}
+}
+
 void GameDx12Bridge_OnLevelReady(const char* levelName)
 {
     if (!EnsureOwnerThread("level_ready"))
@@ -1434,6 +1565,7 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
     state.capturedFrames = 0;
     state.rejectedFrames = 0;
     state.cameraLogged = false;
+    state.nativeGameplayStarted = false;
     state.levelActive = true;
     std::snprintf(state.levelName, sizeof(state.levelName), "%s",
                   levelName && levelName[0] ? levelName : "?");
@@ -1487,8 +1619,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
             else
                 Msg("ph_dx12_m23: invalid OGSR_DX12_GAME_M23_FRAME_DELAY");
         }
-        const char* requestedLevel =
-            std::getenv("OGSR_DX12_GAME_DIAGNOSTIC_LEVEL");
+        const char* requestedLevel = state.nativeRequested
+            ? "jupiter" : std::getenv("OGSR_DX12_GAME_DIAGNOSTIC_LEVEL");
         if (requestedLevel == nullptr || requestedLevel[0] == '\0')
         {
             Msg("ph_dx12_m23: skipped: OGSR_DX12_GAME_DIAGNOSTIC_LEVEL is "
@@ -1544,7 +1676,8 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                     else
                     {
                         const char* materialMode = std::getenv("OGSR_DX12_GAME_B2_TEXTURES");
-                        const bool textured = materialMode != nullptr && std::strcmp(materialMode, "1") == 0;
+                        const bool textured = state.nativeRequested ||
+                            (materialMode != nullptr && std::strcmp(materialMode, "1") == 0);
                         std::vector<GameDx12SceneTexture12> textures;
                         if (textured)
                             GameDx12J2ABatch_ReadTextures(scene, textures);
@@ -1703,6 +1836,8 @@ void GameDx12Bridge_OnLevelTeardown()
     BridgeStateData& state = State();
     if (!state.levelActive)
         return;
+    if (state.nativeRequested && !DrainNative(state, "native_level_teardown"))
+        return;
     state.levelActive = false;
     state.diagnosticLevelBound = false;
     state.m23Bound = false;
@@ -1743,6 +1878,18 @@ void GameDx12Bridge_OnFrame()
         return;
     if (Device.dwWidth == 0 || Device.dwHeight == 0)
         return;
+    if (state.nativeRequested && !state.nativeGameplayStarted)
+    {
+        state.nativeGameplayStarted = true;
+        // В этом preview меню R4 не выводится. Startup -start может
+        // оставить его активным после загрузки и убрать уровень из seqFrame.
+        if (IsMainMenuActive())
+        {
+            Msg("ph_dx12_native: releasing startup menu after level load");
+            Console->Execute("main_menu off");
+            Console->Hide();
+        }
+    }
     if (state.lastGameFrame == Device.dwFrame)
         return;
 
@@ -1796,6 +1943,11 @@ void GameDx12Bridge_OnFrame()
 
     const uint64_t hash = HashMatrix(view, projection, fullTransform);
     state.lastMatrixHash = hash;
+    if (state.nativeRequested)
+    {
+        RenderNativeFrame(state, fullTransform);
+        return;
+    }
     ++state.capturedFrames;
     if (MatrixBitsRequested())
         LogCameraBits(view, projection, fullTransform);
@@ -2327,6 +2479,8 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
     BridgeStateData& state = State();
     if (state.state != BridgeState::Ready)
         return;
+    if (state.nativeRequested && !DrainNative(state, "native_reset"))
+        return;
     state.width = width;
     state.height = height;
     if (state.levelActive)
@@ -2381,6 +2535,8 @@ void GameDx12Bridge_Shutdown()
     }
 
     state.state = BridgeState::ShuttingDown;
+    if (state.nativeRequested)
+        DrainNative(state, "native_shutdown");
     const bool ownerCompletionKnown = !state.gpuUnknown && !state.quarantined;
     state.m23.Shutdown(ownerCompletionKnown);
     if (state.m23.GpuCompletionUnknown())

@@ -116,3 +116,14 @@ inline bool GameDx12Bridge_HasExactCommandLineFlag(
         foundFlag = true;
     return foundFlag;
 }
+
+inline bool GameDx12Bridge_NativeRequested(const char* commandLine) noexcept
+{
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    return GameDx12Bridge_HasExactCommandLineFlag(commandLine, "-dx12_native_game") &&
+           !GameDx12Bridge_HasExactCommandLineFlag(commandLine, "-dx12_game_bridge");
+#else
+    (void)commandLine;
+    return false;
+#endif
+}

@@ -129,6 +129,11 @@ public:
                           Result12* result,
                           std::string& reason);
 
+    bool RecordNativeFrame(ID3D12GraphicsCommandList* list, uint32_t frameSlot,
+                           const DirectX::XMFLOAT4X4& logicalViewProjection,
+                           const float cameraPosition[3], uint32_t& drawCount,
+                           std::string& reason);
+
     void OnLevelTeardown(uint64_t nextEpoch);
     void OnDeviceReset(uint64_t nextEpoch);
 
@@ -254,6 +259,7 @@ private:
     UINT m_textureDescriptorSize = 0;
     uint32_t m_materialView = 0;
     bool m_textured = false;
+    uint64_t m_frameConstantOffset = 0;
 
     M23Ptr12<ID3D12RootSignature> m_rootSignature;
     M23Ptr12<ID3D12PipelineState> m_pipelineState;

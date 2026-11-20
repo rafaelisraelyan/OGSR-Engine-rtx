@@ -69,7 +69,7 @@ void CRT::create(LPCSTR Name, u32 w, u32 h, DXGI_FORMAT f, u32 SampleCount /*= 1
     if (flags.test(CreateBase))
     {
         dwFlags |= CreateBase;
-        if (!bUseAsDepth)
+        if (!bUseAsDepth && HW.m_pSwapChain)
         {
             /*u32 idx;
             char const* str = strrchr(Name, '_');

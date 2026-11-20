@@ -324,6 +324,7 @@ void CRenderDevice::on_idle()
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
                 B2CameraCapture_OnFrameRenderBeginSucceeded();
 #endif
+                if (!GameDx12Bridge_UsesNativeViewport())
                 {
                     ZoneScopedN("Render process");
                     seqRender.Process(rp_Render);

@@ -1060,6 +1060,7 @@ void CRender::End()
 
     PIX_FRAME_END();
 
+    if (HW.m_pSwapChain)
     {
         ZoneScopedN("Present");
 
