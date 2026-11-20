@@ -5,11 +5,7 @@
 
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12M23Fault.h"
-#include "dx12xraylevelasset.h"
-#include "dx12xraylevelgeometry.h"
-
-#include "FS.h"
-#include "LocatorAPI_defs.h"
+#include "dx12j2bbatch.h"
 
 #include <d3dcompiler.h>
 
@@ -22,7 +18,6 @@
 #include <new>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace
 {
@@ -316,41 +311,6 @@ bool GameDx12FourVisual12::Fail(std::string& reason,
     m_lastError = text;
     reason = m_lastError;
     return false;
-}
-
-bool GameDx12FourVisual12::ReadVfsFile(const char* name, uint64_t maxBytes,
-                                       std::vector<uint8_t>& bytes,
-                                       std::string& reason)
-{
-    IReader* reader = FS.r_open(fsgame::level, name);
-    if (reader == nullptr)
-        return Fail(reason, std::string("M23 VFS open failed: ") + name);
-
-    const size_t size = reader->length();
-    if (size == 0 || static_cast<uint64_t>(size) > maxBytes)
-    {
-        FS.r_close(reader);
-        return Fail(reason, std::string("M23 VFS size rejected: ") + name);
-    }
-
-    try
-    {
-        bytes.resize(size);
-    }
-    catch (const std::bad_alloc&)
-    {
-        FS.r_close(reader);
-        return Fail(reason, "M23 VFS read allocation failed");
-    }
-    catch (const std::length_error&)
-    {
-        FS.r_close(reader);
-        return Fail(reason, "M23 VFS read allocation failed");
-    }
-
-    std::memcpy(bytes.data(), reader->begin(), size);
-    FS.r_close(reader);
-    return true;
 }
 
 bool GameDx12FourVisual12::CreatePipeline(ID3D12Device* device,
@@ -661,14 +621,14 @@ bool GameDx12FourVisual12::CreateGeometryBuffers(
     return true;
 }
 
-bool GameDx12FourVisual12::LoadFromVfs(
+bool GameDx12FourVisual12::LoadFromBatch(
     const GameDx12FourVisualOwner12& owner, const char* levelName,
-    uint64_t levelSession, uint64_t levelEpoch, std::string& reason)
+    const j2bbatch12::Identity12& live, j2bbatch12::BatchResult12&& batch,
+    std::string& reason)
 {
     try
     {
-        return LoadFromVfsImpl(owner, levelName, levelSession, levelEpoch,
-                               reason);
+        return LoadFromBatchImpl(owner, levelName, live, batch, reason);
     }
     catch (const std::bad_alloc&)
     {
@@ -706,10 +666,12 @@ bool GameDx12FourVisual12::HandleLoadException(std::string& reason) noexcept
     return false;
 }
 
-bool GameDx12FourVisual12::LoadFromVfsImpl(
+bool GameDx12FourVisual12::LoadFromBatchImpl(
     const GameDx12FourVisualOwner12& owner, const char* levelName,
-    uint64_t levelSession, uint64_t levelEpoch, std::string& reason)
+    const j2bbatch12::Identity12& live, j2bbatch12::BatchResult12& batch,
+    std::string& reason)
 {
+    static_assert(kSlotCount == j2bbatch12::kTargetVisualCount);
     m_lastError.clear();
     if (owner.device == nullptr || owner.queue == nullptr ||
         owner.fence == nullptr || owner.fenceEvent == nullptr ||
@@ -718,8 +680,6 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
         return Fail(reason, "M23 invalid owner context");
     if (levelName == nullptr || levelName[0] == '\0')
         return Fail(reason, "M23 missing level name");
-    if (levelSession == 0 || levelEpoch == 0)
-        return Fail(reason, "M23 invalid level identity");
     if (m_gpuUnknown)
         return Fail(reason, "M23 registry is quarantined");
     if (m_listPoisoned)
@@ -733,67 +693,53 @@ bool GameDx12FourVisual12::LoadFromVfsImpl(
                                       reason))
         return Fail(reason, "M23 plan rejected");
 
-    xraylevel12::Limits limits{};
-    std::vector<uint8_t> levelBytes;
-    std::vector<uint8_t> geomBytes;
-    if (!ReadVfsFile(fsgame::level_files::level, limits.maxLevelBytes,
-                     levelBytes, reason) ||
-        !ReadVfsFile(fsgame::level_files::level_geom, limits.maxGeomBytes,
-                     geomBytes, reason))
-        return false;
+    const auto status = j2bbatch12::AcceptBatch12(batch, live);
+    if (status != j2bbatch12::AcceptStatus12::Accepted)
+    {
+        char message[80] = {};
+        std::snprintf(message, sizeof(message), "M23 CPU batch rejected status=%u",
+                      static_cast<unsigned>(status));
+        return Fail(reason, message);
+    }
 
-    m_generation = NextGeneration(levelSession, levelEpoch, 0);
     for (uint32_t slot = 0; slot < kSlotCount; ++slot)
     {
         const fourvisual12::SlotPlan12& plan = fourvisual12::kPlan[slot];
-        xraylevel12::Geometry geometry;
-        std::string readReason;
-        if (xraylevel12::ReadVisual(levelBytes, geomBytes, plan.visualId,
-                                    geometry, readReason, limits) !=
-            xraylevel12::ReadError::None)
-        {
-            std::string message = "M23 ReadVisual failed for visual ";
-            message += std::to_string(plan.visualId);
-            if (!readReason.empty())
-            {
-                message += " (";
-                message += readReason;
-                message += ")";
-            }
-            return Fail(reason, message);
-        }
-        if (geometry.visual_id != plan.visualId)
-            return Fail(reason, "M23 ReadVisual returned a different visual");
-
-        XrayAssetData12 asset;
-        const char* assetReason = nullptr;
-        if (!BuildXrayLevelAsset12(geometry, asset, &assetReason))
-            return Fail(reason, assetReason != nullptr
-                                    ? assetReason
-                                    : "M23 asset build failed");
-        if (asset.vertices.size() != plan.expectedVertexCount ||
-            asset.indices.size() != plan.expectedIndexCount)
+        const j2bbatch12::Slot12& cpu = batch.slots[slot];
+        if (cpu.source.visualId != plan.visualId)
+            return Fail(reason, "M23 CPU batch visual does not match plan");
+        if (cpu.vertexCount != plan.expectedVertexCount ||
+            cpu.indexCount != plan.expectedIndexCount)
         {
             char message[192] = {};
             std::snprintf(message, sizeof(message),
-                          "M23 visual %u count mismatch verts=%zu/%u "
-                          "indices=%zu/%u",
-                          plan.visualId, asset.vertices.size(),
-                          plan.expectedVertexCount, asset.indices.size(),
+                          "M23 visual %u count mismatch verts=%u/%u "
+                          "indices=%u/%u",
+                          plan.visualId, cpu.vertexCount,
+                          plan.expectedVertexCount, cpu.indexCount,
                           plan.expectedIndexCount);
             return Fail(reason, message);
         }
+    }
 
+    const uint64_t levelSession = live.levelSession;
+    const uint64_t levelEpoch = live.levelEpoch;
+    Msg("ph_dx12_m23: accepted CPU batch sector=%u root=%u hash=%016llX",
+        batch.sectorId, batch.rootVisualId,
+        static_cast<unsigned long long>(batch.stableHash));
+    m_generation = NextGeneration(levelSession, levelEpoch, 0);
+    for (uint32_t slot = 0; slot < kSlotCount; ++slot)
+    {
+        j2bbatch12::Slot12& cpu = batch.slots[slot];
         SlotGpu12& gpu = m_slots[slot];
-        gpu.asset = std::move(asset);
-        gpu.visualId = plan.visualId;
-        gpu.vertexCount =
-            static_cast<uint32_t>(gpu.asset.vertices.size());
-        gpu.indexCount = static_cast<uint32_t>(gpu.asset.indices.size());
+        gpu.asset = std::move(cpu.asset);
+        gpu.visualId = cpu.source.visualId;
+        gpu.vertexCount = cpu.vertexCount;
+        gpu.indexCount = cpu.indexCount;
         gpu.generation = m_generation;
         Msg("ph_dx12_m23: asset slot=%u visual=%u verts=%u indices=%u "
             "min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f) radius=%.3f",
-            slot, plan.visualId, gpu.vertexCount, gpu.indexCount,
+            slot, gpu.visualId, gpu.vertexCount, gpu.indexCount,
             gpu.asset.minimum.x, gpu.asset.minimum.y,
             gpu.asset.minimum.z, gpu.asset.maximum.x,
             gpu.asset.maximum.y, gpu.asset.maximum.z,

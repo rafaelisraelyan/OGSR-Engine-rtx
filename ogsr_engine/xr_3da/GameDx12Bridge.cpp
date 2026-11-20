@@ -6,10 +6,10 @@
 #include "GameDx12LevelGeometry.h"
 #include "GameDx12FourVisual.h"
 #include "GameDx12OffscreenPass.h"
+#include "GameDx12J2ABatch.h"
 #include "GameDx12J2APreparation.h"
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
-#include "GameDx12J2ABatch.h"
 #include "FS.h"
 #include "LocatorAPI_defs.h"
 #endif
@@ -27,12 +27,14 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 
 using Microsoft::WRL::ComPtr;
 
@@ -1510,11 +1512,29 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
                 owner.allocator = state.allocator.Get();
                 owner.list = state.list.Get();
                 owner.fenceValue = &state.fenceValue;
+                constexpr uint32_t jupiterSector = 129;
+                constexpr uint32_t jupiterRootVisual = 17431;
+                std::array<uint32_t, j2bbatch12::kTargetVisualCount> visuals{};
+                for (size_t slot = 0; slot < visuals.size(); ++slot)
+                    visuals[slot] = fourvisual12::kPlan[slot].visualId;
+
+                j2bbatch12::BatchResult12 batch;
+                const j2bbatch12::Identity12 expected{
+                    state.levelSession, state.captureEpoch};
+                const bool prepared = GameDx12J2ABatch_PrepareFromVfs(
+                    state.levelName, expected, jupiterSector, jupiterRootVisual,
+                    visuals, nullptr, false, batch, j2bbatch12::Limits12{});
+                const j2bbatch12::Identity12 live{
+                    state.levelSession, state.captureEpoch};
                 std::string reason;
-                const bool loaded = state.m23.LoadFromVfs(
-                    owner, state.levelName, state.levelSession,
-                    state.captureEpoch, reason);
-                if (!loaded)
+                if (!prepared)
+                {
+                    Msg("ph_dx12_m23: load failed CPU batch error=%u reason='%s'",
+                        static_cast<unsigned>(batch.error.code), batch.error.text);
+                }
+                else if (!state.m23.LoadFromBatch(
+                             owner, state.levelName, live, std::move(batch),
+                             reason))
                 {
                     Msg("ph_dx12_m23: load failed reason='%s'",
                         reason.empty() ? "allocation or unknown failure"

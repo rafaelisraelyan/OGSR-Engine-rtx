@@ -13,7 +13,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -21,6 +20,12 @@
 using Microsoft::WRL::ComPtr;
 
 class GameDx12OffscreenPass12;
+
+namespace j2bbatch12
+{
+struct BatchResult12;
+struct Identity12;
+}
 
 // F4.0-J2B-M23: bounded owner-side registry and diagnostic frame for four real
 // Jupiter visuals (9, 105, 106, 107).
@@ -92,16 +97,14 @@ public:
     GameDx12FourVisual12(const GameDx12FourVisual12&) = delete;
     GameDx12FourVisual12& operator=(const GameDx12FourVisual12&) = delete;
 
-    // Owner-only VFS load/upload of all four visuals. Reads $level$/level and
-    // $level$/level.geom once, validates the M0 counts and tint/plan contract,
-    // then uploads four independent VB/IB pairs in one submission. No draw is
-    // recorded. On failure before submission nothing is left published; on
-    // failure after submission the class quarantines itself.
-    bool LoadFromVfs(const GameDx12FourVisualOwner12& owner,
-                     const char* levelName,
-                     uint64_t levelSession,
-                     uint64_t levelEpoch,
-                     std::string& reason);
+    // Принимает готовый CPU batch для текущего сеанса уровня и загружает
+    // четыре пары VB/IB одной командой отправки. GPU-поколение публикуется
+    // после подтверждения fence. Неизвестное завершение требует карантина.
+    bool LoadFromBatch(const GameDx12FourVisualOwner12& owner,
+                       const char* levelName,
+                       const j2bbatch12::Identity12& live,
+                       j2bbatch12::BatchResult12&& batch,
+                       std::string& reason);
 
     // Owner-thread one-shot diagnostic. Records and submits the combined
     // four-draw pass, then four isolated passes, reading back and saving PNGs
@@ -168,13 +171,11 @@ private:
 
     bool Fail(std::string& reason, const char* text);
     bool Fail(std::string& reason, const std::string& text);
-    bool LoadFromVfsImpl(const GameDx12FourVisualOwner12& owner,
-                         const char* levelName,
-                         uint64_t levelSession,
-                         uint64_t levelEpoch,
-                         std::string& reason);
-    bool ReadVfsFile(const char* name, uint64_t maxBytes,
-                     std::vector<uint8_t>& bytes, std::string& reason);
+    bool LoadFromBatchImpl(const GameDx12FourVisualOwner12& owner,
+                           const char* levelName,
+                           const j2bbatch12::Identity12& live,
+                           j2bbatch12::BatchResult12& batch,
+                           std::string& reason);
     bool CreatePipeline(ID3D12Device* device, std::string& reason);
     bool CreateConstants(ID3D12Device* device, std::string& reason);
     bool CreateGeometryBuffers(ID3D12Device* device,
