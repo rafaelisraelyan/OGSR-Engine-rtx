@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "GameDx12Bridge.h"
 
 bool CRenderDevice::on_message(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, LRESULT& result)
 {
@@ -19,14 +20,20 @@ bool CRenderDevice::on_message(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         // Prevent moving/sizing and power loss in fullscreen mode
         switch (wParam)
         {
-        case SC_MOVE:
         case SC_SIZE:
+        case SC_MOVE:
         case SC_MAXIMIZE:
+            if (GameDx12Bridge_UsesNativeViewport())
+                return false;
+            result = 1;
+            return true;
         case SC_MONITORPOWER: result = 1; return (true);
         }
         return (false);
     }
     case WM_CLOSE: {
+        if (GameDx12Bridge_UsesNativeViewport())
+            Engine.Event.Defer("KERNEL:quit");
         result = 0;
         return (true);
     }

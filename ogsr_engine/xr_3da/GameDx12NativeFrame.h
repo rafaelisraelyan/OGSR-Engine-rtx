@@ -45,7 +45,7 @@ public:
 
     HRESULT Initialize(HWND window, IDXGIFactory2& factory, const Owner& owner);
     HRESULT Begin(HWND window, const Owner& owner, Recording& recording);
-    HRESULT Present(const Owner& owner, bool sceneDrawn);
+    HRESULT Present(const Owner& owner, uint64_t sceneFrame);
     HRESULT Cancel() noexcept;
     HRESULT Drain(const Owner& owner) noexcept;
     bool CompletionUnknown() const noexcept { return m_unknown; }
@@ -71,6 +71,8 @@ private:
     HRESULT Resize(const Owner& owner, uint32_t width, uint32_t height);
     HRESULT CreateTargets(ID3D12Device& device, uint32_t width, uint32_t height);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t index) const noexcept;
+    bool RecordCapture(ID3D12Device& device, Slot& slot);
+    HRESULT FinishCapture(const Owner& owner, uint64_t fence);
 
     std::array<Slot, kFrameCount> m_slots;
     Ptr<IDXGISwapChain3> m_swapchain;
@@ -79,6 +81,11 @@ private:
     Ptr<ID3D12Resource> m_depth;
     Ptr<ID3D12QueryHeap> m_timingQueries;
     Ptr<ID3D12Resource> m_timingReadback;
+    Ptr<ID3D12Resource> m_captureReadback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_captureLayout{};
+    wchar_t m_capturePath[MAX_PATH]{};
+    uint64_t m_captureStride = 0;
+    uint32_t m_captureCount = 0;
     uint64_t m_timestampFrequency = 0;
     GpuTiming m_lastGpuTiming;
     uint32_t m_rtvStride = 0;

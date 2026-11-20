@@ -1545,7 +1545,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     const auto presentStart = FrameClock::now();
     if (SUCCEEDED(hr))
-        hr = state.native.Present(owner, draws != 0);
+        hr = state.native.Present(owner, draws != 0 ? state.nativeScenePresents + 1 : 0);
     const auto presentEnd = FrameClock::now();
     if (FAILED(hr))
     {
@@ -1574,11 +1574,15 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         if (detailed && frames <= 480)
         {
             const auto& gpu = state.native.LastGpuTiming();
-            Msg("ph_dx12_metrics: frame=%llu present=%llu fence=%llu slot=%u mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
+            Msg("ph_dx12_metrics: frame=%llu present=%llu fence=%llu slot=%u draws=%u camera_hash=%016llX "
+                "position=(%.3f,%.3f,%.3f) direction=(%.3f,%.3f,%.3f) mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
                 "snapshot_ms=%.6f serial_ms=%.6f parallel_ms=%.6f record_ms=%.6f "
                 "present_ms=%.6f gpu_present=%llu gpu_ms=%.6f",
                 static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
-                static_cast<unsigned long long>(state.fenceValue), recording.slot,
+                static_cast<unsigned long long>(state.fenceValue), recording.slot, draws,
+                static_cast<unsigned long long>(state.lastMatrixHash),
+                Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
+                Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z,
                 timings.mode, frameMs, elapsed(start, begin),
                 timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
                 elapsed(presentStart, presentEnd), static_cast<unsigned long long>(gpu.present), gpu.milliseconds);

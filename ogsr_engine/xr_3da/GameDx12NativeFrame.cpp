@@ -4,6 +4,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -12,6 +13,10 @@ namespace
 constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT depthFormat = DXGI_FORMAT_D32_FLOAT;
 constexpr DWORD fenceTimeoutMs = 10000;
+constexpr uint32_t captureFrames = 30;
+constexpr uint32_t captureMaxWidth = 1920;
+constexpr uint32_t captureMaxHeight = 1080;
+constexpr uint32_t captureSceneStart = 120;
 
 D3D12_RESOURCE_BARRIER ColorBarrier(ID3D12Resource* resource,
                                    D3D12_RESOURCE_STATES before,
@@ -89,6 +94,17 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     hr = CreateTargets(owner.device, desc.Width, desc.Height);
     if (FAILED(hr))
         return hr;
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_CAMERA_CAPTURE
+    const DWORD directory = GetEnvironmentVariableW(L"OGSR_DX12_NATIVE_CAPTURE_DIR",
+                                                  m_capturePath, MAX_PATH);
+    if (directory >= MAX_PATH ||
+        (directory != 0 && wcscat_s(m_capturePath, L"\\native-frames.rgba") != 0))
+    {
+        m_capturePath[0] = L'\0';
+        Msg("ph_dx12_capture: invalid capture path");
+    }
+#endif
 
     const char* measure = std::getenv("OGSR_DX12_GAME_METRICS");
     if (measure != nullptr && std::strcmp(measure, "1") == 0 &&
@@ -218,6 +234,12 @@ HRESULT GameDx12NativeFrame12::Resize(const Owner& owner, uint32_t width, uint32
     HRESULT hr = Drain(owner);
     if (FAILED(hr))
         return hr;
+    if (m_captureReadback)
+    {
+        Msg("ph_dx12_capture: cancelled on viewport resize after %u frames", m_captureCount);
+        m_capturePath[0] = L'\0';
+        m_captureReadback.Reset();
+    }
     m_depth.Reset();
     for (auto& slot : m_slots)
         slot.color.Reset();
@@ -309,7 +331,89 @@ HRESULT GameDx12NativeFrame12::Cancel() noexcept
     return m_slots[m_slot].list->Close();
 }
 
-HRESULT GameDx12NativeFrame12::Present(const Owner& owner, bool sceneDrawn)
+bool GameDx12NativeFrame12::RecordCapture(ID3D12Device& device, Slot& slot)
+{
+    if (!m_captureReadback)
+    {
+        if (m_width > captureMaxWidth || m_height > captureMaxHeight)
+        {
+            Msg("ph_dx12_capture: viewport exceeds capture limit %ux%u",
+                captureMaxWidth, captureMaxHeight);
+            return false;
+        }
+        const auto source = slot.color->GetDesc();
+        uint64_t bytes = 0;
+        device.GetCopyableFootprints(&source, 0, 1, 0, &m_captureLayout, nullptr, nullptr, &bytes);
+        constexpr uint64_t alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        m_captureStride = (bytes + alignment - 1) & ~(alignment - 1);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = m_captureStride * captureFrames;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = device.CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(m_captureReadback.GetAddressOf()));
+        if (FAILED(hr))
+        {
+            Msg("ph_dx12_capture: readback allocation failed hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION capture{};
+    capture.pResource = m_captureReadback.Get();
+    capture.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    capture.PlacedFootprint = m_captureLayout;
+    capture.PlacedFootprint.Offset = m_captureStride * m_captureCount;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = slot.color.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const auto toCopy = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+    slot.list->ResourceBarrier(1, &toCopy);
+    slot.list->CopyTextureRegion(&capture, 0, 0, 0, &source, nullptr);
+    return true;
+}
+
+HRESULT GameDx12NativeFrame12::FinishCapture(const Owner& owner, uint64_t fence)
+{
+    const HRESULT complete = Wait(owner, fence);
+    if (FAILED(complete))
+        return complete;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(m_captureStride * captureFrames)};
+    void* pixels = nullptr;
+    const HRESULT map = m_captureReadback->Map(0, &range, &pixels);
+    bool written = false;
+    if (SUCCEEDED(map))
+    {
+        std::FILE* output = nullptr;
+        if (_wfopen_s(&output, m_capturePath, L"wb") == 0)
+        {
+            written = std::fwrite(pixels, 1, range.End, output) == range.End;
+            written = std::fclose(output) == 0 && written;
+        }
+        const D3D12_RANGE noWrite{};
+        m_captureReadback->Unmap(0, &noWrite);
+    }
+    Msg("ph_dx12_capture: %s frames=%u first_present=%llu last_present=%llu fence=%llu "
+        "width=%u height=%u pitch=%u stride=%llu",
+        written ? "saved" : "write failed", captureFrames,
+        static_cast<unsigned long long>(m_presentCount - captureFrames + 1),
+        static_cast<unsigned long long>(m_presentCount), static_cast<unsigned long long>(fence),
+        m_width, m_height, m_captureLayout.Footprint.RowPitch,
+        static_cast<unsigned long long>(m_captureStride));
+    m_capturePath[0] = L'\0';
+    m_captureReadback.Reset();
+    return S_OK;
+}
+
+HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
 {
     if (!m_recording || m_unknown)
         return E_FAIL;
@@ -319,6 +423,7 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, bool sceneDrawn)
         return E_FAIL;
     }
     auto& slot = m_slots[m_slot];
+    const bool sceneDrawn = sceneFrame != 0;
     if (m_timingQueries && sceneDrawn)
     {
         const uint32_t query = 2 * m_slot;
@@ -326,7 +431,20 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, bool sceneDrawn)
         slot.list->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                                     query, 2, m_timingReadback.Get(), query * sizeof(uint64_t));
     }
-    const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+    bool captured = false;
+    if (m_capturePath[0] && sceneFrame >= captureSceneStart)
+    {
+        captured = RecordCapture(owner.device, slot);
+        if (!captured)
+            m_capturePath[0] = L'\0';
+    }
+    else if (m_captureReadback)
+    {
+        // The batch must contain consecutive scene presents.
+        m_captureCount = 0;
+    }
+    const auto barrier = ColorBarrier(slot.color.Get(), captured ? D3D12_RESOURCE_STATE_COPY_SOURCE
+                                                                  : D3D12_RESOURCE_STATE_RENDER_TARGET,
                                       D3D12_RESOURCE_STATE_PRESENT);
     slot.list->ResourceBarrier(1, &barrier);
     const HRESULT close = Cancel();
@@ -350,7 +468,17 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, bool sceneDrawn)
         ++m_presentCount;
         if (m_timingQueries && sceneDrawn)
             slot.timingPresent = m_presentCount;
+        if (captured)
+        {
+            Msg("ph_dx12_capture: sequence=%u present=%llu scene_frame=%llu fence=%llu slot=%u",
+                m_captureCount + 1, static_cast<unsigned long long>(m_presentCount),
+                static_cast<unsigned long long>(sceneFrame), static_cast<unsigned long long>(value), m_slot);
+            if (++m_captureCount == captureFrames)
+                return FinishCapture(owner, value);
+        }
     }
+    else if (captured)
+        m_captureCount = 0;
     return hr;
 }
 
@@ -370,6 +498,7 @@ void GameDx12NativeFrame12::Release() noexcept
     m_swapchain.Reset();
     m_timingQueries.Reset();
     m_timingReadback.Reset();
+    m_captureReadback.Reset();
 }
 
 void GameDx12NativeFrame12::Quarantine() noexcept
@@ -389,6 +518,7 @@ void GameDx12NativeFrame12::Quarantine() noexcept
     m_swapchain.Detach();
     m_timingQueries.Detach();
     m_timingReadback.Detach();
+    m_captureReadback.Detach();
 }
 
 #endif
