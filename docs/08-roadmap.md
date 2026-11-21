@@ -34,7 +34,7 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 | **F4.0-B** | Нативный игровой DX12 vertical slice, реальные DDS, камера/Present, независимое ревью PASS WITH NOTES | Ограниченный участок, не вся игра |
 | **F4.1-E** | Jupiter: **20 880** source visual ID совпали с R4, **13 911** рисуемых static visuals, 0 dropped unreachable. Реальные игровые снимки, GBV logs | Отдельные game-owned объекты/двери, `level.details`, blend, свет, HUD; independent code review ещё нужен |
 | **Source F4.1** | Ветка [опубликована](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/tree/feature/f41-full-static-jupiter), 49 линейных feature commits, HEAD `b9b3dd227` | Не слита в `prypiat`, интеграционная clean matrix не пройдена |
-| **F4.2-A/B** | **AUTHOR GAMEPLAY EVIDENCE PASS WITH NOTES / INDEPENDENT SOURCE REVIEW PENDING**: в локальной feature-ветке F4.2 показаны настоящие rigid visuals, подвижная дверь, физические ящики и инстансы `level.details`; тесты R4/DX12 заявлены PASS | Подтвердить код SHA, сборки, оригинальное размещение/pose и окончательную совместимость; взвешенный skinning, искажающие материалы, ветер и production approval остаются открытыми |
+| **F4.2-A/B** | **PUBLISHED / GAMEPLAY AUTHOR EVIDENCE PASS WITH NOTES / FOCUSED SOURCE REVIEW WITH NOTES**: исходники опубликованы в [feature/f42-game-visuals-details](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/tree/feature/f42-game-visuals-details), SHA `7d5dc1858922`; real rigid visuals, динамическая дверь и оригинальные детали; [первичный independent review](dx12-f42-independent-source-review.md) | Windows build/evidence replay ещё не проверены независимо, требуется CPU timing/slot profiling [#16](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/16); weighted skinning, distortion, ветер, TDR и production approval остаются открытыми |
 | **DXR/RTX** | ADR и техническая концепция | Реальный ray-traced игровой кадр не принят |
 | **Volumetric Clouds** | Standalone DX12 ray marcher и погодная ветка | Последний R4 rebuild получил 2×P2 REQUEST CHANGES, игровой HDR composite не принят |
 | **PhysX** | Opt-in source integration через [PR #1](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/pull/1), 16-live controlled ragdoll тест | Full ALife/save/loot/performance и default-on HOLD, ODE fallback |
@@ -43,7 +43,7 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 
 | Очередь | Цель | Гейт завершения |
 |---|---|---|
-| **Сейчас — проверка законченного функционального пакета** | F4.2-A/B по отчёту Codex/Terra реализованы локально, последние заявленные SHA `5bbf53966` (tested code) и `7d5dc1858` (doc HEAD); код F4.2 пока не найден на GitHub | Независимое source review, exact build/evidence provenance и адресная приемка; не утверждать production PASS |
+| **Сейчас — контроль опубликованного F4.2** | F4.2-A/B опубликован в GitHub, exact HEAD `7d5dc1858922ebbbdee845b0967b44b8d679a42f`; начато независимое source review по игровым snapshots, OGF, деталям и GPU lifecycle | Закрыть [направленные замечания source review](dx12-f42-independent-source-review.md), подтвердить бинарники/доказательства и performance; merge в `prypiat` только по отдельному решению |
 | **Параллельная база** | F4.1-E опубликован на GitHub, его independent integration review всё ещё открыт | Проверить source/lifecycle/regression на актуальной ветке и будущий merge candidate |
 | **Ранняя интеграция, параллельно или сразу после F4.2-A/B** | **F4.2-SKY: наше небо и объёмные облака** [#15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15) | Рабочий game-owned sky/background, CEnvironment, GPU cloud compositing, корректный indoor occlusion, Classic 2D fallback; пока opt-in |
 | **После F4.2** | F4.3 паритет исходных материалов, света и прозрачности R4; интеграция с новым sky pass | Нормальный opaque/cutout/**blended**, legacy shaders, sun/local lights; **без новых PBR-текстур** |
@@ -84,7 +84,7 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 
 **Результат:** двери, висящие лампы, ящики и другие игровые rigid props в оригинальных координатах и состоянии; затем трава/малые детали в исходных местах. Не возвращать hardcoded sector IDs и не создавать второй VFS loader.
 
-**Checkpoint 21–22 ноября 2026 — исполнитель сообщил об игровых тестах F4.2-A/B; независимое ревью ещё не состоялось.** В локальной `feature/f42-game-visuals-details` заявлен проверенный code SHA `5bbf53966`, documentation HEAD `7d5dc1858`. На момент сверки в GitHub **нет удалённой F4.2 ветки и этих коммитов**: вывод ниже основан на предоставленном отчёте и игровых изображениях, **не на независимом чтении локальных C++/HLSL и raw logs**. Код не слит в `prypiat`.
+**Checkpoint 21–22 ноября 2026 — F4.2-A/B опубликован; независимое ограниченное source review начато.** Опубликованная [ветка F4.2](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/tree/feature/f42-game-visuals-details) имеет проверенный remote HEAD `7d5dc1858922ebbbdee845b0967b44b8d679a42f`, подтверждённый базис F4.1-E и 11 коммитов F4.2. Заявленный tested code SHA `5bbf53966`. [Проверены непосредственно C++-пути snapshots, rigid OGF, level.details, frame buffers, lifecycle](dx12-f42-independent-source-review.md): no confirmed critical error in the reviewed paths; **independent Windows build and GPU/evidence replay NOT RUN**. Ни один F4.2 кодовый коммит не слит в `prypiat`.
 
 | Область | Авторское игровое evidence | Открытая граница |
 |---|---|---|
@@ -96,7 +96,7 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 
 **Визуальные расхождения на приложенных кадрах:** R4 интерьер значительно темнее, с NPC и действующим освещением, тогда как DX12 ещё имеет плоское освещение и отсутствие показанных NPC; на левом арочном проёме DX12 заметны границы/прямоугольные участки, требующие source-backed проверки; открытая сцена DX12 имеет однотонное небо вместо погодных облаков R4. Не объявлять эти отличия исправленными в F4.2: часть относится к F4.3/F4.4 и запланированному [F4.2-SKY #15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15). Декали остаются [Issue #13](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/13).
 
-**Tech Lead gate:** F4.2-A/B **REAL-GAME AUTHOR TESTS PASS WITH NOTES, SOURCE REVIEW PENDING, MERGE HOLD**. Не требовать новых масштабных аудитов до чтения опубликованного кода. Следующий функциональный результат — ранняя интеграция собственного неба, затем перенос остальных R4 render paths с [матрицей паритета](dx12-r4-render-parity.md).
+**Tech Lead gate:** F4.2-A/B **PUBLISHED; AUTHOR GAMEPLAY EVIDENCE PASS WITH NOTES; FOCUSED INDEPENDENT SOURCE REVIEW WITH NOTES; FULL ACCEPTANCE/PRODUCTION MERGE HOLD**. Из исходников подтверждён [риск CPU frame preparation/timing #16](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/16), но факт падения FPS пока не установлен. Нужны адресные Windows/GPU и R4 проверки на финальном бинарнике, не очередной общий аудит. Следующий функциональный пакет — собственное небо [F4.2-SKY #15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15), затем остальные R4 paths из [матрицы паритета](dx12-r4-render-parity.md).
 
 
 
