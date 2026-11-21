@@ -13,6 +13,7 @@ namespace
 constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT depthFormat = DXGI_FORMAT_D32_FLOAT;
 constexpr DWORD fenceTimeoutMs = 10000;
+constexpr uint64_t removedFenceValue = UINT64_MAX;
 constexpr uint32_t captureFrames = 30;
 constexpr uint32_t captureMaxWidth = 1920;
 constexpr uint32_t captureMaxHeight = 1080;
@@ -193,7 +194,8 @@ HRESULT GameDx12NativeFrame12::Wait(const Owner& owner, uint64_t value) noexcept
     }
     if (SUCCEEDED(hr))
         hr = owner.device.GetDeviceRemovedReason();
-    if (SUCCEEDED(hr) && owner.fence.GetCompletedValue() < value)
+    const uint64_t completed = owner.fence.GetCompletedValue();
+    if (SUCCEEDED(hr) && (completed == removedFenceValue || completed < value))
         hr = E_FAIL;
     if (FAILED(hr))
         m_unknown = true;
@@ -206,7 +208,7 @@ HRESULT GameDx12NativeFrame12::Drain(const Owner& owner) noexcept
         return E_FAIL;
     if (!m_submitted)
         return S_OK;
-    if (owner.fenceValue == (std::numeric_limits<uint64_t>::max)())
+    if (owner.fenceValue >= removedFenceValue - 1)
     {
         m_unknown = true;
         return E_FAIL;
@@ -431,7 +433,7 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
 {
     if (!m_recording || m_unknown)
         return E_FAIL;
-    if (owner.fenceValue == (std::numeric_limits<uint64_t>::max)())
+    if (owner.fenceValue >= removedFenceValue - 1)
     {
         Cancel();
         return E_FAIL;
@@ -468,6 +470,21 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     m_submitted = true;
     ID3D12CommandList* lists[]{slot.list.Get()};
     owner.queue.ExecuteCommandLists(1, lists);
+    if (m_presentCount == 79)
+    {
+        const char* probe = std::getenv("OGSR_DX12_GAME_NATIVE_REMOVE_DEVICE");
+        if (probe && std::strcmp(probe, "1") == 0)
+        {
+            Ptr<ID3D12Device5> removable;
+            if (SUCCEEDED(owner.device.QueryInterface(IID_PPV_ARGS(removable.GetAddressOf()))))
+            {
+                Msg("ph_dx12_f42: fault device removal after ExecuteCommandLists present=80");
+                removable->RemoveDevice();
+            }
+            else
+                Msg("ph_dx12_f42: fault device removal unavailable (ID3D12Device5)");
+        }
+    }
     const uint64_t value = owner.fenceValue + 1;
     const HRESULT signal = owner.queue.Signal(&owner.fence, value);
     if (FAILED(signal))
