@@ -36,11 +36,23 @@ $ready     = First-Match 'ph_dx12_f41: ready'
 $loaded    = First-Match 'ph_dx12_f41: scene loaded'
 $infoInit  = First-Match 'infoqueue phase=init'
 $infoShut  = First-Match 'infoqueue phase=shutdown'
+$capture   = First-Match 'ph_dx12_capture: saved frames='
+$scene42   = @(All-Matches 'ph_dx12_f42:')
 $failure   = All-Matches 'ph_dx12_f41: load failed'
 $declPools = All-Matches 'ph_dx12_f41: vb_pool '
 $texMiss   = All-Matches 'ph_dx12_f41: texture missing'
 $texUnsup  = All-Matches 'ph_dx12_f41: texture unsupported'
 $metrics   = All-Matches 'ph_dx12_metrics: frame='
+
+$processResult = [ordered]@{}
+$manifestPath = Join-Path $RunDirectory 'manifest.md'
+if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+    $fields = 'renderer', 'save', 'exit', 'cleanExit', 'closeRequested', 'closeAccepted', 'closeForced', 'windowShotDone', 'windowShotSha256'
+    foreach ($line in Get-Content -LiteralPath $manifestPath) {
+        $name, $value = $line -split '=', 2
+        if ($fields -contains $name) { $processResult[$name] = $value }
+    }
+}
 
 $drawCounts = @()
 foreach ($line in $metrics) {
@@ -60,6 +72,9 @@ if ($drawCounts.Count -gt 0) {
 $summary = [ordered]@{
     run                  = Split-Path $RunDirectory -Leaf
     log                  = $log.Name
+    process              = $processResult
+    native_capture       = $capture
+    scene_f42            = $scene42
     snapshot             = $snapshot
     hierarchy            = $hierarchy
     pools                = $pools
@@ -88,6 +103,11 @@ $md += '# F4.1 run summary'
 $md += ''
 $md += 'run: ' + $summary.run
 $md += 'log: ' + $summary.log
+$md += 'native capture: ' + $capture
+$md += ''
+$md += '## Process'
+$md += ''
+foreach ($field in $processResult.Keys) { $md += $field + '=' + $processResult[$field] }
 $md += ''
 $md += '| item | value |'
 $md += '|---|---|'
@@ -111,6 +131,14 @@ $md += '```'
 $md += $infoInit
 $md += $infoShut
 $md += '```'
+if ($scene42.Count -gt 0) {
+    $md += ''
+    $md += '## F4.2'
+    $md += ''
+    $md += '```'
+    $md += $scene42
+    $md += '```'
+}
 Set-Content -Path (Join-Path $RunDirectory 'summary.md') -Value $md -Encoding ASCII
 
 Write-Output ('summary written for ' + $summary.run)

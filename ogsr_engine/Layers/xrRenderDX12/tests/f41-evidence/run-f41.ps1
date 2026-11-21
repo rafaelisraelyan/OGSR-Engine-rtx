@@ -11,13 +11,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Run,
+    [string]$RunsRoot = '',
     [string]$Exe = '',
     [string]$GameData = 'C:\OGSR_J1_Runtime_R2\gamedata',
     [string]$ArchRoot = 'C:\OGSR_J1_Runtime_R2',
     [string]$Save = 'b23_jupiter',
+    [string]$Demo = '',
     [switch]$Capture,
     [switch]$NoClose,
     [int]$TimeoutSeconds = 120,
+    [ValidateRange(1, 600)][int]$ShutdownTimeoutSeconds = 20,
     [int]$Width = 1280,
     [int]$Height = 720,
     [string]$Route = '',
@@ -29,44 +32,67 @@ param(
     [switch]$Cmp,
     [string]$WindowShot = '',
     [int]$WindowShotDelay = 18,
+    [string]$WindowShotReadyPattern = '',
     [int]$ViewMode = 0,
     [hashtable]$Env = @{}
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$runsRoot = Join-Path $PSScriptRoot 'runs'
-$dir = Join-Path $runsRoot $Run
+$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\..\..'))
+if ($Run -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$' -or $Run.EndsWith('.')) {
+    throw "Invalid run identifier: $Run"
+}
+if ($RunsRoot -eq '') { $RunsRoot = Join-Path $PSScriptRoot 'runs' }
+$RunsRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunsRoot)
+$dir = Join-Path $RunsRoot $Run
 
-if (Test-Path $dir) {
+if (Test-Path -LiteralPath $dir) {
     throw "Run directory already exists: $dir"
 }
 if ($Exe -eq '') {
     $Exe = Join-Path $repo 'bin_x64\xrEngine.exe'
 }
-if (!(Test-Path $Exe)) {
-    throw "Engine executable is missing: $Exe"
-}
-if (!(Test-Path $GameData)) {
-    throw "Game data is missing: $GameData"
-}
-if (!(Test-Path (Join-Path $ArchRoot 'levels'))) {
+$Exe = (Get-Item -LiteralPath $Exe).FullName
+$binaryRoot = Split-Path -Parent $Exe
+$GameData = (Get-Item -LiteralPath $GameData).FullName
+$ArchRoot = (Get-Item -LiteralPath $ArchRoot).FullName
+if (!(Test-Path -LiteralPath (Join-Path $ArchRoot 'levels') -PathType Container)) {
     throw "Level archives are missing under: $ArchRoot"
 }
+$sourceSave = Join-Path $ArchRoot "appdata\savedgames\$Save.scop"
+if (!(Test-Path -LiteralPath $sourceSave -PathType Leaf)) {
+    throw "Requested save is missing: $sourceSave"
+}
+if ($Demo -ne '') {
+    $Demo = (Get-Item -LiteralPath $Demo).FullName
+    if ([IO.Path]::GetExtension($Demo) -ine '.xrdemo') { throw "Expected an .xrdemo file: $Demo" }
+}
+if ($WindowShot -ne '') {
+    $WindowShot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WindowShot)
+    if (Test-Path -LiteralPath $WindowShot) { throw "Window screenshot already exists: $WindowShot" }
+}
+if ($WindowShotReadyPattern -ne '') { $null = [regex]::new($WindowShotReadyPattern) }
 
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
+New-Item -ItemType Directory -Force -Path $RunsRoot | Out-Null
+New-Item -ItemType Directory -Path $dir | Out-Null
 $exeName = "xrEngine_$Run.exe"
-Copy-Item $Exe (Join-Path $dir $exeName)
+Copy-Item -LiteralPath $Exe -Destination (Join-Path $dir $exeName)
 
-foreach ($dll in @('nvngx_dlss.dll', 'OpenAL32.dll')) {
-    $source = Join-Path $repo "bin_x64\$dll"
-    if (Test-Path $source) { Copy-Item $source $dir }
+foreach ($dll in @('nvngx_dlss.dll', 'OpenAL32.dll', 'dbghelp.dll')) {
+    $source = Join-Path $binaryRoot $dll
+    if (Test-Path -LiteralPath $source -PathType Leaf) {
+        Copy-Item -LiteralPath $source -Destination $dir
+    }
 }
 
 # gamedata РїСЂРѕРіРѕРЅР° = РїРѕР»РЅР°СЏ РєРѕРїРёСЏ РёРіСЂРѕРІРѕРіРѕ gamedata СЂСЏРґРѕРј СЃ EXE ($fs_root$).
 $overlayLog = Join-Path $dir 'overlay-copy.log'
-robocopy $GameData (Join-Path $dir 'gamedata') /E /COPY:DAT /R:1 /W:1 /NP /NFL /NDL |
+$PSNativeCommandUseErrorActionPreference = $false
+robocopy $GameData (Join-Path $dir 'gamedata') /E /COPY:DAT /XJ /R:1 /W:1 /NP /NFL /NDL |
     Out-File -FilePath $overlayLog -Encoding utf8
+if ($LASTEXITCODE -ge 8) {
+    throw "Overlay copy failed (robocopy exit $LASTEXITCODE). See $overlayLog"
+}
 
 $appdata = Join-Path $dir 'appdata'
 New-Item -ItemType Directory -Force -Path (Join-Path $appdata 'savedgames') | Out-Null
@@ -83,6 +109,7 @@ foreach ($known in @("$Save.scop", 'b23_zaton.scop')) {
         Copy-Item $source (Join-Path $appdata 'savedgames')
     }
 }
+if ($Demo -ne '') { Copy-Item -LiteralPath $Demo -Destination (Join-Path $appdata 'savedgames') }
 
 $fsgame = @"
 `$app_data_root$		= true|		false|		$dir\appdata\
@@ -134,18 +161,33 @@ if ($NoAlphaTest) { $environment['OGSR_DX12_GAME_SCENE_NOTEST'] = '1' }
 if ($Cmp) { $environment['OGSR_DX12_CMP'] = '1' }
 if ($ViewMode -ne 0) { $environment['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$ViewMode }
 foreach ($key in $Env.Keys) { $environment[$key] = $Env[$key] }
-foreach ($key in $environment.Keys) {
-    [Environment]::SetEnvironmentVariable($key, [string]$environment[$key], 'Process')
+
+function Get-GameLog {
+    Get-ChildItem -LiteralPath (Join-Path $dir 'appdata\logs') -Filter 'xray_gr_*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
 $started = Get-Date
-$process = Start-Process -FilePath (Join-Path $dir $exeName) -WorkingDirectory $dir `
-    -ArgumentList ($arguments -join ' ') -PassThru
+$savedEnvironment = @{}
+try {
+    foreach ($key in $environment.Keys) {
+        $savedEnvironment[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+        [Environment]::SetEnvironmentVariable($key, [string]$environment[$key], 'Process')
+    }
+    $process = Start-Process -FilePath (Join-Path $dir $exeName) -WorkingDirectory $dir `
+        -ArgumentList ($arguments -join ' ') -PassThru
+} finally {
+    foreach ($key in $savedEnvironment.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key], 'Process')
+    }
+}
+Write-Output "launched pid=$($process.Id) run directory: $dir"
 $peakWorkingSet = 0
 $peakPrivate = 0
 $deadline = $started.AddSeconds($TimeoutSeconds)
-$closed = $false
 $windowShotDone = $false
+$windowShotError = ''
+$closeForced = $false
 while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
     try {
@@ -155,12 +197,17 @@ while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
     } catch { }
     if ($WindowShot -ne '' -and -not $windowShotDone -and
         ((Get-Date) - $started).TotalSeconds -ge $WindowShotDelay) {
-        $windowShotDone = $true
+        if ($WindowShotReadyPattern -ne '') {
+            $currentLog = Get-GameLog
+            if (!$currentLog -or !(Select-String -LiteralPath $currentLog.FullName -Pattern $WindowShotReadyPattern -Quiet -ErrorAction SilentlyContinue)) {
+                continue
+            }
+        }
         try {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-                -File (Join-Path $PSScriptRoot 'capture-window.ps1') `
-                -ProcessId $process.Id -OutputPath $WindowShot 2>&1 | Out-Null
-        } catch { }
+            & (Join-Path $PSScriptRoot 'capture-window.ps1') -ProcessId $process.Id -OutputPath $WindowShot
+            $windowShotDone = $true
+            $windowShotError = ''
+        } catch { $windowShotError = $_.Exception.Message }
     }
 }
 $closeRequested = $null
@@ -168,28 +215,45 @@ $closeAccepted = $null
 if (-not $process.HasExited -and -not $NoClose) {
     $closeRequested = Get-Date
     $closeAccepted = $process.CloseMainWindow()
-    if (-not $process.WaitForExit(20000)) {
-        $process.Kill()
-        $process.WaitForExit(5000)
+    if (-not $process.WaitForExit($ShutdownTimeoutSeconds * 1000)) {
+        try {
+            $process.Kill()
+            $closeForced = $true
+        } catch {
+            if (!$process.HasExited) { throw }
+        }
+        $null = $process.WaitForExit(5000)
     }
 }
 $exitCode = if ($process.HasExited) { $process.ExitCode } else { -1 }
 $completed = Get-Date
 
-$logFile = Get-ChildItem (Join-Path $dir 'appdata\logs') -Filter 'xray_gr_*.log' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$logFile = Get-GameLog
+$windowShotHash = if ($windowShotDone) { (Get-FileHash -LiteralPath $WindowShot -Algorithm SHA256).Hash } else { '' }
 
 $manifest = @(
     "run=$Run"
+    "processId=$($process.Id)"
+    "renderer=$(if ($R4) { 'R4' } else { 'native DX12 requested' })"
     "exe=$exeName"
     "exe_sha256=$((Get-FileHash (Join-Path $dir $exeName) -Algorithm SHA256).Hash)"
     "args=$($arguments -join ' ')"
     "env=$((($environment.GetEnumerator() | Sort-Object Key | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'))"
+    "gamedata=$GameData"
+    "archives=$ArchRoot"
+    "save=$Save"
+    "demo=$Demo"
     "started=$($started.ToString('o'))"
     "closeRequested=$($closeRequested)"
     "closeAccepted=$closeAccepted"
+    "closeForced=$closeForced"
     "completed=$($completed.ToString('o'))"
     "exit=$exitCode"
+    "cleanExit=$($process.HasExited -and $exitCode -eq 0 -and !$closeForced)"
+    "windowShot=$WindowShot"
+    "windowShotDone=$windowShotDone"
+    "windowShotSha256=$windowShotHash"
+    "windowShotError=$windowShotError"
     "peakWorkingSet=$peakWorkingSet"
     "sampledPeakPrivate=$peakPrivate"
     "log=$($logFile.Name)"

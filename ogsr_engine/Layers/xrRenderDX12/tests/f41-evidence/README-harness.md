@@ -1,4 +1,4 @@
-# F4.1 / F4.1-E evidence harness
+# Игровые проверки native DX12 и R4
 
 Инструменты, которыми снимались доказательства этапов F4.1 (полная статическая
 сцена Jupiter) и F4.1-E (сверка R4↔DX12). Скрипты лёгкие и переносимые:
@@ -17,19 +17,42 @@
 ## Типовой прогон
 
 ```powershell
-# DX12, свободная камера, захват кадров
-.\run-f41.ps1 -Run f41-final-a-actorcam -Capture -Fly '-120,60,120,-30,35,0'
+$runs = 'C:\OGSR-evidence\F4.2\runs'
+$dx12 = 'C:\OGSR-builds\f42-camera\xrEngine.exe'
+$r4 = 'C:\OGSR-builds\f42-r4\xrEngine.exe'
 
-# сводка по логу прогона
-.\summarize-f41.ps1 -RunDirectory .\runs\f41-final-a-actorcam
+.\run-f41.ps1 -Run jupiter-interior-dx12 -RunsRoot $runs -Exe $dx12 `
+    -Save b23_jupiter -Capture
+python .\decode-native-capture.py (Join-Path $runs 'jupiter-interior-dx12')
+.\summarize-f41.ps1 -RunDirectory (Join-Path $runs 'jupiter-interior-dx12')
 
-# сравнение R4 <-> DX12 (инвентарь, отправленные draw, спавн-объекты)
-.\run-f41.ps1 -Run f41-cmp -Cmp
-
-# R4-половина: та же сборка без DX12-моста + снимок окна
-.\run-f41.ps1 -Run f41-r4 -R4 -Cmp -Exe .\bin\xrEngine-f41e-off.exe `
-    -WindowShot .\runs\f41-r4-shot.png -WindowShotDelay 45
+.\run-f41.ps1 -Run jupiter-interior-r4 -RunsRoot $runs -Exe $r4 -R4 `
+    -Save b23_jupiter -WindowShot (Join-Path $runs 'jupiter-interior-r4\window.png') `
+    -WindowShotDelay 45
+.\run-f41.ps1 -Run zaton-r4 -RunsRoot $runs -Exe $r4 -R4 -Save b23_zaton
 ```
+
+Пути в примере заменяются путями конкретного запуска из его манифеста.
+Скрипт копирует EXE и доступные DLL из одного каталога сборки, готовит
+отдельную копию `gamedata`, конфигурацию и сохранения. Архивы игры читаются
+из `-ArchRoot`. Каждому прогону нужен новый `-Run` внутри `-RunsRoot`.
+
+Парные кадры интерьера снимаются из одного сохранения и при одинаковом
+размере клиентской области. Для движения можно записать путь штатной
+командой `demo_record <имя>`, передать файл через `-Demo <файл.xrdemo>`
+и воспроизвести его командой `demo_play <имя>` на обеих сборках.
+`-Fly` меняет камеру только в DX12. Для снимка R4 при необходимости
+задайте `-WindowShotReadyPattern` со строкой игрового лога, после которой
+сцена готова. Кадр и его SHA-256 записываются в манифест запуска.
+
+Штатное завершение подтверждается `cleanExit=True` и `closeForced=False`.
+Для сравнения R4 также требуется проверить в логе факт загрузки уровня,
+а в PNG наличие геометрии и целевой камеры. В DX12 дочитайте итоговую
+запись InfoQueue до конца и проверьте наличие `debug=1`, `gbv=1`,
+`gbvVerified=1` и нулевые счётчики warning/error/corruption/discarded.
+Декодер сверяет 30 последовательных Present, номера слотов, fences и
+размер readback. Для движущегося объекта дополнительно нужна привязка
+изменения его world transform или bone pose к этому ряду Present.
 
 ## Переменные окружения движка, которые использует harness
 
