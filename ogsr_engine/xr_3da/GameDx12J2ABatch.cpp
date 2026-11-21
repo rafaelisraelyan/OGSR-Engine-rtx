@@ -250,11 +250,89 @@ void GameDx12J2ABatch_ReadTextures(
     }
 }
 
+void GameDx12J2ABatch_ReadTextureNames(
+    const std::vector<std::string>& names,
+    std::vector<GameDx12SceneTexture12>& textures,
+    GameDx12TextureReadStats12& stats, uint64_t maxTotalBytes) noexcept
+{
+    stats = GameDx12TextureReadStats12{};
+    textures.clear();
+    stats.requested = static_cast<uint32_t>(names.size());
+    try
+    {
+        if (!OnMainThread())
+            return;
+        textures.resize(names.size());
+        uint64_t totalBytes = 0;
+        for (size_t index = 0; index < names.size(); ++index)
+        {
+            auto& entry = textures[index];
+            entry.name = names[index];
+            ++stats.decoded;
+            if (entry.name.empty() || entry.name.size() > 180 ||
+                entry.name.find("..") != std::string::npos ||
+                entry.name.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.\\") !=
+                    std::string::npos)
+            {
+                --stats.decoded;
+                ++stats.unsupported;
+                continue;
+            }
+            if (totalBytes >= maxTotalBytes)
+            {
+                --stats.decoded;
+                ++stats.unsupported;
+                continue;
+            }
+            const uint64_t budget = maxTotalBytes - totalBytes;
+            const std::string ddsName = entry.name + ".dds";
+            double openMs = 0.0;
+            double copyMs = 0.0;
+            j2bbatch12::ErrorInfo12 error;
+            std::vector<uint8_t> bytes;
+            const char* reason = "texture allocation failed";
+            if (!ReadVfsFile("DDS", ddsName.c_str(), (std::min)(budget, 16ull * 1024ull * 1024ull),
+                             bytes, error, openMs, copyMs) &&
+                !ReadVfsFile("DDS", ddsName.c_str(),
+                             (std::min)(budget, 16ull * 1024ull * 1024ull), bytes,
+                             error, openMs, copyMs, fsgame::game_textures))
+            {
+                --stats.decoded;
+                ++stats.missing;
+                Msg("ph_dx12_f41: texture missing name='%s' code=%u", entry.name.c_str(),
+                    static_cast<unsigned>(error.code));
+                continue;
+            }
+            if (!DecodeXrayDds12(bytes, entry.dds, &reason, true))
+            {
+                --stats.decoded;
+                ++stats.unsupported;
+                Msg("ph_dx12_f41: texture unsupported name='%s' reason='%s'",
+                    entry.name.c_str(), reason != nullptr ? reason : "?");
+                continue;
+            }
+            totalBytes += entry.dds.data.size();
+            const std::string thmName = entry.name + ".thm";
+            std::vector<uint8_t> thm;
+            if (ReadVfsFile("THM", thmName.c_str(), 16384, thm, error, openMs,
+                            copyMs, fsgame::game_textures))
+                entry.alphaTest = BinaryAlphaFromThm(thm, entry.dds);
+        }
+        stats.bytes = totalBytes;
+    }
+    catch (...)
+    {
+        textures.clear();
+        stats.decoded = 0;
+    }
+}
+
 bool GameDx12J2ABatch_ReadSnapshot(const char* levelName,
-                                  const j2bbatch12::Identity12& identity,
-                                  j2bbatch12::Snapshot12& snapshot,
-                                  const j2bbatch12::Limits12& limits,
-                                  j2bbatch12::ErrorInfo12& error) noexcept
+                                   const j2bbatch12::Identity12& identity,
+                                   j2bbatch12::Snapshot12& snapshot,
+                                   const j2bbatch12::Limits12& limits,
+                                   j2bbatch12::ErrorInfo12& error) noexcept
 {
     snapshot = {};
     j2bbatch12::SetErrorInfo(error, j2bbatch12::Error12::None, "");

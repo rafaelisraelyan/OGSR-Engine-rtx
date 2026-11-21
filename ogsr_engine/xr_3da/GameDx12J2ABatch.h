@@ -15,6 +15,25 @@ void GameDx12J2ABatch_ReadTextures(
     const j2bbatch12::SceneBatch12& scene,
     std::vector<GameDx12SceneTexture12>& textures) noexcept;
 
+// F4.1: чтение текстур по готовому списку имён для полной статической сцены.
+// Индекс в списке текстур совпадает с индексом имени, поэтому разрешённые
+// материалы визуалов ссылаются на него напрямую. Неподдержанные/отсутствующие
+// DDS не прерывают загрузку: запись остаётся с пустым dds и учитывается
+// счётчиком в stats.
+struct GameDx12TextureReadStats12
+{
+    uint32_t requested = 0;
+    uint32_t decoded = 0;
+    uint32_t missing = 0;
+    uint32_t unsupported = 0;
+    uint64_t bytes = 0;
+};
+
+void GameDx12J2ABatch_ReadTextureNames(
+    const std::vector<std::string>& names,
+    std::vector<GameDx12SceneTexture12>& textures,
+    GameDx12TextureReadStats12& stats, uint64_t maxTotalBytes) noexcept;
+
 // Engine-side owner adapter. VFS access happens here on the owner thread; the
 // CPU batch core receives only the immutable Snapshot12. No GPU resource is
 // created.

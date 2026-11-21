@@ -88,6 +88,7 @@ namespace
 constexpr uint32_t kD3dDeclTypeFloat3 = 2;
 constexpr uint32_t kD3dDeclTypeD3dColor = 4;
 constexpr uint32_t kD3dDeclTypeShort2 = 6;
+constexpr uint32_t kD3dDeclTypeShort4 = 7;
 constexpr uint32_t kD3dDeclUsagePosition = 0;
 constexpr uint32_t kD3dDeclUsageNormal = 3;
 constexpr uint32_t kD3dDeclUsageTexcoord = 5;
@@ -578,6 +579,47 @@ bool IsSelectedDeclaration(const VbInfo& vb) noexcept
            d[6].usage == 0 && d[6].usage_index == 0;
 }
 
+// F4.1: классификация фактических раскладок level.geom. Все поддержанные
+// варианты имеют stride 32 и одинаковый префикс; различается только место
+// TEXCOORD0, поэтому GPU-путь может обойтись двумя input layout.
+VertexLayout12 ClassifyDeclaration(const VbInfo& vb) noexcept
+{
+    if (vb.stride != 32 || vb.declaration_count < 5 ||
+        vb.declaration_count > 7)
+        return VertexLayout12::Unsupported;
+
+    const auto match = [&vb](uint32_t index, uint16_t offset, uint8_t type,
+                             uint8_t usage, uint8_t usage_index) noexcept
+    {
+        const DeclarationElement& element = vb.declaration[index];
+        return element.stream == 0 && element.offset == offset &&
+               element.type == type && element.method == 0 &&
+               element.usage == usage && element.usage_index == usage_index;
+    };
+
+    if (!match(0, 0, kD3dDeclTypeFloat3, kD3dDeclUsagePosition, 0) ||
+        !match(1, 12, kD3dDeclTypeD3dColor, kD3dDeclUsageNormal, 0) ||
+        !match(2, 16, kD3dDeclTypeD3dColor, kD3dDeclUsageTangent, 0) ||
+        !match(3, 20, kD3dDeclTypeD3dColor, kD3dDeclUsageBinormal, 0))
+        return VertexLayout12::Unsupported;
+
+    if (vb.declaration_count == 7 &&
+        match(4, 24, kD3dDeclTypeD3dColor, kD3dDeclUsageColor, 0) &&
+        match(5, 28, kD3dDeclTypeShort2, kD3dDeclUsageTexcoord, 0))
+        return VertexLayout12::Classic;
+
+    if (match(4, 24, kD3dDeclTypeShort2, kD3dDeclUsageTexcoord, 0))
+        return VertexLayout12::UvAt24;
+
+    // SHORT4 в позиции TEXCOORD0 — это (u, v, lmu, lmv): первые две short
+    // компоненты и есть базовая UV, поэтому раскладка совпадает с UvAt24.
+    if (vb.declaration_count == 6 &&
+        match(4, 24, kD3dDeclTypeShort4, kD3dDeclUsageTexcoord, 0))
+        return VertexLayout12::UvAt24;
+
+    return VertexLayout12::Unsupported;
+}
+
 ReadError ParseAndPublish(std::span<const uint8_t> level,
                           std::span<const uint8_t> geom,
                           uint32_t visual_id,
@@ -884,6 +926,345 @@ ReadError ReadVisual(std::span<const uint8_t> level_bytes,
         output.clear();
         SetReasonBestEffort(reason, ReadError::UnexpectedException);
         return ReadError::UnexpectedException;
+    }
+}
+
+namespace
+{
+// Границы visual уже лежат в OGF_HEADER в мировых координатах (level.geom
+// запечён level-компилятором), поэтому отдельный проход по вершинам для
+// culling-сферы не нужен.
+void MakeSphere(const Bounds& bounds, float center[3], float& radius) noexcept
+{
+    double dx = 0.0;
+    double dy = 0.0;
+    double dz = 0.0;
+    for (int c = 0; c < 3; ++c)
+    {
+        center[c] = static_cast<float>(
+            (static_cast<double>(bounds.minimum[c]) +
+             static_cast<double>(bounds.maximum[c])) * 0.5);
+        const double half = (static_cast<double>(bounds.maximum[c]) -
+                             static_cast<double>(bounds.minimum[c])) * 0.5;
+        if (c == 0)
+            dx = half;
+        else if (c == 1)
+            dy = half;
+        else
+            dz = half;
+    }
+    radius = static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
+    if (!std::isfinite(radius) || radius < 0.0f)
+        radius = 0.0f;
+}
+
+// Разбирает один visual верхнего контейнера. Возвращает false, если visual
+// нельзя описать диапазоном пулов; причина остаётся в счётчике reject.
+bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
+                    PoolVisual& visual) noexcept
+{
+    const uint64_t end = chunk.payload + chunk.size;
+    uint64_t pos = chunk.payload;
+    bool has_header = false;
+    bool has_gc = false;
+    bool has_swi = false;
+    uint32_t swi_offset = 0;
+    uint16_t swi_num_tris = 0;
+    uint16_t swi_num_verts = 0;
+    uint32_t vb_id = 0;
+    uint32_t vbase = 0;
+    uint32_t vcount = 0;
+    uint32_t ib_id = 0;
+    uint32_t ibase = 0;
+    uint32_t icount = 0;
+
+    while (pos < end)
+    {
+        uint32_t type = 0;
+        uint32_t size = 0;
+        if (end - pos < 8)
+            return false;
+        if (!ReadU32(level, pos, type) || !ReadU32(level, pos + 4, size))
+            return false;
+        if ((type & kCompressMark) != 0)
+            return false;
+        const uint64_t data = pos + 8;
+        if (size > end - data)
+            return false;
+
+        if (type == kOgfHeader)
+        {
+            if (has_header || size != 44)
+                return false;
+            if (level[static_cast<size_t>(data)] != kOgfVersion)
+                return false;
+            visual.type = level[static_cast<size_t>(data + 1)];
+            uint16_t shader_id = 0;
+            if (!ReadU16(level, data + 2, shader_id))
+                return false;
+            visual.shader_id = shader_id;
+            for (int i = 0; i < 3; ++i)
+            {
+                if (!ReadF32(level, data + 4 + i * 4,
+                             visual.header_bounds.minimum[i]) ||
+                    !ReadF32(level, data + 16 + i * 4,
+                             visual.header_bounds.maximum[i]))
+                    return false;
+                if (!std::isfinite(visual.header_bounds.minimum[i]) ||
+                    !std::isfinite(visual.header_bounds.maximum[i]))
+                    return false;
+            }
+            if (visual.header_bounds.minimum[0] >
+                    visual.header_bounds.maximum[0] ||
+                visual.header_bounds.minimum[1] >
+                    visual.header_bounds.maximum[1] ||
+                visual.header_bounds.minimum[2] >
+                    visual.header_bounds.maximum[2])
+                return false;
+            has_header = true;
+        }
+        else if (type == kOgfGcContainer)
+        {
+            if (has_gc || size != 24)
+                return false;
+            if (!ReadU32(level, data + 0, vb_id) ||
+                !ReadU32(level, data + 4, vbase) ||
+                !ReadU32(level, data + 8, vcount) ||
+                !ReadU32(level, data + 12, ib_id) ||
+                !ReadU32(level, data + 16, ibase) ||
+                !ReadU32(level, data + 20, icount))
+                return false;
+            has_gc = true;
+        }
+        else if (type == kOgfFastPath)
+        {
+            // Payload fast-path не используется ни R4, ни этим reader-ом.
+        }
+        else if (type == kOgfSwiData)
+        {
+            // 4 reserved u32, count, затем count записей FSlideWindow.
+            if (has_swi || size < kSwiHeaderBytes)
+                return false;
+            uint32_t swiCount = 0;
+            if (!ReadU32(level, data + 16, swiCount) || swiCount == 0 ||
+                swiCount > 4096)
+                return false;
+            if (size < kSwiHeaderBytes +
+                           static_cast<uint64_t>(swiCount) * kSlideWindowBytes)
+                return false;
+            // R4 при максимальном LOD берёт окно 0 — это самая подробная
+            // геометрия. Для статической сцены этого достаточно; выбор LOD по
+            // расстоянию относится к следующим этапам.
+            if (!ReadU32(level, data + kSwiHeaderBytes, swi_offset) ||
+                !ReadU16(level, data + kSwiHeaderBytes + 4, swi_num_tris) ||
+                !ReadU16(level, data + kSwiHeaderBytes + 6, swi_num_verts))
+                return false;
+            has_swi = true;
+        }
+        else
+        {
+            return false;
+        }
+        pos = data + size;
+    }
+
+    if (!has_header || !has_gc)
+        return false;
+    visual.vb_id = vb_id;
+    visual.vbase = vbase;
+    visual.vcount = vcount;
+    visual.ib_id = ib_id;
+    visual.ibase = ibase;
+    visual.icount = icount;
+    if (visual.type == kMtProgressive)
+    {
+        if (!has_swi || swi_num_tris == 0 || swi_num_verts == 0)
+            return false;
+        visual.ibase = ibase + swi_offset;
+        visual.icount = static_cast<uint32_t>(swi_num_tris) * 3u;
+        visual.vcount = swi_num_verts;
+    }
+    return true;
+}
+} // namespace
+
+const char* VertexLayoutName(VertexLayout12 layout) noexcept
+{
+    switch (layout)
+    {
+    case VertexLayout12::Classic:
+        return "pos/normal/tangent/binormal/color@24/uv@28";
+    case VertexLayout12::UvAt24:
+        return "pos/normal/tangent/binormal/uv@24";
+    default:
+        return "unsupported";
+    }
+}
+
+ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
+                         std::span<const uint8_t> geom_bytes,
+                         LevelPools& output, std::string& reason,
+                         const Limits& limits) noexcept
+{
+    output = LevelPools{};
+    SetReasonBestEffort(reason, ReadError::None);
+    if (level_bytes.empty())
+        return Fail(reason, ReadError::EmptyLevelInput);
+    if (geom_bytes.empty())
+        return Fail(reason, ReadError::EmptyGeomInput);
+    if (level_bytes.size() > limits.maxLevelBytes)
+        return Fail(reason, ReadError::LevelInputTooLarge);
+    if (geom_bytes.size() > limits.maxGeomBytes)
+        return Fail(reason, ReadError::GeomInputTooLarge);
+
+    try
+    {
+        Chunk visuals{};
+        ReadError error =
+            FindUniqueChunk(level_bytes, kLevelVisualsChunk, visuals, reason);
+        if (error != ReadError::None)
+            return error;
+
+        std::vector<VbInfo> vbs;
+        std::vector<IbInfo> ibs;
+        error = ParseGeometry(geom_bytes, vbs, ibs, reason);
+        if (error != ReadError::None)
+            return error;
+
+        LevelPools candidate;
+        candidate.vertex_pools.reserve(vbs.size());
+        for (const VbInfo& vb : vbs)
+        {
+            VertexPoolInfo info;
+            info.id = vb.id;
+            info.count = vb.count;
+            info.stride = vb.stride;
+            info.data_offset = vb.data_offset;
+            info.declaration_count = vb.declaration_count;
+            info.declaration = vb.declaration;
+            info.layout = ClassifyDeclaration(vb);
+            info.supported = info.layout != VertexLayout12::Unsupported;
+            candidate.vertex_payload_bytes +=
+                static_cast<uint64_t>(vb.count) * vb.stride;
+            candidate.vertex_pools.push_back(info);
+        }
+        candidate.index_pools.reserve(ibs.size());
+        for (const IbInfo& ib : ibs)
+        {
+            IndexPoolInfo info;
+            info.id = ib.id;
+            info.count = ib.count;
+            info.data_offset = ib.data_offset;
+            candidate.index_pools.push_back(info);
+        }
+
+        const uint64_t end = visuals.payload + visuals.size;
+        uint64_t pos = visuals.payload;
+        while (pos < end)
+        {
+            uint32_t type = 0;
+            uint32_t size = 0;
+            if (end - pos < 8)
+                return Fail(reason, ReadError::TruncatedVisualChunkHeader);
+            if (!ReadU32(level_bytes, pos, type) ||
+                !ReadU32(level_bytes, pos + 4, size))
+                return Fail(reason, ReadError::TruncatedVisualChunkHeader);
+            if ((type & kCompressMark) != 0)
+                return Fail(reason, ReadError::CompressedChunk);
+            const uint64_t payload = pos + 8;
+            if (size > end - payload)
+                return Fail(reason, ReadError::VisualChunkExceedsContainer);
+
+            Chunk chunk{};
+            chunk.id = type;
+            chunk.payload = payload;
+            chunk.size = size;
+
+            PoolVisual visual;
+            visual.id = type;
+            if (!ReadPoolVisual(level_bytes, chunk, visual))
+            {
+                visual.drawable = false;
+                visual.reject = visual.type == kMtNormal
+                                    ? ReadError::UnsupportedOgfSubchunk
+                                    : ReadError::UnsupportedVisualType;
+            }
+            else if (visual.type != kMtNormal && visual.type != kMtProgressive)
+            {
+                visual.drawable = false;
+                visual.reject = ReadError::UnsupportedVisualType;
+            }
+            else if (visual.vb_id >= candidate.vertex_pools.size())
+            {
+                visual.drawable = false;
+                visual.reject = ReadError::InvalidSourceVbId;
+            }
+            else if (visual.ib_id >= candidate.index_pools.size())
+            {
+                visual.drawable = false;
+                visual.reject = ReadError::InvalidSourceIbId;
+            }
+            else if (!candidate.vertex_pools[visual.vb_id].supported)
+            {
+                visual.drawable = false;
+                visual.reject = ReadError::UnsupportedDeclaration;
+            }
+            else
+            {
+                const VertexPoolInfo& vb = candidate.vertex_pools[visual.vb_id];
+                const IndexPoolInfo& ib = candidate.index_pools[visual.ib_id];
+                if (visual.vcount == 0 || visual.icount == 0 ||
+                    (visual.icount % 3) != 0)
+                {
+                    visual.drawable = false;
+                    visual.reject = ReadError::InvalidVisualCounts;
+                }
+                else if (visual.vbase > vb.count ||
+                         visual.vcount > vb.count - visual.vbase ||
+                         visual.ibase > ib.count ||
+                         visual.icount > ib.count - visual.ibase)
+                {
+                    visual.drawable = false;
+                    visual.reject = ReadError::VertexRangeOutsideVb;
+                }
+                else
+                {
+                    visual.drawable = true;
+                    visual.layout = candidate.vertex_pools[visual.vb_id].layout;
+                    float center[3] = {0.0f, 0.0f, 0.0f};
+                    float radius = 0.0f;
+                    MakeSphere(visual.header_bounds, center, radius);
+                    for (int c = 0; c < 3; ++c)
+                        visual.sphere_center[c] = center[c];
+                    visual.sphere_radius = radius;
+                }
+            }
+
+            if (visual.drawable)
+                ++candidate.visuals_drawable;
+            else
+                ++candidate.visuals_rejected;
+            candidate.visuals.push_back(visual);
+            pos = payload + size;
+        }
+
+        output = std::move(candidate);
+        return ReadError::None;
+    }
+    catch (const std::bad_alloc&)
+    {
+        output = LevelPools{};
+        return Fail(reason, ReadError::AllocationFailure);
+    }
+    catch (const std::exception&)
+    {
+        output = LevelPools{};
+        return Fail(reason, ReadError::UnexpectedException);
+    }
+    catch (...)
+    {
+        output = LevelPools{};
+        return Fail(reason, ReadError::UnexpectedException);
     }
 }
 } // namespace xraylevel12

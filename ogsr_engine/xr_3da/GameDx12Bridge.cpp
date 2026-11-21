@@ -9,6 +9,7 @@
 #include "GameDx12OffscreenPass.h"
 #include "GameDx12J2ABatch.h"
 #include "GameDx12J2APreparation.h"
+#include "GameDx12StaticScene.h"
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
 #include "FS.h"
@@ -38,6 +39,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -129,6 +131,9 @@ struct BridgeStateData
     // validated visual placement.
     GameDx12LevelGeometry12 geometry;
     GameDx12FourVisual12 m23;
+    // F4.1: полная статическая сцена уровня. Отделена от диагностического M23
+    // пути: у неё своя загрузка, свои пулы и своя статистика.
+    GameDx12StaticScene12 staticScene;
     GameDx12OffscreenPass12 offscreen;
     GameDx12NativeFrame12 native;
 
@@ -149,6 +154,14 @@ struct BridgeStateData
     BridgeDiagnosticsVerdict diagnosticsVerdict =
         BridgeDiagnosticsVerdict::Unverified;
     char levelName[128]{};
+    // F4.1 full static scene identity/flags.
+    bool staticSceneRequested = false;
+    bool staticSceneAttempted = false;
+    bool staticSceneBound = false;
+    bool staticSceneEnabledLogged = false;
+    uint64_t staticSceneSession = 0;
+    uint64_t staticSceneEpoch = 0;
+    uint32_t staticSceneDraws = 0;
 };
 
 BridgeStateData& State()
@@ -592,6 +605,11 @@ void PrepareInfoQueue()
 
     state.prePolicyStorageDenied =
         state.infoQueue->GetNumMessagesDeniedByStorageFilter();
+    // F4.1: полная статическая сцена выполняет тысячи draw и порождает поток
+    // сообщений Debug Layer. При дефолтном лимите очередь отбрасывает
+    // сообщения, и итоговый вердикт становится UNVERIFIED. Лимит поднимается
+    // заранее, чтобы диагностика не теряла данные.
+    state.infoQueue->SetMessageCountLimit(1ull << 18);
     const UINT64 stored = state.infoQueue->GetNumStoredMessages();
     const UINT64 retrievable =
         state.infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
@@ -718,6 +736,43 @@ BridgeInfoQueueResult EvaluateInfoQueue(const char* phase)
     if (result.firstFailure[0] != '\0')
         Msg("ph_dx12_bridge: infoqueue first_failure='%s'",
             result.firstFailure);
+
+    // F4.1: текст предупреждений и ошибок. Без него вердикт FAIL невозможно
+    // разобрать: счётчики показывают «47 warning», но не причину.
+    if (state.infoQueue &&
+        result.verdict != BridgeDiagnosticsVerdict::Pass)
+    {
+        const UINT64 stored = state.infoQueue->GetNumStoredMessages();
+        uint32_t logged = 0;
+        for (UINT64 index = 0; index < stored && logged < 10; ++index)
+        {
+            SIZE_T size = 0;
+            if (FAILED(state.infoQueue->GetMessage(index, nullptr, &size)) ||
+                size == 0)
+                continue;
+            std::vector<uint8_t> buffer(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+            if (FAILED(state.infoQueue->GetMessage(index, message, &size)))
+                continue;
+            if (message->Severity == D3D12_MESSAGE_SEVERITY_INFO ||
+                message->Severity == D3D12_MESSAGE_SEVERITY_MESSAGE)
+                continue;
+            if (message->pDescription == nullptr)
+                continue;
+            char text[241] = {};
+            size_t copy = message->DescriptionByteLength;
+            if (copy > sizeof(text) - 1)
+                copy = sizeof(text) - 1;
+            std::memcpy(text, message->pDescription, copy);
+            for (size_t i = 0; i < copy; ++i)
+                if (text[i] == '\n' || text[i] == '\r')
+                    text[i] = ' ';
+            Msg("ph_dx12_bridge: infoqueue detail severity=%u id=%u text='%s'",
+                static_cast<unsigned>(message->Severity),
+                static_cast<unsigned>(message->ID), text);
+            ++logged;
+        }
+    }
 
     return result;
 }
@@ -1473,6 +1528,9 @@ void GameDx12Bridge_ApplyNativeVideoMode(uint32_t width, uint32_t height)
             width, height, GetLastError());
 }
 
+// F4.1 evidence-only свободная камера (определение ниже, файловая область).
+bool FlyCameraMatrix(Matrix4& result, uint64_t sequence);
+
 namespace
 {
 bool DrainNative(BridgeStateData& state, const char* stage)
@@ -1515,7 +1573,72 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     uint32_t draws = 0;
     GameDx12FourVisual12::NativeTimings12 timings;
     std::string reason;
-    if (SUCCEEDED(hr) && state.m23Bound && state.m23.IsLoaded() &&
+    bool sceneRecorded = false;
+    if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
+        state.staticScene.LevelSession() == state.levelSession &&
+        state.staticScene.LevelEpoch() == state.captureEpoch)
+    {
+        DirectX::XMFLOAT4X4 viewProjection;
+        Matrix4 flyTransform{};
+        if (FlyCameraMatrix(flyTransform, state.captureSequence))
+        {
+            std::memcpy(&viewProjection, flyTransform.m, sizeof(viewProjection));
+        }
+        else
+        {
+            std::memcpy(&viewProjection, fullTransform.m, sizeof(viewProjection));
+        }
+        if (recording.width != state.width || recording.height != state.height)
+        {
+            const float sourceAspect =
+                static_cast<float>(state.width) / state.height;
+            const float clientAspect =
+                static_cast<float>(recording.width) / recording.height;
+            for (auto& row : viewProjection.m)
+                row[0] *= sourceAspect / clientAspect;
+        }
+        const float position[]{Device.vCameraPosition.x,
+                               Device.vCameraPosition.y,
+                               Device.vCameraPosition.z};
+        GameDx12StaticScene12::FrameStats12 sceneStats;
+        try
+        {
+            if (!state.staticScene.RecordNativeFrame(
+                    recording.list, recording.slot, viewProjection, position,
+                    sceneStats, reason))
+                hr = E_FAIL;
+            else
+                sceneRecorded = true;
+        }
+        catch (...)
+        {
+            hr = E_FAIL;
+        }
+        if (sceneRecorded)
+        {
+            draws = sceneStats.draws;
+            state.staticSceneDraws = sceneStats.draws;
+            timings.mode = "static";
+            timings.recordMs = sceneStats.record_ms;
+            timings.snapshotMs = sceneStats.cull_ms;
+            timings.serialMs = 0.0;
+            timings.parallelMs = 0.0;
+            static const bool sceneDetail = []
+            {
+                const char* value = std::getenv("OGSR_DX12_GAME_SCENE_LOG");
+                return value != nullptr && std::strcmp(value, "1") == 0;
+            }();
+            if (sceneDetail && (state.nativeScenePresents % 60) == 0)
+                Msg("ph_dx12_f41: frame draws=%u culled=%u total=%u cull_ms=%.4f "
+                    "record_ms=%.4f position=(%.3f,%.3f,%.3f)",
+                    sceneStats.draws, sceneStats.culled, sceneStats.total,
+                    sceneStats.cull_ms, sceneStats.record_ms,
+                    position[0], position[1], position[2]);
+        }
+        if (FAILED(hr))
+            state.native.Cancel();
+    }
+    else if (SUCCEEDED(hr) && state.m23Bound && state.m23.IsLoaded() &&
         state.m23.LevelSession() == state.levelSession &&
         state.m23.LevelEpoch() == state.captureEpoch)
     {
@@ -1612,6 +1735,448 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
 }
 }
 
+bool StaticSceneRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_STATIC_SCENE");
+        return !(value != nullptr && std::strcmp(value, "0") == 0);
+    }();
+    return enabled;
+}
+
+// F4.1 evidence-only свободная камера.
+//
+// Позволяет снять одну и ту же РЕАЛЬНУЮ сцену из произвольной точки карты,
+// не подменяя ни геометрию, ни проекцию: ориентация берётся из штатной
+// игровой view-матрицы, проекция — штатная Device.mProject. Камера актёра и
+// обычный кадр продолжают работать без этого флага.
+//
+// Формат OGSR_DX12_GAME_FLY: "x,y,z,yawDeg[,pitchDeg[,spinDegPerSecond]]".
+bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
+{
+    static const bool prepared = []
+    {
+        return true;
+    }();
+    (void)prepared;
+    static char spec[256] = {};
+    static bool specLoaded = false;
+    static float origin[3] = {0.0f, 0.0f, 0.0f};
+    static float yawDegrees = 0.0f;
+    static float pitchDegrees = 0.0f;
+    static float spinDegrees = 0.0f;
+    static bool valid = false;
+    if (!specLoaded)
+    {
+        specLoaded = true;
+        const char* value = std::getenv("OGSR_DX12_GAME_FLY");
+        if (value != nullptr && value[0] != '\0' &&
+            std::strlen(value) < sizeof(spec))
+        {
+            std::snprintf(spec, sizeof(spec), "%s", value);
+            const int parsed = std::sscanf(spec, "%f,%f,%f,%f,%f,%f",
+                                           &origin[0], &origin[1], &origin[2],
+                                           &yawDegrees, &pitchDegrees,
+                                           &spinDegrees);
+            valid = parsed >= 4;
+        }
+        if (valid)
+        {
+            Msg("ph_dx12_f41: fly camera origin=(%.2f,%.2f,%.2f) yaw=%.2f "
+                "pitch=%.2f spin=%.2f",
+                origin[0], origin[1], origin[2], yawDegrees, pitchDegrees,
+                spinDegrees);
+        }
+    }
+    if (!valid)
+        return false;
+
+    const float yaw =
+        (yawDegrees + spinDegrees * static_cast<float>(sequence) / 60.0f) *
+        (3.14159265358979323846f / 180.0f);
+    const float pitch = pitchDegrees * (3.14159265358979323846f / 180.0f);
+    const float cosYaw = std::cos(yaw);
+    const float sinYaw = std::sin(yaw);
+    const float cosPitch = std::cos(pitch);
+    const float sinPitch = std::sin(pitch);
+
+    // Базис берётся из штатной игровой view-матрицы: X-Ray хранит right/up/dir
+    // в столбцах 0..2 (row-vector view). Так ориентация гарантированно
+    // совпадает с игровой, включая соглашения уровня.
+    float right[3] = {Device.mView.m[0][0], Device.mView.m[1][0],
+                      Device.mView.m[2][0]};
+    float up[3] = {Device.mView.m[0][1], Device.mView.m[1][1],
+                   Device.mView.m[2][1]};
+    float forward[3] = {Device.mView.m[0][2], Device.mView.m[1][2],
+                        Device.mView.m[2][2]};
+
+    const auto rotateYaw = [cosYaw, sinYaw](float v[3])
+    {
+        const float x = v[0];
+        const float z = v[2];
+        v[0] = x * cosYaw - z * sinYaw;
+        v[2] = x * sinYaw + z * cosYaw;
+    };
+    rotateYaw(right);
+    rotateYaw(up);
+    rotateYaw(forward);
+
+    if (pitchDegrees != 0.0f)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            const float up0 = up[c];
+            const float forward0 = forward[c];
+            up[c] = up0 * cosPitch + forward0 * sinPitch;
+            forward[c] = -up0 * sinPitch + forward0 * cosPitch;
+        }
+    }
+
+    const auto dot3 = [](const float a[3], const float b[3])
+    { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+
+    Matrix4 view{};
+    for (int i = 0; i < 3; ++i)
+    {
+        view.m[i][0] = right[i];
+        view.m[i][1] = up[i];
+        view.m[i][2] = forward[i];
+        view.m[i][3] = 0.0f;
+    }
+    view.m[3][0] = -dot3(right, origin);
+    view.m[3][1] = -dot3(up, origin);
+    view.m[3][2] = -dot3(forward, origin);
+    view.m[3][3] = 1.0f;
+
+    // fullTransform = View * Projection (row-vector convention): p*world * V * P.
+    Matrix4 product{};
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int column = 0; column < 4; ++column)
+        {
+            float sum = 0.0f;
+            for (int inner = 0; inner < 4; ++inner)
+                sum += view.m[row][inner] * Device.mProject.m[inner][column];
+            product.m[row][column] = sum;
+        }
+    }
+    result = product;
+    return true;
+}
+// F4.1: единый проход загрузки полной статики уровня.
+//
+// Штатные данные и штатный обход: VFS-снапшот (level + level.geom), парсер
+// иерархии уровня, обход ВСЕХ секторов, общеуровневый индекс пулов. Никаких
+// ручных списков визуалов и никакого выбора сектора здесь нет.
+void LoadFullStaticScene(BridgeStateData& state)
+{
+    const j2bbatch12::Identity12 identity{state.levelSession, state.captureEpoch};
+    j2bbatch12::Limits12 snapshotLimits{};
+    // Полный уровень: лимиты вертикального среза (16/128 МБ) рассчитаны на
+    // один сектор и здесь недостаточны.
+    snapshotLimits.maxLevelBytes = 128ull * 1024ull * 1024ull;
+    snapshotLimits.maxGeomBytes = 1024ull * 1024ull * 1024ull;
+
+    const auto totalStart = std::chrono::steady_clock::now();
+    j2bbatch12::Snapshot12 snapshot;
+    j2bbatch12::ErrorInfo12 error;
+    if (!GameDx12J2ABatch_ReadSnapshot(state.levelName, identity, snapshot,
+                                       snapshotLimits, error))
+    {
+        Msg("ph_dx12_f41: load failed stage=snapshot code=%u reason='%s'",
+            static_cast<unsigned>(error.code), error.text);
+        return;
+    }
+    Msg("ph_dx12_f41: snapshot level_bytes=%zu geom_bytes=%zu open_ms=%.3f "
+        "copy_ms=%.3f",
+        snapshot.levelBytes.size(), snapshot.geomBytes.size(), snapshot.vfsOpenMs,
+        snapshot.vfsCopyMs);
+
+    levelhierarchy12::LevelHierarchy hierarchy;
+    std::string reason;
+    if (!levelhierarchy12::Parse(snapshot.levelBytes, hierarchy, reason))
+    {
+        Msg("ph_dx12_f41: load failed stage=hierarchy reason='%s'",
+            reason.c_str());
+        return;
+    }
+    std::vector<levelhierarchy12::LeafInstance> leaves;
+    levelhierarchy12::CollectStats collectStats;
+    const levelhierarchy12::CollectBudget budget{4000000u, 20000000u, 40000000u};
+    const auto collectStatus = levelhierarchy12::CollectLeaves(
+        hierarchy, budget, leaves, collectStats, reason);
+    if (collectStatus != levelhierarchy12::CollectStatus::Complete)
+    {
+        Msg("ph_dx12_f41: load failed stage=collect status=%u nodes=%llu "
+            "edges=%llu instances=%u reason='%s'",
+            static_cast<unsigned>(collectStatus),
+            static_cast<unsigned long long>(collectStats.nodeVisits),
+            static_cast<unsigned long long>(collectStats.edgeVisits),
+            collectStats.instances, reason.c_str());
+        return;
+    }
+    Msg("ph_dx12_f41: hierarchy sectors=%zu visuals=%zu leaves=%zu "
+        "node_visits=%llu edge_visits=%llu",
+        hierarchy.sectors.size(), hierarchy.visuals.size(), leaves.size(),
+        static_cast<unsigned long long>(collectStats.nodeVisits),
+        static_cast<unsigned long long>(collectStats.edgeVisits));
+
+    // F4.1: гистограмма типов и типы корней секторов. Нужна, чтобы дыры в
+    // геометрии объяснялись фактами (какие типы пропускает leaf-обход), а не
+    // догадками.
+    {
+        uint32_t typeCounts[16] = {};
+        size_t maxType = 0;
+        for (const auto& node : hierarchy.visuals)
+        {
+            if (node.type < 16)
+                ++typeCounts[node.type];
+            maxType = (std::max)(maxType, static_cast<size_t>(node.type));
+        }
+        char histogram[256] = {};
+        size_t used = 0;
+        for (size_t type = 0; type <= (std::min)(maxType, size_t{15}); ++type)
+        {
+            if (typeCounts[type] == 0)
+                continue;
+            const int written = std::snprintf(histogram + used,
+                                              sizeof(histogram) - used,
+                                              "type%zu=%u ", type,
+                                              typeCounts[type]);
+            if (written <= 0 || static_cast<size_t>(written) >= sizeof(histogram) - used)
+                break;
+            used += static_cast<size_t>(written);
+        }
+        uint32_t rootTypes[16] = {};
+        for (const auto& sector : hierarchy.sectors)
+        {
+            if (sector.rootVisualId < hierarchy.visuals.size())
+            {
+                const uint8_t type = hierarchy.visuals[sector.rootVisualId].type;
+                if (type < 16)
+                    ++rootTypes[type];
+            }
+        }
+        Msg("ph_dx12_f41: visual_types %s", histogram);
+        Msg("ph_dx12_f41: sector_root_types normal=%u hierarchy=%u "
+            "progressive=%u lod=%u tree=%u other=%u",
+            rootTypes[0], rootTypes[1], rootTypes[2], rootTypes[6], rootTypes[7],
+            rootTypes[3] + rootTypes[4] + rootTypes[5] + rootTypes[8] +
+                rootTypes[9] + rootTypes[10] + rootTypes[11] + rootTypes[12]);
+    }
+
+    xraylevel12::Limits readLimits{};
+    readLimits.maxLevelBytes = snapshotLimits.maxLevelBytes;
+    readLimits.maxGeomBytes = snapshotLimits.maxGeomBytes;
+    xraylevel12::LevelPools pools;
+    const xraylevel12::ReadError readError = xraylevel12::ReadLevelPools(
+        snapshot.levelBytes, snapshot.geomBytes, pools, reason, readLimits);
+    if (readError != xraylevel12::ReadError::None)
+    {
+        Msg("ph_dx12_f41: load failed stage=pools error=%u reason='%s'",
+            static_cast<unsigned>(readError), reason.c_str());
+        return;
+    }
+    GameDx12StaticScene12_LogDeclarationInventory(pools);
+
+    // Мировые границы загружаемой статики: нужны и для отчёта, и для выбора
+    // позиций доказательных кадров.
+    {
+        float minimum[3] = {1e30f, 1e30f, 1e30f};
+        float maximum[3] = {-1e30f, -1e30f, -1e30f};
+        uint32_t counted = 0;
+        double totalRadius = 0.0;
+        for (const auto& visual : pools.visuals)
+        {
+            if (!visual.drawable)
+                continue;
+            ++counted;
+            totalRadius += visual.sphere_radius;
+            for (int c = 0; c < 3; ++c)
+            {
+                const float low = visual.sphere_center[c] - visual.sphere_radius;
+                const float high = visual.sphere_center[c] + visual.sphere_radius;
+                if (low < minimum[c])
+                    minimum[c] = low;
+                if (high > maximum[c])
+                    maximum[c] = high;
+            }
+        }
+        Msg("ph_dx12_f41: bounds min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f) "
+            "size=(%.1f,%.1f,%.1f) visuals=%u avg_radius=%.3f",
+            minimum[0], minimum[1], minimum[2], maximum[0], maximum[1],
+            maximum[2], maximum[0] - minimum[0], maximum[1] - minimum[1],
+            maximum[2] - minimum[2], counted,
+            counted != 0 ? totalRadius / counted : 0.0);
+    }
+
+    // R4 рисует статику через секторы, поэтому недостижимый visual не должен
+    // попадать в кадр. Обход собственный: levelhierarchy12::CollectLeaves
+    // эмитит только MT_NORMAL (это корректно для старого среза), а полная
+    // карта содержит ещё и drawable MT_PROGRESSIVE с SWI-окнами.
+    //
+    // MT_TREE_ST/MT_TREE_PM намеренно не раскрываются: они рисуются только
+    // через per-instance tree_data, которого в этом этапе нет. Иначе их
+    // дочерняя геометрия попала бы в мир без инстансных трансформаций.
+    {
+        std::unordered_map<uint32_t, size_t> byId;
+        byId.reserve(hierarchy.visuals.size() * 2);
+        for (size_t index = 0; index < hierarchy.visuals.size(); ++index)
+            byId.emplace(hierarchy.visuals[index].id, index);
+
+        std::vector<uint8_t> reachable(hierarchy.visuals.size(), 0);
+        uint32_t reachableNormal = 0;
+        uint32_t reachableProgressive = 0;
+        uint32_t skippedTree = 0;
+        uint32_t skippedType = 0;
+        uint32_t cycleGuard = 0;
+
+        struct Frame12
+        {
+            uint32_t visualIndex = 0;
+            uint32_t depth = 0;
+        };
+        std::vector<Frame12> stack;
+        stack.reserve(4096);
+        for (const auto& sector : hierarchy.sectors)
+        {
+            const auto root = byId.find(sector.rootVisualId);
+            if (root != byId.end())
+                stack.push_back({static_cast<uint32_t>(root->second), 0});
+        }
+        while (!stack.empty())
+        {
+            const Frame12 current = stack.back();
+            stack.pop_back();
+            if (current.visualIndex >= hierarchy.visuals.size() ||
+                current.depth > levelhierarchy12::kMaxDepth)
+                continue;
+            if (++cycleGuard > 4000000u)
+                break;
+            const auto& node = hierarchy.visuals[current.visualIndex];
+            if (reachable[current.visualIndex] != 0)
+                continue;
+            reachable[current.visualIndex] = 1;
+
+            const bool drawable = node.type == levelhierarchy12::kMtNormal ||
+                                  node.type == 2u;
+            if (drawable)
+            {
+                if (node.type == levelhierarchy12::kMtNormal)
+                    ++reachableNormal;
+                else
+                    ++reachableProgressive;
+                continue;
+            }
+            if (node.type == 7 || node.type == 11) // MT_TREE_ST / MT_TREE_PM
+            {
+                ++skippedTree;
+                continue;
+            }
+            if (node.type != levelhierarchy12::kMtHierarchy &&
+                node.type != 6) // MT_HIERARHY / MT_LOD
+            {
+                ++skippedType;
+                continue;
+            }
+            if (node.type == 6)
+            {
+                // MT_LOD хранит уровни детализации одного объекта. R4 рисует
+                // ровно один уровень, поэтому все LOD-дети сразу дали бы
+                // z-fighting. Берём первый (самый подробный).
+                if (!node.children.empty())
+                {
+                    const auto child = byId.find(node.children.front());
+                    if (child != byId.end())
+                        stack.push_back(
+                            {static_cast<uint32_t>(child->second), current.depth + 1});
+                }
+                continue;
+            }
+            for (const uint32_t childId : node.children)
+            {
+                const auto child = byId.find(childId);
+                if (child != byId.end())
+                    stack.push_back(
+                        {static_cast<uint32_t>(child->second), current.depth + 1});
+            }
+        }
+
+        uint32_t referenced = 0;
+        uint32_t dropped = 0;
+        for (size_t index = 0; index < pools.visuals.size(); ++index)
+        {
+            const auto& visual = pools.visuals[index];
+            const auto found = byId.find(visual.id);
+            const bool inTree =
+                found != byId.end() && reachable[found->second] != 0;
+            if (!visual.drawable)
+                continue;
+            if (inTree)
+            {
+                ++referenced;
+                continue;
+            }
+            pools.visuals[index].drawable = false;
+            pools.visuals[index].reject = xraylevel12::ReadError::VisualNotFound;
+            --pools.visuals_drawable;
+            ++pools.visuals_rejected;
+            ++dropped;
+        }
+        Msg("ph_dx12_f41: reachability normal=%u progressive=%u referenced=%u "
+            "dropped_unreachable=%u skipped_tree_nodes=%u skipped_other_types=%u",
+            reachableNormal, reachableProgressive, referenced, dropped,
+            skippedTree, skippedType);
+    }
+
+    std::vector<std::string> textureNames;
+    std::vector<GameDx12StaticMaterial12> materials;
+    GameDx12StaticScene12_ResolveMaterials(snapshot.levelBytes, pools,
+                                           textureNames, materials);
+    std::vector<GameDx12SceneTexture12> textures;
+    GameDx12TextureReadStats12 textureStats;
+    GameDx12J2ABatch_ReadTextureNames(textureNames, textures, textureStats,
+                                      2ull * 1024ull * 1024ull * 1024ull);
+    Msg("ph_dx12_f41: textures unique=%u decoded=%u missing=%u unsupported=%u "
+        "bytes=%llu",
+        textureStats.requested, textureStats.decoded, textureStats.missing,
+        textureStats.unsupported,
+        static_cast<unsigned long long>(textureStats.bytes));
+
+    GameDx12StaticSceneOwner12 owner;
+    owner.device = state.device.Get();
+    owner.queue = state.queue.Get();
+    owner.fence = state.fence.Get();
+    owner.fenceEvent = state.fenceEvent;
+    owner.allocator = state.allocator.Get();
+    owner.list = state.list.Get();
+    owner.fenceValue = &state.fenceValue;
+
+    std::string loadReason;
+    if (!state.staticScene.Load(owner, state.levelName, state.levelSession,
+                                state.captureEpoch, pools,
+                                std::span<const uint8_t>(snapshot.geomBytes),
+                                textures, materials, loadReason))
+    {
+        Msg("ph_dx12_f41: load failed stage=gpu reason='%s'",
+            loadReason.c_str());
+        return;
+    }
+
+    state.staticSceneBound = true;
+    state.staticSceneSession = state.levelSession;
+    state.staticSceneEpoch = state.captureEpoch;
+    const auto& stats = state.staticScene.Stats();
+    Msg("ph_dx12_f41: ready level='%s' session=%llu epoch=%llu "
+        "sources=%u draws_potential=%u total_ms=%.3f",
+        state.levelName, static_cast<unsigned long long>(state.staticSceneSession),
+        static_cast<unsigned long long>(state.staticSceneEpoch),
+        state.staticScene.SourceCount(), stats.visuals_drawable,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - totalStart).count());
+}
+
 void GameDx12Bridge_OnLevelReady(const char* levelName)
 {
     if (!EnsureOwnerThread("level_ready"))
@@ -1664,6 +2229,41 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
         static_cast<unsigned long long>(state.captureEpoch));
+
+    // F4.1: обычный native runtime загружает ВСЮ статическую сцену уровня.
+    // Диагностические списки (M23/J1) остаются отдельными opt-in путями.
+    state.staticSceneRequested = state.nativeRequested && StaticSceneRequested();
+    state.staticSceneAttempted = false;
+    state.staticSceneBound = false;
+    state.staticSceneSession = 0;
+    state.staticSceneEpoch = 0;
+    state.staticSceneDraws = 0;
+    if (state.staticSceneRequested)
+    {
+        if (!state.staticSceneEnabledLogged)
+        {
+            state.staticSceneEnabledLogged = true;
+            Msg("ph_dx12_f41: full static scene enabled");
+        }
+        state.staticSceneAttempted = true;
+        try
+        {
+            LoadFullStaticScene(state);
+        }
+        catch (...)
+        {
+            Msg("ph_dx12_f41: load failed stage=exception");
+        }
+        if (!state.gpuUnknown && !state.quarantined &&
+            state.staticScene.GpuCompletionUnknown())
+            QuarantineForGeometryUnknown("f41_static_scene");
+    }
+    else if (state.nativeRequested && !state.staticSceneEnabledLogged)
+    {
+        state.staticSceneEnabledLogged = true;
+        Msg("ph_dx12_f41: full static scene disabled by "
+            "OGSR_DX12_GAME_STATIC_SCENE=0");
+    }
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
     RunJ2BBatchRuntimeProbe(state.levelName, state.levelSession,
@@ -1956,6 +2556,14 @@ void GameDx12Bridge_OnLevelTeardown()
     state.m23.OnLevelTeardown(state.captureEpoch);
     if (state.m23.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("m23_level_teardown");
+    state.staticSceneBound = false;
+    state.staticSceneAttempted = false;
+    state.staticSceneSession = 0;
+    state.staticSceneEpoch = 0;
+    state.staticSceneDraws = 0;
+    state.staticScene.OnLevelTeardown(state.captureEpoch);
+    if (state.staticScene.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("f41_level_teardown");
     Msg("ph_dx12_bridge: level teardown level='%s' session=%llu epoch=%llu",
         state.levelName,
         static_cast<unsigned long long>(state.levelSession),
@@ -2598,6 +3206,10 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         state.m23.OnDeviceReset(state.captureEpoch);
         if (state.m23.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("m23_device_reset");
+        state.staticSceneBound = false;
+        state.staticScene.OnDeviceReset(state.captureEpoch);
+        if (state.staticScene.GpuCompletionUnknown())
+            QuarantineForGeometryUnknown("f41_device_reset");
         if (M23Requested())
             RebindM23AfterDeviceReset("device_reset");
         else
@@ -2635,6 +3247,10 @@ void GameDx12Bridge_Shutdown()
     if (state.nativeRequested)
         DrainNative(state, "native_shutdown");
     const bool ownerCompletionKnown = !state.gpuUnknown && !state.quarantined;
+    state.staticSceneBound = false;
+    state.staticScene.Shutdown(ownerCompletionKnown);
+    if (state.staticScene.GpuCompletionUnknown())
+        QuarantineForGeometryUnknown("f41_shutdown");
     state.m23.Shutdown(ownerCompletionKnown);
     if (state.m23.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("m23_shutdown");

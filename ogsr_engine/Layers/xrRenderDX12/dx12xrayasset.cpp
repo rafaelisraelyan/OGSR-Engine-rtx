@@ -297,9 +297,14 @@ bool ComputeTextureMipLayout(DXGI_FORMAT format, uint32_t width,
         return false;
     uint64_t pitch = 0;
     uint64_t rowCount = 0;
-    if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC3_UNORM)
+    if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC2_UNORM ||
+        format == DXGI_FORMAT_BC3_UNORM || format == DXGI_FORMAT_BC4_UNORM ||
+        format == DXGI_FORMAT_BC5_UNORM || format == DXGI_FORMAT_BC7_UNORM)
     {
-        const uint64_t blockBytes = format == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+        const uint64_t blockBytes =
+            (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM)
+                ? 8ull
+                : 16ull;
         pitch = (static_cast<uint64_t>(width) + 3ull) / 4ull * blockBytes;
         rowCount = (static_cast<uint64_t>(height) + 3ull) / 4ull;
     }
@@ -346,7 +351,11 @@ bool ValidateXrayTextureSource(const XrayTextureData12& texture,
         texture.mipCount > MaximumMipCount(texture.width, texture.height))
         return Fail(reason, "invalid DDS dimensions/mips");
     if (texture.format != DXGI_FORMAT_BC1_UNORM &&
+        texture.format != DXGI_FORMAT_BC2_UNORM &&
         texture.format != DXGI_FORMAT_BC3_UNORM &&
+        texture.format != DXGI_FORMAT_BC4_UNORM &&
+        texture.format != DXGI_FORMAT_BC5_UNORM &&
+        texture.format != DXGI_FORMAT_BC7_UNORM &&
         texture.format != DXGI_FORMAT_R8G8B8A8_UNORM)
         return Fail(reason, "unsupported DDS texture format");
 
@@ -404,7 +413,11 @@ bool ValidateXrayTextureCopy(const XrayTextureData12& texture,
         // D3D12 reports BC footprints on block boundaries; sub-4 mips are
         // represented by one 4x4 block, not by their logical 2x2/1x1 size.
         const bool compressed = texture.format == DXGI_FORMAT_BC1_UNORM ||
-                                texture.format == DXGI_FORMAT_BC3_UNORM;
+                                texture.format == DXGI_FORMAT_BC2_UNORM ||
+                                texture.format == DXGI_FORMAT_BC3_UNORM ||
+                                texture.format == DXGI_FORMAT_BC4_UNORM ||
+                                texture.format == DXGI_FORMAT_BC5_UNORM ||
+                                texture.format == DXGI_FORMAT_BC7_UNORM;
         const uint32_t footprintWidth =
             compressed
                 ? ((mipWidth + 3u) / 4u) * 4u : mipWidth;
@@ -485,10 +498,47 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
         return Fail(reason, "DDS pixel format is not FOURCC");
     const auto* fourcc = file.data() + 84;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint64_t headerBytes = 128;
     if (std::memcmp(fourcc, "DXT1", 4) == 0)
         format = DXGI_FORMAT_BC1_UNORM;
+    else if (std::memcmp(fourcc, "DXT3", 4) == 0)
+        format = DXGI_FORMAT_BC2_UNORM;
     else if (allowBc3 && std::memcmp(fourcc, "DXT5", 4) == 0)
         format = DXGI_FORMAT_BC3_UNORM;
+    else if (std::memcmp(fourcc, "DX10", 4) == 0)
+    {
+        // F4.1: расширенный заголовок DX10 — единственный способ выразить
+        // BC4/BC5/BC7 и новые DXT-варианты в DDS.
+        if (file.size() < 148)
+            return Fail(reason, "DDS DX10 header is truncated");
+        const uint32_t dxgiFormat = ReadU32(file.data() + 128);
+        switch (dxgiFormat)
+        {
+        case 71: // DXGI_FORMAT_BC1_UNORM
+            format = DXGI_FORMAT_BC1_UNORM;
+            break;
+        case 74: // DXGI_FORMAT_BC2_UNORM
+            format = DXGI_FORMAT_BC2_UNORM;
+            break;
+        case 77: // DXGI_FORMAT_BC3_UNORM
+            if (!allowBc3)
+                return Fail(reason, "DDS BC3 is disabled for this caller");
+            format = DXGI_FORMAT_BC3_UNORM;
+            break;
+        case 80: // DXGI_FORMAT_BC4_UNORM
+            format = DXGI_FORMAT_BC4_UNORM;
+            break;
+        case 83: // DXGI_FORMAT_BC5_UNORM
+            format = DXGI_FORMAT_BC5_UNORM;
+            break;
+        case 98: // DXGI_FORMAT_BC7_UNORM
+            format = DXGI_FORMAT_BC7_UNORM;
+            break;
+        default:
+            return Fail(reason, "DDS DX10 format is unsupported");
+        }
+        headerBytes = 148;
+    }
     if (ReadU32(file.data() + 76) != 32 || format == DXGI_FORMAT_UNKNOWN)
         return Fail(reason, "DDS has an unsupported legacy FOURCC");
     if ((caps & kDdscapsTexture) == 0)
@@ -506,7 +556,7 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
     texture.format = format;
     texture.mips.reserve(mipCount);
 
-    const uint64_t payloadBytes = file.size() - 128ull;
+    const uint64_t payloadBytes = file.size() - headerBytes;
     uint64_t offset = 0;
     uint32_t mipWidth = width;
     uint32_t mipHeight = height;
@@ -536,7 +586,8 @@ bool DecodeXrayDds12(std::span<const uint8_t> file,
     }
     if (offset > payloadBytes || offset > UINT32_MAX)
         return Fail(reason, "DDS mip data exceeds file");
-    texture.data.assign(file.begin() + 128, file.begin() + 128 + offset);
+    texture.data.assign(file.begin() + static_cast<ptrdiff_t>(headerBytes),
+                        file.begin() + static_cast<ptrdiff_t>(headerBytes + offset));
     return ValidateXrayTextureSource(texture, reason);
 }
 

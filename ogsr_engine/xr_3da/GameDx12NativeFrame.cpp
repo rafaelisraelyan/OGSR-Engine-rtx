@@ -313,7 +313,21 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width),
                                  static_cast<float>(height), 0.0f, 1.0f};
     const D3D12_RECT area{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    constexpr float clear[]{0.03f, 0.05f, 0.09f, 1.0f};
+    // F4.1: статическая сцена рисуется без скайбокса, поэтому цвет очистки
+    // задаёт «небо» кадра. OGSR_DX12_CLEAR позволяет переопределить его.
+    float clear[4] = {0.42f, 0.50f, 0.62f, 1.0f};
+    if (const char* clearSpec = std::getenv("OGSR_DX12_CLEAR"))
+    {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        if (std::sscanf(clearSpec, "%f,%f,%f", &r, &g, &b) == 3)
+        {
+            clear[0] = r;
+            clear[1] = g;
+            clear[2] = b;
+        }
+    }
     slot.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     slot.list->RSSetViewports(1, &viewport);
     slot.list->RSSetScissorRects(1, &area);

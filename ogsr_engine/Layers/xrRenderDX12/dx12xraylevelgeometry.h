@@ -25,6 +25,11 @@ constexpr uint32_t kLevelVisualsChunk = 3;
 constexpr uint32_t kLevelShadersChunk = 2;
 constexpr uint32_t kLevelVertexChunk = 9;
 constexpr uint32_t kLevelIndexChunk = 10;
+// F4.1: SWI-окна прогрессивной геометрии и тип MT_PROGRESSIVE.
+constexpr uint32_t kOgfSwiData = 6;
+constexpr uint32_t kMtProgressive = 2;
+constexpr uint32_t kSwiHeaderBytes = 20;   // 4 reserved u32 + count
+constexpr uint32_t kSlideWindowBytes = 8;  // u32 offset, u16 num_tris, u16 num_verts
 
 // Старший бит chunk id — CFS_CompressMark. B1 не умеет декомпрессию,
 // поэтому сжатые chunk'и отклоняются до интерпретации payload.
@@ -195,6 +200,96 @@ struct Geometry
 // память исходного level и действует, пока живёт неизменяемый snapshot.
 std::string_view FindShaderBinding(std::span<const uint8_t> level,
                                    uint32_t shaderId) noexcept;
+
+// F4.1: раскладки вершин, реально встречающиеся в level.geom Jupiter.
+//
+// Все три имеют stride 32 и одинаковый префикс POSITION/NORMAL/TANGENT/
+// BINORMAL. Различаются только последние 8 байт, поэтому D3D12 input layout
+// отличается лишь смещением TEXCOORD0.
+enum class VertexLayout12 : uint8_t
+{
+    Unsupported = 0,
+    // COLOR0 @24 (D3DCOLOR) + TEXCOORD0 @28 (SHORT2). Классический FVF 0x112.
+    Classic = 1,
+    // TEXCOORD0 @24 (SHORT2). Встречается либо с TEXCOORD1 @28, либо как
+    // SHORT4 @24 (uv + lightmap): первые две short-компоненты — всё равно uv.
+    UvAt24 = 2,
+};
+
+const char* VertexLayoutName(VertexLayout12 layout) noexcept;
+
+// F4.1: общеуровневый индекс статики.
+//
+// ReadVisual читает ровно один visual и заново разбирает общий контейнер
+// level.geom на каждом вызове. Для всей карты (десятки тысяч visual) это
+// квадратичная работа. ReadLevelPools разбирает пулы VB/IB один раз, а затем
+// описывает каждый visual диапазоном внутри этих пулов. Вершины не
+// копируются: GPU-путь загружает пулы напрямую и рисует поддиапазоны так же,
+// как R4 (FVisual::Render -> vBase/vCount, iBase/iCount).
+struct PoolVisual
+{
+    uint32_t id = 0;
+    // Тип из OGF_HEADER (MT_*). Хранится даже для отвергнутых visual, чтобы
+    // диагностика показывала реальную причину.
+    uint8_t type = 0;
+    bool drawable = false;
+    // Код отказа для неотрисовываемого visual (ReadError), 0 = отрисовываемый.
+    ReadError reject = ReadError::None;
+
+    uint32_t shader_id = 0;
+    uint32_t vb_id = 0;
+    uint32_t vbase = 0;
+    uint32_t vcount = 0;
+    uint32_t ib_id = 0;
+    uint32_t ibase = 0;
+    uint32_t icount = 0;
+    // Раскладка пула, в котором лежит visual (валидна при drawable == true).
+    VertexLayout12 layout = VertexLayout12::Unsupported;
+
+    Bounds header_bounds{};
+    float sphere_center[3] = {0.0f, 0.0f, 0.0f};
+    float sphere_radius = 0.0f;
+};
+
+struct VertexPoolInfo
+{
+    uint32_t id = 0;
+    uint32_t count = 0;
+    uint32_t stride = 0;
+    // Байтовое смещение payload пула внутри переданного level.geom.
+    uint64_t data_offset = 0;
+    uint32_t declaration_count = 0;
+    std::array<DeclarationElement, kMaxDeclarationElements> declaration{};
+    // true, если объявление совпадает с единственным поддержанным (FVF 0x112).
+    bool supported = false;
+    // F4.1: конкретная поддержанная раскладка пула (см. VertexLayout12).
+    VertexLayout12 layout = VertexLayout12::Unsupported;
+};
+
+struct IndexPoolInfo
+{
+    uint32_t id = 0;
+    uint32_t count = 0;
+    uint64_t data_offset = 0;
+};
+
+struct LevelPools
+{
+    std::vector<VertexPoolInfo> vertex_pools;
+    std::vector<IndexPoolInfo> index_pools;
+    // Отсортировано по id visual, ровно по одной записи на visual контейнера.
+    std::vector<PoolVisual> visuals;
+    uint32_t visuals_drawable = 0;
+    uint32_t visuals_rejected = 0;
+    uint64_t vertex_payload_bytes = 0;
+};
+
+// Разбирает контейнер визуалов (chunk 3) и общие пулы level.geom один раз.
+// Никакой памяти вершин не копируется: только метаданные и байтовые диапазоны.
+ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
+                         std::span<const uint8_t> geom_bytes,
+                         LevelPools& output, std::string& reason,
+                         const Limits& limits = Limits{}) noexcept;
 
 // Читает один shared-container MT_NORMAL visual из переданных байтов level
 // и level.geom.
