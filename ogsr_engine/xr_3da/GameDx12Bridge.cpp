@@ -1766,6 +1766,7 @@ bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
     static float yawDegrees = 0.0f;
     static float pitchDegrees = 0.0f;
     static float spinDegrees = 0.0f;
+    static float drift[3] = {0.0f, 0.0f, 0.0f};
     static bool valid = false;
     if (!specLoaded)
     {
@@ -1775,22 +1776,30 @@ bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
             std::strlen(value) < sizeof(spec))
         {
             std::snprintf(spec, sizeof(spec), "%s", value);
-            const int parsed = std::sscanf(spec, "%f,%f,%f,%f,%f,%f",
+            const int parsed = std::sscanf(spec, "%f,%f,%f,%f,%f,%f,%f,%f,%f",
                                            &origin[0], &origin[1], &origin[2],
                                            &yawDegrees, &pitchDegrees,
-                                           &spinDegrees);
+                                           &spinDegrees, &drift[0], &drift[1],
+                                           &drift[2]);
             valid = parsed >= 4;
         }
         if (valid)
         {
             Msg("ph_dx12_f41: fly camera origin=(%.2f,%.2f,%.2f) yaw=%.2f "
-                "pitch=%.2f spin=%.2f",
+                "pitch=%.2f spin=%.2f drift=(%.2f,%.2f,%.2f)",
                 origin[0], origin[1], origin[2], yawDegrees, pitchDegrees,
-                spinDegrees);
+                spinDegrees, drift[0], drift[1], drift[2]);
         }
     }
     if (!valid)
         return false;
+
+    // Дрейф задаёт скорость в м/с и позволяет доказать именно перемещение
+    // камеры, а не только поворот.
+    const float seconds = static_cast<float>(sequence) / 60.0f;
+    const float eye[3] = {origin[0] + drift[0] * seconds,
+                          origin[1] + drift[1] * seconds,
+                          origin[2] + drift[2] * seconds};
 
     const float yaw =
         (yawDegrees + spinDegrees * static_cast<float>(sequence) / 60.0f) *
@@ -1844,9 +1853,9 @@ bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
         view.m[i][2] = forward[i];
         view.m[i][3] = 0.0f;
     }
-    view.m[3][0] = -dot3(right, origin);
-    view.m[3][1] = -dot3(up, origin);
-    view.m[3][2] = -dot3(forward, origin);
+    view.m[3][0] = -dot3(right, eye);
+    view.m[3][1] = -dot3(up, eye);
+    view.m[3][2] = -dot3(forward, eye);
     view.m[3][3] = 1.0f;
 
     // fullTransform = View * Projection (row-vector convention): p*world * V * P.
