@@ -1871,6 +1871,19 @@ void LogVisualComparison(const xraylevel12::LevelPools& pools,
     Msg("ph_cmp: inv role=r4 count=%d pools_visuals=%zu hierarchy_visuals=%zu",
         r4Count, pools.visuals.size(), hierarchy.visuals.size());
 
+    // F4.1-E: детали уровня — отдельный статический путь (CDetailManager),
+    // он не входит в контейнер визуалов. Фиксируем наличие файла, чтобы
+    // отчёт опирался на факт, а не на предположение.
+    if (FS.exist("$level$", "level.details"))
+    {
+        Msg("ph_cmp: details present=1 path='$level$/level.details' "
+            "supported=0 note='CDetailManager instanced clutter, not read by DX12'");
+    }
+    else
+    {
+        Msg("ph_cmp: details present=0");
+    }
+
     const int count =
         (std::min)(r4Count, static_cast<int>(pools.visuals.size()));
     uint32_t r4Types[16] = {};
