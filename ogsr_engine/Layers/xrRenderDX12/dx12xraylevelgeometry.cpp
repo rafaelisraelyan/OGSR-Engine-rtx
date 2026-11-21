@@ -961,13 +961,17 @@ void MakeSphere(const Bounds& bounds, float center[3], float& radius) noexcept
 // Разбирает один visual верхнего контейнера. Возвращает false, если visual
 // нельзя описать диапазоном пулов; причина остаётся в счётчике reject.
 bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
-                    PoolVisual& visual) noexcept
+                    const std::vector<std::vector<SwiWindow>>* swiTables,
+                    PoolVisual& visual, uint32_t& rejectChunk) noexcept
 {
     const uint64_t end = chunk.payload + chunk.size;
     uint64_t pos = chunk.payload;
+    rejectChunk = 0;
     bool has_header = false;
     bool has_gc = false;
     bool has_swi = false;
+    bool has_swi_container = false;
+    uint32_t swi_container_id = 0;
     bool has_tree = false;
     float tree_world[16] = {};
     uint32_t swi_offset = 0;
@@ -1063,6 +1067,15 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
                 return false;
             has_swi = true;
         }
+        else if (type == kOgfSwiContainer)
+        {
+            // OGF_SWICONTAINER: u32 id записи в таблице SWI уровня.
+            if (has_swi_container || size < 4)
+                return false;
+            if (!ReadU32(level, data, swi_container_id))
+                return false;
+            has_swi_container = true;
+        }
         else if (type == kOgfTreeDef2)
         {
             // Fmatrix (16 float) + два блока по 5 float (color/hemi).
@@ -1079,6 +1092,7 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
         }
         else
         {
+            rejectChunk = type;
             return false;
         }
         pos = data + size;
@@ -1093,7 +1107,27 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
     visual.ibase = ibase;
     visual.icount = icount;
     const bool isTree = visual.type == kMtTreeSt || visual.type == kMtTreePm;
-    if (visual.type == kMtProgressive || (isTree && has_swi))
+    // MT_TREE_PM: окно берётся из таблицы SWI уровня по id из chunk 20,
+    // как FTreeVisual_PM::Load -> RenderInstanced (SW.num_verts,
+    // iBase + SW.offset, SW.num_tris).
+    if (visual.type == kMtTreePm)
+    {
+        if (!has_swi_container || swiTables == nullptr ||
+            swi_container_id >= swiTables->size())
+            return false;
+        const auto& windows = (*swiTables)[swi_container_id];
+        if (windows.empty())
+            return false;
+        const SwiWindow& window = windows.front();
+        if (window.num_tris == 0 || window.num_verts == 0)
+            return false;
+        visual.ibase = ibase + window.offset;
+        visual.icount = static_cast<uint32_t>(window.num_tris) * 3u;
+        visual.vcount = window.num_verts;
+        visual.swi_id = swi_container_id;
+        visual.has_swi = true;
+    }
+    else if (visual.type == kMtProgressive || (isTree && has_swi))
     {
         if (!has_swi || swi_num_tris == 0 || swi_num_verts == 0)
             return false;
@@ -1157,6 +1191,59 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
             return error;
 
         LevelPools candidate;
+        // F4.1-E: таблица SWI уровня. R4 читает её из level.geom
+        // (r4_loader.cpp: LoadSWIs(geom)), а не из level: item_count, затем на
+        // запись 4 reserved u32, u32 count, count * FSlideWindow.
+        {
+            Chunk swisChunk{};
+            const ReadError swisError =
+                FindUniqueChunk(geom_bytes, kLevelSwisChunk, swisChunk, reason);
+            if (swisError == ReadError::None)
+            {
+                uint64_t swiPos = swisChunk.payload;
+                const uint64_t swiEnd = swisChunk.payload + swisChunk.size;
+                uint32_t itemCount = 0;
+                if (swiEnd - swiPos < 4 ||
+                    !ReadU32(geom_bytes, swiPos, itemCount) ||
+                    itemCount > kMaxSwiItems)
+                    return Fail(reason, ReadError::TruncatedChunkHeader);
+                swiPos += 4;
+                candidate.swi_tables.resize(itemCount);
+                for (uint32_t item = 0; item < itemCount; ++item)
+                {
+                    if (swiEnd - swiPos < kSwiHeaderBytes)
+                        return Fail(reason, ReadError::TruncatedChunkHeader);
+                    uint32_t windowCount = 0;
+                    if (!ReadU32(geom_bytes, swiPos + 16, windowCount) ||
+                        windowCount > kMaxSwiWindows)
+                        return Fail(reason, ReadError::TruncatedChunkHeader);
+                    swiPos += kSwiHeaderBytes;
+                    const uint64_t bytes =
+                        static_cast<uint64_t>(windowCount) * kSlideWindowBytes;
+                    if (bytes > swiEnd - swiPos)
+                        return Fail(reason, ReadError::ChunkExceedsInput);
+                    auto& windows = candidate.swi_tables[item];
+                    windows.resize(windowCount);
+                    for (uint32_t window = 0; window < windowCount; ++window)
+                    {
+                        SwiWindow entry;
+                        if (!ReadU32(geom_bytes, swiPos, entry.offset) ||
+                            !ReadU16(geom_bytes, swiPos + 4, entry.num_tris) ||
+                            !ReadU16(geom_bytes, swiPos + 6, entry.num_verts))
+                            return Fail(reason, ReadError::TruncatedChunkHeader);
+                        windows[window] = entry;
+                        swiPos += kSlideWindowBytes;
+                    }
+                }
+            }
+            else if (swisError != ReadError::MissingMandatoryChunk)
+            {
+                // Отсутствие таблицы не фатально: level без PM-деревьев её не
+                // содержит. Любая другая ошибка — порча контейнера.
+                return swisError;
+            }
+        }
+
         candidate.vertex_pools.reserve(vbs.size());
         for (const VbInfo& vb : vbs)
         {
@@ -1183,6 +1270,11 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
             candidate.index_pools.push_back(info);
         }
 
+        // F4.1-E: гистограмма отвергнутых подчанков по типу визуала. Без неё
+        // причина отказа «тип» маскирует реальную (например неизвестный
+        // OGF-подчанок у MT_TREE_PM).
+        uint32_t rejectChunks[16][32] = {};
+
         const uint64_t end = visuals.payload + visuals.size;
         uint64_t pos = visuals.payload;
         while (pos < end)
@@ -1207,12 +1299,16 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
 
             PoolVisual visual;
             visual.id = type;
-            if (!ReadPoolVisual(level_bytes, chunk, visual))
+            uint32_t rejectChunk = 0;
+            if (!ReadPoolVisual(level_bytes, chunk, &candidate.swi_tables, visual,
+                                rejectChunk))
             {
                 visual.drawable = false;
                 visual.reject = visual.type == kMtNormal
                                     ? ReadError::UnsupportedOgfSubchunk
                                     : ReadError::UnsupportedVisualType;
+                if (rejectChunk != 0 && visual.type < 16 && rejectChunk < 32)
+                    ++rejectChunks[visual.type][rejectChunk];
             }
             else if (visual.type != kMtNormal && visual.type != kMtProgressive &&
                      visual.type != kMtTreeSt && visual.type != kMtTreePm)
@@ -1275,6 +1371,17 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
         }
 
         output = std::move(candidate);
+        // Диагностика печатается владельцем через LogDeclarationInventory;
+        // сама гистограмма живёт в LevelPools::rejected_chunks.
+        for (uint32_t type = 0; type < 16; ++type)
+        {
+            for (uint32_t chunkId = 0; chunkId < 32; ++chunkId)
+            {
+                if (rejectChunks[type][chunkId] != 0)
+                    output.rejected_chunks.push_back(
+                        {type, chunkId, rejectChunks[type][chunkId]});
+            }
+        }
         return ReadError::None;
     }
     catch (const std::bad_alloc&)

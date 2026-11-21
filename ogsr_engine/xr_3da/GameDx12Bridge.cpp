@@ -19,6 +19,14 @@
 #include "igame_level.h"
 #include "IGame_Persistent.h"
 #include "XR_IOConsole.h"
+// F4.1-E: инвентарь R4 через нейтральный интерфейс рендера и список объектов.
+#include "../Include/xrRender/RenderVisual.h"
+#include "vis_common.h"
+#include "xr_object.h"
+#include "xr_object_list.h"
+
+#include <algorithm>
+#include <vector>
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
@@ -159,6 +167,8 @@ struct BridgeStateData
     bool staticSceneAttempted = false;
     bool staticSceneBound = false;
     bool staticSceneEnabledLogged = false;
+    // F4.1-E: инвентарь динамики снимается после того, как мир заспавнен.
+    bool dynamicInventoryLogged = false;
     uint64_t staticSceneSession = 0;
     uint64_t staticSceneEpoch = 0;
     uint32_t staticSceneDraws = 0;
@@ -1745,6 +1755,190 @@ bool StaticSceneRequested()
     return enabled;
 }
 
+// F4.1-E: включение машинно-читаемого сравнения R4 <-> DX12.
+bool ComparisonRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_CMP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// F4.1-E: инвентарь динамических игровых объектов (спавн-объекты уровня).
+//
+// Двери в CoP — это не статика level.geom, а CPhysicObject со скелетным
+// визуалом (аудит: PhysicObject.cpp:25-97, GameObject.cpp:262-263). Наш
+// статический конвейер их не покрывает принципиально, поэтому их надо
+// считать и классифицировать, а не смешивать с пропусками статики.
+void LogDynamicObjectInventory()
+{
+    if (!ComparisonRequested())
+        return;
+    if (g_pGameLevel == nullptr)
+        return;
+
+    const u32 total = g_pGameLevel->Objects.o_count();
+    Msg("ph_cmp: dyn summary objects=%u", total);
+
+    // Группировка по (тип визуала, секция) без лишних аллокаций.
+    struct Bucket12
+    {
+        u32 type = 0;
+        u32 count = 0;
+        u32 visible = 0;
+        char section[64] = {};
+    };
+    std::vector<Bucket12> buckets;
+    buckets.reserve(256);
+    u32 withVisual = 0;
+    u32 withoutVisual = 0;
+    u32 visibleCount = 0;
+    for (u32 index = 0; index < total; ++index)
+    {
+        CObject* object = g_pGameLevel->Objects.o_get_by_iterator(index);
+        if (object == nullptr)
+            continue;
+        IRenderVisual* visual = object->Visual();
+        const u32 type = visual != nullptr ? visual->getType() : 0xFFFFFFFFu;
+        if (visual != nullptr)
+            ++withVisual;
+        else
+            ++withoutVisual;
+        const bool visible = object->getVisible() && visual != nullptr;
+        if (visible)
+            ++visibleCount;
+
+        const char* section = object->cNameSect().c_str();
+        Bucket12* bucket = nullptr;
+        for (auto& candidate : buckets)
+        {
+            if (candidate.type == type &&
+                std::strncmp(candidate.section, section, sizeof(candidate.section) - 1) == 0)
+            {
+                bucket = &candidate;
+                break;
+            }
+        }
+        if (bucket == nullptr)
+        {
+            Bucket12 created;
+            created.type = type;
+            std::snprintf(created.section, sizeof(created.section), "%s", section);
+            buckets.push_back(created);
+            bucket = &buckets.back();
+        }
+        ++bucket->count;
+        if (visible)
+            ++bucket->visible;
+    }
+
+    std::sort(buckets.begin(), buckets.end(),
+              [](const Bucket12& left, const Bucket12& right)
+              { return left.count > right.count; });
+    Msg("ph_cmp: dyn summary objects=%u with_visual=%u without_visual=%u "
+        "visible=%u buckets=%zu",
+        total, withVisual, withoutVisual, visibleCount, buckets.size());
+    const size_t limit = buckets.size() < 24 ? buckets.size() : 24;
+    for (size_t index = 0; index < limit; ++index)
+    {
+        const Bucket12& bucket = buckets[index];
+        Msg("ph_cmp: dyn bucket type=%u count=%u visible=%u section='%s'",
+            bucket.type, bucket.count, bucket.visible, bucket.section);
+    }
+}
+//
+// Оба рендерера индексируют статику уровня одинаково: index в контейнере
+// fsL_VISUALS(3) == id в CRender::Visuals == index в pools.visuals. Поэтому
+// сравнение идёт прямым join по id, без эвристик.
+//
+// Печатаются только факта: что R4 загрузил (тип, сфера), что DX12 считает
+// отрисовываемым и с какой причиной отказа. Отдельно — ид, где тип по R4 и по
+// нашему парсеру расходятся: это дефект парсера, а не «неподдержанный тип».
+void LogVisualComparison(const xraylevel12::LevelPools& pools,
+                         const levelhierarchy12::LevelHierarchy& hierarchy)
+{
+    if (!ComparisonRequested())
+        return;
+    if (Render == nullptr)
+    {
+        Msg("ph_cmp: inv role=r4 unavailable reason='render interface is null'");
+        return;
+    }
+
+    const int r4Count = static_cast<int>(Render->getVisualCount());
+    Msg("ph_cmp: inv role=r4 count=%d pools_visuals=%zu hierarchy_visuals=%zu",
+        r4Count, pools.visuals.size(), hierarchy.visuals.size());
+
+    const int count =
+        (std::min)(r4Count, static_cast<int>(pools.visuals.size()));
+    uint32_t r4Types[16] = {};
+    uint32_t parsedTypes[16] = {};
+    uint32_t typeMismatch = 0;
+    uint32_t r4NormalButUnsupported = 0;
+    for (int index = 0; index < r4Count; ++index)
+    {
+        IRenderVisual* visual = Render->getVisual(index);
+        if (visual == nullptr)
+        {
+            Msg("ph_cmp: inv role=r4 id=%d state=missing", index);
+            continue;
+        }
+        const u32 type = visual->getType();
+        const vis_data& data = visual->getVisData();
+        if (type < 16)
+            ++r4Types[type];
+        const bool inPools = index < static_cast<int>(pools.visuals.size());
+        const auto& parsed = inPools ? pools.visuals[static_cast<size_t>(index)]
+                                     : pools.visuals.front();
+        if (inPools && parsed.type < 16)
+            ++parsedTypes[parsed.type];
+        const bool mismatch = inPools && parsed.type != type;
+        if (mismatch)
+            ++typeMismatch;
+        if (inPools && type == 0 && !parsed.drawable)
+            ++r4NormalButUnsupported;
+        Msg("ph_cmp: inv role=r4 id=%d type=%u cx=%.3f cy=%.3f cz=%.3f r=%.3f "
+            "dx12_drawable=%d dx12_reject=%u dx12_layout=%u mismatch=%d",
+            index, static_cast<unsigned>(type), data.sphere.P.x,
+            data.sphere.P.y, data.sphere.P.z, data.sphere.R,
+            inPools ? (parsed.drawable ? 1 : 0) : -1,
+            inPools ? static_cast<unsigned>(parsed.reject) : 0u,
+            inPools ? static_cast<unsigned>(parsed.layout) : 0u,
+            mismatch ? 1 : 0);
+    }
+
+    char r4Histogram[192] = {};
+    char parsedHistogram[192] = {};
+    size_t usedR4 = 0;
+    size_t usedParsed = 0;
+    for (uint32_t type = 0; type < 16; ++type)
+    {
+        if (r4Types[type] != 0)
+        {
+            const int written = std::snprintf(
+                r4Histogram + usedR4, sizeof(r4Histogram) - usedR4,
+                "type%u=%u ", type, r4Types[type]);
+            if (written > 0 && static_cast<size_t>(written) < sizeof(r4Histogram) - usedR4)
+                usedR4 += static_cast<size_t>(written);
+        }
+        if (parsedTypes[type] != 0)
+        {
+            const int written = std::snprintf(
+                parsedHistogram + usedParsed, sizeof(parsedHistogram) - usedParsed,
+                "type%u=%u ", type, parsedTypes[type]);
+            if (written > 0 && static_cast<size_t>(written) < sizeof(parsedHistogram) - usedParsed)
+                usedParsed += static_cast<size_t>(written);
+        }
+    }
+    Msg("ph_cmp: hist role=r4 %s", r4Histogram);
+    Msg("ph_cmp: hist role=dx12 %s", parsedHistogram);
+    Msg("ph_cmp: inv summary r4_count=%d compared=%d type_mismatch=%u "
+        "r4_normal_unsupported=%u",
+        r4Count, count, typeMismatch, r4NormalButUnsupported);
+}
+
 // F4.1 evidence-only свободная камера.
 //
 // Позволяет снять одну и ту же РЕАЛЬНУЮ сцену из произвольной точки карты,
@@ -1989,6 +2183,9 @@ void LoadFullStaticScene(BridgeStateData& state)
     }
     GameDx12StaticScene12_LogDeclarationInventory(pools);
 
+    // F4.1-E: сопоставление загруженного R4 и поддержанного DX12 по id.
+    LogVisualComparison(pools, hierarchy);
+
     // Мировые границы загружаемой статики: нужны и для отчёта, и для выбора
     // позиций доказательных кадров.
     {
@@ -2038,6 +2235,9 @@ void LoadFullStaticScene(BridgeStateData& state)
         uint32_t reachableNormal = 0;
         uint32_t reachableProgressive = 0;
         uint32_t reachableTree = 0;
+        uint32_t lodNodes = 0;
+        uint32_t lodLadderNodes = 0;
+        uint32_t lodSpreadNodes = 0;
         uint32_t skippedTree = 0;
         uint32_t skippedType = 0;
         uint32_t cycleGuard = 0;
@@ -2096,15 +2296,67 @@ void LoadFullStaticScene(BridgeStateData& state)
             }
             if (node.type == 6)
             {
-                // MT_LOD хранит уровни детализации одного объекта. R4 рисует
-                // ровно один уровень, поэтому все LOD-дети сразу дали бы
-                // z-fighting. Берём первый (самый подробный).
-                if (!node.children.empty())
+                // R4 для крупного объекта добавляет ВСЕХ детей FLOD
+                // (r__dsgraph_build.cpp:552-557), а импостор рисует отдельно.
+                // Но если у детей совпадает центр и отличаются размеры — это
+                // лестница детализации одного объекта, и рисовать надо один
+                // уровень. Решение принимается по данным уровня, а не по
+                // допущению.
+                ++lodNodes;
+                float parentCenter[3] = {
+                    (node.bounds.minimum[0] + node.bounds.maximum[0]) * 0.5f,
+                    (node.bounds.minimum[1] + node.bounds.maximum[1]) * 0.5f,
+                    (node.bounds.minimum[2] + node.bounds.maximum[2]) * 0.5f};
+                const float parentSize =
+                    (std::max)(node.bounds.maximum[0] - node.bounds.minimum[0],
+                               (std::max)(node.bounds.maximum[1] - node.bounds.minimum[1],
+                                          node.bounds.maximum[2] - node.bounds.minimum[2]));
+                bool ladder = node.children.size() > 1;
+                if (ladder && parentSize > 0.0f)
                 {
-                    const auto child = byId.find(node.children.front());
+                    const float tolerance = parentSize * 0.02f;
+                    for (const uint32_t childId : node.children)
+                    {
+                        const auto child = byId.find(childId);
+                        if (child == byId.end())
+                            continue;
+                        const auto& childBounds =
+                            hierarchy.visuals[child->second].bounds;
+                        const float childCenter[3] = {
+                            (childBounds.minimum[0] + childBounds.maximum[0]) * 0.5f,
+                            (childBounds.minimum[1] + childBounds.maximum[1]) * 0.5f,
+                            (childBounds.minimum[2] + childBounds.maximum[2]) * 0.5f};
+                        for (int axis = 0; axis < 3; ++axis)
+                        {
+                            if (std::fabs(childCenter[axis] - parentCenter[axis]) >
+                                tolerance)
+                            {
+                                ladder = false;
+                                break;
+                            }
+                        }
+                        if (!ladder)
+                            break;
+                    }
+                }
+                if (ladder)
+                {
+                    ++lodLadderNodes;
+                }
+                else
+                {
+                    ++lodSpreadNodes;
+                }
+                // R4 добавляет ВСЕХ детей FLOD в ближней зоне
+                // (r__dsgraph_build.cpp:552-557) и не выбирает ребёнка по
+                // индексу. Повторяем это поведение, чтобы покрытие совпадало;
+                // счётчики выше остаются диагностикой семантики LOD.
+                for (const uint32_t childId : node.children)
+                {
+                    const auto child = byId.find(childId);
                     if (child != byId.end())
-                        stack.push_back(
-                            {static_cast<uint32_t>(child->second), current.depth + 1});
+                        stack.push_back({static_cast<uint32_t>(child->second),
+                                         current.depth + 1});
                 }
                 continue;
             }
@@ -2119,6 +2371,7 @@ void LoadFullStaticScene(BridgeStateData& state)
 
         uint32_t referenced = 0;
         uint32_t dropped = 0;
+        uint32_t loggedDropped = 0;
         for (size_t index = 0; index < pools.visuals.size(); ++index)
         {
             const auto& visual = pools.visuals[index];
@@ -2132,6 +2385,16 @@ void LoadFullStaticScene(BridgeStateData& state)
                 ++referenced;
                 continue;
             }
+            if (loggedDropped < 12)
+            {
+                ++loggedDropped;
+                Msg("ph_dx12_f41: dropped id=%u type=%u vcount=%u icount=%u "
+                    "c=(%.1f,%.1f,%.1f) r=%.2f",
+                    visual.id, static_cast<unsigned>(visual.type),
+                    visual.vcount, visual.icount, visual.sphere_center[0],
+                    visual.sphere_center[1], visual.sphere_center[2],
+                    visual.sphere_radius);
+            }
             pools.visuals[index].drawable = false;
             pools.visuals[index].reject = xraylevel12::ReadError::VisualNotFound;
             --pools.visuals_drawable;
@@ -2140,9 +2403,10 @@ void LoadFullStaticScene(BridgeStateData& state)
         }
         Msg("ph_dx12_f41: reachability normal=%u progressive=%u tree=%u "
             "referenced=%u dropped_unreachable=%u skipped_tree_nodes=%u "
-            "skipped_other_types=%u",
+            "skipped_other_types=%u lod_nodes=%u lod_ladder=%u lod_spread=%u",
             reachableNormal, reachableProgressive, reachableTree, referenced,
-            dropped, skippedTree, skippedType);
+            dropped, skippedTree, skippedType, lodNodes, lodLadderNodes,
+            lodSpreadNodes);
     }
 
     std::vector<std::string> textureNames;
@@ -2667,6 +2931,21 @@ void GameDx12Bridge_OnFrame()
     if (state.nativeRequested)
     {
         RenderNativeFrame(state, fullTransform);
+
+    // F4.1-E: мир уже заспавнен (несколько кадров прошло), снимаем инвентарь
+    // динамики один раз на сессию уровня.
+    if (!state.dynamicInventoryLogged && state.nativeScenePresents >= 30)
+    {
+        state.dynamicInventoryLogged = true;
+        try
+        {
+            LogDynamicObjectInventory();
+        }
+        catch (...)
+        {
+            Msg("ph_cmp: dyn summary objects=unavailable");
+        }
+    }
         return;
     }
     ++state.capturedFrames;

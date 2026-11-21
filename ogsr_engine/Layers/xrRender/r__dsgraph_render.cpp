@@ -11,11 +11,32 @@ extern float ps_r__LOD_k;
 
 using namespace R_dsgraph;
 
+namespace
+{
+// F4.1-E: диагностический дамп отправленной статики для сравнения с DX12.
+// Включается только переменной окружения, поведение рендера не меняется.
+bool R4CmpEnabled()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_CMP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+} // namespace
+
 void R_dsgraph_structure::r_dsgraph_render_graph_static(const u32 _priority, const bool skip_tree_branches)
 {
     Device.Statistic->RenderDUMP.Begin();
 
     cmd_list.set_xform_world(Fidentity);
+
+    // F4.1-E: дамп ограничен несколькими кадрами, чтобы лог оставался
+    // читаемым. Кадры без статики (меню, загрузка) бюджет не расходуют.
+    static u32 s_cmpDumpFrames = 0;
+    const bool dumpStatic = R4CmpEnabled() && s_cmpDumpFrames < 6;
+    u32 dumpedItems = 0;
 
     // **************************************************** NORMAL
     {
@@ -81,6 +102,12 @@ void R_dsgraph_structure::r_dsgraph_render_graph_static(const u32 _priority, con
 
                         item.pVisual->Render(cmd_list, clampr(1.f - (1.f - lod) * ps_r__LOD_k, 0.01f, 1.f), phase != CRender::PHASE_NORMAL);
                     }
+                    if (dumpStatic)
+                    {
+                        ++dumpedItems;
+                        Msg("ph_cmp: r4draw kind=static ptr=%p ssa=%.6f lod=%.4f",
+                            static_cast<void*>(item.pVisual), item.ssa, lod);
+                    }
                 }
 
                 if (!items.trees->empty())
@@ -123,6 +150,14 @@ void R_dsgraph_structure::r_dsgraph_render_graph_static(const u32 _priority, con
                                 continue;
 
                             tree.second.pVisual->RenderInstanced(cmd_list, tree.second.data);
+
+                            if (dumpStatic)
+                            {
+                                ++dumpedItems;
+                                Msg("ph_cmp: r4draw kind=tree ptr=%p inst=%u",
+                                    static_cast<void*>(tree.second.pVisual),
+                                    static_cast<unsigned>(tree.second.data.size()));
+                            }
                         }
                     }
                 }
@@ -134,6 +169,9 @@ void R_dsgraph_structure::r_dsgraph_render_graph_static(const u32 _priority, con
             map.clear();
         }
     }
+
+    if (dumpStatic && dumpedItems != 0)
+        ++s_cmpDumpFrames;
 }
 
 void R_dsgraph_structure::r_dsgraph_render_graph_dynamic(u32 _priority)

@@ -348,6 +348,26 @@ void CRender::LoadVisuals(IReader* fs)
 
         Visuals.push_back(V);
 
+        // F4.1-E: инвентарь загруженной статики в машинно-читаемом виде.
+        // Только чтение: ни порядок, ни содержимое Visuals не меняются.
+        // index == id визуала в контейнере fsL_VISUALS(3).
+        static const bool compareDump = []
+        {
+            const char* value = std::getenv("OGSR_DX12_CMP");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (compareDump)
+        {
+            const vis_data& data = V->getVisData();
+            Msg("ph_cmp: r4inv id=%u type=%u cx=%.3f cy=%.3f cz=%.3f r=%.3f "
+                "bmin=(%.3f,%.3f,%.3f) bmax=(%.3f,%.3f,%.3f) ptr=%p",
+                index, static_cast<unsigned>(H.type), data.sphere.P.x,
+                data.sphere.P.y, data.sphere.P.z, data.sphere.R,
+                data.box.min.x, data.box.min.y, data.box.min.z,
+                data.box.max.x, data.box.max.y, data.box.max.z,
+                static_cast<void*>(V));
+        }
+
         chunk->close();
 
         index++;

@@ -297,6 +297,17 @@ bool SceneAlphaTestDisabled()
     return disabled;
 }
 
+// F4.1-E: per-draw дамп для сравнения с R4 (ph_cmp: r4draw).
+bool SceneCompareEnabled()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_CMP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // Process-lifetime карантин: неизвестное завершение GPU-работы запрещает
 // освобождение ресурсов, поэтому они остаются до конца процесса.
 // Сырые указатели без деструкторов: аварийный путь не должен аллоцировать.
@@ -1252,6 +1263,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const uint32_t viewMode = SceneViewMode();
     const float threshold = ps_r_alphatest_threshold;
     const bool alphaTestDisabled = SceneAlphaTestDisabled();
+    // Дамп ограничен тремя кадрами, как и на стороне R4.
+    static uint32_t compareDumpFrames = 0;
+    const bool dumpDraws = SceneCompareEnabled() && compareDumpFrames < 3;
     const auto recordStart = Clock::now();
     // Три прохода: classic, uv@24, flora (uv@24 + мировая матрица).
     // PSO переключается один раз на группу, а не на каждый draw.
@@ -1272,6 +1286,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (cull && !SphereInside(planes, draw.center, draw.radius))
             {
                 ++stats.culled;
+                if (dumpDraws)
+                    Msg("ph_cmp: dx12draw id=%u variant=%u state=culled",
+                        draw.visualId, variant);
                 continue;
             }
             if (!bound)
@@ -1297,10 +1314,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             list->IASetIndexBuffer(&draw.indexView);
             list->DrawIndexedInstanced(draw.icount, 1, 0, 0, 0);
             ++stats.draws;
+            if (dumpDraws)
+                Msg("ph_cmp: dx12draw id=%u variant=%u state=drawn",
+                    draw.visualId, variant);
         }
     }
     list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
     stats.record_ms = Ms(recordStart);
+    if (dumpDraws)
+        ++compareDumpFrames;
     if (stats.draws == 0 && !m_limitLogged)
     {
         m_limitLogged = true;
@@ -1598,6 +1620,12 @@ void GameDx12StaticScene12_LogDeclarationInventory(
         "rejected_container=%u rejected_range=%u rejected_other=%u",
         unsupportedType, unsupportedDeclaration, missingContainer, invalidRange,
         other);
+
+    for (const auto& entry : pools.rejected_chunks)
+    {
+        Msg("ph_dx12_f41: rejected_chunk type=%u chunk=%u count=%u",
+            entry.type, entry.chunkId, entry.count);
+    }
 }
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE

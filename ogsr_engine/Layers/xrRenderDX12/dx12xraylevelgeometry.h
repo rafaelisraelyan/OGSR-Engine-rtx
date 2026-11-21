@@ -35,6 +35,20 @@ constexpr uint32_t kOgfTreeDef2 = 12;
 constexpr uint32_t kMtTreeSt = 7;
 constexpr uint32_t kMtTreePm = 11;
 constexpr uint32_t kTreeDefBytes = 104;    // Fmatrix(64) + 2 * 5 float
+// F4.1-E: прогрессивные деревья берут окна из таблицы SWI самого уровня
+// (chunk 11), а не из OGF: OGF_SWICONTAINER(20) хранит только id.
+constexpr uint32_t kOgfSwiContainer = 20;
+constexpr uint32_t kLevelSwisChunk = 11;
+constexpr uint32_t kMaxSwiItems = 65536;
+constexpr uint32_t kMaxSwiWindows = 65536;
+
+// Окно прогрессивной геометрии (FSlideWindow).
+struct SwiWindow
+{
+    uint32_t offset = 0;
+    uint16_t num_tris = 0;
+    uint16_t num_verts = 0;
+};
 
 // Старший бит chunk id — CFS_CompressMark. B1 не умеет декомпрессию,
 // поэтому сжатые chunk'и отклоняются до интерпретации payload.
@@ -261,6 +275,9 @@ struct PoolVisual
                        0.0f, 1.0f, 0.0f, 0.0f,
                        0.0f, 0.0f, 1.0f, 0.0f,
                        0.0f, 0.0f, 0.0f, 1.0f};
+    // F4.1-E: id записи в таблице SWI уровня (для MT_TREE_PM).
+    uint32_t swi_id = 0;
+    bool has_swi = false;
 };
 
 struct VertexPoolInfo
@@ -291,6 +308,16 @@ struct LevelPools
     std::vector<IndexPoolInfo> index_pools;
     // Отсортировано по id visual, ровно по одной записи на visual контейнера.
     std::vector<PoolVisual> visuals;
+    // F4.1-E: таблица SWI уровня (chunk 11), нужна MT_TREE_PM.
+    std::vector<std::vector<SwiWindow>> swi_tables;
+    // F4.1-E: (тип визуала, id подчанка, сколько раз) для отвергнутых visual.
+    struct RejectedChunk
+    {
+        uint32_t type = 0;
+        uint32_t chunkId = 0;
+        uint32_t count = 0;
+    };
+    std::vector<RejectedChunk> rejected_chunks;
     uint32_t visuals_drawable = 0;
     uint32_t visuals_rejected = 0;
     uint64_t vertex_payload_bytes = 0;
