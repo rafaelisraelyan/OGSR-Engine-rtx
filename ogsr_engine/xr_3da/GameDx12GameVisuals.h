@@ -16,6 +16,7 @@ public:
     bool Prepare(IGame_Level& level, const float eye[3], GameDx12StaticScene12& scene,
                  const GameDx12StaticSceneOwner12& owner, std::string& reason);
     void Reset();
+    void InvalidateFrame(uint64_t epoch);
     const Frame& Snapshot() const { return m_frame; }
     void LogPresent(uint64_t present, uint64_t fence, const GameDx12StaticScene12::AuxStats& draws,
                     const GameDx12StaticScene12::AuxStats& resources) const;
@@ -25,6 +26,7 @@ private:
     {
         std::vector<Part> parts;
         std::string reason;
+        uint32_t identity = 0;
     };
     struct Counts
     {
@@ -47,6 +49,7 @@ private:
     std::unordered_map<std::string, uint32_t> m_rejections;
     bool m_detailsAttempted = false;
     bool m_detailsLoaded = false;
+    bool m_discoveryLogged = false;
     uint32_t m_modelWarnings = 0;
 };
 }

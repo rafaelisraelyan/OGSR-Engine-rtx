@@ -169,7 +169,7 @@ bool ReadBoneCount(Bytes bytes, uint32_t& count, std::string& reason)
     return true;
 }
 
-std::string NormalizePath(std::string_view source)
+std::string NormalizePath(std::string_view source, bool visualName = false)
 {
     std::string result;
     if (source.empty() || source.size() > maxStringLength ||
@@ -184,7 +184,8 @@ std::string NormalizePath(std::string_view source)
         if (value == '/')
             value = '\\';
         if (!((value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') ||
-              value == '_' || value == '-' || value == '.' || value == '\\'))
+              value == '_' || value == '-' || value == '.' || value == '\\' ||
+              (visualName && value == '#')))
             return {};
         result.push_back(value);
     }
@@ -365,7 +366,8 @@ bool ReadRigidModel(const char* visualName, std::vector<Mesh>& meshes, std::stri
         return Fail(reason, "ogf_visual_name");
     try
     {
-        std::string name = NormalizePath(visualName);
+        // Компилятор уровня использует имена meshes\\brkbl#N для разрушаемых частей.
+        std::string name = NormalizePath(visualName, true);
         if (name.empty())
             return Fail(reason, "ogf_visual_name");
         // CModelPool приводит имя к нижнему регистру и удаляет расширение.

@@ -3529,9 +3529,10 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         state.m23.OnDeviceReset(state.captureEpoch);
         if (state.m23.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("m23_device_reset");
-        state.staticSceneBound = false;
-        state.gameVisuals.Reset();
         state.staticScene.OnDeviceReset(state.captureEpoch);
+        state.gameVisuals.InvalidateFrame(state.captureEpoch);
+        if (state.staticSceneBound)
+            state.staticSceneEpoch = state.captureEpoch;
         if (state.staticScene.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("f41_device_reset");
         if (M23Requested())

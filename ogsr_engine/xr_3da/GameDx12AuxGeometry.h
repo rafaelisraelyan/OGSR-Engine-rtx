@@ -38,9 +38,11 @@ struct ObjectDraw
 {
     uint16_t id = 0;
     uint64_t generation = 0;
+    uint32_t visual = 0;
     uint32_t firstMesh = 0;
     uint32_t meshCount = 0;
     uint32_t poseOffset = 0;
+    uint32_t boneCount = 0;
     float center[3]{};
     float radius = 0.0f;
     DirectX::XMFLOAT4X4 world;

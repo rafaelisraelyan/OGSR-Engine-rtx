@@ -98,6 +98,7 @@ bool GameVisuals::LoadPending(IGame_Level& level, GameDx12StaticScene12& scene,
             std::string rejected;
             const bool loaded = ReadRigidModel(visual.c_str(), meshes, rejected);
             auto& model = m_models.try_emplace(visual.c_str()).first->second;
+            model.identity = static_cast<uint32_t>(m_models.size());
             if (!loaded)
             {
                 model.reason = std::move(rejected);
@@ -159,6 +160,9 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
     m_counts.objects = level.Objects.o_count();
     if (!Enabled("OGSR_DX12_GAME_RIGID"))
         return;
+    const char* discovery = std::getenv("OGSR_DX12_GAME_F42_DISCOVERY");
+    const bool discover = !m_discoveryLogged && discovery && std::strcmp(discovery, "1") == 0;
+    uint32_t discovered = 0;
     for (uint32_t i = 0; i < m_counts.objects; ++i)
     {
         CObject* object = level.Objects.o_get_by_iterator(i);
@@ -221,7 +225,9 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
         ObjectDraw entry;
         entry.id = object->ID();
         entry.generation = object->Dx12Generation();
+        entry.visual = model->second.identity;
         entry.poseOffset = static_cast<uint32_t>(m_frame.poses.size());
+        entry.boneCount = bones;
         entry.firstMesh = static_cast<uint32_t>(m_frame.objectMeshes.size());
         Fvector center;
         object->Center(center);
@@ -272,8 +278,18 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
         const float distance = std::hypot(center.x - eye[0], center.y - eye[1], center.z - eye[2]);
         if (distance < CROW_RADIUS2 + entry.radius)
             object->MakeMeCrow();
+        if (discover && discovered < 80 && distance < 25.0f)
+        {
+            Msg("ph_dx12_f42: nearby id=%u generation=%llu section='%s' visual='%s' "
+                "bones=%u parts=%u distance=%.3f position=(%.3f,%.3f,%.3f)",
+                entry.id, entry.generation, object->cNameSect_str(), visualName.c_str(),
+                bones, entry.meshCount, distance, entry.world._41, entry.world._42, entry.world._43);
+            ++discovered;
+        }
         m_frame.objects.push_back(entry);
     }
+    if (discovered != 0 && m_frame.epoch != 0 && m_counts.waitingModel == 0)
+        m_discoveryLogged = true;
 }
 
 bool GameVisuals::Prepare(IGame_Level& level, const float eye[3], GameDx12StaticScene12& scene,
@@ -305,6 +321,16 @@ void GameVisuals::Reset()
     *this = GameVisuals{};
 }
 
+void GameVisuals::InvalidateFrame(uint64_t epoch)
+{
+    m_frame.epoch = epoch;
+    m_frame.objects.clear();
+    m_frame.objectMeshes.clear();
+    m_frame.poses.clear();
+    for (auto& group : m_frame.details)
+        group.transforms.clear();
+}
+
 void GameVisuals::LogPresent(uint64_t present, uint64_t fence,
     const GameDx12StaticScene12::AuxStats& draws, const GameDx12StaticScene12::AuxStats& resources) const
 {
@@ -324,14 +350,11 @@ void GameVisuals::LogPresent(uint64_t present, uint64_t fence,
                         present, fence, m_frame.session, id);
                 else
                 {
-                    const auto next = std::next(it);
-                    const auto endPose = next != m_frame.objects.end() ?
-                        next->poseOffset : m_frame.poses.size();
                     Msg("ph_dx12_f42: trace present=%llu fence=%llu session=%llu id=%lu "
-                        "generation=%llu state=prepared parts=%u world_hash=%016llx pose_hash=%016llx "
+                        "generation=%llu state=prepared visual=%u parts=%u world_hash=%016llx pose_hash=%016llx "
                         "world=(%.4f,%.4f,%.4f)", present, fence, m_frame.session, id,
-                        it->generation, it->meshCount, Hash(std::span(&it->world, 1)),
-                        Hash(std::span(m_frame.poses).subspan(it->poseOffset, endPose - it->poseOffset)),
+                        it->generation, it->visual, it->meshCount, Hash(std::span(&it->world, 1)),
+                        Hash(std::span(m_frame.poses).subspan(it->poseOffset, it->boneCount)),
                         it->world._41, it->world._42, it->world._43);
                 }
             }

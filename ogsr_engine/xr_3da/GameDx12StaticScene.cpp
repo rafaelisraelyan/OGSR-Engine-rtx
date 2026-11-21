@@ -1619,10 +1619,11 @@ void GameDx12StaticScene12::OnLevelTeardown(uint64_t nextEpoch)
 
 void GameDx12StaticScene12::OnDeviceReset(uint64_t nextEpoch)
 {
-    if (m_gpuUnknown)
+    if (GpuCompletionUnknown())
         return;
-    if (m_loaded)
-        OnLevelTeardown(nextEpoch);
+    // Bridge вызывает это после Drain. Меняется размер окна/R4,
+    // D3D12 device и level resources остаются теми же.
+    m_levelEpoch = nextEpoch;
 }
 
 void GameDx12StaticScene12::ReleaseGpu()
