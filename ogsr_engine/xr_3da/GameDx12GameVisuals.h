@@ -49,8 +49,9 @@ private:
     std::unordered_map<std::string, uint32_t> m_rejections;
     bool m_detailsAttempted = false;
     bool m_detailsLoaded = false;
-    bool m_discoveryLogged = false;
+    uint32_t m_discoveryFrames = 0;
     uint32_t m_modelWarnings = 0;
+    uint64_t m_detailTextureBytes = 0;
 };
 }
 

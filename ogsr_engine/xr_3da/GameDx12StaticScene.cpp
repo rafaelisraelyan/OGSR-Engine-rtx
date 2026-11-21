@@ -17,7 +17,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace
@@ -969,6 +969,7 @@ bool GameDx12StaticScene12::CreateTextures(
 
         auto& texture = m_textures[baseIndex + index];
         texture.alphaTest = source.alphaTest;
+        texture.footprintBytes = total;
         if (FAILED(device->CreateCommittedResource(
                 &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -1296,7 +1297,7 @@ bool GameDx12StaticScene12::RegisterMeshes(
     uint64_t bytes = 0;
     std::vector<uint32_t> pending;
     std::vector<std::string> textureNames;
-    std::unordered_map<std::string, bool> unique;
+    std::unordered_set<std::string> unique;
     for (size_t i = 0; i < sources.size(); ++i)
     {
         const auto& mesh = *sources[i];
@@ -1311,7 +1312,7 @@ bool GameDx12StaticScene12::RegisterMeshes(
         {
             if (textureNames.size() >= kMaxTextures - m_textures.size())
                 continue;
-            unique.emplace(mesh.texture, true);
+            unique.emplace(mesh.texture);
             textureNames.push_back(mesh.texture);
         }
         pending.push_back(static_cast<uint32_t>(i));
@@ -1403,6 +1404,21 @@ bool GameDx12StaticScene12::RegisterMeshes(
         m_auxGeometry.push_back(std::move(geometry));
     }
     return true;
+}
+
+uint64_t GameDx12StaticScene12::TextureFootprintBytes(std::span<const uint32_t> meshes) const
+{
+    std::unordered_set<uint32_t> textures;
+    uint64_t bytes = 0;
+    for (const uint32_t mesh : meshes)
+    {
+        if (mesh == gameaux12::kInvalidMesh)
+            continue;
+        const uint32_t texture = m_auxMeshes[mesh].texture - 1;
+        if (textures.insert(texture).second)
+            bytes += m_textures[texture].footprintBytes;
+    }
+    return bytes;
 }
 
 bool GameDx12StaticScene12::RecordNativeFrame(
@@ -1549,6 +1565,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             {
                 drawMesh(m_auxMeshes[mesh], object.id, false, object.poseOffset, 1);
                 ++auxStats.rigidDraws;
+                if (object.id == extras.traceId)
+                    ++auxStats.tracedDraws;
                 submitted = true;
             }
             if (submitted)

@@ -99,6 +99,7 @@ public:
         uint32_t rigidCulled = 0;
         uint32_t rigidSubmitted = 0;
         uint32_t rigidDraws = 0;
+        uint32_t tracedDraws = 0;
         uint32_t detailVisible = 0;
         uint32_t detailSubmitted = 0;
         uint32_t detailDraws = 0;
@@ -136,6 +137,7 @@ public:
                         std::span<const gameaux12::Mesh* const> sources,
                         std::vector<uint32_t>& handles, std::string& reason);
     const AuxStats& AuxResources() const noexcept { return m_auxResources; }
+    uint64_t TextureFootprintBytes(std::span<const uint32_t> meshes) const;
 
     void OnLevelTeardown(uint64_t nextEpoch);
     void OnDeviceReset(uint64_t nextEpoch);
@@ -193,6 +195,7 @@ private:
     {
         ComPtr<ID3D12Resource> image;
         ComPtr<ID3D12Resource> upload;
+        uint64_t footprintBytes = 0;
         bool alphaTest = false;
     };
 

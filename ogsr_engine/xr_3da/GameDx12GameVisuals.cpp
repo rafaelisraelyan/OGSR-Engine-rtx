@@ -35,6 +35,21 @@ bool Finite(float value)
     return (std::bit_cast<uint32_t>(value) & 0x7f800000u) != 0x7f800000u;
 }
 
+uint32_t TraceId()
+{
+    static const uint32_t id = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_F42_TRACE_ID");
+        if (!value || !*value)
+            return UINT32_MAX;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        return end != value && *end == '\0' && parsed <= 65535 ?
+            static_cast<uint32_t>(parsed) : UINT32_MAX;
+    }();
+    return id;
+}
+
 bool CopyTransform(const Fmatrix& source, DirectX::XMFLOAT4X4& destination)
 {
     for (const auto& row : source.m)
@@ -133,6 +148,8 @@ bool GameVisuals::LoadPending(IGame_Level& level, GameDx12StaticScene12& scene,
         return false;
     for (size_t index = 0; index < detailCount; ++index)
         m_frame.details.push_back({handles[index], {}});
+    if (detailCount != 0)
+        m_detailTextureBytes = scene.TextureFootprintBytes(std::span(handles).first(detailCount));
     size_t next = detailCount;
     for (const auto& entry : pending)
     {
@@ -161,7 +178,7 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
     if (!Enabled("OGSR_DX12_GAME_RIGID"))
         return;
     const char* discovery = std::getenv("OGSR_DX12_GAME_F42_DISCOVERY");
-    const bool discover = !m_discoveryLogged && discovery && std::strcmp(discovery, "1") == 0;
+    const bool discover = m_discoveryFrames < 3 && discovery && std::strcmp(discovery, "1") == 0;
     uint32_t discovered = 0;
     for (uint32_t i = 0; i < m_counts.objects; ++i)
     {
@@ -288,8 +305,8 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
         }
         m_frame.objects.push_back(entry);
     }
-    if (discovered != 0 && m_frame.epoch != 0 && m_counts.waitingModel == 0)
-        m_discoveryLogged = true;
+    if (discover)
+        m_discoveryFrames = m_counts.waitingModel == 0 ? 3 : m_discoveryFrames + 1;
 }
 
 bool GameVisuals::Prepare(IGame_Level& level, const float eye[3], GameDx12StaticScene12& scene,
@@ -299,6 +316,7 @@ bool GameVisuals::Prepare(IGame_Level& level, const float eye[3], GameDx12Static
         Reset();
     m_frame.session = scene.LevelSession();
     m_frame.epoch = scene.LevelEpoch();
+    m_frame.traceId = TraceId();
     m_frame.objects.clear();
     m_frame.objectMeshes.clear();
     m_frame.poses.clear();
@@ -334,30 +352,24 @@ void GameVisuals::InvalidateFrame(uint64_t epoch)
 void GameVisuals::LogPresent(uint64_t present, uint64_t fence,
     const GameDx12StaticScene12::AuxStats& draws, const GameDx12StaticScene12::AuxStats& resources) const
 {
-    if (present <= 480)
+    if (present <= 480 && m_frame.traceId != UINT32_MAX)
     {
-        static const char* value = std::getenv("OGSR_DX12_GAME_F42_TRACE_ID");
-        if (value && *value)
+        const uint32_t id = m_frame.traceId;
+        const auto it = std::find_if(m_frame.objects.begin(), m_frame.objects.end(),
+            [id](const ObjectDraw& entry) { return entry.id == id; });
+        if (it == m_frame.objects.end())
+            Msg("ph_dx12_f42: trace present=%llu fence=%llu session=%llu id=%u state=absent",
+                present, fence, m_frame.session, id);
+        else
         {
-            char* end = nullptr;
-            const auto id = std::strtoul(value, &end, 10);
-            if (end != value && *end == '\0' && id <= 65535)
-            {
-                const auto it = std::find_if(m_frame.objects.begin(), m_frame.objects.end(),
-                    [id](const ObjectDraw& entry) { return entry.id == id; });
-                if (it == m_frame.objects.end())
-                    Msg("ph_dx12_f42: trace present=%llu fence=%llu session=%llu id=%lu state=absent",
-                        present, fence, m_frame.session, id);
-                else
-                {
-                    Msg("ph_dx12_f42: trace present=%llu fence=%llu session=%llu id=%lu "
-                        "generation=%llu state=prepared visual=%u parts=%u world_hash=%016llx pose_hash=%016llx "
-                        "world=(%.4f,%.4f,%.4f)", present, fence, m_frame.session, id,
-                        it->generation, it->visual, it->meshCount, Hash(std::span(&it->world, 1)),
-                        Hash(std::span(m_frame.poses).subspan(it->poseOffset, it->boneCount)),
-                        it->world._41, it->world._42, it->world._43);
-                }
-            }
+            Msg("ph_dx12_f42: trace present=%llu fence=%llu session=%llu id=%u "
+                "generation=%llu state=%s visual=%u parts=%u draws=%u "
+                "world_hash=%016llx pose_hash=%016llx world=(%.4f,%.4f,%.4f)",
+                present, fence, m_frame.session, id, it->generation,
+                draws.tracedDraws != 0 ? "submitted" : "culled",
+                it->visual, it->meshCount, draws.tracedDraws, Hash(std::span(&it->world, 1)),
+                Hash(std::span(m_frame.poses).subspan(it->poseOffset, it->boneCount)),
+                it->world._41, it->world._42, it->world._43);
         }
     }
     if (present != 1 && present != 30 && present % 120 != 0)
@@ -379,11 +391,11 @@ void GameVisuals::LogPresent(uint64_t present, uint64_t fence,
         return;
     const auto& s = m_detailStats;
     Msg("ph_dx12_f42: details present=%llu models=%u slots=%u occupied_slots=%u "
-        "geometry_bytes=%llu source=%u eligible=%u visible=%u submitted=%u draws=%u "
+        "geometry_bytes=%llu texture_footprint_bytes=%llu source=%u eligible=%u visible=%u submitted=%u draws=%u "
         "skipped_surface=%u skipped_slope=%u skipped_near=%u skipped_distance=%u skipped_lod=%u "
         "skipped_frustum=%u skipped_material=%u skipped_budget=%u pending_slots=%u "
         "budget_slots=%u invalid_entries=%u invalid_models=%u",
-        present, s.models, s.slots, s.occupiedSlots, s.geometryBytes, s.source, s.eligible,
+        present, s.models, s.slots, s.occupiedSlots, s.geometryBytes, m_detailTextureBytes, s.source, s.eligible,
         draws.detailVisible, draws.detailSubmitted, draws.detailDraws, s.noSurface, s.slopeRejected,
         s.nearExcluded, s.distanceCulled, s.lodCulled, draws.detailCulled, draws.detailMissingMaterial,
         draws.detailBudget + s.candidateBudget, s.pendingSlots, s.cacheBudgetSlots,
