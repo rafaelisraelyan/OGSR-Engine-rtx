@@ -8,7 +8,7 @@
 
 Мы развиваем OGSR/X-Ray для *S.T.A.L.K.E.R.: Call of Pripyat*, сохраняя атмосферу Зоны, масштаб открытых локаций, погодные состояния, время суток, динамику NPC, физику, растительность и игровой сценарий.
 
-**Стратегия:** сначала полный рабочий игровой DirectX 12 renderer с оригинальными данными X-Ray, затем гибридный DXR: аппаратные тени, отражения и при измеренной пользе непрямое освещение. *Control* показывает потенциал выборочных RT-эффектов, но архитектура больших наружных уровней требует собственных решений для visibility, foliage, GPU memory и суточной смены освещения.
+**Стратегия в два принципиальных шага.** **Сначала — функциональный перенос R4/DX11 в DX12**: все нужные исходные объекты и игровые визуалы, эффекты, частицы, декали, свет, погодные render paths, HUD и существующая постобработка, с проверкой по [матрице паритета](dx12-r4-render-parity.md). Только **после достижения игрового паритета и устойчивого lifecycle** — второй этап: улучшение красоты (новые текстуры, материалы/PBR, художественный свет, аппаратные RTX/DXR-тени, отражения и при измеренной пользе непрямое освещение). Никакой переход ко второму шагу не заменяет пропущенные функции первого. *Control* показывает потенциал выборочных RT-эффектов, но архитектура больших наружных уровней требует собственных решений для visibility, foliage, GPU memory и суточной смены освещения.
 
 ### Принципы и границы
 
@@ -46,11 +46,11 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 | **Сейчас** | F4.1-E независимый source/integration review опубликованного кода | Точный Git/EXE SHA, clean build, R4 clean exit и DX12 GPU smoke |
 | **Следующий** | F4.2-A `MT_SKELETON_RIGID` из game-owned объектов | Настоящие двери, лампы и ящики с верной world/bone pose |
 | **Следующий** | F4.2-B исходные `level.details` | Трава/детали, instancing, сравнимое распределение с R4 |
-| **После этого** | F4.3 материалы/sky/basic light | Нормальный opaque/cutout/**blended**, исходные материалы, игровое солнце |
-| **Дальше** | F4.4 NPC animation/оружие/HUD | Реальная игровая сцена, не просто статическая карта |
-| **Перед production** | F4.5 lifecycle и F5 temporal | Стабильные level transitions/GBV/fallback и измеренная GPU-цена |
-| **Параллельно** | Облака R4-R1, PhysX G5.1-S3R-R2 | Закрыть текущие критичные гейты без нового экспериментального scope |
-| **После raster-базы** | DXR G0–G5 | BLAS/TLAS, RT shadows, затем reflections/GI |
+| **После F4.2** | F4.3 паритет существующих материалов, неба, света и прозрачности R4 | Нормальный opaque/cutout/**blended**, legacy shaders, baseline sky/sun/lights; **без новых PBR-текстур** |
+| **Дальше** | F4.4 полный игровой контент и исходные render passes | NPC/оружие/HUD, частицы, декали/wallmarks, погодные эффекты и **существующая R4-постобработка** |
+| **Затем** | F4.5 полная матрица R4→DX12, стабильность и производительность | Нет необъяснённых пропусков объектов/эффектов, безопасный lifecycle, DX11 fallback, измеренный GPU budget |
+| **Параллельно** | Облака R4-R1, PhysX G5.1-S3R-R2 | Их автономные correction gates без подмены требований DX12 parity |
+| **Только после полного переноса** | F5 улучшение качества и масштабирования; DXR G0–G5 | Новые текстуры/PBR и художественная модернизация, temporal/DLSS/FSR, затем BLAS/TLAS и RTX с raster fallback |
 
 ## 3. F4.1-E — подтверждение реальной статической сцены
 
@@ -119,14 +119,14 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 
 | Пакет | Работа | Acceptance |
 |---|---|---|
-| **F4.3 — материалы** | Legacy DDS/THM/shaders, opaque/cutout/**blend**, normal/depth/sky/sun `CEnvironment`, базовый direct light/shadow | Вода/стекло без тёмных opaque patches; same-camera R4 comparison [#6](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/6) |
-| **F4.4 — динамический игровой кадр** | Multi-bone NPC/mutants, animation snapshots, оружие/HUD, game VFX render passes | Настоящий игровой эпизод Jupiter/Zaton |
-| **F4.5 — lifecycle/performance** | `vid_restart`, смена уровня, resize/alt-tab, device loss, repeated teardown, FPS/VRAM/latency | No UAF/GBV corruption; normal exit; real DX11 fallback |
-| **F5 — temporal/upscaling** | Motion vectors, jitter/history, TAA/DLSS/FSR при корректных входных данных | Движение растительности и NPC без history artifacts; измеренный budget |
-| **DXR G0–G2** | Feature detection, ordinary BLAS/TLAS, real geometry IDs и RayQuery/DispatchRays | Correct hit geometry и GPU AS lifetime |
-| **DXR G3–G5** | RT shadows → reflections → при необходимости GI, dynamic/foliage AS | Прирост качества при контролируемой стоимости и raster fallback |
+| **F4.3 — оригинальные материалы и освещение** | R4 DDS/THM/shaders, opaque/cutout/**blend**, normal/depth, baseline sky/sun/local light/shadows и `CEnvironment` | Исходные R4 материалы/свет работают, вода и стекло без неверных opaque patches; [#6](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/6) |
+| **F4.4 — полная функциональность R4** | Multi-bone NPC/mutants, оружие/HUD, particle groups, muzzle flashes, следы попаданий, кровь, wallmarks, scripted draw, погодные эффекты, **исходная постобработка R4** | Инвентарь [R4→DX12](dx12-r4-render-parity.md) закрывает реальные gameplay классы и пассы; matched scenes без необъяснённых пропусков |
+| **F4.5 — проверка полного переноса** | Матрица эффектов/объектов и визуальные регрессии; `vid_restart`, level change, resize/alt-tab, device loss, repeated teardown, CPU/GPU/VRAM budgets | No unexplained R4-only rendering family, no UAF/GBV errors, normal exit, genuine DX11 fallback |
+| **F5 — качество и масштабирование после паритета** | Motion vectors, jitter/history, TAA/DLSS/FSR, upgrade legacy textures/materials в отдельном контролируемом пакете | Исходные сцены не деградируют; качество в движении и GPU/latency budget |
+| **DXR G0–G2 — после паритета** | Feature detection, ordinary BLAS/TLAS, geometry IDs, RayQuery/DispatchRays | Correct hit geometry и safe AS lifetime, raster-only fallback |
+| **DXR G3–G5 — развитие RTX** | RT shadows → reflections → при необходимости GI, dynamic/foliage AS | Прирост качества при контролируемой стоимости и сохранении функциональности R4 |
 
-Крупные открытые уровни X-Ray требуют hybrid raster/RT, а не попытки обязательного full path tracing. Новые PBR материалы должны поддерживаться без поломки legacy assets.
+**Жёсткая граница между переносом и модернизацией:** пока не обеспечен полный перечень необходимых R4 render paths (объекты, инстансы, эффекты, декали, освещение, существующая постобработка, HUD) и рабочий gameplay на DX12, **новые художественные текстуры/PBR и RTX не являются приоритетом и не заменяют недостающие системы**. Исключение — минимально необходимая реализация старого материала/света/паса, без которой невозможно воспроизвести существующее содержимое. Крупные открытые уровни X-Ray затем получат hybrid raster/RT, а не обязательный full path tracing. Совместимость исходных DDS/THM и R4 shader semantics сохраняется.
 
 ### Сквозной принцип: ни одна графическая возможность R4 не должна потеряться
 
