@@ -7,6 +7,23 @@
 
 int psSkeletonUpdate = 32;
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+u64 CKinematics::RigidVisibleChildMask() const
+{
+    u64 mask = 0;
+    for (auto* child : children)
+    {
+        if (!child->getRZFlag())
+            continue;
+        // Visibility_Update переставляет children. Индекс OGF хранится в меше.
+        const auto id = smart_cast<CSkeletonX*>(child)->OriginalChildIndex();
+        if (id < 64)
+            mask |= u64{1} << id;
+    }
+    return mask;
+}
+#endif
+
 u16 CKinematics::LL_BoneID(const char* B) const
 {
     if (const auto I = bone_map_N.find(B); I != bone_map_N.end())

@@ -135,7 +135,17 @@ const Fbox& CObject::BoundingBox() const
 // Class	: CXR_Object
 // Purpose	:
 //----------------------------------------------------------------------
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+namespace
+{
+std::atomic<u64> dx12NextObjectGeneration{1};
+}
+#endif
+
 CObject::CObject() : ISpatial(g_SpatialSpace)
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    , m_dx12Generation(dx12NextObjectGeneration.fetch_add(1, std::memory_order_relaxed))
+#endif
 {
 #pragma todo("Simp: вроде б JR говорил пересмотреть это")
     spatial.type |= STYPE_COLLIDEABLE;

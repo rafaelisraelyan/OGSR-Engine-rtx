@@ -51,6 +51,9 @@ public:
     };
 
 private:
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    const u64 m_dx12Generation;
+#endif
     // Some property variables
     ObjectProperties Props;
     shared_str NameObject;
@@ -85,6 +88,9 @@ public:
     ICF BOOL Local() const { return Props.net_Local; }
     ICF BOOL Remote() const { return !Props.net_Local; }
     ICF u16 ID() const { return Props.net_ID; }
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    ICF u64 Dx12Generation() const { return m_dx12Generation; }
+#endif
     ICF void setID(u16 _ID) { Props.net_ID = _ID; }
     virtual BOOL Ready() { return Props.net_Ready; }
     BOOL GetTmpPreDestroy() const { return Props.bPreDestroy; }

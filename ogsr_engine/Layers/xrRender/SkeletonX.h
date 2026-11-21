@@ -76,6 +76,9 @@ protected:
 
 public:
     BOOL has_visible_bones();
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    u16 OriginalChildIndex() const { return ChildIDX; }
+#endif
     CSkeletonX()
     {
         Parent = nullptr;

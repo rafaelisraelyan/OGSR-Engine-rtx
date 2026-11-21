@@ -33,6 +33,9 @@ public:
     virtual bool GetRFlag(const u32 id) const = 0;
     // Возвращает количество мешей в модели.
     virtual u32 RChildCount() const = 0;
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    virtual u64 RigidVisibleChildMask() const = 0;
+#endif
 
     virtual Fvector3 RC_VisBox(const u32 id) = 0;
     virtual Fvector3 RC_VisCenter(const u32 id) = 0;

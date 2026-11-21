@@ -76,6 +76,9 @@ public:
     void SetRFlag(const u32 id, const bool v) override { children.at(id)->setRZFlag(v); }
     bool GetRFlag(const u32 id) const override { return children.at(id)->getRZFlag(); }
     u32 RChildCount() const override { return children.size(); }
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    u64 RigidVisibleChildMask() const override;
+#endif
 
     Fvector3 RC_VisBox(const u32 id) override;
     Fvector3 RC_VisCenter(const u32 id) override;
