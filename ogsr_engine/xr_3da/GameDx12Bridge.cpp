@@ -2028,6 +2028,7 @@ void LoadFullStaticScene(BridgeStateData& state)
         std::vector<uint8_t> reachable(hierarchy.visuals.size(), 0);
         uint32_t reachableNormal = 0;
         uint32_t reachableProgressive = 0;
+        uint32_t reachableTree = 0;
         uint32_t skippedTree = 0;
         uint32_t skippedType = 0;
         uint32_t cycleGuard = 0;
@@ -2059,17 +2060,21 @@ void LoadFullStaticScene(BridgeStateData& state)
                 continue;
             reachable[current.visualIndex] = 1;
 
-            const bool drawable = node.type == levelhierarchy12::kMtNormal ||
-                                  node.type == 2u;
+            const bool isTree = node.type == 7 || node.type == 11;
+            const bool drawable =
+                node.type == levelhierarchy12::kMtNormal || node.type == 2u ||
+                isTree;
             if (drawable)
             {
                 if (node.type == levelhierarchy12::kMtNormal)
                     ++reachableNormal;
+                else if (isTree)
+                    ++reachableTree;
                 else
                     ++reachableProgressive;
                 continue;
             }
-            if (node.type == 7 || node.type == 11) // MT_TREE_ST / MT_TREE_PM
+            if (isTree)
             {
                 ++skippedTree;
                 continue;
@@ -2124,10 +2129,11 @@ void LoadFullStaticScene(BridgeStateData& state)
             ++pools.visuals_rejected;
             ++dropped;
         }
-        Msg("ph_dx12_f41: reachability normal=%u progressive=%u referenced=%u "
-            "dropped_unreachable=%u skipped_tree_nodes=%u skipped_other_types=%u",
-            reachableNormal, reachableProgressive, referenced, dropped,
-            skippedTree, skippedType);
+        Msg("ph_dx12_f41: reachability normal=%u progressive=%u tree=%u "
+            "referenced=%u dropped_unreachable=%u skipped_tree_nodes=%u "
+            "skipped_other_types=%u",
+            reachableNormal, reachableProgressive, reachableTree, referenced,
+            dropped, skippedTree, skippedType);
     }
 
     std::vector<std::string> textureNames;

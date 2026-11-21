@@ -88,8 +88,8 @@ uv      = (short2(tc) + float2(T.w, B.w)) * (32 / 32768)
 | `MT_HIERRARHY` (1) | 3954 | группа, раскрывается |
 | `MT_PROGRESSIVE` (2) | 789 | **рисуется** по SWI-окну 0 |
 | `MT_LOD` (6) | 3015 | первый (детальный) уровень |
-| `MT_TREE_ST` (7) | 3035 | **не поддержано**, пропускается |
-| `MT_TREE_PM` (11) | 2184 | **не поддержано**, пропускается |
+| `MT_TREE_ST` (7) | 3035 | **рисуется** по TREEDEF2-матрице |
+| `MT_TREE_PM` (11) | 2184 | **не поддержано** (нужен instanced PM-путь) |
 
 `MT_PROGRESSIVE` — важное открытие: это большие патчи рельефа, которые
 обход листьев (`CollectLeaves`) не эмитит. Без них карта выглядела
@@ -97,6 +97,17 @@ uv      = (short2(tc) + float2(T.w, B.w)) * (32 / 32768)
 `OGF_SWIDATA` (chunk 6): 4 reserved u32, count, затем `FSlideWindow`
 `{u32 offset; u16 num_tris; u16 num_verts}`, и рисуется как в
 `FProgressive::Render` — `vBase/vCount`, `iBase+offset`, `num_tris`.
+
+### 3.2a Flora
+
+`MT_TREE_ST` имеет `OGF_GCONTAINER` (то есть рисуется как обычная
+геометрия) и `OGF_TREEDEF2` (chunk 12): `Fmatrix` (16 float) + два блока
+по 5 float. Матрица передаётся в шейдер как `row_major float4x4 World`
+через root constants (b3, 16 dword), у остальной статики она identity.
+Раскладка вершин дерева (`POSITION/NORMAL/TANGENT/BINORMAL/SHORT4@24`,
+stride 32) совпадает с уже поддержанной `UvAt24`, поэтому отдельный PSO не
+нужен — только третий проход с per-draw матрицей. Центр и радиус сферы для
+culling переводятся в мир на этапе загрузки.
 
 ### 3.3 Индексы
 
@@ -152,13 +163,13 @@ snapshot          level_bytes=6873629 geom_bytes=93930032
 hierarchy         sectors=151 visuals=20880 leaves=7903
 visual_types      type0=7903 type1=3954 type2=789 type6=3015 type7=3035 type11=2184
 sector_root_types normal=0 hierarchy=151 progressive=0 lod=0 tree=0
-pools             vb=36 ib=11 visuals=20880 drawable=8692 rejected=12188
+pools             vb=36 ib=11 visuals=20880 drawable=10514 rejected=10366
 layout_visuals    classic=1844 uv24=6848
-reachability      normal=7903 progressive=789 referenced=8692 dropped=0
+reachability      normal=7903 progressive=789 tree=3015 referenced=10514 dropped=1213
                   skipped_tree_nodes=5219
 materials         drawable=8692 textured=8692 no_texture=0 distinct_shader_ids=...
-textures          unique=329 decoded=329 missing=0 unsupported=0 bytes=95604752
-scene loaded      draws=8692 geometry_bytes=93817940 alpha_test=1002
+textures          unique=341 decoded=341 missing=0 unsupported=0 bytes=100838008
+scene loaded      draws=10514 geometry_bytes=93817940 alpha_test=1902
 кадр (интерьер)   draws=1393 culled=7299 record_ms=5.7
 кадр (аэро)       draws=763  culled=7929 record_ms=3.3
 кадр (улица)      draws=516  culled=8176 record_ms=2.2
@@ -168,9 +179,9 @@ InfoQueue         shutdown verdict=PASS debug=1 gbv=1 gbvVerified=1
 
 ## 7. Что осознанно не сделано
 
-- **Деревья** (`MT_TREE_ST`/`MT_TREE_PM`, 5219 узлов) не рисуются: им нужен
-  per-instance `tree_data` и instanced vertex shader. Они учитываются в
-  логе как `skipped_tree_nodes`, а не выдаются за готовые.
+- **`MT_TREE_PM`** (2184 узла) не рисуется: нужен instanced PM-путь.
+  `MT_TREE_ST` (3015) рисуется по `OGF_TREEDEF2`, но без ветровой анимации
+  и без инстансных vertex-атрибутов.
 - **Скайбокс/атмосфера**: небо — цвет очистки.
 - **Тени, PBR, RTX, динамические объекты, HUD, эффекты**: вне этапа.
 - **Порталы/HOM**: culling только по сферам, без посекторной видимости.

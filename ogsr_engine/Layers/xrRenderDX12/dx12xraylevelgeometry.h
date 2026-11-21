@@ -30,6 +30,11 @@ constexpr uint32_t kOgfSwiData = 6;
 constexpr uint32_t kMtProgressive = 2;
 constexpr uint32_t kSwiHeaderBytes = 20;   // 4 reserved u32 + count
 constexpr uint32_t kSlideWindowBytes = 8;  // u32 offset, u16 num_tris, u16 num_verts
+// F4.1: flora. MT_TREE_ST/PM рисуются по OGF_TREEDEF2 с мировой матрицей.
+constexpr uint32_t kOgfTreeDef2 = 12;
+constexpr uint32_t kMtTreeSt = 7;
+constexpr uint32_t kMtTreePm = 11;
+constexpr uint32_t kTreeDefBytes = 104;    // Fmatrix(64) + 2 * 5 float
 
 // Старший бит chunk id — CFS_CompressMark. B1 не умеет декомпрессию,
 // поэтому сжатые chunk'и отклоняются до интерпретации payload.
@@ -249,6 +254,13 @@ struct PoolVisual
     Bounds header_bounds{};
     float sphere_center[3] = {0.0f, 0.0f, 0.0f};
     float sphere_radius = 0.0f;
+    // F4.1: мировая матрица для flora (MT_TREE_*) из OGF_TREEDEF2. У обычной
+    // статики уровня её нет: вершины уже в мировых координатах.
+    bool has_world = false;
+    float world[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                       0.0f, 1.0f, 0.0f, 0.0f,
+                       0.0f, 0.0f, 1.0f, 0.0f,
+                       0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 struct VertexPoolInfo

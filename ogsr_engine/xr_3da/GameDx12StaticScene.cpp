@@ -116,14 +116,22 @@ cbuffer FrameCB : register(b0)
     float4 CameraPosition;
 };
 
+// F4.1: мировая матрица объекта. Для запечённой статики уровня — identity,
+// для flora (MT_TREE_*) — xform из OGF_TREEDEF2.
+cbuffer ObjectCB : register(b3)
+{
+    row_major float4x4 World;
+};
+
 VSOutput main(VSInput input)
 {
     VSOutput output;
-    output.position = mul(float4(input.position, 1.0f), ViewProjection);
-    output.normal = 2.0f * input.nh.zyx - 1.0f;
+    const float4 worldPosition = mul(float4(input.position, 1.0f), World);
+    output.position = mul(worldPosition, ViewProjection);
+    output.normal = mul(2.0f * input.nh.zyx - 1.0f, (float3x3)World);
     output.uv = (float2(input.tc) + float2(input.tangent.w, input.binormal.w))
                 * (32.0f / 32768.0f);
-    output.world = input.position;
+    output.world = worldPosition.xyz;
     return output;
 }
 )";
@@ -337,7 +345,7 @@ bool GameDx12StaticScene12::Fail(std::string& reason, const std::string& text)
 bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                            std::string& reason)
 {
-    D3D12_ROOT_PARAMETER params[3] = {};
+    D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -357,6 +365,11 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[2].Constants.Num32BitValues = 4;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[3].Constants.ShaderRegister = 3;
+    params[3].Constants.Num32BitValues = 16;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -370,7 +383,7 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 3;
+    rootDesc.NumParameters = 4;
     rootDesc.pParameters = params;
     rootDesc.NumStaticSamplers = 1;
     rootDesc.pStaticSamplers = &sampler;
@@ -1088,6 +1101,38 @@ bool GameDx12StaticScene12::Load(
                 draw.alphaTest = true;
             draw.layout =
                 visual.layout == xraylevel12::VertexLayout12::UvAt24 ? 2 : 1;
+            if (visual.has_world)
+            {
+                // Flora: геометрия в локальных координатах, мир задаёт
+                // OGF_TREEDEF2. Центр сферы и радиус переводятся в мир здесь,
+                // чтобы culling работал по реальному положению дерева.
+                draw.layout = 3;
+                for (uint32_t element = 0; element < 16; ++element)
+                    draw.world[element] = visual.world[element];
+                const float local[3] = {visual.sphere_center[0],
+                                        visual.sphere_center[1],
+                                        visual.sphere_center[2]};
+                draw.center[0] = local[0] * draw.world[0] +
+                                 local[1] * draw.world[4] +
+                                 local[2] * draw.world[8] + draw.world[12];
+                draw.center[1] = local[0] * draw.world[1] +
+                                 local[1] * draw.world[5] +
+                                 local[2] * draw.world[9] + draw.world[13];
+                draw.center[2] = local[0] * draw.world[2] +
+                                 local[1] * draw.world[6] +
+                                 local[2] * draw.world[10] + draw.world[14];
+                const float sx = std::sqrt(draw.world[0] * draw.world[0] +
+                                           draw.world[1] * draw.world[1] +
+                                           draw.world[2] * draw.world[2]);
+                const float sy = std::sqrt(draw.world[4] * draw.world[4] +
+                                           draw.world[5] * draw.world[5] +
+                                           draw.world[6] * draw.world[6]);
+                const float sz = std::sqrt(draw.world[8] * draw.world[8] +
+                                           draw.world[9] * draw.world[9] +
+                                           draw.world[10] * draw.world[10]);
+                const float scale = (std::max)(sx, (std::max)(sy, sz));
+                draw.radius = visual.sphere_radius * (scale > 0.0f ? scale : 1.0f);
+            }
             for (int c = 0; c < 3; ++c)
                 draw.center[c] = visual.sphere_center[c];
             draw.radius = visual.sphere_radius;
@@ -1208,9 +1253,14 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const float threshold = ps_r_alphatest_threshold;
     const bool alphaTestDisabled = SceneAlphaTestDisabled();
     const auto recordStart = Clock::now();
-    // Два прохода по раскладкам: PSO переключается один раз на группу, а не
-    // на каждый draw.
-    for (uint32_t variant = 1; variant <= 2; ++variant)
+    // Три прохода: classic, uv@24, flora (uv@24 + мировая матрица).
+    // PSO переключается один раз на группу, а не на каждый draw.
+    const float identity[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f,
+                                0.0f, 0.0f, 1.0f, 0.0f,
+                                0.0f, 0.0f, 0.0f, 1.0f};
+    list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
+    for (uint32_t variant = 1; variant <= 3; ++variant)
     {
         ID3D12PipelineState* pipeline =
             variant == 1 ? m_pipelineState.Get() : m_pipelineUv24.Get();
@@ -1229,6 +1279,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 list->SetPipelineState(pipeline);
                 bound = true;
             }
+            if (variant == 3)
+                list->SetGraphicsRoot32BitConstants(3, 16, draw.world, 0);
             const bool textured =
                 draw.textureIndex != GameDx12StaticMaterial12::kNoTexture;
             auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
@@ -1247,6 +1299,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             ++stats.draws;
         }
     }
+    list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
     stats.record_ms = Ms(recordStart);
     if (stats.draws == 0 && !m_limitLogged)
     {

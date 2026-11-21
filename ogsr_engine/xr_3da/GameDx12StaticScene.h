@@ -143,8 +143,13 @@ private:
         uint32_t icount = 0;
         uint32_t textureIndex = 0;
         bool alphaTest = false;
-        // 1 = TEXCOORD0 @28 (classic), 2 = TEXCOORD0 @24.
+        // 1 = TEXCOORD0 @28 (classic), 2 = TEXCOORD0 @24, 3 = flora с мировой
+        // матрицей из OGF_TREEDEF2.
         uint8_t layout = 1;
+        float world[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                           0.0f, 1.0f, 0.0f, 0.0f,
+                           0.0f, 0.0f, 1.0f, 0.0f,
+                           0.0f, 0.0f, 0.0f, 1.0f};
         float center[3] = {0.0f, 0.0f, 0.0f};
         float radius = 0.0f;
         // Предвычисленный VBV/IBV; адреса валидны после публикации пулов.

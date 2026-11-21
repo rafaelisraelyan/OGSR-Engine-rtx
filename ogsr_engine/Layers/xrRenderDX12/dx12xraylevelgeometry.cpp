@@ -968,6 +968,8 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
     bool has_header = false;
     bool has_gc = false;
     bool has_swi = false;
+    bool has_tree = false;
+    float tree_world[16] = {};
     uint32_t swi_offset = 0;
     uint16_t swi_num_tris = 0;
     uint16_t swi_num_verts = 0;
@@ -1061,6 +1063,20 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
                 return false;
             has_swi = true;
         }
+        else if (type == kOgfTreeDef2)
+        {
+            // Fmatrix (16 float) + два блока по 5 float (color/hemi).
+            if (has_tree || size < kTreeDefBytes)
+                return false;
+            for (uint32_t element = 0; element < 16; ++element)
+            {
+                if (!ReadF32(level, data + element * 4, tree_world[element]))
+                    return false;
+                if (!std::isfinite(tree_world[element]))
+                    return false;
+            }
+            has_tree = true;
+        }
         else
         {
             return false;
@@ -1076,13 +1092,22 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
     visual.ib_id = ib_id;
     visual.ibase = ibase;
     visual.icount = icount;
-    if (visual.type == kMtProgressive)
+    const bool isTree = visual.type == kMtTreeSt || visual.type == kMtTreePm;
+    if (visual.type == kMtProgressive || (isTree && has_swi))
     {
         if (!has_swi || swi_num_tris == 0 || swi_num_verts == 0)
             return false;
         visual.ibase = ibase + swi_offset;
         visual.icount = static_cast<uint32_t>(swi_num_tris) * 3u;
         visual.vcount = swi_num_verts;
+    }
+    if (isTree)
+    {
+        if (!has_tree)
+            return false;
+        visual.has_world = true;
+        for (uint32_t element = 0; element < 16; ++element)
+            visual.world[element] = tree_world[element];
     }
     return true;
 }
@@ -1189,7 +1214,8 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
                                     ? ReadError::UnsupportedOgfSubchunk
                                     : ReadError::UnsupportedVisualType;
             }
-            else if (visual.type != kMtNormal && visual.type != kMtProgressive)
+            else if (visual.type != kMtNormal && visual.type != kMtProgressive &&
+                     visual.type != kMtTreeSt && visual.type != kMtTreePm)
             {
                 visual.drawable = false;
                 visual.reject = ReadError::UnsupportedVisualType;
