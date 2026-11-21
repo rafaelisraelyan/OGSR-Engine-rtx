@@ -152,9 +152,28 @@ culling переводятся в мир на этапе загрузки.
 | `OGSR_DX12_GAME_SCENE_VIEW=1|2|3` | material-id / UV / textured-mask |
 | `OGSR_DX12_GAME_SCENE_LOG=1` | кадровый лог draws/culled/ms |
 | `OGSR_DX12_CLEAR=r,g,b` | цвет «неба» |
+| `OGSR_DX12_CMP=1` | сравнение R4↔DX12: инвентарь, отправленные draw, динамика, детали |
 
 Логи: `ph_dx12_f41: snapshot|hierarchy|visual_types|sector_root_types|pools|
-layout_visuals|reachability|materials|textures|scene loaded|ready|frame`.
+layout_visuals|reachability|dropped|rejected_type|rejected_chunk|textures|
+scene loaded|ready|frame`.
+
+Сравнение R4↔DX12 (`OGSR_DX12_CMP=1`, работает и в R4-сборке):
+
+```
+ph_cmp: r4inv    id=.. type=.. cx=.. r=.. ptr=..     # загрузка статики в R4
+ph_cmp: inv      role=r4|dx12 id=.. type=.. dx12_drawable=.. reject=..
+ph_cmp: hist     role=r4|dx12 type0=.. type1=..
+ph_cmp: r4draw   kind=static|tree ptr=.. [inst=..]   # отправлено в R4
+ph_cmp: dx12draw id=.. variant=.. state=drawn|culled  # отправлено в DX12
+ph_cmp: dyn      bucket type=.. count=.. section='..'  # спавн-объекты
+ph_cmp: details  present=0|1
+```
+
+Ключ к сопоставлению: оба рендерера индексируют статику одинаково
+(индекс в контейнере `fsL_VISUALS(3)` = id в `CRender::Visuals`), поэтому
+join идёт по id без эвристик. `r4draw`/`dx12draw` дополнительно различают
+«отсечено» и «не поддержано», чтобы не смешивать пропуски с culling.
 
 ## 6. Фактический результат (Jupiter)
 
@@ -163,13 +182,15 @@ snapshot          level_bytes=6873629 geom_bytes=93930032
 hierarchy         sectors=151 visuals=20880 leaves=7903
 visual_types      type0=7903 type1=3954 type2=789 type6=3015 type7=3035 type11=2184
 sector_root_types normal=0 hierarchy=151 progressive=0 lod=0 tree=0
-pools             vb=36 ib=11 visuals=20880 drawable=10514 rejected=10366
-layout_visuals    classic=1844 uv24=6848
-reachability      normal=7903 progressive=789 tree=3015 referenced=10514 dropped=1213
-                  skipped_tree_nodes=5219
-materials         drawable=8692 textured=8692 no_texture=0 distinct_shader_ids=...
-textures          unique=341 decoded=341 missing=0 unsupported=0 bytes=100838008
-scene loaded      draws=10514 geometry_bytes=93817940 alpha_test=1902
+pools             vb=36 ib=11 visuals=20880 drawable=13911 rejected=6969
+layout_visuals    classic=1844 uv24=9883
+reachability      normal=7903 progressive=789 tree=5219 referenced=13911
+                  dropped_unreachable=0 lod_nodes=3015 lod_ladder=9 lod_spread=3006
+rejected_chunks   type=1 chunk=10 count=3954   (MT_HIERARHY, ссылки на детей)
+                  type=6 chunk=10 count=3015   (MT_LOD, ссылки на детей)
+rejected_type     6969 = только группы, ни одной отрисовываемой записи
+textures          unique=365 decoded=365 missing=0 unsupported=0 bytes=112401208
+scene loaded      draws=13911 geometry_bytes=93817940 alpha_test=4412
 кадр (интерьер)   draws=1393 culled=7299 record_ms=5.7
 кадр (аэро)       draws=763  culled=7929 record_ms=3.3
 кадр (улица)      draws=516  culled=8176 record_ms=2.2
@@ -177,16 +198,50 @@ InfoQueue         shutdown verdict=PASS debug=1 gbv=1 gbvVerified=1
                   warning=0 error=0 corruption=0 discarded=0
 ```
 
+Сверка с R4 в том же прогоне (`OGSR_DX12_CMP=1`):
+
+```
+ph_cmp: inv role=r4   count=20880 pools_visuals=20880 hierarchy_visuals=20880
+ph_cmp: hist role=r4   type0=7903 type1=3954 type2=789 type6=3015 type7=3035 type11=2184
+ph_cmp: hist role=dx12 type0=7903 type1=3954 type2=789 type6=3015 type7=3035 type11=2184
+ph_cmp: inv summary    r4_count=20880 compared=20880 type_mismatch=0
+                       r4_normal_unsupported=0
+```
+
+То есть контейнер визуалов читается один в один: совпадает количество,
+совпадает тип каждой записи, ни одной `MT_NORMAL` записи не потеряно.
+`20880 = 13911 отрисовываемых + 6969 групп`, `dropped_unreachable=0`.
+
+Динамические объекты уровня (спавн) в том же прогоне:
+
+```
+ph_cmp: dyn summary objects=2540 with_visual=1112 without_visual=1428 visible=648
+ph_cmp: details present=1 path='$level$/level.details' supported=0
+```
+
 ## 7. Что осознанно не сделано
 
-- **`MT_TREE_PM`** (2184 узла) не рисуется: нужен instanced PM-путь.
-  `MT_TREE_ST` (3015) рисуется по `OGF_TREEDEF2`, но без ветровой анимации
-  и без инстансных vertex-атрибутов.
+Классификация остатка — по фактическим данным, а не по предположениям.
+
+- **Спавн-объекты уровня** (двери, лампы, ящики, предметы): 1112 объектов с
+  визуалом, 648 видимых. Все они имеют тип `MT_SKELETON_RIGID` (10) и живут
+  вне `level.geom`: визуал создаётся через `Render->model_Create`
+  (`xr_object.cpp:38`), трансформ — из спавна (`GameObject.cpp:262-263`).
+  Двери — это `CPhysicObject` с костью `door`, а не статическая геометрия
+  (`PhysicObject.cpp:25-97`). Статический конвейер их не покрывает; нужен
+  отдельный путь для скелетных визуалов.
+- **Детали уровня** (`$level$/level.details`): файл присутствует, R4 грузит
+  его через `CDetailManager` (инстансная «трава»/мелочь) и рисует в главном
+  проходе. DX12 его не читает — это отдельный статический путь, не входящий
+  в контейнер 20880.
+- **`MT_TREE_PM`** (2184): теперь рисуется по таблице SWI уровня, но без
+  ветровой анимации и без инстансных vertex-атрибутов; `MT_TREE_ST` (3035) —
+  по `OGF_TREEDEF2` с авторской матрицей.
 - **Скайбокс/атмосфера**: небо — цвет очистки.
-- **Тени, PBR, RTX, динамические объекты, HUD, эффекты**: вне этапа.
+- **Тени, PBR, RTX, HUD, эффекты**: вне этапа.
 - **Порталы/HOM**: culling только по сферам, без посекторной видимости.
 - **LOD по расстоянию**: у `MT_PROGRESSIVE` берётся окно 0 (самый детальный),
-  у `MT_LOD` — первый уровень.
+  у детей `MT_LOD` рисуются все, как это делает R4 в ближней зоне.
 - Прозрачные blended-материалы (стекло, вода) рисуются как cutout/opaque.
 
 ## 8. Известные артефакты
