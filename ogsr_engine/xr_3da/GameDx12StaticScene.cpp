@@ -29,6 +29,10 @@ constexpr uint64_t kFrameConstantsSlots = 2;
 constexpr uint64_t kStagingBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t kStagingAlignment = 512ull;
 constexpr uint32_t kMaxTextures = 16384;
+constexpr uint64_t kMaxAuxGeometryBytes = 64ull * 1024 * 1024;
+constexpr uint64_t kMaxAuxTextureBytes = 256ull * 1024 * 1024;
+constexpr uint64_t kTransformSlotBytes =
+    gameaux12::kMaxFrameTransforms * sizeof(DirectX::XMFLOAT4X4);
 constexpr uint64_t kMaxTextureBytes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxSceneTextureBytes = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr const char* kFallbackTextureName = "";
@@ -131,6 +135,46 @@ VSOutput main(VSInput input)
     output.normal = mul(2.0f * input.nh.zyx - 1.0f, (float3x3)World);
     output.uv = (float2(input.tc) + float2(input.tangent.w, input.binormal.w))
                 * (32.0f / 32768.0f);
+    output.world = worldPosition.xyz;
+    return output;
+}
+)";
+
+constexpr const char* kAuxVertexShader = R"(
+cbuffer FrameCB : register(b0)
+{
+    float4x4 ViewProj;
+};
+cbuffer DrawCB : register(b3)
+{
+    uint MatrixBase;
+};
+
+struct Transform
+{
+    float4 row0, row1, row2, row3;
+};
+StructuredBuffer<Transform> Transforms : register(t1);
+
+struct VSOutput
+{
+    float4 position : SV_Position;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
+    float3 world : TEXCOORD1;
+};
+
+VSOutput main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TEXCOORD0,
+              uint bone : BLENDINDICES, uint instance : SV_InstanceID)
+{
+    const Transform transform = Transforms[MatrixBase + instance + bone];
+    const float4x4 world = float4x4(transform.row0, transform.row1,
+                                   transform.row2, transform.row3);
+    const float4 worldPosition = mul(float4(position, 1), world);
+    VSOutput output;
+    output.position = mul(worldPosition, ViewProj);
+    output.normal = mul(normal, (float3x3)world);
+    output.uv = uv;
     output.world = worldPosition.xyz;
     return output;
 }
@@ -356,7 +400,7 @@ bool GameDx12StaticScene12::Fail(std::string& reason, const std::string& text)
 bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                            std::string& reason)
 {
-    D3D12_ROOT_PARAMETER params[4] = {};
+    D3D12_ROOT_PARAMETER params[5] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -381,6 +425,10 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[3].Constants.Num32BitValues = 16;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[4].Descriptor.ShaderRegister = 1;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -394,7 +442,7 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 4;
+    rootDesc.NumParameters = static_cast<UINT>(std::size(params));
     rootDesc.pParameters = params;
     rootDesc.NumStaticSamplers = 1;
     rootDesc.pStaticSamplers = &sampler;
@@ -516,6 +564,31 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
         &desc, IID_PPV_ARGS(m_pipelineUv24.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "static scene pipeline creation failed (uv24)");
+
+    ComPtr<ID3D10Blob> auxVertex;
+    if (!CompileShader(kAuxVertexShader, "main", "vs_5_0",
+                       auxVertex.GetAddressOf(), reason))
+        return false;
+    using Vertex = gameaux12::Vertex;
+    const D3D12_INPUT_ELEMENT_DESC auxLayout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, position),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, normal),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Vertex, uv),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"BLENDINDICES", 0, DXGI_FORMAT_R32_UINT, 0, offsetof(Vertex, bone),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    desc.VS = {auxVertex->GetBufferPointer(), auxVertex->GetBufferSize()};
+    desc.InputLayout = {auxLayout, static_cast<UINT>(std::size(auxLayout))};
+    if (FAILED(device->CreateGraphicsPipelineState(
+            &desc, IID_PPV_ARGS(m_pipelineRigid.GetAddressOf()))))
+        return Fail(reason, "rigid scene pipeline creation failed");
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    if (FAILED(device->CreateGraphicsPipelineState(
+            &desc, IID_PPV_ARGS(m_pipelineDetail.GetAddressOf()))))
+        return Fail(reason, "level detail pipeline creation failed");
     return true;
 }
 
@@ -539,6 +612,21 @@ bool GameDx12StaticScene12::CreateFrameConstants(ID3D12Device* device,
     return true;
 }
 
+bool GameDx12StaticScene12::CreateInstanceBuffer(ID3D12Device* device,
+                                                 std::string& reason)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    const auto desc = BufferDesc(kTransformSlotBytes * kFrameConstantsSlots);
+    const D3D12_RANGE noRead{};
+    if (FAILED(device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(m_frameTransforms.GetAddressOf()))) ||
+        FAILED(m_frameTransforms->Map(0, &noRead, &m_frameTransformsMapped)))
+        return Fail(reason, "scene transform buffer allocation failed");
+    return true;
+}
+
 bool GameDx12StaticScene12::PrepareUpload(
     const GameDx12StaticSceneOwner12& owner, std::span<const uint8_t> geomBytes,
     const std::vector<GameDx12SceneTexture12>& textures, std::string& reason)
@@ -554,7 +642,7 @@ bool GameDx12StaticScene12::PrepareUpload(
 
     if (!CreatePools(owner, geomBytes, reason))
         return false;
-    if (!textures.empty() && !CreateTextures(owner, textures, reason))
+    if (!CreateTextures(owner, textures, false, reason))
         return false;
     return true;
 }
@@ -573,7 +661,7 @@ bool GameDx12StaticScene12::CreatePools(
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
     const auto stagingDesc = BufferDesc(kStagingBytes);
-    ComPtr<ID3D12Resource> staging;
+    auto& staging = m_copyStaging;
     if (FAILED(device->CreateCommittedResource(
             &uploadHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -585,44 +673,12 @@ bool GameDx12StaticScene12::CreatePools(
         return Fail(reason, "static scene staging buffer mapping failed");
 
     uint64_t cursor = 0;
-    uint64_t fenceValue = 0;
     const auto flush = [&]() -> bool
     {
         if (cursor == 0)
             return true;
-        const HRESULT closeHr = owner.list->Close();
-        if (FAILED(closeHr))
-        {
-            Fail(reason, "static scene upload list close failed");
+        if (!SubmitAndWait(owner, reason))
             return false;
-        }
-        ID3D12CommandList* lists[] = {owner.list};
-        owner.queue->ExecuteCommandLists(1, lists);
-        const uint64_t expected = ++(*owner.fenceValue);
-        if (FAILED(owner.queue->Signal(owner.fence, expected)))
-        {
-            Fail(reason, "static scene upload fence signal failed");
-            return false;
-        }
-        fenceValue = expected;
-        if (owner.fence->GetCompletedValue() < expected &&
-            FAILED(owner.fence->SetEventOnCompletion(expected, owner.fenceEvent)))
-        {
-            Fail(reason, "static scene upload fence event failed");
-            return false;
-        }
-        if (owner.fence->GetCompletedValue() < expected &&
-            WaitForSingleObject(owner.fenceEvent, kFenceTimeoutMs) != WAIT_OBJECT_0)
-        {
-            Fail(reason, "static scene upload fence wait failed");
-            return false;
-        }
-        if (owner.fence->GetCompletedValue() < expected ||
-            owner.device->GetDeviceRemovedReason() != S_OK)
-        {
-            Fail(reason, "static scene upload completion unconfirmed");
-            return false;
-        }
         if (FAILED(owner.allocator->Reset()) ||
             FAILED(owner.list->Reset(owner.allocator, nullptr)))
         {
@@ -732,6 +788,7 @@ bool GameDx12StaticScene12::CreatePools(
     if (!flush())
         return false;
     staging->Unmap(0, nullptr);
+    staging.Reset();
     m_stats.geometry_bytes = geometryBytes;
     m_stats.vertex_pools = static_cast<uint32_t>(m_vertexPools.size());
     m_stats.index_pools = static_cast<uint32_t>(m_indexPools.size());
@@ -756,39 +813,47 @@ bool GameDx12StaticScene12::CreatePools(
         draw.indexView.Format = DXGI_FORMAT_R16_UINT;
         (void)ibInfo;
     }
-    (void)fenceValue;
     return true;
 }
 
 bool GameDx12StaticScene12::CreateTextures(
     const GameDx12StaticSceneOwner12& owner,
-    const std::vector<GameDx12SceneTexture12>& textures, std::string& reason)
+    const std::vector<GameDx12SceneTexture12>& textures, bool append,
+    std::string& reason)
 {
     ID3D12Device* device = owner.device;
-    D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = static_cast<UINT>(textures.size()) + 1;
-    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(device->CreateDescriptorHeap(&heap,
-                                            IID_PPV_ARGS(m_textureHeap.GetAddressOf()))))
-        return Fail(reason, "static scene descriptor heap creation failed");
-    m_textureDescriptorSize = device->GetDescriptorHandleIncrementSize(heap.Type);
-
-    // Дескриптор 0 — null SRV для материалов без текстуры.
-    auto cpu = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv = {};
     nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     nullSrv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(nullptr, &nullSrv, cpu);
+    if (!append)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.NumDescriptors = kMaxTextures + 1;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&heap,
+                IID_PPV_ARGS(m_textureHeap.GetAddressOf()))))
+            return Fail(reason, "scene descriptor heap creation failed");
+        m_textureDescriptorSize = device->GetDescriptorHandleIncrementSize(heap.Type);
+        device->CreateShaderResourceView(nullptr, &nullSrv,
+            m_textureHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+    if (textures.empty())
+        return true;
+    const size_t baseIndex = m_textures.size();
+    if (textures.size() > kMaxTextures - baseIndex)
+        return Fail(reason, "scene texture descriptor budget exhausted");
+    auto cpu = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += baseIndex * m_textureDescriptorSize;
 
     D3D12_HEAP_PROPERTIES defaultHeap = {};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_HEAP_PROPERTIES uploadHeap = {};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
     const auto stagingDesc = BufferDesc(kStagingBytes);
-    ComPtr<ID3D12Resource> staging;
+    auto& staging = m_copyStaging;
     if (FAILED(device->CreateCommittedResource(
             &uploadHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -801,38 +866,8 @@ bool GameDx12StaticScene12::CreateTextures(
 
     const auto flush = [&]() -> bool
     {
-        const HRESULT closeHr = owner.list->Close();
-        if (FAILED(closeHr))
-        {
-            Fail(reason, "static scene texture list close failed");
+        if (!SubmitAndWait(owner, reason))
             return false;
-        }
-        ID3D12CommandList* lists[] = {owner.list};
-        owner.queue->ExecuteCommandLists(1, lists);
-        const uint64_t expected = ++(*owner.fenceValue);
-        if (FAILED(owner.queue->Signal(owner.fence, expected)))
-        {
-            Fail(reason, "static scene texture fence signal failed");
-            return false;
-        }
-        if (owner.fence->GetCompletedValue() < expected &&
-            FAILED(owner.fence->SetEventOnCompletion(expected, owner.fenceEvent)))
-        {
-            Fail(reason, "static scene texture fence event failed");
-            return false;
-        }
-        if (owner.fence->GetCompletedValue() < expected &&
-            WaitForSingleObject(owner.fenceEvent, kFenceTimeoutMs) != WAIT_OBJECT_0)
-        {
-            Fail(reason, "static scene texture fence wait failed");
-            return false;
-        }
-        if (owner.fence->GetCompletedValue() < expected ||
-            owner.device->GetDeviceRemovedReason() != S_OK)
-        {
-            Fail(reason, "static scene texture upload completion unconfirmed");
-            return false;
-        }
         if (FAILED(owner.allocator->Reset()) ||
             FAILED(owner.list->Reset(owner.allocator, nullptr)))
         {
@@ -842,7 +877,9 @@ bool GameDx12StaticScene12::CreateTextures(
         return true;
     };
 
-    m_textures.resize(textures.size());
+    m_textures.resize(baseIndex + textures.size());
+    const uint64_t budget = append ? kMaxAuxTextureBytes - m_auxResources.textureBytes
+                                   : kMaxSceneTextureBytes;
     uint64_t cursor = 0;
     uint64_t textureBytes = 0;
     uint32_t uploaded = 0;
@@ -852,6 +889,8 @@ bool GameDx12StaticScene12::CreateTextures(
     {
         cpu.ptr += m_textureDescriptorSize;
         const auto& source = textures[index];
+        device->CreateShaderResourceView(nullptr, &nullSrv, cpu);
+        m_textureKeys.emplace(source.name, static_cast<uint32_t>(baseIndex + index));
         const auto& dds = source.dds;
         if (dds.data.empty() || dds.mipCount == 0)
         {
@@ -920,7 +959,7 @@ bool GameDx12StaticScene12::CreateTextures(
         UINT64 total = 0;
         device->GetCopyableFootprints(&desc, 0, dds.mipCount, 0, layouts.data(),
                                       rows.data(), rowBytes.data(), &total);
-        if (total > kStagingBytes)
+        if (total > kStagingBytes || total > budget - textureBytes)
         {
             ++failed;
             Msg("ph_dx12_f41: texture too large name='%s' bytes=%llu",
@@ -928,7 +967,8 @@ bool GameDx12StaticScene12::CreateTextures(
             continue;
         }
 
-        auto& texture = m_textures[index];
+        auto& texture = m_textures[baseIndex + index];
+        texture.alphaTest = source.alphaTest;
         if (FAILED(device->CreateCommittedResource(
                 &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -994,39 +1034,36 @@ bool GameDx12StaticScene12::CreateTextures(
 
         textureBytes += total;
         ++uploaded;
-        if (textureBytes > kMaxSceneTextureBytes)
-        {
-            Msg("ph_dx12_f41: texture budget exhausted at %u uploaded",
-                uploaded);
-            break;
-        }
     }
 
     if (cursor != 0 && !flush())
         return false;
     staging->Unmap(0, nullptr);
+    staging.Reset();
 
-    m_stats.textures_requested = static_cast<uint32_t>(textures.size());
-    m_stats.textures_uploaded = uploaded;
-    m_stats.textures_failed = failed;
-    m_stats.texture_bytes = textureBytes;
+    if (append)
+    {
+        m_auxResources.texturesUploaded += uploaded;
+        m_auxResources.textureBytes += textureBytes;
+    }
+    else
+    {
+        m_stats.textures_requested = static_cast<uint32_t>(textures.size());
+        m_stats.textures_uploaded = uploaded;
+        m_stats.textures_failed = failed;
+        m_stats.texture_bytes = textureBytes;
+    }
     return true;
 }
 
 bool GameDx12StaticScene12::SubmitAndWait(
-    const GameDx12StaticSceneOwner12& owner, bool closeList, bool abandon,
-    std::string& reason)
+    const GameDx12StaticSceneOwner12& owner, std::string& reason)
 {
-    if (closeList)
-    {
-        if (abandon)
-        {
-            (void)owner.list->Close();
-            return true;
-        }
-        if (FAILED(owner.list->Close()))
-            return Fail(reason, "static scene list close failed");
-    }
+    if (FAILED(owner.list->Close()))
+        return Fail(reason, "scene upload list close failed");
+    if (*owner.fenceValue >= UINT64_MAX - 1)
+        return Fail(reason, "scene upload fence overflow");
+    m_gpuUnknown = true;
     ID3D12CommandList* lists[] = {owner.list};
     owner.queue->ExecuteCommandLists(1, lists);
     const uint64_t expected = ++(*owner.fenceValue);
@@ -1038,10 +1075,12 @@ bool GameDx12StaticScene12::SubmitAndWait(
     if (owner.fence->GetCompletedValue() < expected &&
         WaitForSingleObject(owner.fenceEvent, kFenceTimeoutMs) != WAIT_OBJECT_0)
         return Fail(reason, "static scene fence wait failed");
-    if (owner.fence->GetCompletedValue() < expected ||
+    const uint64_t completed = owner.fence->GetCompletedValue();
+    if (completed == UINT64_MAX || completed < expected ||
         owner.device->GetDeviceRemovedReason() != S_OK)
         return Fail(reason, "static scene completion unconfirmed");
     m_uploadFenceValue = expected;
+    m_gpuUnknown = false;
     return true;
 }
 
@@ -1153,7 +1192,8 @@ bool GameDx12StaticScene12::Load(
             return Fail(reason, "level has no drawable static geometry");
 
         if (!CreatePipeline(owner.device, reason) ||
-            !CreateFrameConstants(owner.device, reason))
+            !CreateFrameConstants(owner.device, reason) ||
+            !CreateInstanceBuffer(owner.device, reason))
         {
             ReleaseGpu();
             return false;
@@ -1162,16 +1202,20 @@ bool GameDx12StaticScene12::Load(
         const auto poolsStart = Clock::now();
         if (!PrepareUpload(owner, geomBytes, textures, reason))
         {
-            // Неизвестное завершение запрещает освобождение.
-            QuarantineGpu();
+            if (m_gpuUnknown)
+                QuarantineGpu();
+            else
+            {
+                (void)owner.list->Close();
+                ReleaseGpu();
+            }
             return false;
         }
         m_stats.pools_ms = Ms(poolsStart);
-
-        if (!SubmitAndWait(owner, true, false, reason))
+        if (FAILED(owner.list->Close()))
         {
-            QuarantineGpu();
-            return false;
+            ReleaseGpu();
+            return Fail(reason, "scene upload final close failed");
         }
 
         for (auto& texture : m_textures)
@@ -1207,27 +1251,168 @@ bool GameDx12StaticScene12::Load(
     }
     catch (const std::bad_alloc&)
     {
-        QuarantineGpu();
+        if (m_gpuUnknown)
+            QuarantineGpu();
+        else
+        {
+            (void)owner.list->Close();
+            ReleaseGpu();
+        }
         return Fail(reason, "static scene allocation failed");
     }
     catch (const std::exception&)
     {
-        QuarantineGpu();
+        if (m_gpuUnknown)
+            QuarantineGpu();
+        else
+        {
+            (void)owner.list->Close();
+            ReleaseGpu();
+        }
         return Fail(reason, "static scene exception");
     }
     catch (...)
     {
-        QuarantineGpu();
+        if (m_gpuUnknown)
+            QuarantineGpu();
+        else
+        {
+            (void)owner.list->Close();
+            ReleaseGpu();
+        }
         return Fail(reason, "static scene unknown exception");
     }
+}
+
+bool GameDx12StaticScene12::RegisterMeshes(
+    const GameDx12StaticSceneOwner12& owner,
+    std::span<const gameaux12::Mesh* const> sources,
+    std::vector<uint32_t>& handles, std::string& reason)
+{
+    handles.assign(sources.size(), gameaux12::kInvalidMesh);
+    if (!m_loaded || !m_uploadConfirmed || m_gpuUnknown)
+        return Fail(reason, "scene is unavailable for mesh registration");
+
+    uint64_t bytes = 0;
+    std::vector<uint32_t> pending;
+    std::vector<std::string> textureNames;
+    std::unordered_map<std::string, bool> unique;
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        const auto& mesh = *sources[i];
+        if (mesh.vertices.empty() || mesh.indices.empty() ||
+            mesh.vertices.size() > 65536 || mesh.indices.size() > UINT32_MAX / 2u)
+            continue;
+        const auto meshBytes = mesh.vertices.size() * sizeof(gameaux12::Vertex) +
+            ((mesh.indices.size() * sizeof(uint16_t) + 3u) & ~size_t{3});
+        if (meshBytes > kMaxAuxGeometryBytes - m_auxResources.geometryBytes - bytes)
+            continue;
+        if (!m_textureKeys.contains(mesh.texture) && !unique.contains(mesh.texture))
+        {
+            if (textureNames.size() >= kMaxTextures - m_textures.size())
+                continue;
+            unique.emplace(mesh.texture, true);
+            textureNames.push_back(mesh.texture);
+        }
+        pending.push_back(static_cast<uint32_t>(i));
+        bytes += meshBytes;
+    }
+    if (pending.empty())
+        return true;
+    if (!textureNames.empty())
+    {
+        std::vector<GameDx12SceneTexture12> textures;
+        GameDx12TextureReadStats12 stats;
+        GameDx12J2ABatch_ReadTextureNames(textureNames, textures, stats,
+            kMaxAuxTextureBytes - m_auxResources.textureBytes);
+        if (textures.size() != textureNames.size())
+            return Fail(reason, "additional texture read failed");
+        if (FAILED(owner.allocator->Reset()) ||
+            FAILED(owner.list->Reset(owner.allocator, nullptr)))
+            return Fail(reason, "additional texture list reset failed");
+        bool uploaded = false;
+        try
+        {
+            uploaded = CreateTextures(owner, textures, true, reason);
+        }
+        catch (...)
+        {
+            if (!m_gpuUnknown)
+                (void)owner.list->Close();
+            throw;
+        }
+        if (!m_gpuUnknown)
+        {
+            const HRESULT close = owner.list->Close();
+            if (uploaded && FAILED(close))
+                return Fail(reason, "additional texture list close failed");
+        }
+        if (!uploaded)
+            return false;
+    }
+
+    // Вместе храним VB и IB всех новых моделей. Редкие загрузки не
+    // инвалидируют адреса уже записанных кадров или существующие дескрипторы.
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    const auto desc = BufferDesc(bytes);
+    ComPtr<ID3D12Resource> geometry;
+    if (FAILED(owner.device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(geometry.GetAddressOf()))))
+        return Fail(reason, "additional mesh allocation failed");
+    m_auxMeshes.reserve(m_auxMeshes.size() + pending.size());
+    m_auxGeometry.reserve(m_auxGeometry.size() + 1);
+    void* mapped = nullptr;
+    const D3D12_RANGE noRead{};
+    if (FAILED(geometry->Map(0, &noRead, &mapped)))
+        return Fail(reason, "additional mesh map failed");
+    const auto address = geometry->GetGPUVirtualAddress();
+    uint64_t cursor = 0;
+    for (const uint32_t i : pending)
+    {
+        const auto& source = *sources[i];
+        const uint32_t texture = m_textureKeys.at(source.texture);
+        if (m_textures[texture].image == nullptr)
+            continue;
+        const uint32_t vbBytes = static_cast<uint32_t>(
+            source.vertices.size() * sizeof(gameaux12::Vertex));
+        const uint32_t ibBytes = static_cast<uint32_t>(
+            source.indices.size() * sizeof(uint16_t));
+        AuxMesh mesh;
+        mesh.texture = texture + 1;
+        mesh.cutout = source.cutout || m_textures[texture].alphaTest;
+        mesh.indices = static_cast<uint32_t>(source.indices.size());
+        mesh.vb = {address + cursor, vbBytes, sizeof(gameaux12::Vertex)};
+        std::memcpy(static_cast<uint8_t*>(mapped) + cursor, source.vertices.data(), vbBytes);
+        cursor += vbBytes;
+        mesh.ib = {address + cursor, ibBytes, DXGI_FORMAT_R16_UINT};
+        std::memcpy(static_cast<uint8_t*>(mapped) + cursor, source.indices.data(), ibBytes);
+        cursor += (static_cast<uint64_t>(ibBytes) + 3u) & ~uint64_t{3};
+        for (const auto& vertex : source.vertices)
+            mesh.radius = (std::max)(mesh.radius, std::hypot(
+                vertex.position[0], vertex.position[1], vertex.position[2]));
+        handles[i] = static_cast<uint32_t>(m_auxMeshes.size());
+        m_auxMeshes.push_back(mesh);
+        ++m_auxResources.meshesUploaded;
+    }
+    geometry->Unmap(0, nullptr);
+    if (cursor != 0)
+    {
+        m_auxResources.geometryBytes += bytes;
+        m_auxGeometry.push_back(std::move(geometry));
+    }
+    return true;
 }
 
 bool GameDx12StaticScene12::RecordNativeFrame(
     ID3D12GraphicsCommandList* list, uint32_t frameSlot,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
-    const float cameraPosition[3], FrameStats12& stats, std::string& reason)
+    const float cameraPosition[3], const gameaux12::Frame& extras,
+    FrameStats12& stats, AuxStats& auxStats, std::string& reason)
 {
     stats = FrameStats12{};
+    auxStats = AuxStats{};
     if (list == nullptr)
         return Fail(reason, "static scene null command list");
     if (!m_loaded || !m_uploadConfirmed || m_gpuUnknown)
@@ -1320,6 +1505,93 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
     }
     list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
+
+    if (extras.session == LevelSession() && extras.epoch == LevelEpoch())
+    {
+        const uint64_t slotOffset = frameSlot * kTransformSlotBytes;
+        auto* destination = static_cast<uint8_t*>(m_frameTransformsMapped) + slotOffset;
+        uint32_t next = static_cast<uint32_t>(extras.poses.size());
+        if (next > gameaux12::kMaxFrameTransforms)
+            return Fail(reason, "rigid pose exceeds frame transform capacity");
+        if (next != 0)
+            std::memcpy(destination, extras.poses.data(),
+                        next * sizeof(DirectX::XMFLOAT4X4));
+        list->SetGraphicsRootShaderResourceView(4,
+            m_frameTransforms->GetGPUVirtualAddress() + slotOffset);
+
+        const auto drawMesh = [&](const AuxMesh& mesh, uint32_t id, bool detail,
+                                   uint32_t offset, uint32_t count)
+        {
+            auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += static_cast<UINT64>(mesh.texture) * m_textureDescriptorSize;
+            list->SetGraphicsRootDescriptorTable(1, gpu);
+            const uint32_t mode = (mesh.cutout || detail) && !alphaTestDisabled ? 2u : 1u;
+            const uint32_t material[] = {mode, id, viewMode, std::bit_cast<uint32_t>(threshold)};
+            list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
+            list->SetGraphicsRoot32BitConstant(3, offset, 0);
+            list->IASetVertexBuffers(0, 1, &mesh.vb);
+            list->IASetIndexBuffer(&mesh.ib);
+            list->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
+        };
+
+        list->SetPipelineState(m_pipelineRigid.Get());
+        for (const auto& object : extras.objects)
+        {
+            if (cull && !SphereInside(planes, object.center, object.radius))
+            {
+                ++auxStats.rigidCulled;
+                continue;
+            }
+            ++auxStats.rigidVisible;
+            bool submitted = false;
+            for (const uint32_t mesh : std::span(extras.objectMeshes).subspan(
+                     object.firstMesh, object.meshCount))
+            {
+                drawMesh(m_auxMeshes[mesh], object.id, false, object.poseOffset, 1);
+                ++auxStats.rigidDraws;
+                submitted = true;
+            }
+            if (submitted)
+                ++auxStats.rigidSubmitted;
+        }
+
+        list->SetPipelineState(m_pipelineDetail.Get());
+        for (const auto& group : extras.details)
+        {
+            if (group.mesh == gameaux12::kInvalidMesh)
+            {
+                auxStats.detailMissingMaterial += static_cast<uint32_t>(group.transforms.size());
+                continue;
+            }
+            const auto& mesh = m_auxMeshes[group.mesh];
+            const uint32_t first = next;
+            for (const auto& transform : group.transforms)
+            {
+                const float scale = std::hypot(transform._11, transform._12, transform._13);
+                const float center[] = {transform._41, transform._42, transform._43};
+                if (cull && !SphereInside(planes, center, mesh.radius * scale))
+                {
+                    ++auxStats.detailCulled;
+                    continue;
+                }
+                ++auxStats.detailVisible;
+                if (next == gameaux12::kMaxFrameTransforms)
+                {
+                    ++auxStats.detailBudget;
+                    continue;
+                }
+                std::memcpy(destination + next * sizeof(transform), &transform, sizeof(transform));
+                ++next;
+            }
+            if (next > first)
+            {
+                const uint32_t count = next - first;
+                drawMesh(mesh, group.mesh, true, first, count);
+                auxStats.detailSubmitted += count;
+                ++auxStats.detailDraws;
+            }
+        }
+    }
     stats.record_ms = Ms(recordStart);
     if (dumpDraws)
         ++compareDumpFrames;
@@ -1368,12 +1640,23 @@ void GameDx12StaticScene12::ReleaseGpu()
         texture.upload.Reset();
     }
     m_textures.clear();
+    m_textureKeys.clear();
+    m_auxGeometry.clear();
+    m_auxMeshes.clear();
+    m_auxResources = {};
+    m_copyStaging.Reset();
+    if (m_frameTransformsMapped != nullptr && m_frameTransforms != nullptr)
+        m_frameTransforms->Unmap(0, nullptr);
+    m_frameTransformsMapped = nullptr;
+    m_frameTransforms.Reset();
     if (m_frameConstantsMapped != nullptr && m_frameConstants != nullptr)
         m_frameConstants->Unmap(0, nullptr);
     m_frameConstantsMapped = nullptr;
     m_frameConstants.Reset();
     m_textureHeap.Reset();
     m_pipelineUv24.Reset();
+    m_pipelineRigid.Reset();
+    m_pipelineDetail.Reset();
     m_pipelineState.Reset();
     m_rootSignature.Reset();
     m_loaded = false;
@@ -1417,6 +1700,16 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
             texture.image.Detach();
         texture.upload.Detach();
     }
+    for (auto& geometry : m_auxGeometry)
+        geometry.Detach();
+    m_copyStaging.Detach();
+    m_frameTransforms.Detach();
+    m_frameTransformsMapped = nullptr;
+    m_pipelineRigid.Detach();
+    m_pipelineDetail.Detach();
+    m_textureKeys.clear();
+    m_auxGeometry.clear();
+    m_auxMeshes.clear();
     if (m_frameConstantsMapped != nullptr && m_frameConstants != nullptr)
         m_frameConstants->Unmap(0, nullptr);
     m_frameConstantsMapped = nullptr;

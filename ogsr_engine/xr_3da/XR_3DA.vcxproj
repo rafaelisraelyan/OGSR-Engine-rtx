@@ -330,6 +330,22 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
     <ClInclude Include="GameDx12StaticScene.h" />
+    <ClCompile Include="GameDx12GameVisuals.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="GameDx12LevelDetails.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="GameDx12RigidModel.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClInclude Include="GameDx12AuxGeometry.h" />
+    <ClInclude Include="GameDx12GameVisuals.h" />
+    <ClInclude Include="GameDx12LevelDetails.h" />
+    <ClInclude Include="GameDx12RigidModel.h" />
     <ClInclude Include="GameDx12Bridge.h" />
     <ClInclude Include="GameDx12J2APreparation.h" />
     <ClInclude Include="GameDx12J2ABatch.h" />

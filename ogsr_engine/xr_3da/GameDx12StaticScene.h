@@ -2,6 +2,7 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12AuxGeometry.h"
 #include "GameDx12J2ABatch.h"
 #include "dx12xrayasset.h"
 #include "dx12xraylevelgeometry.h"
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <d3d12.h>
@@ -91,6 +93,24 @@ public:
         double record_ms = 0.0;
     };
 
+    struct AuxStats
+    {
+        uint32_t rigidVisible = 0;
+        uint32_t rigidCulled = 0;
+        uint32_t rigidSubmitted = 0;
+        uint32_t rigidDraws = 0;
+        uint32_t detailVisible = 0;
+        uint32_t detailSubmitted = 0;
+        uint32_t detailDraws = 0;
+        uint32_t detailCulled = 0;
+        uint32_t detailMissingMaterial = 0;
+        uint32_t detailBudget = 0;
+        uint32_t meshesUploaded = 0;
+        uint32_t texturesUploaded = 0;
+        uint64_t geometryBytes = 0;
+        uint64_t textureBytes = 0;
+    };
+
     GameDx12StaticScene12() = default;
     ~GameDx12StaticScene12();
     GameDx12StaticScene12(const GameDx12StaticScene12&) = delete;
@@ -108,8 +128,14 @@ public:
 
     bool RecordNativeFrame(ID3D12GraphicsCommandList* list, uint32_t frameSlot,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
-                           const float cameraPosition[3], FrameStats12& stats,
+                           const float cameraPosition[3], const gameaux12::Frame& extras,
+                           FrameStats12& stats, AuxStats& auxStats,
                            std::string& reason);
+
+    bool RegisterMeshes(const GameDx12StaticSceneOwner12& owner,
+                        std::span<const gameaux12::Mesh* const> sources,
+                        std::vector<uint32_t>& handles, std::string& reason);
+    const AuxStats& AuxResources() const noexcept { return m_auxResources; }
 
     void OnLevelTeardown(uint64_t nextEpoch);
     void OnDeviceReset(uint64_t nextEpoch);
@@ -167,12 +193,24 @@ private:
     {
         ComPtr<ID3D12Resource> image;
         ComPtr<ID3D12Resource> upload;
+        bool alphaTest = false;
+    };
+
+    struct AuxMesh
+    {
+        D3D12_VERTEX_BUFFER_VIEW vb{};
+        D3D12_INDEX_BUFFER_VIEW ib{};
+        uint32_t texture = 0;
+        uint32_t indices = 0;
+        float radius = 0.0f;
+        bool cutout = false;
     };
 
     bool Fail(std::string& reason, const char* text);
     bool Fail(std::string& reason, const std::string& text);
     bool CreatePipeline(ID3D12Device* device, std::string& reason);
     bool CreateFrameConstants(ID3D12Device* device, std::string& reason);
+    bool CreateInstanceBuffer(ID3D12Device* device, std::string& reason);
     bool PrepareUpload(const GameDx12StaticSceneOwner12& owner,
                        std::span<const uint8_t> geomBytes,
                        const std::vector<GameDx12SceneTexture12>& textures,
@@ -181,9 +219,8 @@ private:
                      std::span<const uint8_t> geomBytes, std::string& reason);
     bool CreateTextures(const GameDx12StaticSceneOwner12& owner,
                         const std::vector<GameDx12SceneTexture12>& textures,
-                        std::string& reason);
-    bool SubmitAndWait(const GameDx12StaticSceneOwner12& owner, bool closeList,
-                       bool abandon, std::string& reason);
+                        bool append, std::string& reason);
+    bool SubmitAndWait(const GameDx12StaticSceneOwner12& owner, std::string& reason);
     void ReleaseGpu();
     void QuarantineGpu() noexcept;
 
@@ -191,6 +228,10 @@ private:
     std::vector<Buffer12> m_indexPools;
     std::vector<TextureGpu12> m_textures;
     std::vector<DrawSource12> m_draws;
+    std::unordered_map<std::string, uint32_t> m_textureKeys;
+    std::vector<ComPtr<ID3D12Resource>> m_auxGeometry;
+    std::vector<AuxMesh> m_auxMeshes;
+    AuxStats m_auxResources;
     // Копия метаданных пулов нужна для stride/смещений на всё время жизни
     // сцены; байты level.geom после загрузки не удерживаются.
     xraylevel12::LevelPools m_poolRefs;
@@ -199,9 +240,15 @@ private:
     ComPtr<ID3D12PipelineState> m_pipelineState;
     // Вариант для раскладки, где TEXCOORD0 лежит по смещению 24.
     ComPtr<ID3D12PipelineState> m_pipelineUv24;
+    ComPtr<ID3D12PipelineState> m_pipelineRigid;
+    ComPtr<ID3D12PipelineState> m_pipelineDetail;
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
     ComPtr<ID3D12Resource> m_frameConstants;
+    ComPtr<ID3D12Resource> m_frameTransforms;
+    // Держим staging даже при раннем выходе из загрузки с неизвестным fence.
+    ComPtr<ID3D12Resource> m_copyStaging;
     void* m_frameConstantsMapped = nullptr;
+    void* m_frameTransformsMapped = nullptr;
     UINT m_textureDescriptorSize = 0;
 
     LoadStats12 m_stats{};

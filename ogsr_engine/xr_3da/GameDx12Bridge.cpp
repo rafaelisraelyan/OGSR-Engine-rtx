@@ -10,6 +10,7 @@
 #include "GameDx12J2ABatch.h"
 #include "GameDx12J2APreparation.h"
 #include "GameDx12StaticScene.h"
+#include "GameDx12GameVisuals.h"
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
 #include "FS.h"
@@ -142,6 +143,7 @@ struct BridgeStateData
     // F4.1: полная статическая сцена уровня. Отделена от диагностического M23
     // пути: у неё своя загрузка, свои пулы и своя статистика.
     GameDx12StaticScene12 staticScene;
+    gameaux12::GameVisuals gameVisuals;
     GameDx12OffscreenPass12 offscreen;
     GameDx12NativeFrame12 native;
 
@@ -312,6 +314,7 @@ void QuarantineObjects()
 void QuarantineForGeometryUnknown(const char* stage)
 {
     BridgeStateData& state = State();
+    state.staticScene.Shutdown(false);
     if (state.nativeRequested)
         state.native.Quarantine();
     Msg("ph_dx12_bridge: geometry GPU completion unknown at stage='%s'; "
@@ -1539,14 +1542,17 @@ void GameDx12Bridge_ApplyNativeVideoMode(uint32_t width, uint32_t height)
 }
 
 // F4.1 evidence-only свободная камера (определение ниже, файловая область).
-bool FlyCameraMatrix(Matrix4& result, uint64_t sequence);
+bool FlyCameraMatrix(Matrix4& result, uint64_t sequence, float position[3]);
 
 namespace
 {
 bool DrainNative(BridgeStateData& state, const char* stage)
 {
     if (state.native.CompletionUnknown())
+    {
+        QuarantineForGeometryUnknown(stage);
         return false;
+    }
     if (!state.native.IsInitialized())
         return true;
     const GameDx12NativeFrame12::Owner owner{
@@ -1584,13 +1590,17 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     GameDx12FourVisual12::NativeTimings12 timings;
     std::string reason;
     bool sceneRecorded = false;
+    GameDx12StaticScene12::AuxStats auxDraws;
     if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
         state.staticScene.LevelSession() == state.levelSession &&
         state.staticScene.LevelEpoch() == state.captureEpoch)
     {
         DirectX::XMFLOAT4X4 viewProjection;
         Matrix4 flyTransform{};
-        if (FlyCameraMatrix(flyTransform, state.captureSequence))
+        float position[]{Device.vCameraPosition.x,
+                         Device.vCameraPosition.y,
+                         Device.vCameraPosition.z};
+        if (FlyCameraMatrix(flyTransform, state.captureSequence, position))
         {
             std::memcpy(&viewProjection, flyTransform.m, sizeof(viewProjection));
         }
@@ -1607,15 +1617,16 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             for (auto& row : viewProjection.m)
                 row[0] *= sourceAspect / clientAspect;
         }
-        const float position[]{Device.vCameraPosition.x,
-                               Device.vCameraPosition.y,
-                               Device.vCameraPosition.z};
         GameDx12StaticScene12::FrameStats12 sceneStats;
         try
         {
-            if (!state.staticScene.RecordNativeFrame(
+            const GameDx12StaticSceneOwner12 upload{
+                state.device.Get(), state.queue.Get(), state.fence.Get(), state.fenceEvent,
+                state.allocator.Get(), state.list.Get(), &state.fenceValue};
+            if (!state.gameVisuals.Prepare(*g_pGameLevel, position, state.staticScene, upload, reason) ||
+                !state.staticScene.RecordNativeFrame(
                     recording.list, recording.slot, viewProjection, position,
-                    sceneStats, reason))
+                    state.gameVisuals.Snapshot(), sceneStats, auxDraws, reason))
                 hr = E_FAIL;
             else
                 sceneRecorded = true;
@@ -1623,10 +1634,11 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         catch (...)
         {
             hr = E_FAIL;
+            reason = "exception preparing the scene frame";
         }
         if (sceneRecorded)
         {
-            draws = sceneStats.draws;
+            draws = sceneStats.draws + auxDraws.rigidDraws + auxDraws.detailDraws;
             state.staticSceneDraws = sceneStats.draws;
             timings.mode = "static";
             timings.recordMs = sceneStats.record_ms;
@@ -1685,7 +1697,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         state.nativeFailed = true;
         Msg("ph_dx12_native: frame blocked hr=0x%08X reason='%s'; restart to select R4",
             static_cast<unsigned>(hr), reason.c_str());
-        if (state.native.CompletionUnknown())
+        if (state.native.CompletionUnknown() || state.staticScene.GpuCompletionUnknown())
         {
             state.m23.Shutdown(false);
             QuarantineForGeometryUnknown("native_frame");
@@ -1693,6 +1705,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         return;
     }
     const auto count = state.native.PresentCount();
+    if (hr == S_OK && sceneRecorded)
+        state.gameVisuals.LogPresent(count, state.fenceValue, auxDraws, state.staticScene.AuxResources());
     if (hr == S_OK && draws != 0)
     {
         const uint64_t frames = ++state.nativeScenePresents;
@@ -1960,7 +1974,7 @@ void LogVisualComparison(const xraylevel12::LevelPools& pools,
 // обычный кадр продолжают работать без этого флага.
 //
 // Формат OGSR_DX12_GAME_FLY: "x,y,z,yawDeg[,pitchDeg[,spinDegPerSecond]]".
-bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
+bool FlyCameraMatrix(Matrix4& result, uint64_t sequence, float position[3])
 {
     static const bool prepared = []
     {
@@ -2007,6 +2021,7 @@ bool FlyCameraMatrix(Matrix4& result, uint64_t sequence)
     const float eye[3] = {origin[0] + drift[0] * seconds,
                           origin[1] + drift[1] * seconds,
                           origin[2] + drift[2] * seconds};
+    std::memcpy(position, eye, sizeof(eye));
 
     const float yaw =
         (yawDegrees + spinDegrees * static_cast<float>(sequence) / 60.0f) *
@@ -2853,6 +2868,7 @@ void GameDx12Bridge_OnLevelTeardown()
     state.staticSceneSession = 0;
     state.staticSceneEpoch = 0;
     state.staticSceneDraws = 0;
+    state.gameVisuals.Reset();
     state.staticScene.OnLevelTeardown(state.captureEpoch);
     if (state.staticScene.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("f41_level_teardown");
@@ -3514,6 +3530,7 @@ void GameDx12Bridge_OnDeviceReset(uint32_t width, uint32_t height)
         if (state.m23.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("m23_device_reset");
         state.staticSceneBound = false;
+        state.gameVisuals.Reset();
         state.staticScene.OnDeviceReset(state.captureEpoch);
         if (state.staticScene.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("f41_device_reset");
@@ -3555,6 +3572,7 @@ void GameDx12Bridge_Shutdown()
         DrainNative(state, "native_shutdown");
     const bool ownerCompletionKnown = !state.gpuUnknown && !state.quarantined;
     state.staticSceneBound = false;
+    state.gameVisuals.Reset();
     state.staticScene.Shutdown(ownerCompletionKnown);
     if (state.staticScene.GpuCompletionUnknown())
         QuarantineForGeometryUnknown("f41_shutdown");
