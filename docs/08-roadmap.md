@@ -8,7 +8,7 @@
 
 Мы развиваем OGSR/X-Ray для *S.T.A.L.K.E.R.: Call of Pripyat*, сохраняя атмосферу Зоны, масштаб открытых локаций, погодные состояния, время суток, динамику NPC, физику, растительность и игровой сценарий.
 
-**Стратегия в два принципиальных шага.** **Сначала — функциональный перенос R4/DX11 в DX12**: все нужные исходные объекты и игровые визуалы, эффекты, частицы, декали, свет, погодные render paths, HUD и существующая постобработка, с проверкой по [матрице паритета](dx12-r4-render-parity.md). Только **после достижения игрового паритета и устойчивого lifecycle** — второй этап: улучшение красоты (новые текстуры, материалы/PBR, художественный свет, аппаратные RTX/DXR-тени, отражения и при измеренной пользе непрямое освещение). Никакой переход ко второму шагу не заменяет пропущенные функции первого. *Control* показывает потенциал выборочных RT-эффектов, но архитектура больших наружных уровней требует собственных решений для visibility, foliage, GPU memory и суточной смены освещения.
+**Стратегия в два принципиальных шага.** **Сначала — функциональный перенос R4/DX11 в DX12**: все нужные исходные объекты и игровые визуалы, эффекты, частицы, декали, свет, погодные render paths, HUD и существующая постобработка, с проверкой по [матрице паритета](dx12-r4-render-parity.md). Только **после достижения игрового паритета и устойчивого lifecycle** — второй этап: улучшение красоты (новые текстуры, материалы/PBR, художественный свет, аппаратные RTX/DXR-тени, отражения и при измеренной пользе непрямое освещение). **Единственное раннее визуальное исключение по решению владельца — собственное небо OGSR RTX с нашим GPU volumetric cloud renderer:** его добавляем в игровой DX12 уже в ходе/сразу после F4.2, а не реализуем сначала полное старое небо ради последующей замены. Это **не** отменяет обязательную совместимость с игровой погодой R4 и безопасный Classic 2D fallback. Никакой переход ко второму шагу не заменяет пропущенные функции первого. *Control* показывает потенциал выборочных RT-эффектов, но архитектура больших наружных уровней требует собственных решений для visibility, foliage, GPU memory и суточной смены освещения.
 
 ### Принципы и границы
 
@@ -46,7 +46,8 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 | **Сейчас** | F4.1-E независимый source/integration review опубликованного кода | Точный Git/EXE SHA, clean build, R4 clean exit и DX12 GPU smoke |
 | **Следующий** | F4.2-A `MT_SKELETON_RIGID` из game-owned объектов | Настоящие двери, лампы и ящики с верной world/bone pose |
 | **Следующий** | F4.2-B исходные `level.details` | Трава/детали, instancing, сравнимое распределение с R4 |
-| **После F4.2** | F4.3 паритет существующих материалов, неба, света и прозрачности R4 | Нормальный opaque/cutout/**blended**, legacy shaders, baseline sky/sun/lights; **без новых PBR-текстур** |
+| **Ранняя интеграция, параллельно или сразу после F4.2-A/B** | **F4.2-SKY: наше небо и объёмные облака** [#15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15) | Рабочий game-owned sky/background, CEnvironment, GPU cloud compositing, корректный indoor occlusion, Classic 2D fallback; пока opt-in |
+| **После F4.2** | F4.3 паритет исходных материалов, света и прозрачности R4; интеграция с новым sky pass | Нормальный opaque/cutout/**blended**, legacy shaders, sun/local lights; **без новых PBR-текстур** |
 | **Дальше** | F4.4 полный игровой контент и исходные render passes | NPC/оружие/HUD, частицы, декали/wallmarks, погодные эффекты и **существующая R4-постобработка** |
 | **Затем** | F4.5 полная матрица R4→DX12, стабильность и производительность | Нет необъяснённых пропусков объектов/эффектов, безопасный lifecycle, DX11 fallback, измеренный GPU budget |
 | **Параллельно** | Облака R4-R1, PhysX G5.1-S3R-R2 | Их автономные correction gates без подмены требований DX12 parity |
@@ -115,11 +116,29 @@ Jupiter — вокзал с дверями, рельсы и вагоны, кар
 
 **Критерии F4.2:** реальные объекты и оригинальные детали, source-backed game/world transforms, корректное создание/удаление, GBV + R4 regression. Wind и advanced foliage LOD возможно отдельно, но нельзя выдавать отсутствие detail vegetation за завершённый этап. [#12](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/12).
 
+### F4.2-SKY — ранняя интеграция нашего неба (решение владельца 2026-11-21)
+
+**Цель:** не тратить отдельный этап на полное повторение старого R4 sky renderer ради его немедленной замены. В **игровой native DX12** переносим **нашу разработанную sky/cloud систему**, опираясь на существующий standalone GPU ray marcher и его визуальную концепцию; объёмное небо становится ранним пользовательским направлением, а не поздним PBR/RTX-дополнением. [Issue #15 — F4.2-SKY](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15).
+
+**Порядок:** параллельная изолированная ветка или следующий интеграционный пакет непосредственно после F4.2-A/B; главный Codex не бросает unfinished двери/level.details, но **не ждём F4.4/F4.5 и RTX** перед первым игровым небом. Это **opt-in integration R&D**, не производственная приёмка.
+
+| Шаг | Работа | Acceptance |
+|---|---|---|
+| **SKY-0 — data contract** | Прочитать реальный R4 `CEnvironment`/CurrentEnv и stand-alone sky/cloud source; source of truth — игровое время суток, weather cycle/WeatherFX, солнце, ветер, fog и coverage. Один immutable per-game-frame snapshot | Никакого второго погодного таймера, world weather RNG или чтения mutable CEnvironment из GPU worker |
+| **SKY-1 — собственный sky background** | Встраивание sky render pass в существующий D3D12 device/queue/frame и формат color/HDR, camera/projection, horizon, sun/atmospheric context | Небо видно на Jupiter с корректными направлениями/горизонтом; не затирает интерьер, крыши и terrain |
+| **SKY-2 — облачный volume pass** | Адаптировать существующий GPU ray marcher/compute shaders и ресурсы под игровой scene/depth/HDR composite, barriers/descriptors/fences, time/wind movement | Облака реально видны над Jupiter, правильно перекрыты геометрией; камера/день-ночь/ветер работают |
+| **SKY-3 — fallback & quality** | В DX12 режимы Classic 2D и optional Volumetric 3D; Classic безопасен при отсутствии/ошибке 3D. DX11/R4 не меняем | При выключении 3D корректное обычное небо, без сломанного кадра; без двойного слоя старых и новых облаков |
+| **SKY-4 — validation** | Jupiter indoor/outdoor, Zaton, day/night, rain/overcast, camera motion, resize/reload/close; GPU Debug Layer/GBV, 30+ captures, GPU ms/VRAM | Targeted game evidence, прозрачная таблица NOT RUN/known gaps, измеренная цена и нормальная lifetime |
+
+**Текущее ограничение:** standalone V-WEATHER-01C-B всё ещё **HOLD** с нерешёнными R4-R2 диагностическими issues, а V1/V2 formal visual/performance acceptance ещё нет. **Раннее подключение не превращает экспериментальные облака в production-approved**: не переносить опасный standalone control/diagnostic loop в игру, исправить source/ownership issues перед продвижением. В игре нет отдельного cloud-owned device, swapchain, queue, GR scheduler или погоды. Не ломать существующий R4 fallback, не сливать renderer code в `prypiat` без отдельного решения.
+
+---
+
 ## 5. Следующие этапы F4.3–F5 и DXR
 
 | Пакет | Работа | Acceptance |
 |---|---|---|
-| **F4.3 — оригинальные материалы и освещение** | R4 DDS/THM/shaders, opaque/cutout/**blend**, normal/depth, baseline sky/sun/local light/shadows и `CEnvironment` | Исходные R4 материалы/свет работают, вода и стекло без неверных opaque patches; [#6](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/6) |
+| **F4.3 — оригинальные материалы и освещение** | R4 DDS/THM/shaders, opaque/cutout/**blend**, normal/depth, исходный sun/local light/shadows и связка с нашим ранним F4.2-SKY | Исходные R4 материалы/свет совместимы с нашим sky, вода и стекло без неверных opaque patches; [#6](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/6) |
 | **F4.4 — полная функциональность R4** | Multi-bone NPC/mutants, оружие/HUD, particle groups, muzzle flashes, следы попаданий, кровь, wallmarks, scripted draw, погодные эффекты, **исходная постобработка R4** | Инвентарь [R4→DX12](dx12-r4-render-parity.md) закрывает реальные gameplay классы и пассы; matched scenes без необъяснённых пропусков |
 | **F4.5 — проверка полного переноса** | Матрица эффектов/объектов и визуальные регрессии; `vid_restart`, level change, resize/alt-tab, device loss, repeated teardown, CPU/GPU/VRAM budgets | No unexplained R4-only rendering family, no UAF/GBV errors, normal exit, genuine DX11 fallback |
 | **F5 — качество и масштабирование после паритета** | Motion vectors, jitter/history, TAA/DLSS/FSR, upgrade legacy textures/materials в отдельном контролируемом пакете | Исходные сцены не деградируют; качество в движении и GPU/latency budget |
@@ -436,6 +455,8 @@ DX12 + DXR и DX11 сравниваются и тестируются разде
 
 ## 8. Volumetric Clouds — погодная система и интеграция
 
+**Приоритет интеграции (решение владельца 2026-11-21):** наша sky/cloud система должна появиться **рано в игровом native DX12, через F4.2-SKY** ([Issue #15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15)); не воспроизводить старое небо R4 полностью лишь для последующей замены. Это **только opt-in integration R&D**, не отменяет следующие standalone source/diagnostic gates и Classic 2D fallback.
+
 **Актуальный блокер (2026-11-21): V-WEATHER-01C-B-R4-R1, независимый Codex STRICT READ-ONLY → REQUEST CHANGES (4×P2, 1×P3); Tech Lead подтвердил source findings, FINAL 01C-B HOLD, узкий R4-R2 REQUIRED.** Последняя точная поставка SHA256 `8c066d84db4195d801582b2b9be6196235ee03a632140cc9541628e8be11635b`: independent ZIP/SHA/patch PASS (1050/1050 payloads, 136/136 source, 34/34 HLSL, 5 EXE), 58/58 author fault rows consistent but тестовые критерии неполны. Safe terminal & last-submitted-fence check source improvements retained; **CloudProfiler/interactive input/transition/timing writes bypass the safe diagnostic gate, `#endif        flushDeferred();` swallows loop flush, blocked pipes restored before minimize/restore, witness-disabled parser omits pipe-status check, CRT pipe fd rollback incomplete**. Historical static **4/16 NOT MET** (188 channel values at max 1 LSB), same-session R2/R4-R1 16/16; transition+GBV **NOT RUN** (author 770–772 s frame; no clean shutdown), require explicit disposition. **01C-C NOT RUN, V1/V2 formal NOT ACCEPTED, V-L/V-S1 NOT STARTED, V-Q4 BLOCKED**; no production/DX11/R4/HLSL changes.
 
 | Очередь | Что реализовать | Гейт |
@@ -444,7 +465,7 @@ DX12 + DXR и DX11 сравниваются и тестируются разде
 | Fault proofs | Точные hooks, handle/CRT return values, witness activation и negative controls | Failed activation=FAIL, не считать timeout PASS |
 | 01C-C | Same-session GPU p50/p95/VRAM, rain/clear/cloud profiles, resolutions | Измеренная GPU цена и safe default |
 | V1/V2 | Visual acceptance текущего base, R03A перед спорными HCS1/HCS2 | Никаких непроверенных крупных морфологических изменений |
-| V-Q4 | In-game DX12 HDR/depth/sky/cloud composite, CEnvironment sun/weather/wind | Real game captures, resize/reload, barriers/fences |
+| V-Q4 / **F4.2-SKY early** | Ранняя адаптация нашего sky/cloud к game-owned DX12 HDR/depth composite с CEnvironment sun/weather/wind; начальная интеграция opt-in, полный V-Q4 acceptance зависит от закрытия V-WEATHER и тестов | Real game captures, indoor occlusion, Classic fallback, resize/reload, barriers/fences; V-Q4 пока NOT ACCEPTED |
 | V-L/V-S | Lightning, weather transitions, surge после облачной интеграции | Игровая логика и fallback сохраняются |
 
 Наличие game-owned DX12 queue/Present из F4.1 ещё не доказывает доступность HDR sky/color/depth для облаков. В игровом режиме один device/queue/GR, а standalone стенд может иметь свой. `CEnvironment` определяет погоду, shipping пользователь — качество/режим, не debug seed.
