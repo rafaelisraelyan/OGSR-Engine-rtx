@@ -30,7 +30,7 @@ R4 source paths ниже проверены в опубликованной ве
 | Particles / effects / groups | `Layers/xrRender/ParticleEffect.cpp`, `ParticleGroup.cpp`, `Blender_Particle.cpp` | **UNKNOWN / AUDIT REQUIRED** | Дым, огонь, пыль, искры, взрывы по исходным эффектам; emitter lifecycle |
 | Decals / wallmarks / bullet hits | `Layers/xrRender/WallmarksEngine.cpp`, `dxWallMarkArray.cpp` | **KNOWN DEFECT + AUDIT REQUIRED**: [#13](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/13) — мерцание наложений; полное покрытие не доказано | Следы пуль, кровь, грязь, decal на скелетном visual, движение камеры |
 | Dynamic lights / sun / shadow passes | `Layers/xrRenderPC_R4/r4_rendertarget_accum_point.cpp`, `...accum_spot.cpp`, `...phase_smap_D.cpp` | **UNKNOWN / FUTURE F4.3** | Фонарь, лампа, солнце, ночь, динамические тени |
-| Sky, clouds, environment | `Layers/xrRender/dxEnvironmentRender.cpp` | **PARTIAL / FUTURE F4.3 + V** | Time of day, тучи, горизонт, погодные переходы |
+| Sky, clouds, environment | `Layers/xrRender/dxEnvironmentRender.cpp`; собственный standalone V cloud renderer | **EARLY F4.2-SKY PLANNED / NOT GAME INTEGRATED:** своё небо и GPU volumetric clouds вместо полного копирования старого R4 sky; V-WEATHER source gate HOLD, DX12 Classic 2D fallback обязателен | [#15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15), game CEnvironment snapshot, sun/day-night, indoor occlusion, Classic fallback, HDR/depth/GBV |
 | Rain, wetness, thunder, lens flare | `dxRainRender.cpp`, `dxThunderboltRender.cpp`, `dxLensFlareRender.cpp`, R4 rain path | **UNKNOWN / AUDIT REQUIRED** | Дождь/ливень, гроза, блики, дождевые капли на экране |
 | HUD, UI, fonts, inventory | `Layers/xrRender/dxUIRender.cpp`, `dxFontRender.cpp`, `r__dsgraph_render.cpp` HUD phases | **UNKNOWN / FUTURE F4.4** | Миникарта, прицел, инвентарь, PDA, интерактивные окна |
 | Weapon/first-person overlays, scopes | `r__dsgraph_render.cpp` HUD path; related weapon render paths must be enumerated | **UNKNOWN / FUTURE F4.4** | Выстрел, прицел, смена оружия, scope overlay |
@@ -39,6 +39,8 @@ R4 source paths ниже проверены в опубликованной ве
 | Scripted, mod-specific and debug draws | Найти все вызывающие renderer интерфейсы со стороны game/scripts/mods | **UNKNOWN / AUDIT REQUIRED** | Редкие gameplay события и опциональные графические режимы |
 
 *Таблица не полная до полного обхода source registration/callers; новые семейства нужно добавлять, а не скрывать в строке «прочее». Имена источников следует уточнять по актуальному Git tree. «UNKNOWN» не означает «не реализовано».*
+
+**Специальное решение о небе:** в native DX12 early sky implementation используем **собственную OGSR RTX sky/cloud систему** ([#15](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/15)), а не сначала копируем весь R4 sky pipeline. Это осознанное решение о **замене способа визуализации**, **не** об удалении функций: время суток, игровая погода, horizon, weatherFX, перекрытие зданием/terrain и безопасный DX12 Classic 2D fallback должны остаться. В матрице отдельно учитываем небо (можно заменить) и его входы/игровые состояния (терять нельзя). Full V-Q4 cloud acceptance пока не подтверждён.
 
 ## 3. Как построить машинно проверяемый реестр
 
