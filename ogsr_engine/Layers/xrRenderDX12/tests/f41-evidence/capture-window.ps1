@@ -15,6 +15,7 @@ Add-Type -AssemblyName System.Drawing
 
 if (-not ('WindowCaptureNative' -as [type])) {
     Add-Type -Namespace '' -Name 'WindowCaptureNative' -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
 [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
 [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
@@ -28,38 +29,47 @@ $process = Get-Process -Id $ProcessId -ErrorAction Stop
 $handle = $process.MainWindowHandle
 if ($handle -eq [IntPtr]::Zero) { throw "process $ProcessId has no main window" }
 
-$rect = New-Object WindowCaptureNative+RECT
-if (-not [WindowCaptureNative]::GetClientRect($handle, [ref]$rect)) { throw "GetClientRect failed" }
-$width = $rect.Right - $rect.Left
-$height = $rect.Bottom - $rect.Top
-if ($width -le 0 -or $height -le 0) { throw "window client area is empty" }
-
-$bitmap = New-Object System.Drawing.Bitmap($width, $height)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$hdc = $graphics.GetHdc()
-$printed = $false
+# Capture in physical pixels even when the host uses display scaling.
+$previousDpi = [WindowCaptureNative]::SetThreadDpiAwarenessContext([IntPtr](-4))
 try {
-    $printed = [WindowCaptureNative]::PrintWindow($handle, $hdc, 2) # PW_RENDERFULLCONTENT
+    $rect = New-Object WindowCaptureNative+RECT
+    if (-not [WindowCaptureNative]::GetClientRect($handle, [ref]$rect)) { throw "GetClientRect failed" }
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    if ($width -le 0 -or $height -le 0) { throw "window client area is empty" }
+
+    $bitmap = New-Object System.Drawing.Bitmap($width, $height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $hdc = $graphics.GetHdc()
+    $printed = $false
+    try {
+        $printed = [WindowCaptureNative]::PrintWindow($handle, $hdc, 3) # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+    }
+    finally {
+        $graphics.ReleaseHdc($hdc)
+    }
+
+    if (-not $printed) {
+        # Fallback: copy the screen region under the window.
+        $point = New-Object WindowCaptureNative+POINT
+        [WindowCaptureNative]::ClientToScreen($handle, [ref]$point) | Out-Null
+        $graphics2 = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics2.CopyFromScreen($point.X, $point.Y, 0, 0,
+            (New-Object System.Drawing.Size($width, $height)))
+        $graphics2.Dispose()
+    }
+
+    $directory = Split-Path -Parent $OutputPath
+    if ($directory -ne '' -and !(Test-Path $directory)) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+    $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    $graphics.Dispose()
+    $bitmap.Dispose()
+    Write-Output "captured $width x $height -> $OutputPath"
 }
 finally {
-    $graphics.ReleaseHdc($hdc)
+    if ($previousDpi -ne [IntPtr]::Zero) {
+        [WindowCaptureNative]::SetThreadDpiAwarenessContext($previousDpi) | Out-Null
+    }
 }
-
-if (-not $printed) {
-    # Fallback: copy the screen region under the window.
-    $point = New-Object WindowCaptureNative+POINT
-    [WindowCaptureNative]::ClientToScreen($handle, [ref]$point) | Out-Null
-    $graphics2 = [System.Drawing.Graphics]::FromImage($bitmap)
-    $graphics2.CopyFromScreen($point.X, $point.Y, 0, 0,
-        (New-Object System.Drawing.Size($width, $height)))
-    $graphics2.Dispose()
-}
-
-$directory = Split-Path -Parent $OutputPath
-if ($directory -ne '' -and !(Test-Path $directory)) {
-    New-Item -ItemType Directory -Force -Path $directory | Out-Null
-}
-$bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
-$graphics.Dispose()
-$bitmap.Dispose()
-Write-Output "captured $width x $height -> $OutputPath"
