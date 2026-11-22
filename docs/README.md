@@ -9,6 +9,7 @@
 
 | Документ | О чём |
 |---|---|
+| [00-project-context.md](00-project-context.md) | Сводный контекст проекта: карта каталогов, статусы треков DX12/облака/PhysX, открытые гейты, источники истины |
 | [01-architecture.md](01-architecture.md) | Архитектура: модули, слои, два Lua VM, точки входа. Включает `xrPhysics` и `xrNetServer` |
 | [02-renderer.md](02-renderer.md) | Рендерер: DX11-устройство, кадр (13 стадий), G-buffer **с нормалями**, шейдеры |
 | [03-build-and-dependencies.md](03-build-and-dependencies.md) | Сборка, MSBuild, 22 папки 3rd_party, 12 граблей сборки, ATL-обход, CI |
