@@ -1,0 +1,93 @@
+V-WEATHER-01C-B-R4-R1 exact reproduction commands
+=================================================
+
+Workspace:
+  C:\Users\GR\AppData\Local\OGSR_V_WEATHER_01A_WORK\01c_b_r4_r1_work
+
+Baseline: the exact rebuilt R4 package
+  OGSR_V_WEATHER_01C_B_R4_NonBlocking_Terminal_Corrections.zip
+  SHA-256 bfc4bdd5d74da39226617a2093981e5819d207f7d6ae67d6aedda69a7d5151c8
+  (its source tree is 01c_b_r4_work\standalone_01c_b_r4, left untouched)
+
+Toolchain: Visual Studio 17 2022, x64, Release.
+CMake 4.4.3, MSVC 14.44.35207, Windows SDK 10.0.26100.0,
+fxc 10.0.26100.7705, Python 3.15.1, PowerShell 5.1.
+
+0. Isolated candidate
+   standalone_01c_b_r4_r1 is a copy of the rebuilt R4 source tree with the
+   R4-R1 corrections. The R4 tree and its evidence package are not modified.
+
+1. Three Windows Release builds plus CTest
+   powershell -NoProfile -ExecutionPolicy Bypass -File build_canonical.ps1
+   (configures and builds build_fault, build_developer, build_shipping and runs
+    CTest in each; writes cmake_*.log, build_*.log, ctest_*.log)
+
+2. Terminal / interactive matrix (58 cases)
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_faults.ps1
+   python parse_01c_b_r4_faults.py
+
+   Every case is a separate child process under OGSRCloudsTerminalHarness with a
+   hard timeout. The harness creates:
+     - a shared-memory witness (atomic events, submit/fence counters and the
+       interactive diagnostics counters), and
+     - an ALWAYS-created pipe-status block (independent of the witness), which
+       records per stream whether SetStdHandle / _open_osfhandle / _dup2
+       succeeded, whether activation happened, the probe target and whether the
+       pipes were later deactivated.
+   A child killed by the timeout is counted as FAIL; the only exceptions are the
+   explicitly marked positive controls (control_blocked_pipe_probe,
+   control_stdout_probe, control_stderr_probe, control_both_stdout_probe,
+   control_both_stderr_probe), which MUST time out.
+
+   New in R4-R1:
+     control_stdout_probe          stdout filled, probe writes to stdout
+     control_stderr_probe          stderr filled, probe writes to stderr
+     control_both_stdout_probe     both filled, probe writes to stdout
+     control_both_stderr_probe     both filled, probe writes to stderr
+     pipe_setup_failure_no_activation
+                                   harness passes an invalid handle on purpose;
+                                   installation must FAIL, must not report
+                                   activation, and the child must keep running
+     inflight_no_block             interactive multi-frame diagnostics, no pipes
+     inflight_blocked_stdout       same with a full stdout
+     inflight_blocked_stderr       same with a full stderr
+     inflight_blocked_both         same with both full
+
+3. R4-R1 static captures and the unmodified-R2 same-environment control
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_static.ps1
+   python parse_01c_b_r4_static.py
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_r2_current_static.ps1
+   python compare_r4_vs_r2_static.py
+   python make_static_drift.py
+   <python-with-Pillow> compare_historical_baseline.py
+
+4. Runtime settings state machine and CLI/config isolation
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_runtime.ps1
+   python parse_01c_b_r4_runtime.py
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_cli_tests.ps1
+
+5. D3D12 Debug Layer / GPU-based validation / InfoQueue
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_gbv.ps1
+   python summarize_01c_b_r4_gbv.py
+   powershell -NoProfile -ExecutionPolicy Bypass -File run_01c_b_r4_gbv_transition_control.ps1
+   (the transition-shader investigation is stored under
+    evidence/gbv_transition_investigation with its own README.md, summary.json,
+    per-experiment logs and run_case.ps1)
+
+6. Patch, source evidence, package and verification
+   python make_01c_b_r4_patch.py          # byte-exact R4 -> R4-R1, autocrlf=false
+   python make_source_evidence.py
+   python assemble_01c_b_r4_package.py
+   python verify_01c_b_r4_package.py OGSR_V_WEATHER_01C_B_R4_R1_Interactive_Diagnostic_Corrections.zip
+
+   Applying the incremental patch to a clean rebuilt-R4 tree:
+     git -c core.autocrlf=false apply -p1 V_WEATHER_01C_B_R4_R1_Interactive_Diagnostic.patch
+   The patch is byte-exact and reproduces every changed file byte-for-byte. It
+   must not be applied with end-of-line conversion enabled.
+
+7. GPU hygiene
+   Do not run several GPU suites at the same time on this laptop GPU: concurrent
+   D3D12 clients made swapchain creation fail intermittently (observed as a
+   capture exit -1 / harness setup failure), which is an environment artifact,
+   not a candidate defect. Every reported run above was executed with the GPU
+   otherwise idle.

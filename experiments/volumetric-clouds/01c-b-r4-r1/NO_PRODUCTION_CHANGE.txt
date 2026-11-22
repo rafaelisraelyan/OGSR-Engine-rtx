@@ -1,0 +1,22 @@
+V-WEATHER-01C-B-R4-R1 - NO PRODUCTION CHANGE
+
+- Production OGSR working tree: NOT MODIFIED by this task.
+- OGSR production source, DX11/R4 renderer, HLSL shaders, V-SF Rain,
+  weather transitions, OD1% default and the game DX12 renderer: NOT MODIFIED.
+- Roadmap/docs: NOT MODIFIED (only the Tech Lead changes the roadmap).
+- Git commit/push: NOT PERFORMED.
+- The only modified source tree is the isolated candidate:
+  C:\Users\GR\AppData\Local\OGSR_V_WEATHER_01A_WORK\01c_b_r4_r1_work\standalone_01c_b_r4_r1
+- The accepted rebuilt-R4 baseline remains untouched:
+  C:\Users\GR\AppData\Local\OGSR_V_WEATHER_01A_WORK\01c_b_r4_work\standalone_01c_b_r4
+  evidence package SHA-256
+  bfc4bdd5d74da39226617a2093981e5819d207f7d6ae67d6aedda69a7d5151c8
+- HLSL: no shader file changed. The R4-R1 shader set is byte-identical to the
+  R4/R3 baseline (34/34 files, see validation/shader_sha256.txt).
+- Scope: only the two P2 findings of the independent R4 review (interactive
+  multi-frame diagnostic safety, verified stderr pipe coverage), the fault
+  activation precision follow-up, the transition-shader GBV investigation and
+  the regression re-runs. 01C-C, V-L, V-S1, V-Q4 and shader optimisation were
+  not started.
+- This is a standalone source-only contract. Game adapter/UI/CEnvironment
+  integration is absent and was not evaluated.

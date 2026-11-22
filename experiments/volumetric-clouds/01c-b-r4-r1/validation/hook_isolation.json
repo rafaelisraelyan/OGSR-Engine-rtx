@@ -1,0 +1,60 @@
+{
+  "format": "V_WEATHER_01C_B_R4_R1_HOOK_ISOLATION_V1",
+  "result": "PASS",
+  "binaries": {
+    "developer": {
+      "OGSR_CLOUD_LOGGER_FAULT": false,
+      "OGSR_CLOUD_FAULT_POINT": false,
+      "OGSR_CLOUD_FAULT_PROBE_CAPACITY": false,
+      "OGSR_CLOUD_WITNESS_SHM": false,
+      "OGSR_CLOUD_PIPESTATUS_SHM": false,
+      "OGSR_CLOUD_BLOCK_AT_LABEL": false,
+      "OGSR_CLOUD_TEST_SUPPRESS_LOGGING": false,
+      "OGSR_CLOUD_BLOCK_PROBE_TARGET": false,
+      "OGSR_CLOUD_INFLIGHT_TEST": false,
+      "OGSR_CLOUD_FORCE_PRESENT_NOTICE": false
+    },
+    "shipping": {
+      "OGSR_CLOUD_LOGGER_FAULT": false,
+      "OGSR_CLOUD_FAULT_POINT": false,
+      "OGSR_CLOUD_FAULT_PROBE_CAPACITY": false,
+      "OGSR_CLOUD_WITNESS_SHM": false,
+      "OGSR_CLOUD_PIPESTATUS_SHM": false,
+      "OGSR_CLOUD_BLOCK_AT_LABEL": false,
+      "OGSR_CLOUD_TEST_SUPPRESS_LOGGING": false,
+      "OGSR_CLOUD_BLOCK_PROBE_TARGET": false,
+      "OGSR_CLOUD_INFLIGHT_TEST": false,
+      "OGSR_CLOUD_FORCE_PRESENT_NOTICE": false
+    },
+    "fault": {
+      "OGSR_CLOUD_LOGGER_FAULT": true,
+      "OGSR_CLOUD_FAULT_POINT": true,
+      "OGSR_CLOUD_FAULT_PROBE_CAPACITY": true,
+      "OGSR_CLOUD_WITNESS_SHM": true,
+      "OGSR_CLOUD_PIPESTATUS_SHM": true,
+      "OGSR_CLOUD_BLOCK_AT_LABEL": true,
+      "OGSR_CLOUD_TEST_SUPPRESS_LOGGING": true,
+      "OGSR_CLOUD_BLOCK_PROBE_TARGET": true,
+      "OGSR_CLOUD_INFLIGHT_TEST": true,
+      "OGSR_CLOUD_FORCE_PRESENT_NOTICE": true
+    },
+    "r2_control": {
+      "OGSR_CLOUD_LOGGER_FAULT": false,
+      "OGSR_CLOUD_FAULT_POINT": false,
+      "OGSR_CLOUD_FAULT_PROBE_CAPACITY": false,
+      "OGSR_CLOUD_WITNESS_SHM": false,
+      "OGSR_CLOUD_PIPESTATUS_SHM": false,
+      "OGSR_CLOUD_BLOCK_AT_LABEL": false,
+      "OGSR_CLOUD_TEST_SUPPRESS_LOGGING": false,
+      "OGSR_CLOUD_BLOCK_PROBE_TARGET": false,
+      "OGSR_CLOUD_INFLIGHT_TEST": false,
+      "OGSR_CLOUD_FORCE_PRESENT_NOTICE": false
+    }
+  },
+  "hashes": {
+    "developer": "16add96bb284979298c05c1305343f4bfb17f5f575eefc71901645517fc56a84",
+    "shipping": "886aabaa131f5fcc7e818b212446ccbdaf05c2bd93c1a623f84a2916b7042252",
+    "fault": "3895a120dc47e34bce1d61b76c31c6bc77e9947fc3a0b3d01fef711793555f04",
+    "r2_control": "6860c90c8a3876e190df2c32857654c6bfa9d50e053c273e2ad65633747873f7"
+  }
+}

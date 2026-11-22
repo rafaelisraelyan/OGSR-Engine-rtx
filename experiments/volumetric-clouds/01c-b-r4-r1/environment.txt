@@ -1,0 +1,22 @@
+V-WEATHER-01C-B-R4-R1 environment
+Date: 2026-11-21 +03:00
+OS: Майкрософт Windows 11 Pro 25H2 10.0.26200 (build 26200)
+CPU: AMD Ryzen 9 7845HX with Radeon Graphics (63.2 GB RAM)
+GPU: NVIDIA GeForce RTX 5070 Laptop GPU driver=32.0.16.2124 (2026-11-07)
+GPU: AMD Radeon(TM) 610M driver=32.0.21045.29003 (2026-11-17, present but unused)
+CMake: cmake version 4.4.3
+MSVC: 14.44.35207
+Windows SDK: 10.0.26100.0
+fxc: 10.0.26100.7705
+Python: Python 3.15.1
+PowerShell: 5.1.26100.9818
+Generator: Visual Studio 17 2022, x64, Release
+Baseline: rebuilt R4 evidence package
+  OGSR_V_WEATHER_01C_B_R4_NonBlocking_Terminal_Corrections.zip
+  SHA-256 bfc4bdd5d74da39226617a2093981e5819d207f7d6ae67d6aedda69a7d5151c8
+Baseline source tree: 01c_b_r4_work\standalone_01c_b_r4 (unchanged)
+R2 control: unmodified 01C-B-R2 developer build (hash in REPORT.md)
+TDR: HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDelay = 10;
+  TdrLevel/TdrDdiDelay/TdrLimitTime/TdrLimitCount absent. No TDR or GPU reset
+  events were recorded during any run (see evidence/gbv_transition_investigation
+  /tdr_events.json).

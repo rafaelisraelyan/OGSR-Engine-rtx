@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "clouds_enabled": true,
+  "cloud_render_mode": "volumetric3d",
+  "cloud_quality": "quality",
+  "weather_mode": "rain_sf",
+  "timeline_interrupt": "0:0.65:partly",
+  "storm_front": true,
+  "coverage": 0.1,
+  "density": 9.9,
+  "seed": 7,
+  "shadow_od": 0.01,
+  "shadow_inner_only": true
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "clouds_enabled": true,
+  "cloud_render_mode": "volumetric3d",
+  "cloud_quality": "quality",
+  "seed": 42,
+  "noise_seed": 43,
+  "size": 64,
+  "format": "unorm"
+}

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "clouds_enabled": true,
+  "cloud_render_mode": "volumetric3d",
+  "cloud_quality": "quality"
+}

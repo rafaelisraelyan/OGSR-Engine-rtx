@@ -1,0 +1,35 @@
+{
+  "format": "V_WEATHER_01C_B_R4_SOURCE_EVIDENCE_V2",
+  "result": "PASS",
+  "checks": {
+    "single_exit_site": true,
+    "terminal_noreturn_noexcept": true,
+    "terminal_diagnostics_skipped": true,
+    "terminal_has_no_io_or_allocation": true,
+    "terminal_is_atomic_witness_then_exit": true,
+    "witness_event_is_allocation_free": true,
+    "submission_witness_records_real_call": true,
+    "fence_witness_records_real_completion": true,
+    "execute_immediate_interval_has_no_sink": true,
+    "execute_immediate_interval_has_no_exception": true,
+    "present_interval_has_no_sink": true,
+    "wait_and_signal_are_noexcept_and_do_not_throw": true,
+    "no_exception_around_gpu_waits": true,
+    "pre_retirement_wait_has_no_pre_wait_log": true,
+    "diagnostics_are_not_test_conditional": true,
+    "blocked_pipe_switch_is_late_and_fault_gated": true,
+    "terminal_witness_never_blocks": true,
+    "fault_hook_environment_is_fault_build_only": true,
+    "only_probe_write_touches_a_pipe": true,
+    "no_atexit_or_exit_shortcuts": true,
+    "harness_does_not_suppress_logging": true,
+    "harness_enforces_hard_timeout": true,
+    "harness_reports_timeout_separately": true
+  },
+  "exit_sites": [
+    [
+      "Common.cpp",
+      187
+    ]
+  ]
+}

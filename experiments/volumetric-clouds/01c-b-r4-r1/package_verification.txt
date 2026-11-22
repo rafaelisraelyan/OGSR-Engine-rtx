@@ -1,0 +1,18 @@
+V-WEATHER-01C-B-R4-R1 package verification record
+=================================================
+Deliverable: OGSR_V_WEATHER_01C_B_R4_R1_Interactive_Diagnostic_Corrections.zip
+Baseline: rebuilt R4 package, SHA-256
+  bfc4bdd5d74da39226617a2093981e5819d207f7d6ae67d6aedda69a7d5151c8
+Fault-matrix cases: 58
+Fault-matrix failures: 0
+Fault-matrix result: PASS
+Hook isolation: PASS
+Binaries:
+  developer: 16add96bb284979298c05c1305343f4bfb17f5f575eefc71901645517fc56a84
+  shipping: 886aabaa131f5fcc7e818b212446ccbdaf05c2bd93c1a623f84a2916b7042252
+  fault: 3895a120dc47e34bce1d61b76c31c6bc77e9947fc3a0b3d01fef711793555f04
+  r2_control: 6860c90c8a3876e190df2c32857654c6bfa9d50e053c273e2ad65633747873f7
+Patch: see patch/patch_manifest_r4_r1.json (byte-exact apply verified against a clean R4 tree)
+Verifier: run verify_01c_b_r4_package.py against the ZIP; it recomputes
+  every numeric claim from the packaged raw evidence.
+Author-only evidence: no independent rerun was performed.

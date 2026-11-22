@@ -1,0 +1,30 @@
+V-WEATHER-01C-B-R4 SOURCE PROVEN evidence
+=======================================================
+
+Single std::_Exit(1) site: [('Common.cpp', 187)]
+
+single_exit_site = PASS
+terminal_noreturn_noexcept = PASS
+terminal_diagnostics_skipped = PASS
+terminal_has_no_io_or_allocation = PASS
+terminal_is_atomic_witness_then_exit = PASS
+witness_event_is_allocation_free = PASS
+submission_witness_records_real_call = PASS
+fence_witness_records_real_completion = PASS
+execute_immediate_interval_has_no_sink = PASS
+execute_immediate_interval_has_no_exception = PASS
+present_interval_has_no_sink = PASS
+wait_and_signal_are_noexcept_and_do_not_throw = PASS
+no_exception_around_gpu_waits = PASS
+pre_retirement_wait_has_no_pre_wait_log = PASS
+diagnostics_are_not_test_conditional = PASS
+blocked_pipe_switch_is_late_and_fault_gated = PASS
+terminal_witness_never_blocks = PASS
+fault_hook_environment_is_fault_build_only = PASS
+only_probe_write_touches_a_pipe = PASS
+no_atexit_or_exit_shortcuts = PASS
+harness_does_not_suppress_logging = PASS
+harness_enforces_hard_timeout = PASS
+harness_reports_timeout_separately = PASS
+
+Result: PASS

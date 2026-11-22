@@ -1,0 +1,1209 @@
+diff --git a/src/Application.cpp b/src/Application.cpp
+index e13e994..28ab8c4 100644
+--- a/src/Application.cpp
++++ b/src/Application.cpp
+@@ -1933,7 +1933,7 @@ void Application::WritePreflightReport(const audit::ValidationStatus& status)
+ bool Application::Shutdown()
+ {
+ #if defined(OGSR_CLOUDS_FAULT_INJECTION)
+-    if (clouds::ShutdownFaultPending())
++    if (clouds::ShutdownFaultPendingFor(clouds::CloudFaultPoint::ShutdownApplicationWait))
+         clouds::MaybeActivateBlockedPipes("application-shutdown");
+ #endif
+     const bool anyGpu = renderer_.Device() != nullptr ||
+@@ -2528,38 +2528,70 @@ int Application::RunInteractive()
+     auto previous = std::chrono::steady_clock::now();
+     bool wasMinimized = false;
+     // Diagnostics produced after RenderOneFrame/Present run in an interval where
+-    // the frame fence is not yet confirmed (the interactive path returns without
+-    // waiting). They are deferred into this fixed, allocation-free buffer and
+-    // emitted only after a confirmed idle GPU, so no blocking diagnostic sink
+-    // can sit between a submission and its confirmed completion.
+-    char deferredLogs[8][160]{};
++    // later GPU submissions may still be unconfirmed (the interactive path
++    // returns without waiting). They are deferred into this fixed,
++    // allocation-free buffer and emitted only when the renderer reports a fully
++    // confirmed GPU idle, so no blocking diagnostic sink can sit between a
++    // submission and its confirmation.
++    char deferredLogs[16][192]{};
+     int deferredLogCount = 0;
+     const auto deferLog = [&deferredLogs, &deferredLogCount]
+         (const char* format, auto... args)
+     {
+-        if (deferredLogCount < 8)
++        if (deferredLogCount < 16)
+         {
+             snprintf(deferredLogs[deferredLogCount], sizeof(deferredLogs[0]),
+                      format, args...);
+             ++deferredLogCount;
+         }
+     };
++    const auto flushDeferred = [&]()
++    {
++        if (deferredLogCount == 0)
++            return;
++        // Never emit a diagnostic while later GPU work is unconfirmed.
++        if (!renderer_.GpuIdleConfirmed())
++            return;
++        for (int index = 0; index < deferredLogCount; ++index)
++            Log("%s", deferredLogs[index]);
++        deferredLogCount = 0;
++    };
++#if defined(OGSR_CLOUDS_FAULT_INJECTION)
++    // Address-directed interactive multi-frame test: keep several REAL frame
++    // submissions unconfirmed (a queue gate after frame 0), reuse an old back
++    // buffer, and verify that no blocking diagnostic is attempted meanwhile.
++    const bool inflightTest = clouds::TestEnvFlag("OGSR_CLOUD_INFLIGHT_TEST");
++    // 0 = burst not yet done, 1 = pending window open, 2 = window closed.
++    int inflightPhase = 0;
++#else
++    const bool inflightTest = false;
++#endif
+     while (running_ && window_.PumpMessages())
+     {
+         if (window_.IsMinimized())
+         {
+             if (!wasMinimized)
+             {
+-                Log("window minimized; rendering paused");
++                // Reached after the previous interactive Present: defer instead
++                // of logging into a possibly unconfirmed GPU interval.
++                deferLog("window minimized; rendering paused");
+                 wasMinimized = true;
+             }
+             Sleep(50);
+             previous = std::chrono::steady_clock::now();
++#if defined(OGSR_CLOUDS_FAULT_INJECTION)
++            if (inflightTest && inflightPhase == 1)
++            {
++                // Complete the real minimize/restore cycle: the "restored"
++                // message is deferred like every other post-Present diagnostic.
++                ShowWindow(window_.Handle(), SW_RESTORE);
++            }
++#endif
+             continue;
+         }
+         if (wasMinimized)
+         {
+-            Log("window restored; resuming rendering");
++            deferLog("window restored; resuming rendering");
+             wasMinimized = false;
+         }
+ 
+@@ -2622,6 +2654,84 @@ int Application::RunInteractive()
+         ++renderedFrames_;
+         UpdateTitle(false);
+ 
++#if defined(OGSR_CLOUDS_FAULT_INJECTION)
++        if (inflightTest && inflightPhase == 1 && wasMinimized == false)
++        {
++            // The window was restored: confirm a full idle and drain the
++            // deferred diagnostics that had to wait for it.
++            if (!renderer_.TryWaitForGpu())
++            {
++                TerminalFailClosed(
++                    "inflight test: deferred window completion is UNKNOWN; "
++                    "TERMINAL fail-closed");
++            }
++            flushDeferred();
++            inflightPhase = 2;
++        }
++        if (inflightTest && inflightPhase == 0 && renderedFrames_ >= 1)
++        {
++            // Frame 0 is submitted and confirmed with a real full-idle wait.
++            if (!renderer_.TryWaitForGpu())
++            {
++                TerminalFailClosed(
++                    "inflight test: frame 0 completion is UNKNOWN; "
++                    "TERMINAL fail-closed");
++            }
++
++            // Build a genuinely pending backlog: real frame command lists
++            // submitted back to back with no intervening wait. If this GPU is
++            // fast enough to drain them, submit more; without a confirmed
++            // pending submission the test would prove nothing and must fail.
++            int burstFrames = 0;
++            for (int attempt = 0; attempt < 3; ++attempt)
++            {
++                for (int burst = 0; burst < 2; ++burst)
++                {
++                    if (RenderOneFrame(false, nullptr))
++                        ++burstFrames;
++                }
++                if (!renderer_.GpuIdleConfirmed())
++                    break;
++            }
++            if (renderer_.GpuIdleConfirmed() || burstFrames < 2)
++            {
++                clouds::NoteDiagnosticsUnsafe();
++                Fail("inflight test: could not keep submissions in flight");
++            }
++
++            // Install the full pipes only NOW, while later submissions are
++            // unconfirmed. Every diagnostic from here on would hang if it were
++            // emitted into the blocked stream.
++            clouds::MaybeActivateBlockedPipes("inflight-diagnostics");
++
++            clouds::NoteInflightCheck(
++                static_cast<long>(renderer_.InflightSubmissionCount()));
++
++            // Probe the exact gate that BeginFrame uses. While later frames are
++            // unconfirmed it must refuse to touch the blocked stream; if it ever
++            // flushed, the child would hang here and the harness would report a
++            // timeout = FAIL. Once the GPU is idle a flush is legitimate and is
++            // deliberately not probed (a permanently full pipe would block it).
++            const bool pendingNow = !renderer_.GpuIdleConfirmed();
++            const bool flushedWhilePending =
++                pendingNow && renderer_.FlushDiagnosticsIfIdle("inflight-pending");
++            if (!pendingNow || flushedWhilePending)
++            {
++                clouds::NoteDiagnosticsUnsafe();
++                Fail("inflight test: diagnostics gate did not defer pending work");
++            }
++
++            // The pending window is over: restore the real streams BEFORE any
++            // further logging. A permanently full pipe would (correctly) block
++            // a legitimate post-idle flush, which is not what this test measures.
++            clouds::DeactivateBlockedPipes();
++            // Real minimize/restore cycle; its messages go through the same
++            // deferred buffer and are flushed only after a confirmed idle.
++            ShowWindow(window_.Handle(), SW_MINIMIZE);
++            inflightPhase = 1;
++        }
++#endif        flushDeferred();
++
+         if (options_.resizeTest)
+         {
+             // Exercise ResizeBuffers with two different client sizes while the
+diff --git a/src/CloudFaultInjection.cpp b/src/CloudFaultInjection.cpp
+index b1fde26..060c431 100644
+--- a/src/CloudFaultInjection.cpp
++++ b/src/CloudFaultInjection.cpp
+@@ -149,23 +149,76 @@ bool g_witnessDisabled =
+     TestEnvFlagInternal("OGSR_CLOUD_WITNESS_DISABLE");
+ bool g_witnessInitialized = false;
+ clouds::WitnessBlock* g_witness = nullptr;
++clouds::PipeStatusBlock* g_pipeStatus = nullptr;
++bool g_pipeStatusOpened = false;
+ bool g_blockedPipesActive = false;
++bool g_stdoutOk = false;
++bool g_stderrOk = false;
++bool g_stdoutRequested = false;
++bool g_stderrRequested = false;
++int g_stdoutError = 0;
++int g_stderrError = 0;
++int g_savedStdoutFd = -1;
++int g_savedStderrFd = -1;
++HANDLE g_savedStdoutHandle = INVALID_HANDLE_VALUE;
++HANDLE g_savedStderrHandle = INVALID_HANDLE_VALUE;
++
++void OpenPipeStatus() noexcept
++{
++    if (g_pipeStatusOpened)
++        return;
++    g_pipeStatusOpened = true;
++    char name[160]{};
++    if (ReadTestEnv("OGSR_CLOUD_PIPESTATUS_SHM", name, sizeof(name)) == 0)
++        return;
++    wchar_t wideName[160]{};
++    if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wideName,
++                            static_cast<int>(sizeof(wideName) /
++                                             sizeof(wideName[0]))) <= 0)
++        return;
++    const HANDLE mapping = OpenFileMappingW(FILE_MAP_WRITE, FALSE, wideName);
++    if (!mapping)
++        return;
++    void* view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0,
++                               sizeof(clouds::PipeStatusBlock));
++    CloseHandle(mapping);
++    if (!view)
++        return;
++    auto* block = static_cast<clouds::PipeStatusBlock*>(view);
++    if (block->magic != clouds::kPipeStatusMagic ||
++        block->version != clouds::kPipeStatusVersion)
++        return;
++    g_pipeStatus = block;
++}
+ 
+-void ActivatePipeHandle(const char* envName, DWORD stdHandle, FILE* stream) noexcept
++// Returns 0 on success, or a non-zero diagnostic code. Every step is checked:
++// a stream is only reported as redirected when SetStdHandle, _open_osfhandle
++// and _dup2 all succeeded on it.
++int InstallStream(const char* envName, DWORD stdHandle, FILE* stream,
++                  HANDLE* savedHandle, int* savedFd) noexcept
+ {
+     char raw[32]{};
+     if (ReadTestEnv(envName, raw, sizeof(raw)) == 0)
+-        return;
++        return -1; // not requested
+     const unsigned long long value = _strtoui64(raw, nullptr, 10);
+     if (value == 0)
+-        return;
++        return -2;
+     const HANDLE handle = reinterpret_cast<HANDLE>(
+         static_cast<uintptr_t>(value));
+-    SetStdHandle(stdHandle, handle);
++
++    // Keep the original handle/fd so the test can restore the real stream.
++    *savedHandle = GetStdHandle(stdHandle);
++    *savedFd = _dup(_fileno(stream));
++
++    if (!SetStdHandle(stdHandle, handle))
++        return 1;
+     const int fd = _open_osfhandle(
+         reinterpret_cast<intptr_t>(handle), _O_WRONLY);
+-    if (fd != -1)
+-        _dup2(fd, _fileno(stream));
++    if (fd == -1)
++        return 2;
++    if (_dup2(fd, _fileno(stream)) != 0)
++        return 3;
++    return 0;
+ }
+ 
+ bool ShutdownLoggerFaultMatches(const char* body)
+@@ -195,6 +248,9 @@ void InitWitness() noexcept
+     if (g_witnessInitialized)
+         return;
+     g_witnessInitialized = true;
++    // The pipe-status block is opened regardless of the witness switch, so a
++    // witness-disabled case still exposes per-stream installation results.
++    OpenPipeStatus();
+     if (g_witnessDisabled)
+         return;
+ 
+@@ -242,24 +298,133 @@ void MaybeActivateBlockedPipes(const char* label) noexcept
+         return;
+     }
+ 
+-    ActivatePipeHandle("OGSR_CLOUD_BLOCK_STDOUT_HANDLE",
+-                       STD_OUTPUT_HANDLE, stdout);
+-    ActivatePipeHandle("OGSR_CLOUD_BLOCK_STDERR_HANDLE",
+-                       STD_ERROR_HANDLE, stderr);
++    OpenPipeStatus();
++
++    // Each stream is installed and validated independently. A stream that was
++    // not requested is reported as not requested, never as success.
++    const int stdoutCode = InstallStream(
++        "OGSR_CLOUD_BLOCK_STDOUT_HANDLE", STD_OUTPUT_HANDLE, stdout,
++        &g_savedStdoutHandle, &g_savedStdoutFd);
++    g_stdoutRequested = stdoutCode != -1;
++    g_stdoutError = stdoutCode > 0 ? stdoutCode : 0;
++    g_stdoutOk = stdoutCode == 0;
++
++    const int stderrCode = InstallStream(
++        "OGSR_CLOUD_BLOCK_STDERR_HANDLE", STD_ERROR_HANDLE, stderr,
++        &g_savedStderrHandle, &g_savedStderrFd);
++    g_stderrRequested = stderrCode != -1;
++    g_stderrError = stderrCode > 0 ? stderrCode : 0;
++    g_stderrOk = stderrCode == 0;
++
++    const bool anyRequested = g_stdoutRequested || g_stderrRequested;
++    const bool allOk = (!g_stdoutRequested || g_stdoutOk) &&
++                       (!g_stderrRequested || g_stderrOk);
++
++    // Pipe-status shared memory is created unconditionally by the harness, so
++    // this survives a witness-disabled case.
++    if (g_pipeStatus)
++    {
++        InterlockedExchange(&g_pipeStatus->stdoutRequested,
++                            g_stdoutRequested ? 1 : 0);
++        InterlockedExchange(&g_pipeStatus->stdoutOk, g_stdoutOk ? 1 : 0);
++        InterlockedExchange(&g_pipeStatus->stderrRequested,
++                            g_stderrRequested ? 1 : 0);
++        InterlockedExchange(&g_pipeStatus->stderrOk, g_stderrOk ? 1 : 0);
++        InterlockedExchange(&g_pipeStatus->stdoutError, g_stdoutError);
++        InterlockedExchange(&g_pipeStatus->stderrError, g_stderrError);
++        InterlockedExchange(&g_pipeStatus->activated,
++                            (allOk && anyRequested) ? 1 : 0);
++    }
++
++    if (!anyRequested)
++        return;
++    if (!allOk)
++    {
++        // A failed installation is never reported as a successful activation.
++        WitnessEvent(WitnessCode::BlockedPipesFailed);
++        return;
++    }
++
+     g_blockedPipesActive = true;
+     WitnessEvent(WitnessCode::BlockedPipesActivated);
+ 
+-    // Sensitivity control. The harness can ask the child to perform one
+-    // deliberate write through the freshly installed pipe. Because the pipe has
+-    // no reader, this write must block, the harness must hit its timeout and the
+-    // parser must report the case as a failure. This proves that a full pipe is
+-    // genuinely able to hang the process and that a timeout is never counted as
+-    // a successful fail-closed exit.
+-    if (TestEnvFlagInternal("OGSR_CLOUD_BLOCK_PROBE_WRITE"))
++    // Sensitivity control. `OGSR_CLOUD_BLOCK_PROBE_TARGET` selects which
++    // redirected stream receives one deliberate write: stdout, stderr, or both.
++    // Because the pipe has no reader the write must block, the harness must hit
++    // its timeout and the parser must count that as FAIL. Triggering the probe
++    // per stream is what proves each stream individually, instead of proving
++    // only whichever stream happens to be written first.
++    char target[16]{};
++    if (ReadTestEnv("OGSR_CLOUD_BLOCK_PROBE_TARGET", target,
++                    sizeof(target)) > 0)
++    {
++        LONG probeTarget = 0;
++        if (_stricmp(target, "stdout") == 0)
++            probeTarget = 1;
++        else if (_stricmp(target, "stderr") == 0)
++            probeTarget = 2;
++        else if (_stricmp(target, "both") == 0)
++            probeTarget = 3;
++
++        if (g_pipeStatus)
++        {
++            InterlockedExchange(&g_pipeStatus->probeTarget, probeTarget);
++            InterlockedExchange(&g_pipeStatus->probeStarted,
++                                probeTarget != 0 ? 1 : 0);
++        }
++        if (probeTarget != 0)
++            WitnessEvent(WitnessCode::PipeProbeStarted);
++        else
++            WitnessEvent(WitnessCode::PipeProbeNotRequested);
++
++        if (probeTarget == 1 || probeTarget == 3)
++        {
++            fputs("blocked pipe probe\n", stdout);
++            fflush(stdout);
++        }
++        if (probeTarget == 2 || probeTarget == 3)
++        {
++            fputs("blocked pipe probe\n", stderr);
++            fflush(stderr);
++        }
++    }
++}
++
++void DeactivateBlockedPipes() noexcept
++{
++    if (!g_blockedPipesActive)
++        return;
++    if (g_savedStdoutFd != -1)
++    {
++        _dup2(g_savedStdoutFd, _fileno(stdout));
++        _close(g_savedStdoutFd);
++        g_savedStdoutFd = -1;
++    }
++    if (g_savedStdoutHandle != INVALID_HANDLE_VALUE)
++    {
++        SetStdHandle(STD_OUTPUT_HANDLE, g_savedStdoutHandle);
++        g_savedStdoutHandle = INVALID_HANDLE_VALUE;
++    }
++    if (g_savedStderrFd != -1)
+     {
+-        fputs("blocked pipe probe\n", stdout);
+-        fflush(stdout);
++        _dup2(g_savedStderrFd, _fileno(stderr));
++        _close(g_savedStderrFd);
++        g_savedStderrFd = -1;
+     }
++    if (g_savedStderrHandle != INVALID_HANDLE_VALUE)
++    {
++        SetStdHandle(STD_ERROR_HANDLE, g_savedStderrHandle);
++        g_savedStderrHandle = INVALID_HANDLE_VALUE;
++    }
++    g_blockedPipesActive = false;
++    if (g_pipeStatus)
++        InterlockedExchange(&g_pipeStatus->deactivated, 1);
++    WitnessEvent(WitnessCode::BlockedPipesDeactivated);
++}
++
++bool BlockedPipeStreamOk(int which) noexcept
++{
++    return which == 1 ? g_stdoutOk : g_stderrOk;
+ }
+ 
+ bool BlockedPipesActive() noexcept
+@@ -302,6 +467,96 @@ void NoteFenceConfirmed(unsigned long long fenceValue,
+     InterlockedIncrement(&g_witness->fenceConfirmedCount);
+ }
+ 
++void NoteGpuIdleConfirmed(unsigned long long submitted,
++                          unsigned long long completed) noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedExchange64(&g_witness->lastFlushSubmitted,
++                          static_cast<LONG64>(submitted));
++    InterlockedExchange64(&g_witness->lastFlushCompleted,
++                          static_cast<LONG64>(completed));
++    WitnessEvent(WitnessCode::GpuIdleConfirmed);
++}
++
++void NoteDiagnosticsDeferred(long inflightSubmissions) noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedIncrement(&g_witness->diagDeferCount);
++    // Keep the maximum observed in-flight depth for the evidence reader.
++    LONG current = InterlockedCompareExchange(&g_witness->inflightAtDefer, 0, 0);
++    while (inflightSubmissions > current &&
++           InterlockedCompareExchange(&g_witness->inflightAtDefer,
++                                      inflightSubmissions, current) != current)
++    {
++        current = InterlockedCompareExchange(
++            &g_witness->inflightAtDefer, 0, 0);
++    }
++    WitnessEvent(WitnessCode::DiagnosticsDeferred);
++}
++
++void NoteDiagnosticsFlushed(unsigned long long submitted,
++                            unsigned long long completed) noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedIncrement(&g_witness->diagFlushCount);
++    InterlockedExchange64(&g_witness->lastFlushSubmitted,
++                          static_cast<LONG64>(submitted));
++    InterlockedExchange64(&g_witness->lastFlushCompleted,
++                          static_cast<LONG64>(completed));
++    WitnessEvent(WitnessCode::DiagnosticsFlushed);
++}
++
++void NoteDiagnosticsUnsafe() noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedIncrement(&g_witness->diagUnsafeCount);
++    WitnessEvent(WitnessCode::DiagnosticsUnsafe);
++}
++
++void NoteFrameSubmitted() noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedIncrement(&g_witness->frameSubmitCount);
++    WitnessEvent(WitnessCode::FrameSubmitted);
++}
++
++void NoteFrameFenceConfirmed() noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedIncrement(&g_witness->frameConfirmCount);
++    WitnessEvent(WitnessCode::FrameFenceConfirmed);
++}
++
++void NoteInflightCheck(long inflightSubmissions) noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedExchange(&g_witness->inflightAtCheck, inflightSubmissions);
++    WitnessEvent(WitnessCode::InflightCheck);
++}
++
++void NoteGpuGateInserted() noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedExchange(&g_witness->gateInserted, 1);
++    WitnessEvent(WitnessCode::GpuGateInserted);
++}
++
++void NoteGpuGateReleased() noexcept
++{
++    if (!g_witness)
++        return;
++    InterlockedExchange(&g_witness->gateReleased, 1);
++    WitnessEvent(WitnessCode::GpuGateReleased);
++}
++
+ void ArmCloudFault()
+ {
+     g_armed = true;
+@@ -345,8 +600,35 @@ bool FaultArmedFor(CloudFaultPoint point) noexcept
+     return armed && !g_consumed && ConfiguredFaultPoint() == point;
+ }
+ 
++bool FaultArmedForPoint(CloudFaultPoint point) noexcept
++{
++    return FaultArmedFor(point);
++}
++
++bool LoggerFaultArmedForPoint(LoggerFaultPoint point) noexcept
++{
++    if (!g_loggerFaultArmed || g_loggerFaultConsumed)
++        return false;
++    const LoggerFault fault = ConfiguredLoggerFault();
++    switch (point)
++    {
++    case LoggerFaultPoint::PreRetirement:
++        return fault == LoggerFault::PreRetirement;
++    case LoggerFaultPoint::PreRetirementProbe:
++        return fault == LoggerFault::PreRetirementProbe;
++    case LoggerFaultPoint::WaitError:
++        // Only consumed inside the already-failed wait branch, so it must never
++        // by itself make a successful pre-retirement attempt look terminal.
++        return fault == LoggerFault::WaitError;
++    default:
++        return false;
++    }
++}
++
+ bool TerminalFaultPending() noexcept
+ {
++    // True only for the faults that the post-submit interval of the next
++    // immediate submission will actually consume.
+     if (FaultArmedFor(CloudFaultPoint::RendererPostSubmit) ||
+         FaultArmedFor(CloudFaultPoint::RendererPostSignal))
+         return true;
+@@ -361,24 +643,25 @@ bool TerminalFaultPending() noexcept
+ 
+ bool PreRetirementFaultPending() noexcept
+ {
++    // Only a WaitForGpu fault is consumed by the pre-retirement retirement wait.
++    // The logger faults are merely recorded there; treating WaitError as
++    // "pending" previously switched the pipes on in a call that completed
++    // successfully, which is exactly the false-positive this guards against.
+     if (FaultArmedFor(CloudFaultPoint::WaitForGpu))
+         return true;
+     if (g_loggerFaultArmed && !g_loggerFaultConsumed)
+     {
+         const LoggerFault fault = ConfiguredLoggerFault();
+         if (fault == LoggerFault::PreRetirement ||
+-            fault == LoggerFault::PreRetirementProbe ||
+-            fault == LoggerFault::WaitError)
++            fault == LoggerFault::PreRetirementProbe)
+             return true;
+     }
+     return false;
+ }
+ 
+-bool ShutdownFaultPending() noexcept
++bool ShutdownFaultPendingFor(CloudFaultPoint point) noexcept
+ {
+-    return FaultArmedFor(CloudFaultPoint::ShutdownApplicationWait) ||
+-           FaultArmedFor(CloudFaultPoint::ShutdownCloudWait) ||
+-           FaultArmedFor(CloudFaultPoint::ShutdownRendererWait);
++    return FaultArmedFor(point);
+ }
+ 
+ void MaybeThrowPostSubmitLoggerFault(int stage)
+@@ -521,11 +804,66 @@ bool PreRetirementFaultPending() noexcept
+     return false;
+ }
+ 
+-bool ShutdownFaultPending() noexcept
++bool ShutdownFaultPendingFor(CloudFaultPoint) noexcept
++{
++    return false;
++}
++
++bool FaultArmedForPoint(CloudFaultPoint) noexcept
++{
++    return false;
++}
++
++bool LoggerFaultArmedForPoint(LoggerFaultPoint) noexcept
++{
++    return false;
++}
++
++void DeactivateBlockedPipes() noexcept
++{
++}
++
++bool BlockedPipeStreamOk(int) noexcept
+ {
+     return false;
+ }
+ 
++void NoteGpuIdleConfirmed(unsigned long long, unsigned long long) noexcept
++{
++}
++
++void NoteDiagnosticsDeferred(long) noexcept
++{
++}
++
++void NoteDiagnosticsFlushed(unsigned long long, unsigned long long) noexcept
++{
++}
++
++void NoteDiagnosticsUnsafe() noexcept
++{
++}
++
++void NoteFrameSubmitted() noexcept
++{
++}
++
++void NoteFrameFenceConfirmed() noexcept
++{
++}
++
++void NoteInflightCheck(long) noexcept
++{
++}
++
++void NoteGpuGateInserted() noexcept
++{
++}
++
++void NoteGpuGateReleased() noexcept
++{
++}
++
+ void NoteLogForFaultInjection(const char*, const char*)
+ {
+ }
+diff --git a/src/CloudFaultInjection.h b/src/CloudFaultInjection.h
+index 2a28405..85924de 100644
+--- a/src/CloudFaultInjection.h
++++ b/src/CloudFaultInjection.h
+@@ -65,8 +65,31 @@ bool TerminalFaultPending() noexcept;
+ // reaches the terminal boundary.
+ bool PreRetirementFaultPending() noexcept;
+ 
+-// Test-only: true when one of the shutdown retirement waits is about to fail.
+-bool ShutdownFaultPending() noexcept;
++// Test-only: true when the shutdown retirement wait of the given owner is
++// about to fail. Per-owner, so an activation site cannot switch the pipes on for
++// a fault that another owner will consume (or nobody will).
++bool ShutdownFaultPendingFor(CloudFaultPoint point) noexcept;
++
++// Test-only: exact fault-point predicate, so an activation site can prove that
++// the specific fault it will consume is armed (not merely some fault category).
++bool FaultArmedForPoint(CloudFaultPoint point) noexcept;
++bool LoggerFaultArmedForPoint(LoggerFaultPoint point) noexcept;
++
++// Interactive multi-frame diagnostics accounting. NoteDiagnosticsDeferred is
++// called when a deferred sink had to wait because later GPU work was still
++// unconfirmed; NoteDiagnosticsUnsafe must never be reached and exists to make a
++// violation observable instead of silent.
++void NoteGpuIdleConfirmed(unsigned long long submitted,
++                          unsigned long long completed) noexcept;
++void NoteDiagnosticsDeferred(long inflightSubmissions) noexcept;
++void NoteDiagnosticsFlushed(unsigned long long submitted,
++                            unsigned long long completed) noexcept;
++void NoteDiagnosticsUnsafe() noexcept;
++void NoteFrameSubmitted() noexcept;
++void NoteFrameFenceConfirmed() noexcept;
++void NoteInflightCheck(long inflightSubmissions) noexcept;
++void NoteGpuGateInserted() noexcept;
++void NoteGpuGateReleased() noexcept;
+ 
+ // Attaches the pre-created shared-memory witness. Safe to call once early;
+ // failure just disables the witness and never blocks the terminal path.
+@@ -75,10 +98,20 @@ bool LoggingSuppressed() noexcept;
+ 
+ // Test-only late pipe switch: the child starts with normal file handles and
+ // substitutes already-full pipes only when the label matches. This avoids a
+-// false hang in external GPU/shader libraries during startup.
++// false hang in external GPU/shader libraries during startup. Each stream is
++// validated (SetStdHandle / _open_osfhandle / _dup2); a failed installation
++// never reports success.
+ void MaybeActivateBlockedPipes(const char* label) noexcept;
+ bool BlockedPipesActive() noexcept;
+ 
++// Test-only: restore the original std handles of every redirected stream, so a
++// test that blocked the pipes for a bounded window can finish normally.
++void DeactivateBlockedPipes() noexcept;
++
++// Per-stream installation result for the parent harness. Returns false when a
++// requested stream could not be redirected. `which`: 1 stdout, 2 stderr.
++bool BlockedPipeStreamOk(int which) noexcept;
++
+ // Atomic, allocation-free witness record. No pipe/file/mutex operations.
+ void WitnessEvent(WitnessCode code) noexcept;
+ 
+diff --git a/src/CloudRayMarcher.cpp b/src/CloudRayMarcher.cpp
+index 0e3ac78..f2880ce 100644
+--- a/src/CloudRayMarcher.cpp
++++ b/src/CloudRayMarcher.cpp
+@@ -1417,7 +1417,7 @@ uint64_t CloudRayMarcher::SetOutputDivisor(uint32_t outputDivisor)
+ void CloudRayMarcher::Shutdown()
+ {
+ #if defined(OGSR_CLOUDS_FAULT_INJECTION)
+-    if (clouds::ShutdownFaultPending())
++    if (clouds::ShutdownFaultPendingFor(clouds::CloudFaultPoint::ShutdownCloudWait))
+         clouds::MaybeActivateBlockedPipes("cloud-shutdown");
+ #endif
+     if (!renderer_ && !pipelineState_ && !rootSignature_)
+diff --git a/src/CloudWitness.h b/src/CloudWitness.h
+index f2e3fcb..634c078 100644
+--- a/src/CloudWitness.h
++++ b/src/CloudWitness.h
+@@ -68,6 +68,23 @@ enum class WitnessCode : LONG
+     StartupFirstFrame = 49,
+ 
+     BlockedPipesActivated = 50,
++    BlockedPipesFailed = 51,
++    BlockedPipesDeactivated = 52,
++    PipeProbeStarted = 53,
++    PipeProbeNotRequested = 54,
++
++    GpuIdleConfirmed = 60,
++    DiagnosticsDeferred = 61,
++    DiagnosticsFlushed = 62,
++    DiagnosticsUnsafe = 63,
++    GpuGateInserted = 64,
++    GpuGateReleased = 65,
++    InflightCheck = 66,
++    FrameSubmitted = 67,
++    FrameFenceConfirmed = 68,
++    DiagnosticNoticeDeferred = 69,
++    DiagnosticDrainDeferred = 70,
++    DiagnosticDrainDone = 71,
+ };
+ 
+ struct WitnessEventEntry
+@@ -93,9 +110,43 @@ struct WitnessBlock
+     // can tell a real GPU fence apart from a textual marker.
+     volatile LONG64 lastFenceValue;
+     volatile LONG64 lastCompletedValue;
++    // Interactive multi-frame diagnostics accounting.
++    volatile LONG diagDeferCount;      // deferred because later work pending
++    volatile LONG diagFlushCount;      // flushed after a confirmed full idle
++    volatile LONG diagUnsafeCount;     // MUST stay 0: sink while work pending
++    volatile LONG inflightAtDefer;     // max pending submissions at deferral
++    volatile LONG inflightAtCheck;     // pending submissions at the test check
++    volatile LONG frameSubmitCount;    // interactive Present submissions
++    volatile LONG frameConfirmCount;   // interactive frame fences confirmed
++    volatile LONG gateInserted;
++    volatile LONG gateReleased;
++    volatile LONG64 lastFlushSubmitted;
++    volatile LONG64 lastFlushCompleted;
+     WitnessEventEntry events[kWitnessEventCapacity];
+ };
+ 
++// Test-only pipe status block. Unlike the fault witness it is ALWAYS created by
++// the harness, so a witness-disabled case still reports, in a parent-observable
++// form, whether each redirected stream was really installed.
++constexpr LONG kPipeStatusMagic = 0x52505331; // 'RPS1'
++constexpr LONG kPipeStatusVersion = 1;
++
++struct PipeStatusBlock
++{
++    volatile LONG magic;
++    volatile LONG version;
++    volatile LONG stdoutRequested;
++    volatile LONG stdoutOk;
++    volatile LONG stderrRequested;
++    volatile LONG stderrOk;
++    volatile LONG activated;
++    volatile LONG probeTarget;   // 0 none, 1 stdout, 2 stderr
++    volatile LONG probeStarted;
++    volatile LONG deactivated;
++    volatile LONG stdoutError;   // SetStdHandle/_open_osfhandle/_dup2 code
++    volatile LONG stderrError;
++};
++
+ inline const char* WitnessCodeName(WitnessCode code) noexcept
+ {
+     switch (code)
+@@ -149,6 +200,22 @@ inline const char* WitnessCodeName(WitnessCode code) noexcept
+     case WitnessCode::StartupProfiler: return "startup-profiler";
+     case WitnessCode::StartupFirstFrame: return "startup-first-frame";
+     case WitnessCode::BlockedPipesActivated: return "blocked-pipes-activated";
++    case WitnessCode::BlockedPipesFailed: return "blocked-pipes-failed";
++    case WitnessCode::BlockedPipesDeactivated: return "blocked-pipes-deactivated";
++    case WitnessCode::PipeProbeStarted: return "pipe-probe-started";
++    case WitnessCode::PipeProbeNotRequested: return "pipe-probe-not-requested";
++    case WitnessCode::GpuIdleConfirmed: return "gpu-idle-confirmed";
++    case WitnessCode::DiagnosticsDeferred: return "diagnostics-deferred";
++    case WitnessCode::DiagnosticsFlushed: return "diagnostics-flushed";
++    case WitnessCode::DiagnosticsUnsafe: return "diagnostics-unsafe";
++    case WitnessCode::GpuGateInserted: return "gpu-gate-inserted";
++    case WitnessCode::GpuGateReleased: return "gpu-gate-released";
++    case WitnessCode::InflightCheck: return "inflight-check";
++    case WitnessCode::FrameSubmitted: return "frame-submitted";
++    case WitnessCode::FrameFenceConfirmed: return "frame-fence-confirmed";
++    case WitnessCode::DiagnosticNoticeDeferred: return "diagnostic-notice-deferred";
++    case WitnessCode::DiagnosticDrainDeferred: return "diagnostic-drain-deferred";
++    case WitnessCode::DiagnosticDrainDone: return "diagnostic-drain-done";
+     default: return "unknown";
+     }
+ }
+diff --git a/src/NoiseVolume.cpp b/src/NoiseVolume.cpp
+index c30469a..7045c8f 100644
+--- a/src/NoiseVolume.cpp
++++ b/src/NoiseVolume.cpp
+@@ -794,7 +794,7 @@ const char* NoiseVolume::FormatName() const
+ void NoiseVolume::Shutdown()
+ {
+ #if defined(OGSR_CLOUDS_FAULT_INJECTION)
+-    if (clouds::ShutdownFaultPending())
++    if (false)
+         clouds::MaybeActivateBlockedPipes("noise-shutdown");
+ #endif
+     if (!renderer_ && !volume_ && !computePso_ && !rootSignature_ && !probeBuffer_)
+diff --git a/src/Renderer.cpp b/src/Renderer.cpp
+index e23f3ea..6306f64 100644
+--- a/src/Renderer.cpp
++++ b/src/Renderer.cpp
+@@ -482,25 +482,17 @@ Renderer::Frame Renderer::BeginFrame()
+         if (!TryWaitForFence(backBufferFenceValues_[index],
+                             "wait for back buffer reuse"))
+             TerminalFenceWaitFailure("back buffer reuse");
+-
+-        // The previous use of this back buffer is confirmed complete. Only
+-        // now is it safe to emit deferred, non-critical present/debug
+-        // diagnostics; doing this before the fence would race the debug layer
+-        // while GPU work is still in flight.
+-        FlushPendingPresentNotice();
+-        if (pendingFrameDebugDrain_)
+-        {
+-            pendingFrameDebugDrain_ = false;
+-            try
+-            {
+-                DrainDebugMessages("frame");
+-            }
+-            catch (...)
+-            {
+-            }
+-        }
++        clouds::NoteFrameFenceConfirmed();
+     }
+ 
++    // The reused back buffer is free, but that fence says nothing about frames
++    // submitted after it: with three back buffers, later submissions can still
++    // be in flight. Deferred present/debug diagnostics are therefore emitted
++    // only when the queue fence has caught up with the LAST submission. The
++    // check is non-blocking, so several frames stay in flight and CPU/GPU
++    // overlap is preserved (no WaitForGpu here).
++    FlushDiagnosticsIfIdle("frame");
++
+     ThrowIfFailed(frameAllocators_[index]->Reset(), "Reset frame command allocator");
+     ThrowIfFailed(frameLists_[index]->Reset(frameAllocators_[index].Get(), nullptr),
+                   "Reset frame command list");
+@@ -603,6 +595,8 @@ void Renderer::Present(Frame& frame, std::vector<uint8_t>* captureRgba)
+         fenceValue = ++fenceValue_;
+         if (!TrySignalFence(fenceValue, "signal frame fence"))
+             TerminalPresentFailure("frame fence signal");
++        lastSubmittedFence_ = fenceValue;
++        clouds::NoteFrameSubmitted();
+         backBufferFenceValues_[frame.backBufferIndex] = fenceValue;
+         clouds::WitnessEvent(clouds::WitnessCode::SignalIssued);
+ 
+@@ -620,6 +614,17 @@ void Renderer::Present(Frame& frame, std::vector<uint8_t>* captureRgba)
+             if (occluded_)
+                 pendingPresentNotice_ = 2;
+             occluded_ = false;
++#if defined(OGSR_CLOUDS_FAULT_INJECTION)
++            // Test-only: exercise the deferred present-notice path (the same
++            // path a real occlusion takes) while later submissions may still be
++            // unconfirmed. The notice is emitted only after a confirmed idle.
++            if (clouds::TestEnvFlag("OGSR_CLOUD_FORCE_PRESENT_NOTICE"))
++            {
++                pendingPresentNotice_ = 1;
++                clouds::WitnessEvent(
++                    clouds::WitnessCode::DiagnosticNoticeDeferred);
++            }
++#endif
+             if (FAILED(presentResult))
+             {
+                 ReportDeviceRemoved("Present");
+@@ -892,7 +897,72 @@ bool Renderer::TryWaitForGpu() noexcept
+     const uint64_t value = ++fenceValue_;
+     if (!TrySignalFence(value, "signal full GPU wait"))
+         return false;
+-    return TryWaitForFence(value, "wait for GPU idle");
++    lastSubmittedFence_ = value;
++    if (!TryWaitForFence(value, "wait for GPU idle"))
++        return false;
++    lastConfirmedFence_ = value;
++    clouds::NoteGpuIdleConfirmed(value, fence_->GetCompletedValue());
++    return true;
++}
++
++bool Renderer::GpuIdleConfirmed() const noexcept
++{
++    if (!fence_)
++        return false;
++    // The device-removal sentinel (UINT64_MAX) must never be read as "idle":
++    // completion is unknown, not confirmed.
++    if (deviceRemoved_)
++        return false;
++    if (lastSubmittedFence_ == 0)
++        return true;
++    const uint64_t completed = fence_->GetCompletedValue();
++    if (completed == UINT64_MAX)
++        return false;
++    return completed >= lastSubmittedFence_;
++}
++
++uint32_t Renderer::InflightSubmissionCount() const noexcept
++{
++    if (!fence_ || lastSubmittedFence_ == 0)
++        return 0;
++    const uint64_t completed = fence_->GetCompletedValue();
++    if (completed == UINT64_MAX || completed >= lastSubmittedFence_)
++        return 0;
++    // Every submission signals a distinct fence value, so this difference is a
++    // conservative lower bound on the frames still executing or queued.
++    return static_cast<uint32_t>(lastSubmittedFence_ - completed);
++}
++
++bool Renderer::FlushDiagnosticsIfIdle(const char* phase)
++{
++    if (!pendingPresentNotice_ && !pendingFrameDebugDrain_)
++        return false;
++    if (!GpuIdleConfirmed())
++    {
++        // Later submissions are still in flight. A diagnostic sink here could
++        // block while GPU work is unconfirmed, so it is deferred instead.
++        clouds::NoteDiagnosticsDeferred(
++            static_cast<long>(InflightSubmissionCount()));
++        return false;
++    }
++    clouds::NoteGpuIdleConfirmed(lastSubmittedFence_,
++                                 fence_->GetCompletedValue());
++    clouds::NoteDiagnosticsFlushed(lastSubmittedFence_,
++                                   fence_->GetCompletedValue());
++    FlushPendingPresentNotice();
++    if (pendingFrameDebugDrain_)
++    {
++        pendingFrameDebugDrain_ = false;
++        clouds::WitnessEvent(clouds::WitnessCode::DiagnosticDrainDone);
++        try
++        {
++            DrainDebugMessages(phase);
++        }
++        catch (...)
++        {
++        }
++    }
++    return true;
+ }
+ 
+ void Renderer::ExecuteImmediate(
+@@ -972,6 +1042,7 @@ void Renderer::ExecuteImmediate(
+         fenceValue = ++fenceValue_;
+         if (!TrySignalFence(fenceValue, "signal immediate GPU work"))
+             TerminalImmediateFailure(label, "signal");
++        lastSubmittedFence_ = fenceValue;
+         clouds::WitnessEvent(clouds::WitnessCode::SignalIssued);
+ 
+         stage = "post-signal logger fault";
+@@ -1122,7 +1193,7 @@ void Renderer::ReportLiveObjects()
+ void Renderer::Shutdown()
+ {
+ #if defined(OGSR_CLOUDS_FAULT_INJECTION)
+-    if (clouds::ShutdownFaultPending())
++    if (clouds::ShutdownFaultPendingFor(clouds::CloudFaultPoint::ShutdownRendererWait))
+         clouds::MaybeActivateBlockedPipes("renderer-shutdown");
+ #endif
+     if (!initialized_ && !device_)
+diff --git a/src/Renderer.h b/src/Renderer.h
+index 21a47f9..528b36f 100644
+--- a/src/Renderer.h
++++ b/src/Renderer.h
+@@ -62,6 +62,22 @@ public:
+     // exception: constructing/throwing an exception object allocates on the
+     // heap, and the terminal action must not depend on the heap.
+     [[nodiscard]] bool TryWaitForGpu() noexcept;
++
++    // Non-blocking: true only when EVERY submission issued so far is confirmed
++    // complete by the fence. A confirmed back-buffer fence is not enough: with
++    // three back buffers, later frames can still be in flight behind it.
++    [[nodiscard]] bool GpuIdleConfirmed() const noexcept;
++    [[nodiscard]] uint64_t LastSubmittedFenceValue() const noexcept
++    {
++        return lastSubmittedFence_;
++    }
++    // Number of submissions issued after the last fully confirmed fence.
++    [[nodiscard]] uint32_t InflightSubmissionCount() const noexcept;
++
++
++    // Deferred interactive diagnostics are emitted only when the whole GPU is
++    // idle. Returns true when a flush actually happened.
++    bool FlushDiagnosticsIfIdle(const char* phase);
+     void ExecuteImmediate(
+         const std::function<void(ID3D12GraphicsCommandList*)>& record,
+         const char* label);
+@@ -156,6 +172,11 @@ private:
+     ComPtr<ID3D12Fence> fence_;
+     HANDLE fenceEvent_ = nullptr;
+     uint64_t fenceValue_ = 0;
++    // Highest fence value that has been signalled on the queue. Deferred
++    // diagnostics may only run when the fence has reached this value.
++    uint64_t lastSubmittedFence_ = 0;
++    uint64_t lastConfirmedFence_ = 0;
++
+     uint64_t backBufferFenceValues_[kBackBufferCount]{};
+ 
+     ComPtr<ID3D12Resource> screenReadback_;
+diff --git a/src/WeatherMap.cpp b/src/WeatherMap.cpp
+index ae6f801..2637e78 100644
+--- a/src/WeatherMap.cpp
++++ b/src/WeatherMap.cpp
+@@ -534,7 +534,7 @@ void WeatherMap::Transition(ID3D12GraphicsCommandList* list,
+ void WeatherMap::Shutdown()
+ {
+ #if defined(OGSR_CLOUDS_FAULT_INJECTION)
+-    if (clouds::ShutdownFaultPending())
++    if (false)
+         clouds::MaybeActivateBlockedPipes("weather-shutdown");
+ #endif
+     if (!renderer_ && !texture_ && !pipelineState_ && !rootSignature_)
+diff --git a/tests/terminal_witness_harness.cpp b/tests/terminal_witness_harness.cpp
+index 2d80724..f187ec4 100644
+--- a/tests/terminal_witness_harness.cpp
++++ b/tests/terminal_witness_harness.cpp
+@@ -28,6 +28,9 @@ struct Options
+     int blockMode = 0; // 1 stdout, 2 stderr, 3 both
+     std::wstring blockAt;
+     bool witnessDisabled = false;
++    // Test-only: deliberately pass an invalid handle for this stream so the
++    // child's pipe installation must FAIL and must not report activation.
++    std::wstring breakHandle;
+     std::vector<std::pair<std::wstring, std::wstring>> env;
+     std::vector<std::wstring> childArgs;
+ };
+@@ -42,6 +45,9 @@ struct PipeBlock
+ bool g_parentWitnessReady = false;
+ clouds::WitnessBlock* g_parentWitness = nullptr;
+ HANDLE g_parentMapping = nullptr;
++bool g_parentPipeStatusReady = false;
++clouds::PipeStatusBlock* g_parentPipeStatus = nullptr;
++HANDLE g_parentPipeStatusMapping = nullptr;
+ 
+ const wchar_t* kTestEnvNames[] = {
+     L"OGSR_CLOUD_FAULT_POINT",
+@@ -147,6 +153,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options)
+             options.blockAt = argv[++i];
+         else if (arg == L"--witness-disable")
+             options.witnessDisabled = true;
++        else if (arg == L"--break-handle" && i + 1 < argc)
++            options.breakHandle = argv[++i];
+         else if (arg == L"--env" && i + 1 < argc)
+         {
+             std::wstring pair = argv[++i];
+@@ -211,9 +219,65 @@ bool SetWitnessEnvironment(const Options& options)
+     SetEnvironmentVariableA("OGSR_CLOUD_WITNESS_SHM", narrow);
+     if (options.witnessDisabled)
+         SetEnvironmentVariableA("OGSR_CLOUD_WITNESS_DISABLE", "1");
++
++    // The pipe-status block is created unconditionally: it is the parent-side,
++    // witness-independent proof that each requested stream was really installed.
++    wchar_t pipeShmName[180]{};
++    swprintf_s(pipeShmName, L"Local\\OGSRCloudPipeStatus_%lu_%ls",
++               GetCurrentProcessId(), options.name.c_str());
++    const HANDLE pipeMapping = CreateFileMappingW(
++        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
++        sizeof(clouds::PipeStatusBlock), pipeShmName);
++    if (!pipeMapping)
++        return false;
++    void* pipeView = MapViewOfFile(pipeMapping, FILE_MAP_ALL_ACCESS, 0, 0,
++                                   sizeof(clouds::PipeStatusBlock));
++    if (!pipeView)
++    {
++        CloseHandle(pipeMapping);
++        return false;
++    }
++    g_parentPipeStatusMapping = pipeMapping;
++    auto* pipeBlock = static_cast<clouds::PipeStatusBlock*>(pipeView);
++    ZeroMemory(pipeBlock, sizeof(*pipeBlock));
++    pipeBlock->magic = clouds::kPipeStatusMagic;
++    pipeBlock->version = clouds::kPipeStatusVersion;
++    g_parentPipeStatus = pipeBlock;
++    g_parentPipeStatusReady = true;
++
++    char pipeNarrow[180]{};
++    WideCharToMultiByte(CP_UTF8, 0, pipeShmName, -1, pipeNarrow,
++                        sizeof(pipeNarrow), nullptr, nullptr);
++    SetEnvironmentVariableA("OGSR_CLOUD_PIPESTATUS_SHM", pipeNarrow);
+     return true;
+ }
+ 
++void WritePipeStatus(const std::wstring& path, const Options& options)
++{
++    FILE* file = nullptr;
++    _wfopen_s(&file, path.c_str(), L"w, ccs=UTF-8");
++    if (!file)
++        return;
++    const clouds::PipeStatusBlock* block = g_parentPipeStatus;
++    const int stdoutRequested = (options.blockMode & 1) ? 1 : 0;
++    const int stderrRequested = (options.blockMode & 2) ? 1 : 0;
++    fwprintf(file,
++             L"{\"stdout_requested\":%d,\"stderr_requested\":%d,"
++             L"\"stdout_ok\":%d,\"stderr_ok\":%d,\"activated\":%d,"
++             L"\"probe_target\":%d,\"probe_started\":%d,"
++             L"\"deactivated\":%d,\"stdout_error\":%d,\"stderr_error\":%d}\n",
++             stdoutRequested, stderrRequested,
++             block ? block->stdoutOk : 0,
++             block ? block->stderrOk : 0,
++             block ? block->activated : 0,
++             block ? block->probeTarget : 0,
++             block ? block->probeStarted : 0,
++             block ? block->deactivated : 0,
++             block ? block->stdoutError : 0,
++             block ? block->stderrError : 0);
++    fclose(file);
++}
++
+ void WriteWitness(const std::wstring& path, const clouds::WitnessBlock* block)
+ {
+     FILE* file = nullptr;
+@@ -232,13 +296,31 @@ void WriteWitness(const std::wstring& path, const clouds::WitnessBlock* block)
+                    L"\"last_fence_value\":%lld,"
+                    L"\"last_completed_value\":%lld,"
+                    L"\"fence_confirmed_count\":%ld,"
++                   L"\"diag_defer_count\":%ld,"
++                   L"\"diag_flush_count\":%ld,"
++                   L"\"diag_unsafe_count\":%ld,"
++                   L"\"inflight_at_defer\":%ld,"
++                   L"\"inflight_at_check\":%ld,"
++                   L"\"frame_submit_count\":%ld,"
++                   L"\"frame_confirm_count\":%ld,"
++                   L"\"gate_inserted\":%ld,"
++                   L"\"gate_released\":%ld,"
+                    L"\"events\":[",
+              block->terminalFlag ? 1L : 0L,
+              static_cast<long long>(block->submitCount),
+              static_cast<long long>(block->lastSubmittedList),
+              static_cast<long long>(block->lastFenceValue),
+              static_cast<long long>(block->lastCompletedValue),
+-             block->fenceConfirmedCount ? 1L : 0L);
++             block->fenceConfirmedCount ? 1L : 0L,
++             block->diagDeferCount,
++             block->diagFlushCount,
++             block->diagUnsafeCount,
++             block->inflightAtDefer,
++             block->inflightAtCheck,
++             block->frameSubmitCount,
++             block->frameConfirmCount,
++             block->gateInserted,
++             block->gateReleased);
+     const LONG count = block->sequence;
+     bool first = true;
+     for (LONG i = 0; i < count; ++i)
+@@ -308,17 +390,24 @@ int Run(const Options& options)
+         SetEnvironmentVariableW(name, value);
+     };
+ 
++    const bool breakStdout = options.breakHandle == L"stdout";
++    const bool breakStderr = options.breakHandle == L"stderr";
+     if (options.blockMode & 1)
+     {
+         if (!CreateBlockedPipe(stdoutPipe))
+             return 2;
+         setHandleEnv(L"OGSR_CLOUD_BLOCK_STDOUT_HANDLE", stdoutPipe.write);
++        // Override AFTER the real handle: the child must detect the failure.
++        if (breakStdout)
++            SetEnvironmentVariableW(L"OGSR_CLOUD_BLOCK_STDOUT_HANDLE", L"1");
+     }
+     if (options.blockMode & 2)
+     {
+         if (!CreateBlockedPipe(stderrPipe))
+             return 2;
+         setHandleEnv(L"OGSR_CLOUD_BLOCK_STDERR_HANDLE", stderrPipe.write);
++        if (breakStderr)
++            SetEnvironmentVariableW(L"OGSR_CLOUD_BLOCK_STDERR_HANDLE", L"1");
+     }
+     if (options.blockMode != 0)
+         SetEnvironmentVariableW(L"OGSR_CLOUD_BLOCK_AT_LABEL",
+@@ -382,6 +471,7 @@ int Run(const Options& options)
+     // Re-use the parent mapping created before launch.
+     WriteWitness(witnessPath,
+                  g_parentWitnessReady ? g_parentWitness : nullptr);
++    WritePipeStatus(JoinPath(options.outDir, L"pipe_status.json"), options);
+ 
+     FILE* exitFile = nullptr;
+     _wfopen_s(&exitFile, exitPath.c_str(), L"w, ccs=UTF-8");

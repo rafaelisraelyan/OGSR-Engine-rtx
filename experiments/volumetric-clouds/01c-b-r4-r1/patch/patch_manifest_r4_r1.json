@@ -1,0 +1,84 @@
+{
+  "format": "V_WEATHER_01C_B_R4_R1_PATCH_MANIFEST_V1",
+  "baseline": "C:\\Users\\GR\\AppData\\Local\\OGSR_V_WEATHER_01A_WORK\\01c_b_r4_work\\standalone_01c_b_r4",
+  "baseline_zip_sha256": "bfc4bdd5d74da39226617a2093981e5819d207f7d6ae67d6aedda69a7d5151c8",
+  "current": "C:\\Users\\GR\\AppData\\Local\\OGSR_V_WEATHER_01A_WORK\\01c_b_r4_r1_work\\standalone_01c_b_r4_r1",
+  "eol_policy": "byte-exact, no normalisation",
+  "files": [
+    {
+      "path": "src/Renderer.h",
+      "base_exists": true,
+      "base_sha256": "d5477b75858d6f26cbd6ea9996a21ec9f219c493597efb9361140c13c1d6960b",
+      "current_sha256": "0b92c809ddcc848791075c8c6b71532f5357a4aea3499ed6e1fe8e0dda01606c",
+      "current_size": 7685
+    },
+    {
+      "path": "src/Renderer.cpp",
+      "base_exists": true,
+      "base_sha256": "754643eef97338153dbd3286850314d47dff6070f4d385700c996a98da695acc",
+      "current_sha256": "ba20364acceea17db46bbb32c07f4dff5e354bc7c3d864c62a520daba29ddb12",
+      "current_size": 47142
+    },
+    {
+      "path": "src/Application.cpp",
+      "base_exists": true,
+      "base_sha256": "8543b46e0e677a550a32d8d42adb8c80c26784444907c76273a44aeb75ada2f1",
+      "current_sha256": "54b6833008003cd968aaffbc1a97429bac265b50c6cf86ca913e42609d0d0c4f",
+      "current_size": 240466
+    },
+    {
+      "path": "src/CloudFaultInjection.h",
+      "base_exists": true,
+      "base_sha256": "0f6661807e9ed0a29e28ae5b7133ace41affde75abb56e19762800a4ca2e10d0",
+      "current_sha256": "06567f96f885066b32d7741a354125b935959e493ff98d57abf04cf5032abaa0",
+      "current_size": 5708
+    },
+    {
+      "path": "src/CloudFaultInjection.cpp",
+      "base_exists": true,
+      "base_sha256": "b72d48efa88e518e0d2d88ffe24954dc8b90ed9f952255b3e90195be6312920e",
+      "current_sha256": "a0f87506f32f5df63a51d0525b89cc0212ceb62f8ab43d237f87a9945590652b",
+      "current_size": 24819
+    },
+    {
+      "path": "src/CloudWitness.h",
+      "base_exists": true,
+      "base_sha256": "3a6c9c2d7c159ebd13509da67ad4d46dd1854402c7497c4e0018d9583e017d36",
+      "current_sha256": "45226436d16112b44074815705a8591312bfad13b8e3bf60afccfe8dd6e0244a",
+      "current_size": 9451
+    },
+    {
+      "path": "src/NoiseVolume.cpp",
+      "base_exists": true,
+      "base_sha256": "6d1eeda34008c959e21e557dae26c2a3ed7a844247edb6a14a9b4db3c634407d",
+      "current_sha256": "4197a1a2c730f43f3e6b405bc388a03ccc54fa9220210cc8dbb5bb90d9972c18",
+      "current_size": 32029
+    },
+    {
+      "path": "src/WeatherMap.cpp",
+      "base_exists": true,
+      "base_sha256": "8c9fae3890172c08c31f345f1c1d8ae7d670df11c3dd4d7f0e9502327c8326fc",
+      "current_sha256": "18824b00cbe5057d367d3c1cf9678490d8e3d8c07a2c3a96de01200bca07d121",
+      "current_size": 21282
+    },
+    {
+      "path": "src/CloudRayMarcher.cpp",
+      "base_exists": true,
+      "base_sha256": "31805c8089a0535784b7533be1b32ce497c247b90855a9d01b5d6e411cd2a08d",
+      "current_sha256": "9799b0489044cb9643d74e75d6a1e28da8ec721c37abeaacaa2c471db773b8e8",
+      "current_size": 63676
+    },
+    {
+      "path": "tests/terminal_witness_harness.cpp",
+      "base_exists": true,
+      "base_sha256": "35b9e513fe117749d47ea65c50ef95085539684007b2839976be7653974f0154",
+      "current_sha256": "c5bff3be72eaac335a61669b0c7fffc5f96b27bb2a6a8fbf82192e6ed7b1d8b1",
+      "current_size": 17953
+    }
+  ],
+  "patch_sha256": "d101e9b4eff98ac586a0dd77d7fc9c359fb4bf2be47d2f07b1927a4140ccc7d1",
+  "patch_lines": 1209,
+  "apply_check": "PASS",
+  "apply_mismatches": [],
+  "apply_mode": "byte-for-byte, core.autocrlf=false"
+}
