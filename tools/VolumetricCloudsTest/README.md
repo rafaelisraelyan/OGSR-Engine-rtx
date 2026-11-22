@@ -1,17 +1,18 @@
 # OGSR Volumetric Clouds — standalone DX12 test
 
-Изолированный Windows-инструмент для V0 NoiseVolume/SliceViewer и V1
-volumetric clouds. Не использует X-Ray, `xrCore`, `xrRenderDX12`,
-`xrRender_R4`, игровую физику или материалы. Собирается только с системными
-библиотеками Windows SDK.
+Изолированный Windows-инструмент для V0 NoiseVolume/SliceViewer, V1
+volumetric clouds и V2.3 lighting/atmosphere checkpoint. Не использует
+X-Ray, `xrCore`, `xrRenderDX12`, `xrRender_R4`, игровую физику или материалы.
+Собирается только с системными библиотеками Windows SDK.
 
-Текущий этап — **V1**: ограниченный облачный слой, DX12 compute ray marching,
-Beer–Lambert, Henyey–Greenstein, Clear/Overcast пресеты, compositing и GPU
-timestamps. V0 срезы шума сохранены и являются режимом по умолчанию для
-обратной совместимости. Игровой DX11/DX12 и F4.0 не изменяются.
+Текущий этап — **V2.3**: clipped sun optical depth, единая геометрия плотности
+для камеры и теней, skylight ambient, аналитическая атмосферная перспектива,
+jitter modes, deterministic frame sequences и quality profiles.
+Геометрия облаков V2.2b не менялась.
 
-Статус V1 после audit correction: **READY FOR V1 FINAL DELTA REVIEW**.
-PASS не присваивается до независимой приёмки.
+Статус: **READY FOR V2.3 INDEPENDENT REVIEW**. V2 PASS не присваивается.
+Overcast/Storm «шторы» остаются shape-ограничением density; это зафиксировано
+в known issues. Игровой DX11/DX12, F4.0 и погодные системы не изменяются.
 
 ## Сборка
 
@@ -35,20 +36,43 @@ HLSL-файлы копируются в `shaders/` рядом с EXE и загр
 | Команда | Назначение |
 |---|---|
 | `--mode=slices` | V0 просмотр срезов шума; режим по умолчанию |
-| `--mode=clouds` | V1 volumetric clouds |
-| `--preset=clear` | Clear Day: умеренная облачность, светлые объёмы |
-| `--preset=overcast` | Overcast: плотный слой, тёмные основания |
-| `--steps=N` | шаги ray marching, 8..128 (обычно 32/64) |
+| `--mode=clouds` | volumetric clouds (V2.3) |
+| `--preset=clear` | Clear Day: разреженные облака и большие просветы |
+| `--preset=partly` | Partly Cloudy: крупные массы и широкие просветы |
+| `--preset=overcast` | Overcast: плотный неоднородный слой |
+| `--preset=rain` | Rain Approaching: тёмный фронт |
+| `--preset=storm` | Storm Clouds: массивные грозовые массы |
+| `--preset=sunset` | Sunset / Low Sun: контровое освещение |
+| `--steps=N` | шаги ray marching, 8..256 (quality default 128) |
+| `--shadow-steps=N` | сэмплы солнечной тени, 1..16 (default 6) |
+| `--sun-shadow-distance=M` | предел пути солнечного луча, метры (default 6000) |
+| `--jitter=off\|spatial` | детерминированный jitter выборки (default spatial) |
+| `--lighting=full\|sun-only\|ambient-only` | изоляция вкладов освещения |
+| `--atmosphere=on\|off` | аналитическая атмосферная перспектива |
+| `--profile=performance\|balanced\|quality\|reference` | quality/performance профили |
+| `--sun-elevation=F` / `--sun-azimuth=F` | диагностический override солнца |
+| `--sequence=DIR` | детерминированная последовательность кадров |
+| `--motion=static\|pan-slow\|pan-fast\|up\|fly` | движение камеры в sequence |
+| `--wind=on\|off` | ветер в sequence |
+| `--camera=x,y,z`, `--camera-yaw=F`, `--camera-pitch=F` | стартовая камера sequence |
 | `--window=WxH` | клиентский размер окна, например `1920x1080` |
 | `--coverage=F` | покрытие неба 0..1 |
 | `--density=F` | множитель плотности 0..2 |
-| `--debug-mode=final\|density\|transmittance\|steps\|occupancy` | debug-вывод |
+| `--debug-mode=final\|density\|transmittance\|steps\|occupancy\|weather\|cloud-type\|density-slice\|sun-depth\|sun-transmittance\|shadow-diff\|atmosphere-transmittance\|shadow-path` | debug-вывод |
 | `--time=SECONDS` | фиксированное время ветра для captures |
-| `--selftest` | V0 + V1 проверки, пишет `selftest.txt` |
-| `--capture[=DIR]` | снимки; в clouds mode — 11 сцен, в slices — 10 BMP |
+| `--weather-seed=N` | seed world-space weather map (default 7331) |
+| `--ablation=MODE` | profiling/diagnostic density/shadow ablation |
+| `--vertical-noise=F` | override vertical noise scale |
+| `--scene=NAME` | одна сцена для диагностического capture |
+| `--noise-slice-capture=DIR` | XY/XZ/YZ срезы NoiseVolume |
+| `--slice-axis=xy\|xz\|yz` | ориентация V0-среза |
+| `--cloud-scale=half\|full` | half или full-resolution cloud output |
+| `--warmup=N` | отбросить GPU timings до кадра N |
+| `--selftest` | V0 + V2.3 проверки, пишет `selftest.txt` |
+| `--capture[=DIR]` | снимки; в clouds mode — 38 сцен, в slices — 10 BMP |
 | `--frames=N` | ограничить число кадров |
 | `--resize-test` | два resize во время `--frames` |
-| `--size=64` / `--size=128` | разрешение 3D NoiseVolume |
+| `--size=64` / `--size=128` / `--size=256` | разрешение 3D NoiseVolume |
 | `--seed=N` | seed шума |
 | `--format=16f` / `--format=unorm` | формат 3D-объёма |
 | `--adapter=N`, `--warp` | выбор адаптера / WARP |
@@ -56,11 +80,18 @@ HLSL-файлы копируются в `shaders/` рядом с EXE и загр
 | `--gpu-validation` | GPU-based validation (включает debug layer) |
 | `--test-no-validation` | служебный negative-тест недоступной validation |
 | `--test-no-info-queue` | служебный negative-тест без `ID3D12InfoQueue` |
+| `--test-inject-debug-error` | служебный negative-тест: инъекция D3D12 ERROR после cloud selftest |
 | `--no-vsync` | отключить vsync |
 
 `--selftest` возвращает 0 при PASS, 1 при functional FAIL, 3 при
 INCONCLUSIVE. `--test-no-validation` и `--test-no-info-queue` предназначены
 только для аудита. `--capture` и `--selftest` можно совмещать.
+
+Validation verdict пересчитывается **после** cloud GPU work: selftest ждёт
+GPU, дренирует `ID3D12InfoQueue` и проверяет накопленные сообщения. Любая
+validation ERROR даёт FAIL и exit 1; `--test-inject-debug-error` — служебный
+тест этого пути. Финальный отчёт содержит `final validation verdict` и
+`final debug errors`.
 
 ## Управление
 
@@ -72,14 +103,16 @@ INCONCLUSIVE. `--test-no-validation` и `--test-no-info-queue` предназн�
 | `W/S/A/D/Q/E` | движение; `Shift` — быстрее |
 | колесо, `Z/X` | FOV |
 | `J/L`, `I/K` | азимут / высота солнца |
-| `1` / `2` | Clear Day / Overcast |
+| `1` / `2` / `3` | Clear / Overcast / Partly Cloudy (smooth transition) |
+| `F5` (+Shift) | следующий / предыдущий погодный пресет |
 | `5` / `6` / `7` / `8` | final / density / transmittance / executed steps |
-| `9` | occupancy: шаги с ненулевой плотностью |
+| `9` / `0` / `V` | occupancy / weather coverage / cloud type |
+| `D` | vertical density slice |
 | `M` | циклически сменить debug-режим |
 | `+/-` | density |
 | `[` / `]` | coverage |
 | `,` / `.` | скорость ветра |
-| `P` | пауза анимации ветра |
+| `P` | пауза анимации и перехода погоды |
 | `R` | сброс к воспроизводимой Clear Day сцене |
 | `N` | перегенерация NoiseVolume |
 | `4` | переключить 64³ / 128³ |
@@ -92,6 +125,73 @@ INCONCLUSIVE. `--test-no-validation` и `--test-no-info-queue` предназн�
 `1/2/3` — Perlin/Worley/Combined, стрелки и колесо — Z-срез, `Space` —
 анимация, `D` — диагностика швов, `N` — перегенерация, `4` — 64/128,
 `G/F/O/W/B/E/K` — параметры шума, `F2` — clouds, `H/F1` — справка.
+
+## Архитектура V2.3
+
+```
+world XZ ── wind offset ──► WeatherMap 256×256 RGBA8 (WRAP)
+                                      │ R coverage
+                                      │ G cloud type
+                                      │ B local density
+                                      │ A periodic storm/front
+                                      ▼
+                         type weights / local height / top+bottom fields
+                                      │
+NoiseTexture3D (V0) ──► domain-warped macro + low-frequency mid
+                                      │
+                                      ▼
+                 ONE density geometry (camera and shadow samples)
+                                      │
+              clipped sun ray ──► tau_sun ──► T_sun + multiple scattering
+              sky zenith/horizon ──► skylight ambient
+                                      │
+                                      ▼
+          analytic atmosphere: T_atm, L_atm_front (weighted cloud distance)
+                                      │
+                                      ▼
+                    CloudRayMarcher (half or full)
+                                      │
+                    CloudComposite (sky * T + cloudRGB)
+```
+
+- **V2.3B**: `SampleCloudDensityInternal(position)` — единственная функция
+  геометрии. `SampleCloudDensity` и `SampleCloudDensityForLight` — обёртки над
+  ней; debug `shadow-density-diff` доказывает совпадение (max 2.38e-7).
+- **V2.3A**: солнечный луч обрезается консервативным slab и
+  `--sun-shadow-distance`; `tau_sun = ∫ rho ds` на этом отрезке.
+  `--debug-mode=sun-depth|sun-transmittance|shadow-path` показывают вклады.
+- **V2.3C**: direct `S*T*phase`, multiple scattering
+  `T + MS*(1-T)`, skylight ambient с occlusions по высоте и плотности.
+  `--lighting=sun-only|ambient-only` изолирует вклады.
+- **V2.3D**: `tau_atm = beta*exp(-h_avg/H)*d`, `T_atm = exp(-tau_atm)`;
+  `L_atm_front = skyColor*(1-T_atm)`; `T_total = T_cloud*T_atm`.
+  `--atmosphere=on|off` для A/B; при `coverage=0` кадры совпадают.
+- **V2.3E**: `--jitter=off|spatial`; `--sequence` + `--motion` +
+  `--camera` пишут кадры и `sequence_metrics.txt`.
+- **V2.3F**: `--profile=performance|balanced|quality|reference`.
+- Weather map генерируется GPU compute один раз; слоты `9/10/11` заняты,
+  `0..8` сохранены за V0/V1.
+- Ветер вычитается из world XZ до сэмплирования карты и 3D noise.
+- `IntersectLayer` использует консервативные bounds:
+  `volumeMargin = 0.5*heightVariation + 0.35*layerThickness`.
+- `--debug-mode=density-slice` / `D` — вертикальный срез плотности.
+- `--noise-slice-capture` + `--slice-axis` — XY/XZ/YZ срезы NoiseVolume.
+- `--ablation` — density/shadow/no-warp/macro-only диагностика.
+- `CloudProfiler` пишет median/p95/min/max; `--warmup=N` отбрасывает прогрев
+  ровно (120 frames + warmup 20 = 100 samples).
+
+### Ограничения V2.3
+
+- Overcast/Storm underside содержит крупные вертикальные «шторы» — это форма
+  density (V2.2b), lighting её читает, но не перестраивает.
+- Полноценный temporal reprojection/denoiser не добавлялся; jitter
+  детерминированный, sequences измеряют зерно, а не TAA.
+- 32/64 шага дают step-aliasing; quality path — 128 steps + jitter.
+- Detail/fine убраны из core density (диагностические пути сохранены).
+- `weatherEvolution` reserved for V2.4, не работает.
+- Нижняя полусфера остаётся атмосферной дымкой без геометрии.
+- Weather tile 4096 может повторяться на дистанции.
+- Нет cloud shadows, молний, выбросов, DXR, игрового DX12.
 
 ## Архитектура V1
 
@@ -264,24 +364,41 @@ OGSRCloudsTest.exe --mode=clouds --preset=clear --time=1 --capture=<t1>
 
 ## Производительность
 
-Измерения — GPU timestamps, не CPU frame time. Пример на NVIDIA GeForce RTX
-5070 Laptop GPU, 128³ noise, half-resolution cloud output, 120 кадров:
+GPU timestamps, 1920×1080, 120 кадров, warmup 20 (100 samples), burn-in 30 s,
+3 повтора, конфигурации чередуются; clocks/power/temp пишутся через
+`nvidia-smi` (`scripts/measure_v23_performance.ps1`). Laptop RTX 5070
+чередует power state 25–112 W, разброс внутри конфигурации до 5.8×.
+В таблице — best-case (наименее throttled) cloud ms; сравнивать можно только
+строки одного прогона.
 
-| Разрешение | Пресет | Шаги | Cloud ms | Composite ms | Total ms |
-|---|---|---:|---:|---:|---:|
-| 1280×720 | Clear | 32 | 0.362 | 0.043 | 0.405 |
-| 1280×720 | Clear | 64 | 0.738 | 0.091 | 0.829 |
-| 1280×720 | Overcast | 32 | 0.362 | 0.024 | 0.386 |
-| 1280×720 | Overcast | 64 | 0.831 | 0.025 | 0.856 |
-| 1920×1080 | Clear | 32 | 0.554 | 0.058 | 0.612 |
-| 1920×1080 | Clear | 64 | 1.250 | 0.097 | 1.347 |
-| 1920×1080 | Overcast | 32 | 0.761 | 0.058 | 0.818 |
-| 1920×1080 | Overcast | 64 | 1.554 | 0.054 | 1.608 |
+| Profile | Steps | Shadow | Scale | Clear | Overcast | Storm |
+|---|---:|---:|---|---:|---:|---:|
+| performance | 64 | 2 | half | 1.931 | 1.561 | 0.685 |
+| balanced | 96 | 4 | half | 2.655 | 3.054 | 1.509 |
+| quality | 128 | 6 | half | 4.178 | 4.790 | 2.642 |
+| reference | 128 | 6 | full | 12.597 | 16.849 | 9.528 |
 
-Это измерения конкретной машины и не являются обещанием FPS-бюджета.
+Quality — рекомендуемый режим; reference (full-res) в 3–3.5× дороже.
+V2.2b vs V2.3, interleaved в одной сессии, 1080p half 128:
+Clear 3.489 → 3.926 ms (+13%), Overcast 4.322 → 4.337 (+0.3%),
+Storm 2.161 → 2.520 (+17%). Стоимость нового освещения — +0–17%.
+
+Step sweep (1080p half, shadow 6): 32/64/96/128 = 1.524/2.545/3.437/4.213 ms
+(Clear), 1.707/2.794/3.837/4.770 ms (Overcast).
+Shadow sweep (128 steps): 1/2/4/6 = 2.907/3.205/3.684/4.149 ms (Clear),
+2.343/2.844/3.861/4.627 ms (Overcast).
+
+Полные данные: `artifacts/v23_final_evidence/performance_v23.txt`,
+`performance_v23_summary.txt`, `performance_v22b_vs_v23.txt`.
 
 ## Evidence
 
+- `artifacts/v23_final_evidence/` — V2.3 selftests, GBV/negative logs,
+  `performance_v23*.txt`, `performance_v22b_vs_v23.txt`,
+  `temporal_metrics.txt`, `lighting_ab.txt`.
+- `artifacts/v23_lighting/` — lighting/atmosphere/sun-path A/B sheets.
+- `artifacts/v23_sequences/` — 12 последовательностей по 30 кадров + metrics.
+- `artifacts/v23_final_capture/` — 38 сцен × 720p half, 720p full, 1080p half.
 - `artifacts/v1_evidence/` — build/CTest, hardware/WARP/GBV selftests,
   negative-validation matrix, GPU timestamp matrix, performance.txt.
 - `artifacts/v1_capture/` — 720p Clear/Overcast/debug/camera captures,

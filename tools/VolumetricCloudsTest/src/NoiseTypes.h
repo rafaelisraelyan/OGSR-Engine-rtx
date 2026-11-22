@@ -132,7 +132,7 @@ struct ViewConstants
     uint32_t resolution = 128;
 
     float time = 0.0f;
-    uint32_t reserved0 = 0;
+    uint32_t sliceAxis = 0;     // 0 XY, 1 XZ, 2 YZ
     uint32_t reserved1 = 0;
     uint32_t reserved2 = 0;
 };

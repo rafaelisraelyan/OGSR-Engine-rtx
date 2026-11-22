@@ -61,6 +61,14 @@ public:
         const std::function<void(ID3D12GraphicsCommandList*)>& record,
         const char* label);
 
+    // Drains all stored debug messages into the running error/warning totals.
+    // Used by the selftest after cloud GPU work so the final verdict sees every
+    // message, not just the messages present before the cloud pass.
+    void PollDebugMessages(const char* phase);
+    // Test-only: injects one D3D12 ERROR into the info queue. Requires the
+    // debug layer and an available ID3D12InfoQueue.
+    bool InjectDebugError();
+
     ID3D12Device* Device() const { return device_.Get(); }
     ID3D12CommandQueue* Queue() const { return queue_.Get(); }
     ID3D12DescriptorHeap* SrvHeap() const { return srvHeap_.Get(); }

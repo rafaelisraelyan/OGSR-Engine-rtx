@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 class Renderer;
 
@@ -29,6 +30,7 @@ public:
     // Call only after the fence for frameIndex has completed.
     void Collect(uint32_t frameIndex);
     void CollectAll();
+    void ResetStatistics();
     void LogSummary() const;
 
     double LastCloudMs() const { return lastCloudMs_; }
@@ -50,4 +52,7 @@ private:
     double sumCompositeMs_ = 0.0;
     double sumTotalMs_ = 0.0;
     uint64_t samples_ = 0;
+    std::vector<double> cloudSamples_;
+    std::vector<double> compositeSamples_;
+    std::vector<double> totalSamples_;
 };

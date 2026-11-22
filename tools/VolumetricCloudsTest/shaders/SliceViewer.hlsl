@@ -3,6 +3,8 @@
 // Sampling uses a static linear-wrap sampler, which also lets the diagnostic
 // mode tile the volume 3x3 and expose any discontinuity at the seams.
 
+#pragma warning(disable: 4000)
+
 Texture3D<float4> NoiseTexture : register(t0);
 SamplerState LinearWrap : register(s0);
 
@@ -14,7 +16,7 @@ cbuffer ViewParams : register(b0)
     uint Resolution;
 
     float Time;
-    uint Reserved0;
+    uint SliceAxis;     // 0 XY, 1 XZ, 2 YZ
     uint Reserved1;
     uint Reserved2;
 };
@@ -41,6 +43,15 @@ float SelectChannel(float4 value, uint channel)
     return channel == 0 ? value.r : (channel == 1 ? value.g : value.b);
 }
 
+float3 AxisUv(float2 planeUv, float z, uint axis)
+{
+    if (axis == 1)
+        return float3(planeUv.x, z, planeUv.y); // XZ
+    if (axis == 2)
+        return float3(z, planeUv.x, planeUv.y); // YZ
+    return float3(planeUv, z);                  // XY
+}
+
 float4 SlicePS(VertexOutput input) : SV_Target0
 {
     // SliceIndex is in texel units, so texel centers map to (i + 0.5) / N.
@@ -54,7 +65,8 @@ float4 SlicePS(VertexOutput input) : SV_Target0
         // the 3x3 tiling has no visible discontinuity at the internal borders.
         // Only the outer image frame is tinted; internal joins stay untouched.
         const float2 tiledUv = input.uv * 3.0;
-        const float4 noise = NoiseTexture.SampleLevel(LinearWrap, float3(tiledUv, z), 0);
+        const float4 noise = NoiseTexture.SampleLevel(
+            LinearWrap, AxisUv(tiledUv, z, SliceAxis), 0);
         const float value = SelectChannel(noise, Channel);
 
         const float2 edge = min(input.uv, 1.0 - input.uv);
@@ -63,7 +75,8 @@ float4 SlicePS(VertexOutput input) : SV_Target0
         return float4(color, 1.0);
     }
 
-    const float4 noise = NoiseTexture.SampleLevel(LinearWrap, float3(input.uv, z), 0);
+    const float4 noise = NoiseTexture.SampleLevel(
+        LinearWrap, AxisUv(input.uv, z, SliceAxis), 0);
     const float value = SelectChannel(noise, Channel);
     return float4(value, value, value, 1.0);
 }

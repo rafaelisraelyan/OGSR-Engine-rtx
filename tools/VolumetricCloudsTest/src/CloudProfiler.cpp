@@ -3,7 +3,9 @@
 #include "Renderer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace
 {
@@ -76,6 +78,7 @@ void CloudProfiler::Shutdown()
     enabled_ = false;
     renderer_ = nullptr;
     pending_.fill(false);
+    ResetStatistics();
 }
 
 void CloudProfiler::BeginFrame(ID3D12GraphicsCommandList* list,
@@ -159,6 +162,9 @@ void CloudProfiler::Collect(uint32_t frameIndex)
     sumCloudMs_ += lastCloudMs_;
     sumCompositeMs_ += lastCompositeMs_;
     sumTotalMs_ += lastTotalMs_;
+    cloudSamples_.push_back(lastCloudMs_);
+    compositeSamples_.push_back(lastCompositeMs_);
+    totalSamples_.push_back(lastTotalMs_);
     ++samples_;
 
     if (samples_ == 1 || samples_ % 30 == 0)
@@ -174,6 +180,39 @@ void CloudProfiler::CollectAll()
         Collect(frame);
 }
 
+void CloudProfiler::ResetStatistics()
+{
+    sumCloudMs_ = 0.0;
+    sumCompositeMs_ = 0.0;
+    sumTotalMs_ = 0.0;
+    samples_ = 0;
+    cloudSamples_.clear();
+    compositeSamples_.clear();
+    totalSamples_.clear();
+    pending_.fill(false);
+}
+
+namespace
+{
+double Percentile(std::vector<double> values, double fraction)
+{
+    if (values.empty())
+        return 0.0;
+    std::sort(values.begin(), values.end());
+    // Linear interpolation between ranks (type 7). The previous lower-rank
+    // truncation reported the 30th of 60 samples as the median and biased
+    // p95 low; the GPU report must use the same definition as the audit.
+    const double position =
+        std::clamp(fraction, 0.0, 1.0) *
+        static_cast<double>(values.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const size_t upper = static_cast<size_t>(std::ceil(position));
+    const double weight = position - static_cast<double>(lower);
+    return values[lower] +
+           (values[upper] - values[lower]) * weight;
+}
+} // namespace
+
 void CloudProfiler::LogSummary() const
 {
     if (samples_ == 0)
@@ -187,4 +226,26 @@ void CloudProfiler::LogSummary() const
         "composite %.3f ms, total %.3f ms",
         static_cast<unsigned long long>(samples_),
         sumCloudMs_ / count, sumCompositeMs_ / count, sumTotalMs_ / count);
+    if (cloudSamples_.empty())
+        return;
+
+    const auto minmax = [](const std::vector<double>& values)
+    {
+        const auto [minimum, maximum] =
+            std::minmax_element(values.begin(), values.end());
+        return std::pair<double, double>(*minimum, *maximum);
+    };
+    const auto cloudRange = minmax(cloudSamples_);
+    const auto compositeRange = minmax(compositeSamples_);
+    const auto totalRange = minmax(totalSamples_);
+    Log("gpu timestamps distribution: cloud median %.3f p95 %.3f min %.3f "
+        "max %.3f | composite median %.3f p95 %.3f min %.3f max %.3f | "
+        "total median %.3f p95 %.3f min %.3f max %.3f",
+        Percentile(cloudSamples_, 0.50), Percentile(cloudSamples_, 0.95),
+        cloudRange.first, cloudRange.second,
+        Percentile(compositeSamples_, 0.50),
+        Percentile(compositeSamples_, 0.95),
+        compositeRange.first, compositeRange.second,
+        Percentile(totalSamples_, 0.50), Percentile(totalSamples_, 0.95),
+        totalRange.first, totalRange.second);
 }

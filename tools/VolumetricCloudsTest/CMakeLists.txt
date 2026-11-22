@@ -21,6 +21,7 @@ add_executable(OGSRCloudsTest
     src/Renderer.cpp
     src/SliceViewer.cpp
     src/Validation.cpp
+    src/WeatherMap.cpp
     src/Window.cpp
 )
 
@@ -45,6 +46,7 @@ target_link_libraries(OGSRCloudsTest PRIVATE
     dxguid
     d3dcompiler
     user32
+    bcrypt
 )
 
 # The HLSL sources are loaded at runtime from <exe>/shaders. Keeping them as
@@ -107,6 +109,102 @@ if(OGSR_CLOUDS_VALIDATE_SHADERS)
             COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
                     /Fo "${SHADER_CHECK_DIR}/CloudRayMarch.cso"
                     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarch.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbe.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbe.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeFormulaF1.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeFormulaF1.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeFormulaF2.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeFormulaF2.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeFormulaF3.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeFormulaF3.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeFormulaF4.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeFormulaF4.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeFormulaF5.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeFormulaF5.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbePrototypeA.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbePrototypeA.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbePrototypeB.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbePrototypeB.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchReference.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchReference.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchReferenceA03a.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchReferenceA03a.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeReference.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeReference.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeReferenceA03a.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeReferenceA03a.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchReferenceA03b.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchReferenceA03b.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchProbeReferenceA03b.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchProbeReferenceA03b.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityVolume
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityVolume.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolume.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityVolume
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityVolumeA03a.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03a.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E StormBoundary
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityBoundaryA03a.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03a.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityColumns
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityColumnsA03a.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03a.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityVolume
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityVolumeA03b.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03b.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E StormBoundary
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityBoundaryA03b.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03b.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityColumns
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityColumnsA03b.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolumeA03b.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E StormBoundary
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityBoundary.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolume.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E DensityColumns
+                    /Fo "${SHADER_CHECK_DIR}/CloudDensityColumns.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudDensityVolume.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchPrototypeA.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchPrototypeA.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchPrototypeB.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchPrototypeB.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchFormulaF2.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchFormulaF2.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchFormulaF1.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchFormulaF1.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchFormulaF3.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchFormulaF3.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchFormulaF4.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchFormulaF4.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E CloudRayMarch
+                    /Fo "${SHADER_CHECK_DIR}/CloudRayMarchFormulaF5.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudRayMarchFormulaF5.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E GenerateWeather
+                    /Fo "${SHADER_CHECK_DIR}/WeatherGenerate.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/WeatherGenerate.hlsl"
+            COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T cs_5_1 /E ProbeWeatherSampler
+                    /Fo "${SHADER_CHECK_DIR}/WeatherGenerate.probe.cso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/WeatherGenerate.hlsl"
             COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /T vs_5_1 /E FullscreenVS
                     /Fo "${SHADER_CHECK_DIR}/CloudComposite.vs.cso"
                     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/CloudComposite.hlsl"

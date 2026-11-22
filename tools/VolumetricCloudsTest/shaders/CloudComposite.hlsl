@@ -18,6 +18,13 @@ cbuffer CloudParams : register(b0)
     float4 Output;
     float4 SkyZenith;
     float4 SkyHorizon;
+    float4 WeatherA;
+    float4 WeatherB;
+    float4 WeatherC;
+    float4 Lighting;
+    float4 Atmosphere;
+    float4 LightingFlags;
+    float4 Morphology;
 };
 
 Texture2D<float4> CloudTexture : register(t0);
@@ -86,8 +93,10 @@ float4 CloudCompositePS(VertexOutput input) : SV_Target0
     const uint debugMode = (uint)Shaping.w;
 
     float3 color = 0.0;
-    if (debugMode >= 1 && debugMode <= 4)
+    if (debugMode >= 1 && debugMode <= 19)
     {
+        // All diagnostic modes write displayable values directly; no sky,
+        // exposure or tone mapping. Modes 18/19 are A01/A02b probes.
         color = cloud.rgb;
     }
     else
@@ -101,9 +110,13 @@ float4 CloudCompositePS(VertexOutput input) : SV_Target0
     }
 
     // A tiny ordered dither prevents 8-bit banding in dark overcast skies.
-    const float dither =
-        frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453) / 255.0;
-    color += dither;
+    // Ray-profile diagnostics must stay quantitative, so they skip it.
+    if (debugMode != 14 && debugMode != 19)
+    {
+        const float dither =
+            frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453) / 255.0;
+        color += dither;
+    }
 
     return float4(LinearToSrgb(color), 1.0);
 }

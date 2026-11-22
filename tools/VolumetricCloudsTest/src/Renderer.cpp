@@ -854,6 +854,24 @@ void Renderer::DrainDebugMessages(const char* phase)
         infoQueue_->ClearStoredMessages();
 }
 
+void Renderer::PollDebugMessages(const char* phase)
+{
+    DrainDebugMessages(phase);
+}
+
+bool Renderer::InjectDebugError()
+{
+    if (!infoQueue_)
+        return false;
+
+    const char* text = "V2.3 test injected debug error";
+    return SUCCEEDED(infoQueue_->AddMessage(
+        D3D12_MESSAGE_CATEGORY_APPLICATION_DEFINED,
+        D3D12_MESSAGE_SEVERITY_ERROR,
+        D3D12_MESSAGE_ID_UNKNOWN,
+        text));
+}
+
 void Renderer::ReportDeviceRemoved(const char* context, bool fenceSentinel)
 {
     if (!device_)
