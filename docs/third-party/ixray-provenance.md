@@ -33,3 +33,5 @@
 - `LightTrack.cpp` (`calc_sky_hemi_value`, `calc_sun_value`, `prepare_lights`), `R_Backend_hemi.cpp`, `deffer_base.*`, `forward_base.ps.hlsl` — сверка каналов освещения. FR1 использует направления, дистанцию ray test и sky scale из имеющегося OGSR CROS.
 - `r4_rendertarget_phase_smap_S.cpp`, `r4_rendertarget_accum_spot.cpp`, `shadow.hlsli`, `pcf_filter.hlsli` и shadow VS/PS — сверка пространств сравнения depth и согласования caster с видимой геометрией. Выбор point-граней и узкий PCF реализованы для DX12 depth array.
 - `R_sun.cpp`, direct accumulation и фаза солнечной карты — проверка направления и visibility. `water.ps.hlsl` и `shared/watermove.hlsli` — сверка water normal, Fresnel, fallback и глубины. Линейная композиция и выборки из существующего frame slot реализованы в DX12.
+
+См. [отчёт независимого ревью F4.3-FR2](../dx12-f43f-fr2-lighting-audit.md).
