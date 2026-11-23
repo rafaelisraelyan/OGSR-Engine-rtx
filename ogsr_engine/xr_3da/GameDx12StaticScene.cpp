@@ -60,6 +60,7 @@ struct SceneFrameConstants
     DirectX::XMFLOAT4 waterWeather;
     DirectX::XMFLOAT4 waterSky;
     std::array<DirectX::XMFLOAT4X4, kLocalShadowLayers> localShadowViewProjection;
+    uint32_t diagnosticLight[4]; // Целевой GPU slot + 1 и признак явного ID.
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(SceneFrameConstants, lightingFlags) == 192);
@@ -67,6 +68,8 @@ static_assert(offsetof(SceneFrameConstants, localLights) == 208);
 static_assert(offsetof(SceneFrameConstants, hemiColor) == 208 + sizeof(SceneFrameConstants::localLights));
 static_assert(offsetof(SceneFrameConstants, localShadowViewProjection) ==
     offsetof(SceneFrameConstants, waterSky) + sizeof(DirectX::XMFLOAT4));
+static_assert(offsetof(SceneFrameConstants, diagnosticLight) ==
+    offsetof(SceneFrameConstants, localShadowViewProjection) + sizeof(SceneFrameConstants::localShadowViewProjection));
 constexpr uint64_t kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint64_t kFrameConstantsSize = (sizeof(SceneFrameConstants) + kConstantAlignment - 1) &
     ~(kConstantAlignment - 1);
@@ -93,6 +96,7 @@ constexpr uint32_t kSceneDescriptorCount = kTerrainDescriptor +
 constexpr uint32_t kLightmapHemi = 1024u;
 constexpr uint32_t kTerrainDetail = 2048u;
 constexpr uint32_t kTerrainBaseHemi = 4096u;
+constexpr uint32_t kObjectSkyHemi = 8192u;
 constexpr uint32_t kSunShadowSize = 2048;
 constexpr float kSunShadowRadius = 48.0f;
 // Центр ближней области приёмников в 20 м перед камерой. Глубина сохраняет
@@ -410,6 +414,7 @@ cbuffer FrameCB : register(b0)
     float4 WaterWeather;
     float4 WaterSky;
     float4x4 LocalShadowViewProjection[LOCAL_SHADOW_LAYERS];
+    uint4 DiagnosticLight;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -634,6 +639,7 @@ cbuffer AuxGeometryCB : register(b4)
     uint ReservedGeometry;
     float WallmarkClipShift;
     uint AdvancedWaterGeometry;
+    float ObjectSkyHemi;
 };
 
 struct Transform
@@ -696,7 +702,7 @@ VSOutput main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TE
     output.normal = normalSquared > 0.0f ? normalize(worldNormal) : float3(0, 1, 0);
     output.uv = uv;
     output.world = worldPosition;
-    output.hemi = 0.0f;
+    output.hemi = ObjectSkyHemi;
     output.lmapUv = 0.0f;
     return output;
 }
@@ -793,9 +799,15 @@ bool ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     if (source.type.y == 0)
         return false;
     layer = source.type.y - 1;
-    const float3 delta = position - source.positionInverseRangeSquared.xyz;
+    // Смещение задаётся в метрах. Грань point-карты выбирается уже
+    // по смещённому приёмнику, который будет спроецирован в эту грань.
+    const float3 lightPosition = source.positionInverseRangeSquared.xyz;
+    const float footprint = clamp(length(position - lightPosition) * (1.0f / 1024.0f), 0.004f, 0.05f);
+    const float3 receiver = position + lightDirection * 0.003f +
+        normal * (footprint * (1.0f - saturate(dot(normal, lightDirection))));
     if (source.type.x == 0)
     {
+        const float3 delta = receiver - lightPosition;
         const float3 axis = abs(delta);
         if (axis.x >= max(axis.y, axis.z))
             layer += delta.x >= 0.0f ? 0 : 1;
@@ -804,11 +816,8 @@ bool ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
         else
             layer += delta.z >= 0.0f ? 4 : 5;
     }
-    // Perspective depth сжимается вдали от источника. Постоянный offset
-    // в NDC там отрывал тени от caster на расстояние порядка метров.
-    const float footprint = clamp(length(delta) * (1.0f / 1024.0f), 0.004f, 0.05f);
-    const float3 receiver = position + lightDirection * 0.003f +
-        normal * (footprint * (1.0f - saturate(dot(normal, lightDirection))));
+    if (layer >= LOCAL_SHADOW_LAYERS)
+        return false;
     const float4 clipPosition = mul(float4(receiver, 1.0f), LocalShadowViewProjection[layer]);
     if (clipPosition.w <= 0.0f)
         return false;
@@ -817,13 +826,37 @@ bool ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     return all(coords > 0.0f) && all(coords < 1.0f);
 }
 
+float SampleLocalVisibility(float3 coords, uint layer)
+{
+    const float2 halfTexel = 0.5f / 1024.0f;
+    const float2 center = clamp(coords.xy, halfTexel, 1.0f - halfTexel);
+    float visibility = LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(center, layer), coords.z);
+    [branch]
+    if (visibility > 0.0f && visibility < 1.0f)
+    {
+        // Узкий PCF на границе. Не читаем белый border за последним текселем.
+        const float2 offset = float2(0.55f, 0.55f) / 1024.0f;
+        const float2 low = clamp(coords.xy - offset, halfTexel, 1.0f - halfTexel);
+        const float2 high = clamp(coords.xy + offset, halfTexel, 1.0f - halfTexel);
+        visibility = (visibility +
+            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(low, layer), coords.z) +
+            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(high, layer), coords.z)) / 3.0f;
+    }
+    return visibility;
+}
+
 float LocalVisibility(LocalLightData source, float3 position, float3 normal, float3 lightDirection)
 {
     float3 coords;
     uint layer;
     if (!ProjectLocalShadow(source, position, normal, lightDirection, coords, layer))
         return 1.0f;
-    return LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(coords.xy, layer), coords.z);
+    return SampleLocalVisibility(coords, layer);
+}
+
+bool DebugLightMatches(uint index)
+{
+    return DiagnosticLight.y == 0 || DiagnosticLight.x == index + 1;
 }
 
 float3 DebugLocalShadow(float3 position, float3 normal)
@@ -834,7 +867,8 @@ float3 DebugLocalShadow(float3 position, float3 normal)
         const LocalLightData source = LocalLights[index];
         const float3 delta = source.positionInverseRangeSquared.xyz - position;
         const float3 lightDirection = SafeDirection(delta);
-        if (source.type.y == 0 || dot(delta, delta) * source.positionInverseRangeSquared.w >= 1.0f ||
+        if (!DebugLightMatches(index) || source.type.y == 0 ||
+            dot(delta, delta) * source.positionInverseRangeSquared.w >= 1.0f ||
             (source.type.x != 0 && dot(-lightDirection, source.directionOuterCos.xyz) < source.directionOuterCos.w))
             continue;
         float3 coords;
@@ -851,7 +885,7 @@ float3 DebugLocalShadow(float3 position, float3 normal)
             return saturate((linearDepth - nearDepth) / (farDepth - nearDepth)).xxx;
         }
         if (ViewMode == 5)
-            return LocalShadow.SampleCmpLevelZero(SunShadowSampler, sampleCoords, coords.z).xxx;
+            return SampleLocalVisibility(coords, layer).xxx;
         return frac((source.type.y) * float3(0.618f, 0.381f, 0.173f));
     }
     return float3(0.12f, 0.0f, 0.12f);
@@ -859,7 +893,7 @@ float3 DebugLocalShadow(float3 position, float3 normal)
 
 float3 IndirectHemi(float3 normal, float bakedHemi)
 {
-    if (HemiColor.w <= 0.0f || (TextureMode & (512u | 1024u | 4096u)) == 0)
+    if (HemiColor.w <= 0.0f || (TextureMode & (512u | 1024u | 4096u | 8192u)) == 0)
         return 0.0f;
     // R4 v_hemi: направленная полусфера модулируется одним запечённым каналом.
     const float weight = saturate(bakedHemi) * saturate(0.5f + 0.5f * normal.y);
@@ -867,20 +901,18 @@ float3 IndirectHemi(float3 normal, float bakedHemi)
     return pow(ambient + max(0.0f, HemiColor.rgb) * weight, 2.2f) - pow(ambient, 2.2f);
 }
 
-float3 WorldLighting(float3 normal, float3 position, float bakedHemi)
+float3 LocalLighting(float3 normal, float3 position, bool diagnostic)
 {
-    float3 light = Ambient.rgb + IndirectHemi(normal, bakedHemi);
-    const float sunCosine = saturate(dot(normal, -SunDirection.xyz));
-    if (LightingFlags.y != 0 && sunCosine > 0.0f)
-        light += SunColor.rgb * (sunCosine * SunVisibility(position, normal, sunCosine));
-
+    float3 light = 0.0f;
     [loop]
     for (uint index = 0; index < min(LightingFlags.z, (uint)MAX_LOCAL_LIGHTS); ++index)
     {
+        if (diagnostic && !DebugLightMatches(index))
+            continue;
         const LocalLightData source = LocalLights[index];
         const float3 toLight = source.positionInverseRangeSquared.xyz - position;
         const float distanceSquared = dot(toLight, toLight);
-        // R4 plight_local: q-linear falloff, .95 радиуса задаётся при упаковке.
+        // R4 plight_local: q-linear falloff, .95 радиуса уже в снимке.
         const float falloff = saturate(1.0f - max(0.1f, distanceSquared) * source.positionInverseRangeSquared.w);
         if (falloff <= 0.0f)
             continue;
@@ -930,60 +962,64 @@ float3 ReconstructOpaqueWorld(float2 uv, float depth)
     return world.xyz / max(world.w, 1.0e-6f);
 }
 
-float ReadOpaqueDepth(float2 uv, float2 dimensions)
+struct OpaqueDepthSample
 {
-    return OpaqueDepth.Load(int3(clamp(int2(uv * dimensions), int2(0, 0), int2(dimensions) - 1), 0));
+    float2 uv;
+    float depth;
+};
+
+OpaqueDepthSample ReadOpaqueDepth(float2 uv, float2 dimensions)
+{
+    const int2 pixel = clamp(int2(uv * dimensions), int2(0, 0), int2(dimensions) - 1);
+    OpaqueDepthSample sample;
+    sample.uv = (float2(pixel) + 0.5f) / dimensions;
+    sample.depth = OpaqueDepth.Load(int3(pixel, 0));
+    return sample;
 }
 
 )"
 R"(float3 WaterReflection(float3 position, float3 normal, float3 direction, float2 dimensions, float fresnel)
 {
-    // Fallback использует линейный цвет среды и сохраняет оттенок при
-    // значениях конфигурации выше диапазона LDR.
+    // Цвет среды остаётся fallback для промахов screen-space луча.
     const float3 weatherSky = max(0.0f, WaterSky.rgb);
     const float3 sky = weatherSky / max(1.0f, max(weatherSky.r, max(weatherSky.g, weatherSky.b))) *
         lerp(0.55f, 1.0f, saturate(direction.y));
+    float3 reflected = sky;
     [branch]
-    if (fresnel < 0.04f || direction.y < -0.07f)
-        return sky;
-
-    const float3 origin = position + normal * 0.07f;
-    float2 hitUv = 0.0f;
-    float confidence = 0.0f;
-    [loop]
-    for (uint step = 1; step <= 8; ++step)
+    if (fresnel >= 0.04f && direction.y >= -0.07f)
     {
-        const float distanceAlongRay = 0.22f * step * step;
-        const float3 rayPoint = origin + direction * distanceAlongRay;
-        const float4 clipPoint = mul(float4(rayPoint, 1), ViewProjection);
-        if (clipPoint.w <= 0.0f)
-            break;
-        const float3 ndc = clipPoint.xyz / clipPoint.w;
-        const float2 uv = ndc.xy * float2(0.5f, -0.5f) + 0.5f;
-        if (any(uv <= 0.0f) || any(uv >= 1.0f) || ndc.z <= 0.0f || ndc.z >= 1.0f)
-            break;
-        const float depth = ReadOpaqueDepth(uv, dimensions);
-        if (depth >= 1.0f || ndc.z < depth)
-            continue;
-        const float3 hit = ReconstructOpaqueWorld(uv, depth);
-        const float3 offset = hit - origin;
-        const float alongRay = dot(offset, direction);
-        if (alongRay <= 0.15f)
-            continue;
-        const float3 offRay = offset - direction * alongRay;
-        const float tolerance = 0.08f + 0.14f * step;
-        if (dot(offRay, offRay) < tolerance * tolerance && alongRay <= distanceAlongRay + tolerance)
+        const float3 origin = position + normal * 0.07f;
+        [loop]
+        for (uint step = 1; step <= 8; ++step)
         {
-            const float2 edge = min(uv, 1.0f - uv);
-            hitUv = uv;
-            confidence = saturate(min(edge.x, edge.y) * 10.0f) * (1.0f - step / 9.0f);
+            const float distanceAlongRay = 0.22f * step * step;
+            const float3 rayPoint = origin + direction * distanceAlongRay;
+            const float4 clipPoint = mul(float4(rayPoint, 1), ViewProjection);
+            if (clipPoint.w <= 0.0f)
+                break;
+            const float3 ndc = clipPoint.xyz / clipPoint.w;
+            const float2 uv = ndc.xy * float2(0.5f, -0.5f) + 0.5f;
+            if (any(uv <= 0.0f) || any(uv >= 1.0f) || ndc.z <= 0.0f || ndc.z >= 1.0f)
+                break;
+            const OpaqueDepthSample opaque = ReadOpaqueDepth(uv, dimensions);
+            if (opaque.depth >= 1.0f || ndc.z < opaque.depth)
+                continue;
+            const float3 offset = ReconstructOpaqueWorld(opaque.uv, opaque.depth) - origin;
+            const float alongRay = dot(offset, direction);
+            if (alongRay <= 0.15f)
+                continue;
+            const float3 offRay = offset - direction * alongRay;
+            const float tolerance = 0.08f + 0.14f * step;
+            if (dot(offRay, offRay) < tolerance * tolerance && alongRay <= distanceAlongRay + tolerance)
+            {
+                const float2 edge = min(opaque.uv, 1.0f - opaque.uv);
+                const float confidence = saturate(min(edge.x, edge.y) * 10.0f) * (1.0f - step / 9.0f);
+                reflected = lerp(sky, OpaqueColor.SampleLevel(WallmarkSampler, opaque.uv, 0).rgb, confidence);
+            }
+            break;
         }
-        break;
     }
-    [branch]
-    if (confidence > 0.0f)
-        return lerp(sky, OpaqueColor.SampleLevel(WallmarkSampler, hitUv, 0).rgb, confidence);
-    return sky;
+    return reflected;
 }
 
 float4 ShadeWater(PSInput input, float4 baseColor)
@@ -1017,16 +1053,16 @@ float4 ShadeWater(PSInput input, float4 baseColor)
         return float4(ToDisplay(reflected), 1.0f);
 
     const bool puddle = (TextureMode & 256u) != 0;
-    const float depth = ReadOpaqueDepth(screenUv, dimensions);
-    const float thickness = depth >= 1.0f ? 12.0f :
-        distance(ReconstructOpaqueWorld(screenUv, depth), input.world);
+    const OpaqueDepthSample opaque = ReadOpaqueDepth(screenUv, dimensions);
+    const float thickness = opaque.depth >= 1.0f ? 12.0f :
+        distance(ReconstructOpaqueWorld(opaque.uv, opaque.depth), input.world);
     const float shore = saturate(thickness * (puddle ? 100.0f : 3.0f));
     const float2 distortedUv = screenUv + wave.xy * (shore * (puddle ? 0.004f : 0.02f));
     float2 refractionUv = screenUv;
     if (all(distortedUv > 0.0f) && all(distortedUv < 1.0f))
     {
-        const float displacedDepth = ReadOpaqueDepth(distortedUv, dimensions);
-        if (displacedDepth >= depth - 1.0e-4f && displacedDepth > input.position.z)
+        const OpaqueDepthSample displaced = ReadOpaqueDepth(distortedUv, dimensions);
+        if (displaced.depth >= opaque.depth - 1.0e-4f && displaced.depth > input.position.z)
             refractionUv = distortedUv;
     }
     const float3 transmitted = OpaqueColor.SampleLevel(WallmarkSampler, refractionUv, 0).rgb;
@@ -1074,7 +1110,8 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
 
 float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
-    const float3 n = normalize(input.normal);
+    const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
+    const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
     float4 baseColor = float4(0.72f, 0.72f, 0.76f, 1.0f);
     const bool textured = (TextureMode & 1) != 0;
     if (textured)
@@ -1104,13 +1141,23 @@ float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         bakedHemi = baseColor.a; // BmmD terrain: alpha базового слоя перед detail.
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
+    const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
+    if (ViewMode == 13)
+    {
+        const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
+        const float direct = dot(SunColor.rgb * sunCosine, luminance);
+        const float local = dot(LocalLighting(n, input.world, true), luminance);
+        const float3 display = ToDisplay(float3(direct, 0.0f, local));
+        return float4(display.r, SunVisibility(input.world, n, sunCosine), display.b, 1.0f);
+    }
     float3 light = 1.0f;
     if ((TextureMode & 4) == 0)
     {
         if (LightingFlags.x != 0)
         {
-            const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
-            light = WorldLighting(SafeDirection(flipNormal ? -input.normal : input.normal), input.world, bakedHemi);
+            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, false);
+            if (sunCosine > 0.0f)
+                light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine));
         }
         else
         {
@@ -1237,6 +1284,7 @@ struct LocalShadowViews
 {
     std::array<std::array<FrustumPlane, 6>, kLocalShadowLayers> frusta{};
     std::array<bool, kLocalShadowLayers> active{};
+    std::array<bool, gamelight12::MaxLocalLights> invalidProjection{};
     uint32_t count = 0;
 };
 
@@ -1281,50 +1329,61 @@ bool BuildLocalShadowViews(const gamelight12::LocalLight& light, uint32_t firstL
     return true;
 }
 
-void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting, const float camera[3],
+void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
     std::span<uint64_t, kSpotShadowLayers + 1> previous, SceneFrameConstants& constants, LocalShadowViews& views)
 {
     const auto remembered = std::array{previous[0], previous[1], previous[2]};
-    for (uint32_t slot = 0; slot < previous.size(); ++slot)
+    const uint32_t lightCount = constants.lightingFlags[2];
+    std::array<uint32_t, kSpotShadowLayers + 1> winners;
+    winners.fill(UINT32_MAX);
+    for (uint32_t slot = 0; slot < winners.size(); ++slot)
     {
         const bool spot = slot < kSpotShadowLayers;
-        previous[slot] = 0;
         uint32_t best = UINT32_MAX;
         double bestScore = 0.0;
-        for (uint32_t index = 0; index < constants.lightingFlags[2]; ++index)
+        for (uint32_t index = 0; index < lightCount; ++index)
         {
             const auto& light = lighting.localLights[index];
-            if (!light.castsShadow || light.id == 0 || constants.localLights[index].type[1] != 0 ||
-                (light.type == gamelight12::LocalType::Spot) != spot)
+            if (!light.castsShadow || light.id == 0 ||
+                (light.type == gamelight12::LocalType::Spot) != spot ||
+                std::find(winners.begin(), winners.end(), index) != winners.end())
                 continue;
-            const double dx = double{light.position.x} - camera[0];
-            const double dy = double{light.position.y} - camera[1];
-            const double dz = double{light.position.z} - camera[2];
-            const double range2 = double{light.range} * light.range;
-            const double luminance = 0.2126 * light.color.x + 0.7152 * light.color.y + 0.0722 * light.color.z;
-            double score = luminance * range2 / (range2 + dx * dx + dy * dy + dz * dz);
-            // Смена источника требует заметного выигрыша по приоритету.
-            if (std::find(remembered.begin(), remembered.end(), light.id) != remembered.end())
-                score *= 1.15;
-            if (score > bestScore ||
-                (best != UINT32_MAX && score == bestScore && light.id < lighting.localLights[best].id))
+            const bool held = std::find(remembered.begin(), remembered.end(), light.id) != remembered.end();
+            const double score = light.selectionScore * (held ? 1.25 : 1.0);
+            if (best == UINT32_MAX ||
+                (light.nearVolume == lighting.localLights[best].nearVolume ?
+                    score > bestScore : light.nearVolume))
             {
                 best = index;
                 bestScore = score;
             }
         }
-        if (best == UINT32_MAX)
+        winners[slot] = best;
+    }
+
+    // Перестановка двух победителей spot не меняет привязку к физическим слоям.
+    if (winners[1] != UINT32_MAX && lighting.localLights[winners[1]].id == remembered[0])
+        std::swap(winners[0], winners[1]);
+    else if (winners[0] != UINT32_MAX && lighting.localLights[winners[0]].id == remembered[1])
+        std::swap(winners[0], winners[1]);
+
+    for (uint32_t slot = 0; slot < winners.size(); ++slot)
+    {
+        previous[slot] = 0;
+        const uint32_t index = winners[slot];
+        if (index == UINT32_MAX)
             continue;
-        const uint32_t layer = spot ? slot : kSpotShadowLayers;
-        const auto& light = lighting.localLights[best];
-        if (BuildLocalShadowViews(light, layer, constants, views))
+        const auto& light = lighting.localLights[index];
+        if (!BuildLocalShadowViews(light, slot, constants, views))
         {
-            auto& type = constants.localLights[best].type;
-            type[1] = layer + 1;
-            type[2] = std::bit_cast<uint32_t>(light.shadowNear);
-            type[3] = std::bit_cast<uint32_t>(light.shadowFar);
-            previous[slot] = light.id;
+            views.invalidProjection[index] = true;
+            continue;
         }
+        auto& type = constants.localLights[index].type;
+        type[1] = slot + 1;
+        type[2] = std::bit_cast<uint32_t>(light.shadowNear);
+        type[3] = std::bit_cast<uint32_t>(light.shadowFar);
+        previous[slot] = light.id;
     }
 }
 
@@ -1336,7 +1395,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 12ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 13ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -3096,6 +3155,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     FrustumPlane sunPlanes[6]{};
     LocalShadowViews localShadowViews;
     const uint32_t viewMode = SceneViewMode();
+    constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.viewProjection = Transpose(logicalViewProjection);
     constants.cameraPosition = {cameraPosition[0], cameraPosition[1], cameraPosition[2], 1.0f};
     if (lighting.enabled && lighting.levelSession == LevelSession() && lighting.levelEpoch == LevelEpoch())
@@ -3131,11 +3191,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 gpu.directionOuterCos = {light.direction.x, light.direction.y, light.direction.z, light.outerCos};
                 gpu.colorInnerCos = {light.color.x, light.color.y, light.color.z, light.innerCos};
                 gpu.type[0] = static_cast<uint32_t>(light.type);
+                if (light.id == lighting.tracedLightId)
+                    constants.diagnosticLight[0] = index + 1;
             }
             if (m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
             {
                 const auto selectionStart = Clock::now();
-                SelectLocalShadowViews(lighting, cameraPosition, m_previousLocalShadowLights, constants, localShadowViews);
+                SelectLocalShadowViews(lighting, m_previousLocalShadowLights, constants, localShadowViews);
                 for (uint32_t slot = 0; slot < lightCount; ++slot)
                 {
                     const auto layerPlusOne = constants.localLights[slot].type[1];
@@ -3148,24 +3210,43 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 }
                 stats.shadowCpuMs += Ms(selectionStart);
             }
-            const auto traceCount = (std::min)(lighting.localTraceCount,
-                static_cast<uint32_t>(lighting.localTrace.size()));
-            for (uint32_t index = 0; index < traceCount; ++index)
-            {
-                const auto& trace = lighting.localTrace[index];
-                const bool selected = trace.gpuSlot >= 0 && static_cast<uint32_t>(trace.gpuSlot) < lightCount;
-                const auto layer = selected ? constants.localLights[trace.gpuSlot].type[1] : 0u;
-                const int active = trace.rejection == gamelight12::LocalRejection::NotInSpatialQuery ?
-                    -1 : (trace.active ? 1 : 0);
-                Msg("ph_dx12_f43f: light_id=%llu distance=%.2f radius=%.2f active=%d candidate=%d "
-                    "camera_inside=%d selected_for_lighting=%d source_shadow=%d shadow_eligible=%d "
-                    "selected_for_shadows=%d gpu_slot=%d shadow_layer=%d rejection_reason=%s",
-                    static_cast<unsigned long long>(trace.id), trace.distance, trace.radius, active,
-                    trace.candidate ? 1 : 0, trace.cameraInside ? 1 : 0, selected ? 1 : 0,
-                    trace.sourceShadow ? 1 : 0, trace.shadowEligible ? 1 : 0, layer != 0 ? 1 : 0, trace.gpuSlot,
-                    layer != 0 ? static_cast<int>(layer - 1) : -1, gamelight12::LocalTraceReasonName(trace.rejection));
-            }
         }
+    }
+    for (uint32_t index = 0; index < lighting.localTraceCount; ++index)
+    {
+        const auto& trace = lighting.localTrace[index];
+        const bool selected = trace.gpuSlot >= 0 &&
+            static_cast<uint32_t>(trace.gpuSlot) < constants.lightingFlags[2];
+        const auto layer = selected ? constants.localLights[trace.gpuSlot].type[1] : 0u;
+        const bool observed = trace.inFrustumQuery || trace.inNearQuery;
+        const char* shadowReason = "none";
+        if (!selected)
+            shadowReason = "not_selected_for_lighting";
+        else if (!trace.shadowEligible)
+            shadowReason = trace.sourceShadow ? "ineligible" : "source_unshadowed";
+        else if (m_localShadow == nullptr)
+            shadowReason = "map_unavailable_or_disabled";
+        else if (viewMode > 0 && viewMode < 4)
+            shadowReason = "view_disabled";
+        else if (localShadowViews.invalidProjection[trace.gpuSlot])
+            shadowReason = "invalid_projection";
+        else if (layer == 0)
+            shadowReason = "shadow_budget";
+        const auto* gpu = selected ? &constants.localLights[trace.gpuSlot].positionInverseRangeSquared : nullptr;
+        Msg("ph_dx12_f43fr1: light_id=%llu frame=%llu distance=%.2f radius=%.2f active=%d "
+            "type=%u frustum_query=%d near_query=%d near_volume=%d camera_inside=%d candidate=%d "
+            "selected_for_lighting=%d source_shadow=%d shadow_eligible=%d selected_for_shadows=%d "
+            "gpu_slot=%d shadow_layer=%d position=(%.3f,%.3f,%.3f) gpu_position=(%.3f,%.3f,%.3f) "
+            "rejection_reason=%s shadow_rejection=%s",
+            static_cast<unsigned long long>(trace.id), static_cast<unsigned long long>(lighting.frame),
+            trace.distance, trace.radius, observed ? (trace.active ? 1 : 0) : -1,
+            static_cast<unsigned>(trace.type), trace.inFrustumQuery ? 1 : 0, trace.inNearQuery ? 1 : 0,
+            trace.nearVolume ? 1 : 0, trace.cameraInside ? 1 : 0, trace.candidate ? 1 : 0,
+            selected ? 1 : 0, trace.sourceShadow ? 1 : 0, trace.shadowEligible ? 1 : 0, layer != 0 ? 1 : 0,
+            trace.gpuSlot, layer != 0 ? static_cast<int>(layer - 1) : -1,
+            trace.position.x, trace.position.y, trace.position.z,
+            gpu ? gpu->x : 0.0f, gpu ? gpu->y : 0.0f, gpu ? gpu->z : 0.0f,
+            gamelight12::LocalTraceReasonName(trace.rejection), shadowReason);
     }
     const auto normalTexture = m_textureKeys.find(gamewater12::WaterNormal);
     const bool waterView = viewMode == 11 || viewMode == 12;
@@ -3323,7 +3404,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     uint32_t boundTerrainSet = 0;
     float boundTerrainScale = 0.0f;
     bool waterPass = false;
-    const bool limitMaterialView = (viewMode == 1 || (viewMode >= 7 && viewMode <= 10)) &&
+    const bool limitMaterialView = (viewMode == 1 || (viewMode >= 7 && viewMode <= 10) || viewMode == 13) &&
         R1VisualSelection()[0] != UINT32_MAX;
     const auto bindMaterial = [&](uint32_t descriptor, uint32_t id, SurfaceMode surface,
                                   bool wallmarkClamp, gameaux12::TransparentMaterial transparency,
@@ -3427,20 +3508,22 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     };
 
     const auto submitAuxGeometry = [&](const AuxMesh& mesh, uint32_t id, SurfaceMode surface,
-                                       uint32_t offset, uint32_t count, bool twoSided, bool shadow = false)
+                                       uint32_t offset, uint32_t count, bool twoSided, bool shadow = false,
+                                       float skyHemi = 0.0f)
     {
         list->SetGraphicsRoot32BitConstant(3, offset, 0);
         if (shadow)
             bindShadowMaterial(mesh.descriptor, surface);
         else
         {
-            bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, twoSided);
-            const uint32_t geometry[] = {0u,
-                std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f)};
-            list->SetGraphicsRoot32BitConstants(5, 2, geometry, 0);
+            bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, twoSided,
+                false, skyHemi > 0.0f ? kObjectSkyHemi : 0u);
             const bool waves = waterPass && gamewater12::WaterEnabled() &&
                 surface == SurfaceMode::Translucent && mesh.transparency == gameaux12::TransparentMaterial::Water;
-            list->SetGraphicsRoot32BitConstant(5, waves ? 1u : 0u, 2);
+            const uint32_t geometry[] = {0u,
+                std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f),
+                waves ? 1u : 0u, std::bit_cast<uint32_t>(skyHemi)};
+            list->SetGraphicsRoot32BitConstants(5, static_cast<UINT>(std::size(geometry)), geometry, 0);
         }
         worldIdentity = false;
         list->IASetVertexBuffers(0, 1, &mesh.vb);
@@ -3589,15 +3672,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 gameaux12::SurfaceModeName(draw.surface));
     };
     const auto drawMesh = [&](const AuxMesh& mesh, uint32_t id, SurfaceMode surface,
-                              uint32_t offset, uint32_t count, ID3D12PipelineState* regular)
+                              uint32_t offset, uint32_t count, ID3D12PipelineState* regular, float skyHemi = 0.0f)
     {
         bindPipeline(surface, 2, regular);
-        submitAuxGeometry(mesh, id, surface, offset, count, regular == m_pipelineDetail.Get());
+        submitAuxGeometry(mesh, id, surface, offset, count, regular == m_pipelineDetail.Get(), false, skyHemi);
         CountSurfaceDraw(auxStats.surfaces, surface);
     };
     const auto drawObjectPart = [&](const AuxMesh& mesh, const gameaux12::ObjectDraw& object)
     {
-        drawMesh(mesh, object.id, mesh.surface, object.poseOffset, 1, m_pipelineSkeletal.Get());
+        drawMesh(mesh, object.id, mesh.surface, object.poseOffset, 1, m_pipelineSkeletal.Get(), object.skyHemi);
         if (traceAux && object.id == extras.traceId && m_auxTraceMessages < kMaxVisualTraceMessages)
         {
             const auto handle = static_cast<uint32_t>(&mesh - m_auxMeshes.data());

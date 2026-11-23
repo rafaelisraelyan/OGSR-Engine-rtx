@@ -21,7 +21,7 @@ param(
     [switch]$Validation,
     [uint64]$LightId,
     [ValidateSet('Default','ShadowDepth','ShadowVisibility','ShadowSlot','Albedo','Normals',
-        'Lighting','Hemi','WaterNormals','WaterReflection','Material')]
+        'Lighting','Hemi','WaterNormals','WaterReflection','Material','LightTerms')]
     [string]$View = 'Default'
 )
 
@@ -51,7 +51,13 @@ if (-not (Select-String -LiteralPath $config -Pattern $expectedAlias -Quiet)) {
 if (Get-Process -Name xrEngine -ErrorAction SilentlyContinue) { throw 'Закройте текущий экземпляр xrEngine.' }
 
 $arguments = @('-fsltx', 'fsgame.ltx', '-nogameintro', '-log')
-if (-not $R4) { $arguments += '-dx12_native_game' }
+if (-not $R4) {
+    $arguments += '-dx12_native_game'
+    if ($SceneLog) { $arguments += '-SceneLog' }
+    if ($LightId -ne 0) {
+        $arguments += @('-LightId', $LightId.ToString([Globalization.CultureInfo]::InvariantCulture))
+    }
+}
 $arguments += @('-start', 'server(b23_jupiter/single/alife/load)')
 
 $start = New-Object System.Diagnostics.ProcessStartInfo
@@ -87,7 +93,7 @@ foreach ($feature in $features.GetEnumerator()) {
 }
 $views = @{
     Default = 0; Material = 1; ShadowDepth = 4; ShadowVisibility = 5; ShadowSlot = 6
-    Albedo = 7; Normals = 8; Lighting = 9; Hemi = 10; WaterNormals = 11; WaterReflection = 12
+    Albedo = 7; Normals = 8; Lighting = 9; Hemi = 10; WaterNormals = 11; WaterReflection = 12; LightTerms = 13
 }
 $start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
@@ -104,6 +110,7 @@ $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_R1_OBJECT_ID')
 if ($null -ne $GeometryObjectId) {
     $start.EnvironmentVariables['OGSR_DX12_GAME_R1_OBJECT_ID'] = [string]$GeometryObjectId
 }
+Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
 $engine = [System.Diagnostics.Process]::Start($start)
 try {
     $engine.WaitForExit()

@@ -1612,44 +1612,66 @@ bool LightingFlag(const char* name)
     return value && std::strcmp(value, "1") == 0;
 }
 
+struct LightingDiagnostics
+{
+    bool sceneLog = false;
+    bool traceNearest = false;
+    uint64_t lightId = 0;
+};
+
+const LightingDiagnostics& LightingDiagnosticOptions()
+{
+    static const LightingDiagnostics options = []
+    {
+        LightingDiagnostics result;
+        const bool sceneArgument = GameDx12Bridge_HasExactCommandLineFlag(Core.Params, "-SceneLog");
+        result.sceneLog = sceneArgument || LightingFlag("OGSR_DX12_GAME_SCENE_LOG");
+        result.traceNearest = sceneArgument || LightingFlag("OGSR_DX12_GAME_TRACE_LIGHTS");
+        const auto readId = [](const char* begin, const char* end)
+        {
+            uint64_t id = 0;
+            const auto parsed = std::from_chars(begin, end, id);
+            return parsed.ec == std::errc{} && parsed.ptr == end ? id : uint64_t{0};
+        };
+        const char* argument = nullptr;
+        const bool hasLightId = GameDx12Bridge_HasExactCommandLineFlag(Core.Params, "-LightId", &argument);
+        if (hasLightId)
+        {
+            if (*argument == '"')
+                ++argument;
+            argument += std::strlen("-LightId");
+            if (*argument == '"')
+                ++argument;
+            argument += std::strspn(argument, " \t");
+            const bool quoted = *argument == '"';
+            if (quoted)
+                ++argument;
+            const char* end = argument + std::strcspn(argument, quoted ? "\"" : " \t");
+            if (!quoted || (*end == '"' && (end[1] == '\0' || end[1] == ' ' || end[1] == '\t')))
+                result.lightId = readId(argument, end);
+        }
+        else if (const char* value = std::getenv("OGSR_DX12_GAME_TRACE_LIGHT_ID"))
+            result.lightId = readId(value, value + std::strlen(value));
+        result.sceneLog = result.sceneLog || result.lightId != 0;
+        Msg("ph_dx12_f43fr1: diagnostics scene_log=%d trace_nearest=%d trace_light_id=%llu "
+            "scene_log_arg=%d light_id_arg=%d light_id_arg_valid=%d scene_view='%s'",
+            result.sceneLog ? 1 : 0, result.traceNearest && result.lightId == 0 ? 1 : 0,
+            static_cast<unsigned long long>(result.lightId), sceneArgument ? 1 : 0,
+            hasLightId ? 1 : 0, hasLightId && result.lightId != 0 ? 1 : 0,
+            std::getenv("OGSR_DX12_GAME_SCENE_VIEW") ? std::getenv("OGSR_DX12_GAME_SCENE_VIEW") : "0");
+        return result;
+    }();
+    return options;
+}
+
 void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewProjection,
                         const float position[3], gamelight12::FrameSnapshot& snapshot)
 {
     using gamelight12::LocalRejection;
-    if (!g_SpatialSpace || !snapshot.localEnabled)
-        return;
-
-    Fmatrix view{};
-    static_assert(sizeof(view.m) == sizeof(viewProjection.m));
-    std::memcpy(view.m, viewProjection.m, sizeof(view.m));
-    CFrustum frustum{};
-    frustum.CreateFromMatrix(view, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
-
-    // Отдельная область около камеры сохраняет свет, пересекающий ближнюю
-    // плоскость, даже если он отсутствует в видимом списке пространственной БД.
-    // Как в light::vis_prepare R4, учитываем enclosing sphere и запас near plane.
-    const Fvector eye{position[0], position[1], position[2]};
-    constexpr float nearGuard = 2.0f * VIEWPORT_NEAR;
-    struct ClearQuery
-    {
-        xr_vector<ISpatial*>& frustum;
-        xr_vector<ISpatial*>& nearLights;
-        ~ClearQuery() { frustum.clear(); nearLights.clear(); }
-    } clearQuery{state.lightQuery, state.nearLightQuery};
-    g_SpatialSpace->q_frustum(state.lightQuery, 0, STYPE_LIGHTSOURCE, frustum);
-    g_SpatialSpace->q_sphere(state.nearLightQuery, 0, STYPE_LIGHTSOURCE, eye, nearGuard);
-
-    static const uint64_t traceLightId = []
-    {
-        uint64_t id = 0;
-        const char* value = std::getenv("OGSR_DX12_GAME_TRACE_LIGHT_ID");
-        if (!value)
-            return id;
-        const char* end = value + std::strlen(value);
-        const auto parsed = std::from_chars(value, end, id);
-        return parsed.ec == std::errc{} && parsed.ptr == end ? id : uint64_t{0};
-    }();
-    static const bool traceRequested = traceLightId != 0 || LightingFlag("OGSR_DX12_GAME_TRACE_LIGHTS");
+    const auto& options = LightingDiagnosticOptions();
+    const uint64_t traceLightId = options.lightId;
+    snapshot.tracedLightId = traceLightId;
+    const bool traceRequested = traceLightId != 0 || options.traceNearest;
     bool trace = false;
     if (traceRequested)
     {
@@ -1659,14 +1681,40 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
             state.nextLocalLightTrace = now + std::chrono::seconds(3);
     }
 
-    struct Priority
+    if (!g_SpatialSpace || !snapshot.localEnabled)
     {
-        double score = 0.0;
-        bool cameraInside = false;
-    };
-    std::array<Priority, gamelight12::MaxLocalLights> priorities{};
+        if (trace && traceLightId != 0)
+        {
+            auto& record = snapshot.localTrace[snapshot.localTraceCount++];
+            record.id = traceLightId;
+            record.distance = record.radius = -1.0f;
+            record.rejection = LocalRejection::Disabled;
+        }
+        return;
+    }
+
+    Fmatrix view{};
+    static_assert(sizeof(view.m) == sizeof(viewProjection.m));
+    std::memcpy(view.m, viewProjection.m, sizeof(view.m));
+    CFrustum frustum{};
+    frustum.CreateFromMatrix(view, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+
+    // Расстояние от глаза до угла near plane текущей проекции.
+    const float scaleX = std::hypot(viewProjection._11, viewProjection._21, viewProjection._31);
+    const float scaleY = std::hypot(viewProjection._12, viewProjection._22, viewProjection._32);
+    const float nearGuard = VIEWPORT_NEAR * std::hypot(1.0f,
+        1.0f / (std::max)(0.01f, scaleX), 1.0f / (std::max)(0.01f, scaleY));
+    const Fvector eye{position[0], position[1], position[2]};
+    struct ClearQuery
+    {
+        xr_vector<ISpatial*>& frustum;
+        xr_vector<ISpatial*>& nearLights;
+        ~ClearQuery() { frustum.clear(); nearLights.clear(); }
+    } clearQuery{state.lightQuery, state.nearLightQuery};
+    g_SpatialSpace->q_frustum(state.lightQuery, 0, STYPE_LIGHTSOURCE, frustum);
+    g_SpatialSpace->q_sphere(state.nearLightQuery, 0, STYPE_LIGHTSOURCE, eye, nearGuard);
     const bool limitDistantShadows = ps_r2_ls_flags.test(R2FLAG_LIGHT_NO_DIST_SHADOWS);
-    const auto consider = [&](ISpatial* entry)
+    const auto consider = [&](ISpatial* entry, bool inFrustum, bool inNearQuery)
     {
         IRender_Light* source = entry->dcast_Light();
         if (!source)
@@ -1683,34 +1731,39 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
                                  0.0722 * candidate.color.z;
         if (rejection == LocalRejection::None && luminance <= 0.0)
             rejection = LocalRejection::NoEnergy;
+        const auto& sphere = entry->spatial.sphere;
+        const float nearRadius = sphere.R + nearGuard;
+        const bool nearVolume = std::isfinite(nearRadius) && nearRadius > 0.0f &&
+            eye.distance_to_sqr(sphere.P) <= nearRadius * nearRadius;
+        if (rejection == LocalRejection::None && !inFrustum && !nearVolume)
+            rejection = LocalRejection::OutsideNearSphere;
         const bool eligible = rejection == LocalRejection::None;
         bool cameraInside = false;
         if (eligible)
         {
             candidate.castsShadow = candidate.castsShadow &&
                 (!limitDistantShadows || distanceSquared <= 10000.0);
-            const double eyeRange = double{candidate.range} + nearGuard;
             const double axial = -(dx * candidate.direction.x + dy * candidate.direction.y +
                 dz * candidate.direction.z);
-            cameraInside = distanceSquared <= eyeRange * eyeRange &&
+            cameraInside = distanceSquared <= rangeSquared &&
                 (candidate.type == gamelight12::LocalType::Point ||
-                 distanceSquared <= nearGuard * nearGuard ||
                  (axial >= 0.0 && axial * axial >= distanceSquared * candidate.outerCos * candidate.outerCos));
+            candidate.nearVolume = nearVolume;
+            candidate.selectionScore = luminance * rangeSquared / (rangeSquared + distanceSquared);
             ++snapshot.localCandidateCount;
 
-            const double score = luminance * rangeSquared / (rangeSquared + distanceSquared);
             uint32_t insert = 0;
             for (; insert < snapshot.localCount; ++insert)
             {
-                const auto& current = priorities[insert];
-                if (cameraInside != current.cameraInside)
+                const auto& current = snapshot.localLights[insert];
+                if (candidate.nearVolume != current.nearVolume)
                 {
-                    if (cameraInside)
+                    if (candidate.nearVolume)
                         break;
                     continue;
                 }
-                if (score > current.score ||
-                    (score == current.score && candidate.id < snapshot.localLights[insert].id))
+                if (candidate.selectionScore > current.selectionScore ||
+                    (candidate.selectionScore == current.selectionScore && candidate.id < current.id))
                     break;
             }
             if (insert < snapshot.localLights.size())
@@ -1718,11 +1771,7 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
                 if (snapshot.localCount < snapshot.localLights.size())
                     ++snapshot.localCount;
                 for (uint32_t index = snapshot.localCount - 1; index > insert; --index)
-                {
-                    priorities[index] = priorities[index - 1];
                     snapshot.localLights[index] = snapshot.localLights[index - 1];
-                }
-                priorities[insert] = {score, cameraInside};
                 snapshot.localLights[insert] = candidate;
             }
         }
@@ -1734,6 +1783,11 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
         record.id = candidate.id;
         record.distance = static_cast<float>(std::sqrt(distanceSquared));
         record.radius = candidate.range;
+        record.position = candidate.position;
+        record.type = candidate.type;
+        record.inFrustumQuery = inFrustum;
+        record.inNearQuery = inNearQuery;
+        record.nearVolume = nearVolume;
         record.rejection = rejection;
         record.active = candidate.active;
         record.candidate = eligible;
@@ -1758,18 +1812,17 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
     };
 
     for (ISpatial* entry : state.lightQuery)
-        consider(entry);
+        consider(entry, true, trace &&
+            std::find(state.nearLightQuery.begin(), state.nearLightQuery.end(), entry) != state.nearLightQuery.end());
     for (ISpatial* entry : state.nearLightQuery)
     {
-        // q_sphere сначала проверяет AABB. Уточняем его настоящей сферой.
-        const auto& sphere = entry->spatial.sphere;
-        const float radius = sphere.R + nearGuard;
-        if (!std::isfinite(radius) || radius <= 0.0f ||
-            eye.distance_to_sqr(sphere.P) > radius * radius ||
-            std::find(state.lightQuery.begin(), state.lightQuery.end(), entry) != state.lightQuery.end())
-            continue;
-        consider(entry);
+        if (std::find(state.lightQuery.begin(), state.lightQuery.end(), entry) == state.lightQuery.end())
+            consider(entry, false, true);
     }
+
+    // При изменении ранга тот же набор света получает те же GPU-индексы.
+    std::sort(snapshot.localLights.begin(), snapshot.localLights.begin() + snapshot.localCount,
+        [](const auto& left, const auto& right) { return left.id < right.id; });
     for (uint32_t index = 0; index < snapshot.localCount; ++index)
         snapshot.localShadowCandidateCount += snapshot.localLights[index].castsShadow ? 1u : 0u;
 
@@ -1806,11 +1859,17 @@ gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,
 
     static const bool lighting = LightingFlag("OGSR_DX12_GAME_LIGHTING");
     if (!lighting || !g_pGamePersistent)
+    {
+        CaptureLocalLights(state, viewProjection, position, snapshot);
         return snapshot;
+    }
 
     const CEnvDescriptorMixer* env = g_pGamePersistent->Environment().CurrentEnv;
     if (!env || !FiniteVector(env->ambient) || !std::isfinite(ps_r2_sun_lumscale_amb))
+    {
+        CaptureLocalLights(state, viewProjection, position, snapshot);
         return snapshot;
+    }
 
     // Ambient и оттенок отражённого света берутся из одного погодного снимка R4.
     const float ambientScale = (std::max)(0.f, ps_r2_sun_lumscale_amb);
@@ -1821,7 +1880,10 @@ gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,
     snapshot.ambient = {ambient(env->ambient.x), ambient(env->ambient.y), ambient(env->ambient.z)};
     if (!std::isfinite(snapshot.ambient.x) || !std::isfinite(snapshot.ambient.y) ||
         !std::isfinite(snapshot.ambient.z))
+    {
+        CaptureLocalLights(state, viewProjection, position, snapshot);
         return snapshot;
+    }
 
     static const bool hemi = LightingFlag("OGSR_DX12_GAME_HEMI");
     if (hemi && std::isfinite(ps_r2_sun_lumscale_hemi))
@@ -1908,7 +1970,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     GameDx12StaticScene12::AuxStats auxDraws;
     GameDx12StaticScene12::FrameStats12 sceneStats;
     gamelight12::FrameSnapshot lighting;
-    static const bool sceneDetail = LightingFlag("OGSR_DX12_GAME_SCENE_LOG");
+    const bool sceneDetail = LightingDiagnosticOptions().sceneLog;
     double prepareMs = 0.0;
     if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
         state.staticScene.LevelSession() == state.levelSession &&

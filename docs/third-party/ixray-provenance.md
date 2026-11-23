@@ -24,3 +24,12 @@
 | GameDx12StaticScene.cpp, ResourceManager.cpp | gamedata/shaders/d3d11/deffer_base.vs.hlsl, deffer_base.ps.hlsl, deffer_detail.vs.hlsl; src/Layers/xrRender/TextureDescrManager.cpp, Blender_Recorder_R2.cpp, DetailManager.cpp, LightTrack.cpp | Разделение detail, lightmap и динамического hemi. Конкретные слои и масштаб использованы из OGSR |
 
 Бинарные игровые ассеты IX-Ray в рабочее дерево не добавлялись. Сторонний блок caustics и его авторские фрагменты из водного шейдера не переносились. Использование DX12 описано в локальном отчёте F4.3‑E.
+
+## F4.3‑FR1
+
+Закреплённый коммит IX-Ray — [7b74303ed0f2d93cf63b65983e3c819f323ebf5c](https://github.com/ixray-team/ixray-1.6-stcop/tree/7b74303ed0f2d93cf63b65983e3c819f323ebf5c). В FR1 использованы следующие референсы.
+
+- `light_vis.cpp` (`vis_prepare`, `vis_update`), `r4_R_render.cpp`, `Light_Package.cpp`, `light.cpp` и `Light_DB.cpp` — сопоставление владения источником, near-plane guard и стабильного отбора с текущим DX12.
+- `LightTrack.cpp` (`calc_sky_hemi_value`, `calc_sun_value`, `prepare_lights`), `R_Backend_hemi.cpp`, `deffer_base.*`, `forward_base.ps.hlsl` — сверка каналов освещения. FR1 использует направления, дистанцию ray test и sky scale из имеющегося OGSR CROS.
+- `r4_rendertarget_phase_smap_S.cpp`, `r4_rendertarget_accum_spot.cpp`, `shadow.hlsli`, `pcf_filter.hlsli` и shadow VS/PS — сверка пространств сравнения depth и согласования caster с видимой геометрией. Выбор point-граней и узкий PCF реализованы для DX12 depth array.
+- `R_sun.cpp`, direct accumulation и фаза солнечной карты — проверка направления и visibility. `water.ps.hlsl` и `shared/watermove.hlsli` — сверка water normal, Fresnel, fallback и глубины. Линейная композиция и выборки из существующего frame slot реализованы в DX12.

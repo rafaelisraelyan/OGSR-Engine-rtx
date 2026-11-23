@@ -45,6 +45,7 @@ private:
     Frame m_frame;
     Counts m_rigidCounts;
     Counts m_skinnedCounts;
+    uint32_t m_nextHemiObject = 0;
     uint32_t m_objects = 0;
     uint32_t m_visuals = 0;
     uint32_t m_unsupported = 0;

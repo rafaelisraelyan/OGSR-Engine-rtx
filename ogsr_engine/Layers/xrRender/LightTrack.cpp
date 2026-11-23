@@ -325,6 +325,43 @@ void CROS_impl::calc_sun_value(const Fvector& position, const CObject* _object)
     }
 }
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+bool CROS_impl::NeedsDx12SkyHemi(const Fvector& position) const
+{
+    return (MODE & IRender_ObjectSpecific::TRACE_HEMI) &&
+        (dx12SkySamples < lt_hemisamples || !dx12SkyPosition.similar(position, 0.3f));
+}
+
+float CROS_impl::Dx12SkyHemi() const
+{
+    return dx12SkySamples != 0 ?
+        static_cast<float>(dx12SkyOpen) / static_cast<float>(dx12SkySamples) *
+            ps_r2_dhemi_sky_scale : 0.0f;
+}
+
+void CROS_impl::SampleDx12SkyHemi(const Fvector& position, const CObject& object)
+{
+    if (!dx12SkyPosition.similar(position, 0.3f))
+    {
+        dx12SkyPosition = position;
+        dx12SkySamples = dx12SkyOpen = 0;
+    }
+
+    // Такой же sky-only trace, как в CROS R4. Локальные источники
+    // и солнце уже считаются отдельно в DX12.
+    constexpr u32 raysPerUpdate = 4;
+    const u32 end = (std::min)(dx12SkySamples + raysPerUpdate, static_cast<u32>(lt_hemisamples));
+    for (; dx12SkySamples < end; ++dx12SkySamples)
+    {
+        const auto& sample = hdir[dx12SkySamples];
+        Fvector direction;
+        direction.set(sample[0], sample[1], sample[2]).normalize();
+        dx12SkyOpen += !g_pGameLevel->ObjectSpace.RayTest(position, direction, 50.f,
+            collide::rqtStatic, nullptr, &object) ? 1u : 0u;
+    }
+}
+#endif
+
 void CROS_impl::calc_sky_hemi_value(const Fvector& position, const CObject* _object)
 {
     // hemi-tracing

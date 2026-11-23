@@ -9,6 +9,7 @@
 #include "vis_common.h"
 #include "xr_object.h"
 #include "../Include/xrRender/Kinematics.h"
+#include "../Layers/xrRender/LightTrack.h"
 
 #include <algorithm>
 #include <bit>
@@ -303,6 +304,20 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
         std::strcmp(skinnedDiscovery, "1") == 0;
     uint32_t discovered = 0;
     uint32_t discoveredSkinned = 0;
+    static const bool skyHemiEnabled = []
+    {
+        const char* hemi = std::getenv("OGSR_DX12_GAME_HEMI");
+        const char* lighting = std::getenv("OGSR_DX12_GAME_LIGHTING");
+        return hemi && lighting && std::strcmp(hemi, "1") == 0 && std::strcmp(lighting, "1") == 0;
+    }();
+    struct HemiUpdate
+    {
+        CObject* object = nullptr;
+        Fvector position{};
+        size_t snapshotIndex = 0;
+        uint32_t levelIndex = 0;
+    };
+    HemiUpdate firstHemiUpdate, nextHemiUpdate;
     for (uint32_t i = 0; i < m_objects; ++i)
     {
         CObject* object = level.Objects.o_get_by_iterator(i);
@@ -424,6 +439,24 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
             continue;
         }
         const float distance = std::hypot(center.x - eye[0], center.y - eye[1], center.z - eye[2]);
+        if (skyHemiEnabled)
+        {
+            auto* ros = dynamic_cast<CROS_impl*>(object->renderable.pROS);
+            if (ros)
+                entry.skyHemi = ros->Dx12SkyHemi();
+            if (distance < 40.0f + entry.radius && object->renderable.pROS_Allowed)
+            {
+                const Fvector position{center.x, center.y + 0.3f * entry.radius, center.z};
+                if (!ros || ros->NeedsDx12SkyHemi(position))
+                {
+                    const HemiUpdate update{object, position, m_frame.objects.size(), i};
+                    if (!firstHemiUpdate.object)
+                        firstHemiUpdate = update;
+                    if (!nextHemiUpdate.object && i >= m_nextHemiObject)
+                        nextHemiUpdate = update;
+                }
+            }
+        }
         if (!skinned && distance < CROW_RADIUS2 + entry.radius)
             object->MakeMeCrow();
         auto& discoveryCount = skinned ? discoveredSkinned : discovered;
@@ -438,6 +471,16 @@ void GameVisuals::Capture(IGame_Level& level, const float eye[3])
             ++discoveryCount;
         }
         m_frame.objects.push_back(entry);
+    }
+    const auto& hemiUpdate = nextHemiUpdate.object ? nextHemiUpdate : firstHemiUpdate;
+    if (hemiUpdate.object)
+    {
+        m_nextHemiObject = hemiUpdate.levelIndex + 1;
+        if (auto* ros = dynamic_cast<CROS_impl*>(hemiUpdate.object->ROS()))
+        {
+            ros->SampleDx12SkyHemi(hemiUpdate.position, *hemiUpdate.object);
+            m_frame.objects[hemiUpdate.snapshotIndex].skyHemi = ros->Dx12SkyHemi();
+        }
     }
     if (discover)
         m_discoveryFrames = m_rigidCounts.waitingModel == 0 ? 3 : m_discoveryFrames + 1;

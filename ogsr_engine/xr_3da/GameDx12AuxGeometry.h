@@ -51,6 +51,7 @@ struct ObjectDraw
     uint32_t boneCount = 0;
     float center[3]{};
     float radius = 0.0f;
+    float skyHemi = 0.0f;
     DirectX::XMFLOAT4X4 world;
     bool skinned = false;
 };

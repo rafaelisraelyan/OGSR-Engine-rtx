@@ -4,6 +4,8 @@
 
 #pragma once
 
+class light;
+
 const float lt_inc = 4.f;
 const float lt_dec = 2.f;
 const int lt_hemisamples = 26;
@@ -65,6 +67,12 @@ private:
     float sun_value;
     float sun_smooth;
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    Fvector dx12SkyPosition{};
+    u32 dx12SkySamples = 0;
+    u32 dx12SkyOpen = 0;
+#endif
+
     Fvector approximate;
 
 
@@ -84,6 +92,11 @@ public:
     const float* get_luminocity_hemi_cube() override { return hemi_cube_smooth; }
 
     void update(IRenderable* O);
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    bool NeedsDx12SkyHemi(const Fvector& position) const;
+    float Dx12SkyHemi() const;
+    void SampleDx12SkyHemi(const Fvector& position, const CObject& object);
+#endif
 
     // that is for render only
     void update_smooth(IRenderable* O = nullptr);

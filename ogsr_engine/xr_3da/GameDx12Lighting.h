@@ -37,6 +37,8 @@ struct LocalLight
     uint64_t id = 0;
     float shadowNear = 0.1f;
     float shadowFar = 0.0f;
+    double selectionScore = 0.0;
+    bool nearVolume = false;
     bool sourceShadow = false;
     bool castsShadow = false;
     bool active = false;
@@ -77,6 +79,8 @@ enum class LocalRejection : uint8_t
     NoEnergy,
     LightingBudget,
     NotInSpatialQuery,
+    OutsideNearSphere,
+    Disabled,
 };
 
 inline const char* LocalTraceReasonName(LocalRejection reason) noexcept
@@ -92,6 +96,8 @@ inline const char* LocalTraceReasonName(LocalRejection reason) noexcept
     case LocalRejection::NoEnergy: return "no_energy";
     case LocalRejection::LightingBudget: return "lighting_budget";
     case LocalRejection::NotInSpatialQuery: return "not_in_spatial_query";
+    case LocalRejection::OutsideNearSphere: return "outside_near_sphere";
+    case LocalRejection::Disabled: return "disabled";
     }
     return "unknown";
 }
@@ -101,10 +107,15 @@ struct LocalLightTrace
     uint64_t id = 0;
     float distance = 0.0f;
     float radius = 0.0f;
+    Vec3 position;
+    LocalType type = LocalType::Point;
     int32_t gpuSlot = -1;
     LocalRejection rejection = LocalRejection::None;
     bool active = false;
     bool candidate = false;
+    bool inFrustumQuery = false;
+    bool inNearQuery = false;
+    bool nearVolume = false;
     bool cameraInside = false;
     bool sourceShadow = false;
     bool shadowEligible = false;
@@ -131,6 +142,7 @@ struct FrameSnapshot
     uint32_t localCount = 0;
     uint32_t localCandidateCount = 0;
     uint32_t localShadowCandidateCount = 0;
+    uint64_t tracedLightId = 0;
     std::array<LocalLightTrace, MaxLocalLightTrace> localTrace{};
     uint32_t localTraceCount = 0;
 };
