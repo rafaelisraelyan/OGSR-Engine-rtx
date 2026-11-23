@@ -4,11 +4,13 @@
 
 #include "GameDx12AuxGeometry.h"
 #include "GameDx12J2ABatch.h"
+#include "GameDx12Surface.h"
 #include "dx12xrayasset.h"
 #include "dx12xraylevelgeometry.h"
 
 #include <DirectXMath.h>
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -55,8 +57,9 @@ struct GameDx12StaticMaterial12
 {
     static constexpr uint32_t kNoTexture = 0xFFFFFFFFu;
     uint32_t textureIndex = kNoTexture;
-    bool alphaTest = false;
-    bool haveBinding = false;
+    gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Auto;
+    bool wallmarkClamp = false;
+    bool hasOverride = false;
 };
 
 class GameDx12StaticScene12
@@ -65,6 +68,17 @@ public:
     static constexpr DWORD kFenceTimeoutMs = 30000;
     // Дескриптор 0 занят null-SRV (материал без текстуры).
     static constexpr uint32_t kNullDescriptor = 0;
+
+    struct SurfaceStats
+    {
+        uint32_t opaque = 0;
+        uint32_t cutout = 0;
+        uint32_t overlayOpaque = 0;
+        uint32_t overlayCutout = 0;
+        uint32_t overlayBlend = 0;
+        uint32_t overlayMultiply = 0;
+        uint32_t translucent = 0;
+    };
 
     struct LoadStats12
     {
@@ -78,6 +92,9 @@ public:
         uint32_t textures_failed = 0;
         uint32_t draws_without_texture = 0;
         uint32_t drawing_alpha_test = 0;
+        uint32_t material_overrides = 0;
+        uint32_t material_missing_srv = 0;
+        uint32_t unsupported_materials = 0;
         uint64_t geometry_bytes = 0;
         uint64_t texture_bytes = 0;
         double pools_ms = 0.0;
@@ -89,6 +106,7 @@ public:
         uint32_t draws = 0;
         uint32_t culled = 0;
         uint32_t total = 0;
+        SurfaceStats surfaces;
         double cull_ms = 0.0;
         double record_ms = 0.0;
     };
@@ -99,6 +117,10 @@ public:
         uint32_t rigidCulled = 0;
         uint32_t rigidSubmitted = 0;
         uint32_t rigidDraws = 0;
+        uint32_t animatedVisible = 0;
+        uint32_t animatedCulled = 0;
+        uint32_t animatedSubmitted = 0;
+        uint32_t animatedDraws = 0;
         uint32_t tracedDraws = 0;
         uint32_t detailVisible = 0;
         uint32_t detailSubmitted = 0;
@@ -108,6 +130,9 @@ public:
         uint32_t detailBudget = 0;
         uint32_t meshesUploaded = 0;
         uint32_t texturesUploaded = 0;
+        uint32_t missingMaterial = 0;
+        uint32_t unsupportedMaterial = 0;
+        SurfaceStats surfaces;
         uint64_t geometryBytes = 0;
         uint64_t textureBytes = 0;
     };
@@ -169,11 +194,14 @@ private:
         uint32_t vcount = 0;
         uint32_t ibase = 0;
         uint32_t icount = 0;
-        uint32_t textureIndex = 0;
-        bool alphaTest = false;
+        uint32_t shaderId = 0;
+        uint32_t descriptor = kNullDescriptor;
+        gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Opaque;
+        bool wallmarkClamp = false;
         // 1 = TEXCOORD0 @28 (classic), 2 = TEXCOORD0 @24, 3 = flora с мировой
         // матрицей из OGF_TREEDEF2.
         uint8_t layout = 1;
+        uint8_t traceSlot = UINT8_MAX;
         float world[16] = {1.0f, 0.0f, 0.0f, 0.0f,
                            0.0f, 1.0f, 0.0f, 0.0f,
                            0.0f, 0.0f, 1.0f, 0.0f,
@@ -196,6 +224,7 @@ private:
         ComPtr<ID3D12Resource> image;
         ComPtr<ID3D12Resource> upload;
         uint64_t footprintBytes = 0;
+        DXGI_FORMAT srvFormat = DXGI_FORMAT_UNKNOWN;
         bool alphaTest = false;
     };
 
@@ -203,10 +232,29 @@ private:
     {
         D3D12_VERTEX_BUFFER_VIEW vb{};
         D3D12_INDEX_BUFFER_VIEW ib{};
-        uint32_t texture = 0;
+        uint32_t descriptor = kNullDescriptor;
         uint32_t indices = 0;
+        uint32_t allocation = 0;
+        uint32_t vbOffset = 0;
+        uint32_t ibOffset = 0;
+        uint32_t requiredBones = 0;
         float radius = 0.0f;
-        bool cutout = false;
+        gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Opaque;
+        bool wallmarkClamp = false;
+        bool skinned = false;
+    };
+
+    struct DeferredPipelines
+    {
+        enum Slot : uint32_t { Solid, Blend, Multiply, Translucent, Count };
+        std::array<ComPtr<ID3D12PipelineState>, Count> states;
+    };
+
+    enum class VisualTraceState : uint8_t { Initial, Culled, Submitted };
+    struct VisualTrace
+    {
+        VisualTraceState state = VisualTraceState::Initial;
+        uint8_t messages = 0;
     };
 
     bool Fail(std::string& reason, const char* text);
@@ -235,6 +283,9 @@ private:
     std::vector<ComPtr<ID3D12Resource>> m_auxGeometry;
     std::vector<AuxMesh> m_auxMeshes;
     AuxStats m_auxResources;
+    std::array<VisualTrace, 2> m_visualTrace;
+    uint64_t m_visualTraceFrame = 0;
+    uint8_t m_auxTraceMessages = 0;
     // Копия метаданных пулов нужна для stride/смещений на всё время жизни
     // сцены; байты level.geom после загрузки не удерживаются.
     xraylevel12::LevelPools m_poolRefs;
@@ -243,8 +294,10 @@ private:
     ComPtr<ID3D12PipelineState> m_pipelineState;
     // Вариант для раскладки, где TEXCOORD0 лежит по смещению 24.
     ComPtr<ID3D12PipelineState> m_pipelineUv24;
-    ComPtr<ID3D12PipelineState> m_pipelineRigid;
+    ComPtr<ID3D12PipelineState> m_pipelineSkeletal;
     ComPtr<ID3D12PipelineState> m_pipelineDetail;
+    // classic, uv@24 (включая flora), skeletal
+    std::array<DeferredPipelines, 3> m_deferredPipelines;
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
     ComPtr<ID3D12Resource> m_frameConstants;
     ComPtr<ID3D12Resource> m_frameTransforms;
@@ -274,7 +327,7 @@ private:
 
 // F4.1: связывает shader_id каждого визуала с первой текстурой записи
 // level-шейдера (chunk 2). Возвращает уникальные имена в порядке первого
-// появления и параллельный pools.visuals материал (индекс текстуры + aref).
+// появления и параллельный pools.visuals материал (текстура и режим поверхности).
 void GameDx12StaticScene12_ResolveMaterials(
     std::span<const uint8_t> levelBytes, const xraylevel12::LevelPools& pools,
     std::vector<std::string>& uniqueTextureNames,

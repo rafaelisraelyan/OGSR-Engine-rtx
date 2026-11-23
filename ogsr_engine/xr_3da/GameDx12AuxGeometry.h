@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GameDx12Surface.h"
+
 #include <DirectXMath.h>
 
 #include <cstdint>
@@ -8,7 +10,7 @@
 
 namespace gameaux12
 {
-constexpr uint32_t kMaxBones = 64;
+constexpr uint32_t kMaxBones = 128;
 constexpr uint32_t kInvalidMesh = UINT32_MAX;
 constexpr uint32_t kMaxFrameTransforms = 131072;
 
@@ -17,7 +19,8 @@ struct Vertex
     float position[3];
     float normal[3];
     float uv[2];
-    uint32_t bone = 0;
+    uint32_t bones[4]{};
+    float weights[4]{1.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct Mesh
@@ -26,12 +29,15 @@ struct Mesh
     std::vector<uint16_t> indices;
     std::string texture;
     bool cutout = false;
+    bool skinned = false;
+    std::string shader;
+    SurfaceMode surface = SurfaceMode::Auto;
 };
 
 struct Part
 {
     uint32_t mesh = kInvalidMesh;
-    uint64_t boneMask = 0;
+    uint32_t requiredBones = 0;
 };
 
 struct ObjectDraw
@@ -46,6 +52,7 @@ struct ObjectDraw
     float center[3]{};
     float radius = 0.0f;
     DirectX::XMFLOAT4X4 world;
+    bool skinned = false;
 };
 
 struct DetailDraw

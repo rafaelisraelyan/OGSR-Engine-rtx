@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +24,7 @@
 namespace
 {
 using Clock = std::chrono::steady_clock;
+using gameaux12::SurfaceMode;
 
 constexpr uint64_t kFrameConstantsSize = 256;
 constexpr uint64_t kFrameConstantsSlots = 2;
@@ -33,9 +35,59 @@ constexpr uint64_t kMaxAuxGeometryBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kMaxAuxTextureBytes = 256ull * 1024 * 1024;
 constexpr uint64_t kTransformSlotBytes =
     gameaux12::kMaxFrameTransforms * sizeof(DirectX::XMFLOAT4X4);
+static_assert(sizeof(DirectX::XMFLOAT4X4) == 4 * 4 * sizeof(float));
 constexpr uint64_t kMaxTextureBytes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxSceneTextureBytes = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr const char* kFallbackTextureName = "";
+constexpr uint8_t kMaxVisualTraceMessages = 12;
+
+constexpr bool IsOverlay(SurfaceMode surface)
+{
+    return surface == SurfaceMode::OverlayOpaque || surface == SurfaceMode::OverlayCutout ||
+        surface == SurfaceMode::OverlayBlend || surface == SurfaceMode::OverlayMultiply;
+}
+
+constexpr bool IsBlended(SurfaceMode surface)
+{
+    return surface == SurfaceMode::OverlayBlend || surface == SurfaceMode::OverlayMultiply ||
+        surface == SurfaceMode::Translucent;
+}
+
+constexpr bool IsCutout(SurfaceMode surface)
+{
+    return surface == SurfaceMode::Cutout || surface == SurfaceMode::OverlayCutout;
+}
+
+constexpr SurfaceMode ResolveSurface(SurfaceMode surface, bool binaryAlpha)
+{
+    if (surface == SurfaceMode::Auto)
+        return binaryAlpha ? SurfaceMode::Cutout : SurfaceMode::Opaque;
+    return surface;
+}
+
+void CountSurfaceDraw(GameDx12StaticScene12::SurfaceStats& stats, SurfaceMode surface)
+{
+    switch (surface)
+    {
+    case SurfaceMode::Opaque: ++stats.opaque; break;
+    case SurfaceMode::Cutout: ++stats.cutout; break;
+    case SurfaceMode::OverlayOpaque: ++stats.overlayOpaque; break;
+    case SurfaceMode::OverlayCutout: ++stats.overlayCutout; break;
+    case SurfaceMode::OverlayBlend: ++stats.overlayBlend; break;
+    case SurfaceMode::OverlayMultiply: ++stats.overlayMultiply; break;
+    case SurfaceMode::Translucent: ++stats.translucent; break;
+    default: break;
+    }
+}
+
+// Эти флаги передаются в MaterialCB обоих путей.
+constexpr uint32_t kSampleBase = 1u;
+constexpr uint32_t kClipAlpha = 2u;
+constexpr uint32_t kUnlit = 4u;
+constexpr uint32_t kOutputAlpha = 8u;
+constexpr uint32_t kWallmarkClamp = 16u;
+// R4 WallmarksEngine вычитает этот сдвиг из проекционного _43.
+constexpr float kWallmarkClipShift = 0.0001f;
 
 double Ms(Clock::time_point start)
 {
@@ -57,6 +109,32 @@ bool FiniteMatrix(const DirectX::XMFLOAT4X4& matrix)
             if (!std::isfinite(matrix.m[row][column]))
                 return false;
     return true;
+}
+
+uint32_t RequiredAuxBones(const gameaux12::Mesh& mesh)
+{
+    uint32_t required = 0;
+    for (const uint16_t index : mesh.indices)
+    {
+        if (index >= mesh.vertices.size())
+            return 0;
+        const auto& vertex = mesh.vertices[index];
+        float total = 0.f;
+        for (uint32_t influence = 0; influence < std::size(vertex.bones); ++influence)
+        {
+            const float weight = vertex.weights[influence];
+            const uint32_t bone = vertex.bones[influence];
+            if (!std::isfinite(weight) || weight < 0.f || weight > 1.0f + 1.0e-6f)
+                return 0;
+            if (bone >= gameaux12::kMaxBones || (weight == 0.f && bone != 0))
+                return 0;
+            required = (std::max)(required, bone + 1);
+            total += weight;
+        }
+        if (std::abs(total - 1.f) > 1.e-4f)
+            return 0;
+    }
+    return required;
 }
 
 D3D12_RESOURCE_DESC BufferDesc(uint64_t size)
@@ -127,14 +205,23 @@ cbuffer ObjectCB : register(b3)
     row_major float4x4 World;
 };
 
+cbuffer StaticGeometryCB : register(b4)
+{
+    uint TreeGeometry;
+    float WallmarkClipShift;
+};
+
 VSOutput main(VSInput input)
 {
     VSOutput output;
     const float4 worldPosition = mul(float4(input.position, 1.0f), World);
     output.position = mul(worldPosition, ViewProjection);
+    if (output.position.z > 0.0f)
+        output.position.z = max(0.0f, output.position.z - WallmarkClipShift);
     output.normal = mul(2.0f * input.nh.zyx - 1.0f, (float3x3)World);
-    output.uv = (float2(input.tc) + float2(input.tangent.w, input.binormal.w))
-                * (32.0f / 32768.0f);
+    // FTreeVisual и tree_s используют короткие UV без дробной добавки и масштаб 16.
+    output.uv = TreeGeometry != 0 ? float2(input.tc) * (16.0f / 32768.0f) :
+        (float2(input.tc) + float2(input.tangent.w, input.binormal.w)) * (32.0f / 32768.0f);
     output.world = worldPosition.xyz;
     return output;
 }
@@ -150,11 +237,23 @@ cbuffer DrawCB : register(b3)
     uint MatrixBase;
 };
 
+cbuffer AuxGeometryCB : register(b4)
+{
+    uint ReservedGeometry;
+    float WallmarkClipShift;
+};
+
 struct Transform
 {
     float4 row0, row1, row2, row3;
 };
 StructuredBuffer<Transform> Transforms : register(t1);
+
+float4x4 LoadWorldTransform(uint index)
+{
+    const Transform transform = Transforms[index];
+    return float4x4(transform.row0, transform.row1, transform.row2, transform.row3);
+}
 
 struct VSOutput
 {
@@ -165,17 +264,34 @@ struct VSOutput
 };
 
 VSOutput main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TEXCOORD0,
-              uint bone : BLENDINDICES, uint instance : SV_InstanceID)
+              uint4 bones : BLENDINDICES, float4 weights : BLENDWEIGHT,
+              uint instance : SV_InstanceID)
 {
-    const Transform transform = Transforms[MatrixBase + instance + bone];
-    const float4x4 world = float4x4(transform.row0, transform.row1,
-                                   transform.row2, transform.row3);
-    const float4 worldPosition = mul(float4(position, 1), world);
+    // Матрицы позы уже включают object-to-world. Для деталей offset
+    // адресует последовательность инстансов, у каждого одна матрица.
+    const uint baseIndex = MatrixBase + instance;
+    float3 worldPosition = 0.0f;
+    float3 worldNormal = 0.0f;
+    [unroll]
+    for (uint influence = 0; influence < 4; ++influence)
+    {
+        const float weight = weights[influence];
+        if (weight > 0.0f)
+        {
+            const float4x4 world = LoadWorldTransform(baseIndex + bones[influence]);
+            worldPosition += weight * mul(float4(position, 1.0f), world).xyz;
+            // Как skinning_dir в R4, берём только линейную часть.
+            worldNormal += weight * mul(normal, (float3x3)world);
+        }
+    }
     VSOutput output;
-    output.position = mul(worldPosition, ViewProj);
-    output.normal = mul(normal, (float3x3)world);
+    output.position = mul(float4(worldPosition, 1.0f), ViewProj);
+    if (output.position.z > 0.0f)
+        output.position.z = max(0.0f, output.position.z - WallmarkClipShift);
+    const float normalSquared = dot(worldNormal, worldNormal);
+    output.normal = normalSquared > 0.0f ? normalize(worldNormal) : float3(0, 1, 0);
     output.uv = uv;
-    output.world = worldPosition.xyz;
+    output.world = worldPosition;
     return output;
 }
 )";
@@ -183,6 +299,7 @@ VSOutput main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TE
 constexpr const char* kScenePixelShader = R"(
 Texture2D BaseColor : register(t0);
 SamplerState BaseSampler : register(s0);
+SamplerState WallmarkSampler : register(s1);
 
 cbuffer MaterialCB : register(b1)
 {
@@ -204,25 +321,28 @@ float4 main(PSInput input) : SV_Target
 {
     const float3 n = normalize(input.normal);
     float4 baseColor = float4(0.72f, 0.72f, 0.76f, 1.0f);
-    if (TextureMode != 0)
-        baseColor = BaseColor.Sample(BaseSampler, input.uv);
-    if (TextureMode == 2)
+    const bool textured = (TextureMode & 1) != 0;
+    if (textured)
+        baseColor = (TextureMode & 16) != 0 ? BaseColor.SampleLevel(WallmarkSampler, input.uv, 0) :
+            BaseColor.Sample(BaseSampler, input.uv);
+    if ((TextureMode & 2) != 0)
         clip(baseColor.a - AlphaThreshold);
     if (ViewMode == 1)
         return float4(frac((MaterialId + 1) * float3(0.618f, 0.381f, 0.173f)), 1.0f);
     if (ViewMode == 2)
         return float4(frac(input.uv), saturate(n.y * 0.5f + 0.5f), 1.0f);
     if (ViewMode == 3)
-        return TextureMode == 0 ? float4(0.9f, 0.1f, 0.1f, 1.0f)
-                                : float4(0.1f, 0.1f, 0.1f, 1.0f);
+        return textured ? float4(0.1f, 0.1f, 0.1f, 1.0f)
+                        : float4(0.9f, 0.1f, 0.1f, 1.0f);
     const float3 sunDir = normalize(float3(-0.42f, 0.78f, 0.35f));
     const float sun = saturate(dot(n, sunDir));
     // Базовое освещение первого этапа: солнце + верхняя полусфера.
     const float sky = saturate(n.y) * 0.22f;
     const float light = 0.55f + 0.45f * sun + sky;
-    const float3 linearColor = saturate(baseColor.rgb * light);
+    const float3 linearColor = saturate(baseColor.rgb * ((TextureMode & 4) != 0 ? 1.0f : light));
+    const float alpha = (TextureMode & 8) != 0 ? baseColor.a : 1.0f;
     return float4(max(min(12.92f * linearColor, 0.04045f),
-                      1.055f * pow(linearColor, 1.0f / 2.4f) - 0.055f), 1.0f);
+                      1.055f * pow(linearColor, 1.0f / 2.4f) - 0.055f), alpha);
 }
 )";
 
@@ -341,6 +461,51 @@ bool SceneAlphaTestDisabled()
     return disabled;
 }
 
+const std::array<uint32_t, 2>& R1VisualSelection()
+{
+    static const auto selected = []
+    {
+        constexpr std::array<uint32_t, 2> empty{UINT32_MAX, UINT32_MAX};
+        const char* value = std::getenv("OGSR_DX12_GAME_R1_VISUAL_ID");
+        if (!value || !*value)
+            return empty;
+
+        auto ids = empty;
+        std::string_view remaining(value);
+        for (auto& id : ids)
+        {
+            const auto comma = remaining.find(',');
+            auto token = remaining.substr(0, comma);
+            const auto first = token.find_first_not_of(" \t");
+            if (first == token.npos)
+                break;
+            token = token.substr(first, token.find_last_not_of(" \t") - first + 1);
+            const char* end = token.data() + token.size();
+            const auto parse = std::from_chars(token.data(), end, id);
+            if (parse.ec != std::errc{} || parse.ptr != end || id == UINT32_MAX)
+                break;
+            if (comma == remaining.npos)
+            {
+                if (ids[1] == ids[0])
+                    ids[1] = UINT32_MAX;
+                return ids;
+            }
+            remaining.remove_prefix(comma + 1);
+        }
+        Msg("ph_dx12_f43_r1: invalid OGSR_DX12_GAME_R1_VISUAL_ID expected one or two decimal IDs");
+        return empty;
+    }();
+    return selected;
+}
+
+uint8_t R1VisualTraceSlot(const std::array<uint32_t, 2>& selected, uint32_t visualId)
+{
+    for (uint8_t slot = 0; slot < selected.size(); ++slot)
+        if (selected[slot] != UINT32_MAX && selected[slot] == visualId)
+            return slot;
+    return UINT8_MAX;
+}
+
 // F4.1-E: per-draw дамп для сравнения с R4 (ph_cmp: r4draw).
 bool SceneCompareEnabled()
 {
@@ -400,7 +565,7 @@ bool GameDx12StaticScene12::Fail(std::string& reason, const std::string& text)
 bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                            std::string& reason)
 {
-    D3D12_ROOT_PARAMETER params[5] = {};
+    D3D12_ROOT_PARAMETER params[6] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -429,6 +594,11 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[4].Descriptor.ShaderRegister = 1;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[5].Constants.ShaderRegister = 4;
+    params[5].Constants.Num32BitValues = 2;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -441,11 +611,20 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     sampler.ShaderRegister = 0;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    auto wallmarkSampler = sampler;
+    wallmarkSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    wallmarkSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    wallmarkSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    wallmarkSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    wallmarkSampler.MaxAnisotropy = 1;
+    wallmarkSampler.ShaderRegister = 1;
+    const D3D12_STATIC_SAMPLER_DESC samplers[] = {sampler, wallmarkSampler};
+
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters = static_cast<UINT>(std::size(params));
     rootDesc.pParameters = params;
-    rootDesc.NumStaticSamplers = 1;
-    rootDesc.pStaticSamplers = &sampler;
+    rootDesc.NumStaticSamplers = static_cast<UINT>(std::size(samplers));
+    rootDesc.pStaticSamplers = samplers;
     rootDesc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -497,6 +676,7 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     rasterizer.CullMode = (cullValue != nullptr && std::strcmp(cullValue, "none") == 0)
                               ? D3D12_CULL_MODE_NONE
                               : D3D12_CULL_MODE_BACK;
+    m_cullEnabled = rasterizer.CullMode == D3D12_CULL_MODE_BACK;
     rasterizer.FrontCounterClockwise = FALSE;
     rasterizer.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     rasterizer.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
@@ -539,10 +719,49 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     desc.NodeMask = 0;
     desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
+    const auto createDeferred = [&](DeferredPipelines& pipelines)
+    {
+        for (uint32_t slot = 0; slot < DeferredPipelines::Count; ++slot)
+        {
+            auto deferred = desc;
+            deferred.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            deferred.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            if (slot != DeferredPipelines::Translucent)
+            {
+                // D32_FLOAT и обычный Z: ограниченный отрицательный bias
+                // отделяет накладку от её опорной плоскости.
+                deferred.RasterizerState.DepthBias = -1;
+                deferred.RasterizerState.SlopeScaledDepthBias = -0.5f;
+                deferred.RasterizerState.DepthBiasClamp = -4.0e-6f;
+            }
+            auto& target = deferred.BlendState.RenderTarget[0];
+            target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
+                D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+            if (slot != DeferredPipelines::Solid)
+            {
+                target.BlendEnable = TRUE;
+                target.SrcBlend = slot == DeferredPipelines::Multiply
+                    ? D3D12_BLEND_DEST_COLOR : D3D12_BLEND_SRC_ALPHA;
+                target.DestBlend = slot == DeferredPipelines::Multiply
+                    ? D3D12_BLEND_SRC_COLOR : D3D12_BLEND_INV_SRC_ALPHA;
+                target.BlendOp = D3D12_BLEND_OP_ADD;
+                target.SrcBlendAlpha = D3D12_BLEND_ONE;
+                target.DestBlendAlpha = D3D12_BLEND_ZERO;
+                target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            }
+            if (FAILED(device->CreateGraphicsPipelineState(
+                    &deferred, IID_PPV_ARGS(pipelines.states[slot].GetAddressOf()))))
+                return Fail(reason, "deferred surface pipeline creation failed");
+        }
+        return true;
+    };
+
     hr = device->CreateGraphicsPipelineState(
         &desc, IID_PPV_ARGS(m_pipelineState.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "static scene pipeline creation failed");
+    if (!createDeferred(m_deferredPipelines[0]))
+        return false;
 
     // F4.1: вторая фактическая раскладка level.geom — TEXCOORD0 по смещению
     // 24 (вместо COLOR@24 + TEXCOORD@28). Шейдеры и состояния те же, поэтому
@@ -564,12 +783,15 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
         &desc, IID_PPV_ARGS(m_pipelineUv24.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "static scene pipeline creation failed (uv24)");
+    if (!createDeferred(m_deferredPipelines[1]))
+        return false;
 
     ComPtr<ID3D10Blob> auxVertex;
     if (!CompileShader(kAuxVertexShader, "main", "vs_5_0",
                        auxVertex.GetAddressOf(), reason))
         return false;
     using Vertex = gameaux12::Vertex;
+    static_assert(sizeof(Vertex) == 64);
     const D3D12_INPUT_ELEMENT_DESC auxLayout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, position),
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -577,14 +799,18 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Vertex, uv),
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"BLENDINDICES", 0, DXGI_FORMAT_R32_UINT, 0, offsetof(Vertex, bone),
+        {"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_UINT, 0, offsetof(Vertex, bones),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, weights),
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
     desc.VS = {auxVertex->GetBufferPointer(), auxVertex->GetBufferSize()};
     desc.InputLayout = {auxLayout, static_cast<UINT>(std::size(auxLayout))};
     if (FAILED(device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(m_pipelineRigid.GetAddressOf()))))
-        return Fail(reason, "rigid scene pipeline creation failed");
+            &desc, IID_PPV_ARGS(m_pipelineSkeletal.GetAddressOf()))))
+        return Fail(reason, "skeletal scene pipeline creation failed");
+    if (!createDeferred(m_deferredPipelines[2]))
+        return false;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     if (FAILED(device->CreateGraphicsPipelineState(
             &desc, IID_PPV_ARGS(m_pipelineDetail.GetAddressOf()))))
@@ -1032,6 +1258,7 @@ bool GameDx12StaticScene12::CreateTextures(
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = dds.mipCount;
         device->CreateShaderResourceView(texture.image.Get(), &srv, cpu);
+        texture.srvFormat = srvFormat;
 
         textureBytes += total;
         ++uploaded;
@@ -1120,6 +1347,9 @@ bool GameDx12StaticScene12::Load(
         m_levelName = levelName;
         m_levelSession = levelSession;
         m_levelEpoch = levelEpoch;
+        m_visualTrace = {};
+        m_visualTraceFrame = 0;
+        m_auxTraceMessages = 0;
         m_generation = (levelSession * 0x9E3779B97F4A7C15ull) ^
                        (levelEpoch * 0xBF58476D1CE4E5B9ull) ^
                        0x4634314C4C534354ull;
@@ -1128,11 +1358,35 @@ bool GameDx12StaticScene12::Load(
 
         m_draws.clear();
         m_draws.reserve(pools.visuals_drawable);
+        const auto& selected = R1VisualSelection();
+        std::array<bool, 2> seen{};
         for (size_t index = 0; index < pools.visuals.size(); ++index)
         {
             const auto& visual = pools.visuals[index];
+            const uint8_t traceSlot = R1VisualTraceSlot(selected, visual.id);
+            if (traceSlot != UINT8_MAX)
+                seen[traceSlot] = true;
             if (!visual.drawable)
+            {
+                if (traceSlot != UINT8_MAX)
+                    Msg("ph_dx12_f43_r1: static visual_id=%u type=%u shader_id=%u "
+                        "state=rejected reason='%s'",
+                        visual.id, static_cast<unsigned>(visual.type), visual.shader_id,
+                        xraylevel12::ReadErrorMessage(visual.reject));
                 continue;
+            }
+            const auto& material = materials[index];
+            if (material.hasOverride)
+                ++m_stats.material_overrides;
+            if (material.surface == SurfaceMode::Unsupported)
+            {
+                ++m_stats.unsupported_materials;
+                if (traceSlot != UINT8_MAX)
+                    Msg("ph_dx12_f43_r1: static visual_id=%u shader_id=%u "
+                        "state=rejected reason='unsupported_material'",
+                        visual.id, visual.shader_id);
+                continue;
+            }
             DrawSource12 draw;
             draw.visualId = visual.id;
             draw.vbPool = visual.vb_id;
@@ -1141,15 +1395,16 @@ bool GameDx12StaticScene12::Load(
             draw.vcount = visual.vcount;
             draw.ibase = visual.ibase;
             draw.icount = visual.icount;
-            draw.textureIndex = materials[index].textureIndex;
-            draw.alphaTest = materials[index].alphaTest;
-            // F4.1: если THM текстуры сообщает alpha (сетки, листва, решётки),
-            // материал вырезается по порогу даже когда имя шейдера не содержит
-            // aref. Иначе такие поверхности рисуются сплошным чёрным.
-            if (draw.textureIndex != GameDx12StaticMaterial12::kNoTexture &&
-                draw.textureIndex < textures.size() &&
-                textures[draw.textureIndex].alphaTest)
-                draw.alphaTest = true;
+            draw.shaderId = visual.shader_id;
+            draw.traceSlot = traceSlot;
+            const bool haveTexture = material.textureIndex < textures.size();
+            if (haveTexture)
+                draw.descriptor = material.textureIndex + 1;
+            else if (material.textureIndex != GameDx12StaticMaterial12::kNoTexture)
+                return Fail(reason, "static material references an out-of-range texture");
+            draw.surface = ResolveSurface(material.surface,
+                haveTexture && textures[material.textureIndex].alphaTest);
+            draw.wallmarkClamp = material.wallmarkClamp;
             draw.layout =
                 visual.layout == xraylevel12::VertexLayout12::UvAt24 ? 2 : 1;
             if (visual.has_world)
@@ -1189,6 +1444,10 @@ bool GameDx12StaticScene12::Load(
             draw.radius = visual.sphere_radius;
             m_draws.push_back(draw);
         }
+        for (size_t slot = 0; slot < selected.size(); ++slot)
+            if (selected[slot] != UINT32_MAX && !seen[slot])
+                Msg("ph_dx12_f43_r1: static visual_id=%u state=rejected "
+                    "reason='visual_not_in_level_pool'", selected[slot]);
         if (m_draws.empty())
             return Fail(reason, "level has no drawable static geometry");
 
@@ -1223,14 +1482,58 @@ bool GameDx12StaticScene12::Load(
             texture.upload.Reset();
         m_uploadConfirmed = true;
 
-        m_stats.draws_without_texture = 0;
-        m_stats.drawing_alpha_test = 0;
-        for (const auto& draw : m_draws)
+        for (auto& draw : m_draws)
         {
-            if (draw.textureIndex == GameDx12StaticMaterial12::kNoTexture)
-                ++m_stats.draws_without_texture;
-            if (draw.alphaTest)
+            // Есть запись DDS в таблице, но отсутствует загруженный SRV.
+            // Обычная поверхность получит диагностический цвет, а вырезка
+            // или накладка без текстуры пропускается.
+            const uint32_t requestedDescriptor = draw.descriptor;
+            const bool haveSrv = requestedDescriptor != kNullDescriptor &&
+                m_textures[requestedDescriptor - 1].image != nullptr;
+            const bool skip = !haveSrv && draw.surface != SurfaceMode::Opaque;
+            if (!haveSrv)
+            {
+                if (draw.descriptor != kNullDescriptor || draw.surface != SurfaceMode::Opaque)
+                    ++m_stats.material_missing_srv;
+                draw.descriptor = kNullDescriptor;
+                if (!skip)
+                    ++m_stats.draws_without_texture;
+            }
+            if (!skip && IsCutout(draw.surface))
                 ++m_stats.drawing_alpha_test;
+            if (draw.traceSlot != UINT8_MAX)
+            {
+                const auto* source = requestedDescriptor == kNullDescriptor
+                    ? nullptr : &textures[requestedDescriptor - 1];
+                const auto byteOffset = uint64_t{draw.vbase} * draw.vertexView.StrideInBytes;
+                Msg("ph_dx12_f43_r1: static visual_id=%u shader_id=%u texture='%s' "
+                    "state=%s reason='%s' pso='%s' layout=%u srv=%u requested_srv=%u "
+                    "dds_format=%u srv_format=%u thm_binary=%d "
+                    "vb_pool=%u vbase=%u vcount=%u vb_offset=%llu vb_stride=%u vb_bytes=%u "
+                    "ib_pool=%u ibase=%u icount=%u ib_offset=%llu ib_format=%u "
+                    "start_index=0 base_vertex=0",
+                    draw.visualId, draw.shaderId, source ? source->name.c_str() : "-",
+                    skip ? "rejected" : "ready", haveSrv ? "none" : "no_srv",
+                    gameaux12::SurfaceModeName(draw.surface), static_cast<unsigned>(draw.layout),
+                    draw.descriptor, requestedDescriptor,
+                    source ? static_cast<unsigned>(source->dds.format) : 0u,
+                    haveSrv ? static_cast<unsigned>(m_textures[draw.descriptor - 1].srvFormat) : 0u,
+                    source && source->alphaTest ? 1 : 0,
+                    draw.vbPool, draw.vbase, draw.vcount,
+                    static_cast<unsigned long long>(byteOffset), draw.vertexView.StrideInBytes,
+                    draw.vertexView.SizeInBytes, draw.ibPool, draw.ibase, draw.icount,
+                    static_cast<unsigned long long>(uint64_t{draw.ibase} * sizeof(uint16_t)),
+                    static_cast<unsigned>(draw.indexView.Format));
+            }
+        }
+        std::erase_if(m_draws, [](const DrawSource12& draw)
+        {
+            return draw.descriptor == kNullDescriptor && draw.surface != SurfaceMode::Opaque;
+        });
+        if (m_draws.empty())
+        {
+            ReleaseGpu();
+            return Fail(reason, "level has no drawable static materials");
         }
 
         m_loaded = true;
@@ -1294,19 +1597,37 @@ bool GameDx12StaticScene12::RegisterMeshes(
     if (!m_loaded || !m_uploadConfirmed || m_gpuUnknown)
         return Fail(reason, "scene is unavailable for mesh registration");
 
+    struct PendingMesh
+    {
+        uint32_t source;
+        uint32_t requiredBones;
+    };
     uint64_t bytes = 0;
-    std::vector<uint32_t> pending;
+    std::vector<PendingMesh> pending;
     std::vector<std::string> textureNames;
     std::unordered_set<std::string> unique;
     for (size_t i = 0; i < sources.size(); ++i)
     {
         const auto& mesh = *sources[i];
+        if (mesh.surface == SurfaceMode::Unsupported)
+        {
+            ++m_auxResources.unsupportedMaterial;
+            continue;
+        }
         if (mesh.vertices.empty() || mesh.indices.empty() ||
             mesh.vertices.size() > 65536 || mesh.indices.size() > UINT32_MAX / 2u)
             continue;
+        if (mesh.texture.empty())
+        {
+            ++m_auxResources.missingMaterial;
+            continue;
+        }
         const auto meshBytes = mesh.vertices.size() * sizeof(gameaux12::Vertex) +
             ((mesh.indices.size() * sizeof(uint16_t) + 3u) & ~size_t{3});
         if (meshBytes > kMaxAuxGeometryBytes - m_auxResources.geometryBytes - bytes)
+            continue;
+        const uint32_t requiredBones = RequiredAuxBones(mesh);
+        if (requiredBones == 0)
             continue;
         if (!m_textureKeys.contains(mesh.texture) && !unique.contains(mesh.texture))
         {
@@ -1315,7 +1636,7 @@ bool GameDx12StaticScene12::RegisterMeshes(
             unique.emplace(mesh.texture);
             textureNames.push_back(mesh.texture);
         }
-        pending.push_back(static_cast<uint32_t>(i));
+        pending.push_back({static_cast<uint32_t>(i), requiredBones});
         bytes += meshBytes;
     }
     if (pending.empty())
@@ -1370,23 +1691,34 @@ bool GameDx12StaticScene12::RegisterMeshes(
         return Fail(reason, "additional mesh map failed");
     const auto address = geometry->GetGPUVirtualAddress();
     uint64_t cursor = 0;
-    for (const uint32_t i : pending)
+    for (const auto& candidate : pending)
     {
+        const uint32_t i = candidate.source;
         const auto& source = *sources[i];
         const uint32_t texture = m_textureKeys.at(source.texture);
         if (m_textures[texture].image == nullptr)
+        {
+            ++m_auxResources.missingMaterial;
             continue;
+        }
         const uint32_t vbBytes = static_cast<uint32_t>(
             source.vertices.size() * sizeof(gameaux12::Vertex));
         const uint32_t ibBytes = static_cast<uint32_t>(
             source.indices.size() * sizeof(uint16_t));
         AuxMesh mesh;
-        mesh.texture = texture + 1;
-        mesh.cutout = source.cutout || m_textures[texture].alphaTest;
+        mesh.descriptor = texture + 1;
+        mesh.surface = ResolveSurface(source.surface,
+                                     source.cutout || m_textures[texture].alphaTest);
+        mesh.wallmarkClamp = gameaux12::UsesWallmarkClamp(source.shader);
         mesh.indices = static_cast<uint32_t>(source.indices.size());
+        mesh.requiredBones = candidate.requiredBones;
+        mesh.skinned = source.skinned;
+        mesh.allocation = static_cast<uint32_t>(m_auxGeometry.size());
+        mesh.vbOffset = static_cast<uint32_t>(cursor);
         mesh.vb = {address + cursor, vbBytes, sizeof(gameaux12::Vertex)};
         std::memcpy(static_cast<uint8_t*>(mapped) + cursor, source.vertices.data(), vbBytes);
         cursor += vbBytes;
+        mesh.ibOffset = static_cast<uint32_t>(cursor);
         mesh.ib = {address + cursor, ibBytes, DXGI_FORMAT_R16_UINT};
         std::memcpy(static_cast<uint8_t*>(mapped) + cursor, source.indices.data(), ibBytes);
         cursor += (static_cast<uint64_t>(ibBytes) + 3u) & ~uint64_t{3};
@@ -1412,9 +1744,9 @@ uint64_t GameDx12StaticScene12::TextureFootprintBytes(std::span<const uint32_t> 
     uint64_t bytes = 0;
     for (const uint32_t mesh : meshes)
     {
-        if (mesh == gameaux12::kInvalidMesh)
+        if (mesh >= m_auxMeshes.size())
             continue;
-        const uint32_t texture = m_auxMeshes[mesh].texture - 1;
+        const uint32_t texture = m_auxMeshes[mesh].descriptor - 1;
         if (textures.insert(texture).second)
             bytes += m_textures[texture].footprintBytes;
     }
@@ -1468,18 +1800,166 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     static uint32_t compareDumpFrames = 0;
     const bool dumpDraws = SceneCompareEnabled() && compareDumpFrames < 3;
     const auto recordStart = Clock::now();
-    // Три прохода: classic, uv@24, flora (uv@24 + мировая матрица).
-    // PSO переключается один раз на группу, а не на каждый draw.
+    static const bool traceAuxEnabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_R1_OBJECT_ID");
+        return value != nullptr && *value != '\0';
+    }();
+    const bool traceAux = traceAuxEnabled && extras.traceId != UINT32_MAX;
+    if (R1VisualSelection()[0] != UINT32_MAX || traceAux)
+        ++m_visualTraceFrame;
+    const auto traceStaticDraw = [&](const DrawSource12& draw, VisualTraceState state)
+    {
+        if (draw.traceSlot == UINT8_MAX)
+            return;
+        auto& trace = m_visualTrace[draw.traceSlot];
+        if (trace.state == state || trace.messages >= kMaxVisualTraceMessages)
+            return;
+        trace.state = state;
+        const bool submitted = state == VisualTraceState::Submitted;
+        const bool overlay = IsOverlay(draw.surface);
+        const bool deferredDepth = overlay || draw.surface == SurfaceMode::Translucent;
+        Msg("ph_dx12_f43_r1: static visual_id=%u frame=%llu state=%s reason='%s' "
+            "pso='%s' srv=%u alpha_clip=%d alpha_threshold=%.4f "
+            "raster_cull=%s frustum=%d depth_func=%s depth_write=%d depth_bias=%d capped=%d",
+            draw.visualId, static_cast<unsigned long long>(m_visualTraceFrame),
+            submitted ? "submitted" : "culled", submitted ? "none" : "frustum",
+            gameaux12::SurfaceModeName(draw.surface), draw.descriptor,
+            IsCutout(draw.surface) && !alphaTestDisabled ? 1 : 0, threshold,
+            m_cullEnabled ? "back" : "none", cull ? 1 : 0,
+            deferredDepth ? "less_equal" : "less", deferredDepth ? 0 : 1, overlay ? 1 : 0,
+            ++trace.messages == kMaxVisualTraceMessages ? 1 : 0);
+    };
+
+    struct DeferredDraw
+    {
+        const DrawSource12* draw;
+        const AuxMesh* mesh;
+        const gameaux12::ObjectDraw* object;
+        SurfaceMode surface;
+        float depth;
+    };
+    std::vector<DeferredDraw> deferred;
+    const auto viewDepth = [&](const float center[3])
+    {
+        // При перспективной проекции clip.w пропорционален глубине камеры.
+        const float depth = center[0] * logicalViewProjection._14 +
+            center[1] * logicalViewProjection._24 + center[2] * logicalViewProjection._34 +
+            logicalViewProjection._44;
+        return std::isfinite(depth) ? depth : 0.0f;
+    };
+
+    ID3D12PipelineState* boundPipeline = nullptr;
+    const auto bindPipeline = [&](SurfaceMode surface, uint32_t layout, ID3D12PipelineState* regular)
+    {
+        ID3D12PipelineState* pipeline = regular;
+        if (IsOverlay(surface) || surface == SurfaceMode::Translucent)
+        {
+            auto slot = DeferredPipelines::Solid;
+            if (surface == SurfaceMode::OverlayBlend)
+                slot = DeferredPipelines::Blend;
+            else if (surface == SurfaceMode::OverlayMultiply)
+                slot = DeferredPipelines::Multiply;
+            else if (surface == SurfaceMode::Translucent)
+                slot = DeferredPipelines::Translucent;
+            pipeline = m_deferredPipelines[layout].states[slot].Get();
+        }
+        if (boundPipeline != pipeline)
+        {
+            list->SetPipelineState(pipeline);
+            boundPipeline = pipeline;
+        }
+    };
+    const auto bindMaterial = [&](uint32_t descriptor, uint32_t id, SurfaceMode surface,
+                                  bool wallmarkClamp)
+    {
+        auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += static_cast<UINT64>(descriptor) * m_textureDescriptorSize;
+        list->SetGraphicsRootDescriptorTable(1, gpu);
+        uint32_t mode = descriptor == kNullDescriptor ? 0u : kSampleBase;
+        if (descriptor != kNullDescriptor && IsCutout(surface) && !alphaTestDisabled)
+            mode |= kClipAlpha;
+        if (IsOverlay(surface))
+            mode |= kUnlit;
+        if (IsBlended(surface))
+            mode |= kOutputAlpha;
+        if (wallmarkClamp)
+            mode |= kWallmarkClamp;
+        const uint32_t material[] = {mode, id, viewMode, std::bit_cast<uint32_t>(threshold)};
+        list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
+    };
+
     const float identity[16] = {1.0f, 0.0f, 0.0f, 0.0f,
                                 0.0f, 1.0f, 0.0f, 0.0f,
                                 0.0f, 0.0f, 1.0f, 0.0f,
                                 0.0f, 0.0f, 0.0f, 1.0f};
-    list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
+    bool worldIdentity = false;
+    const auto drawStatic = [&](const DrawSource12& draw)
+    {
+        const bool classic = draw.layout == 1;
+        bindPipeline(draw.surface, classic ? 0u : 1u,
+                     classic ? m_pipelineState.Get() : m_pipelineUv24.Get());
+        if (draw.layout == 3 || !worldIdentity)
+        {
+            worldIdentity = draw.layout != 3;
+            list->SetGraphicsRoot32BitConstants(3, 16, worldIdentity ? identity : draw.world, 0);
+        }
+        const uint32_t geometry[] = {draw.layout == 3 ? 1u : 0u,
+            std::bit_cast<uint32_t>(IsOverlay(draw.surface) ? kWallmarkClipShift : 0.0f)};
+        list->SetGraphicsRoot32BitConstants(5, 2, geometry, 0);
+        bindMaterial(draw.descriptor, draw.visualId, draw.surface, draw.wallmarkClamp);
+        list->IASetVertexBuffers(0, 1, &draw.vertexView);
+        list->IASetIndexBuffer(&draw.indexView);
+        list->DrawIndexedInstanced(draw.icount, 1, 0, 0, 0);
+        traceStaticDraw(draw, VisualTraceState::Submitted);
+        CountSurfaceDraw(stats.surfaces, draw.surface);
+        ++stats.draws;
+        if (dumpDraws)
+            Msg("ph_cmp: dx12draw id=%u variant=%u state=drawn shader_id=%u srv=%u surface='%s'",
+                draw.visualId, draw.layout, draw.shaderId, draw.descriptor,
+                gameaux12::SurfaceModeName(draw.surface));
+    };
+    const auto drawMesh = [&](const AuxMesh& mesh, uint32_t id, SurfaceMode surface,
+                              uint32_t offset, uint32_t count, ID3D12PipelineState* regular)
+    {
+        bindPipeline(surface, 2, regular);
+        bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp);
+        list->SetGraphicsRoot32BitConstant(3, offset, 0);
+        const uint32_t geometry[] = {0u,
+            std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f)};
+        list->SetGraphicsRoot32BitConstants(5, 2, geometry, 0);
+        worldIdentity = false;
+        list->IASetVertexBuffers(0, 1, &mesh.vb);
+        list->IASetIndexBuffer(&mesh.ib);
+        list->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
+        CountSurfaceDraw(auxStats.surfaces, surface);
+    };
+    const auto drawObjectPart = [&](const AuxMesh& mesh, const gameaux12::ObjectDraw& object)
+    {
+        drawMesh(mesh, object.id, mesh.surface, object.poseOffset, 1, m_pipelineSkeletal.Get());
+        if (traceAux && object.id == extras.traceId && m_auxTraceMessages < kMaxVisualTraceMessages)
+        {
+            const auto handle = static_cast<uint32_t>(&mesh - m_auxMeshes.data());
+            Msg("ph_dx12_f43_r1: aux_gpu object_id=%u generation=%llu frame=%llu handle=%u "
+                "state=submitted pso='%s' srv=%u srv_format=%u allocation=%u vb_offset=%u "
+                "vb_stride=%u vb_bytes=%u ib_offset=%u icount=%u ib_format=%u "
+                "start_index=0 base_vertex=0 pose_offset=%u bone_count=%u capped=%d",
+                static_cast<unsigned>(object.id), static_cast<unsigned long long>(object.generation),
+                static_cast<unsigned long long>(m_visualTraceFrame), handle,
+                gameaux12::SurfaceModeName(mesh.surface), mesh.descriptor,
+                static_cast<unsigned>(m_textures[mesh.descriptor - 1].srvFormat), mesh.allocation,
+                mesh.vbOffset, mesh.vb.StrideInBytes, mesh.vb.SizeInBytes, mesh.ibOffset, mesh.indices,
+                static_cast<unsigned>(mesh.ib.Format), object.poseOffset, object.boneCount,
+                ++m_auxTraceMessages == kMaxVisualTraceMessages ? 1 : 0);
+        }
+        ++(object.skinned ? auxStats.animatedDraws : auxStats.rigidDraws);
+        if (object.id == extras.traceId)
+            ++auxStats.tracedDraws;
+    };
+
+    // Базовое покрытие static: classic, uv@24, flora с мировой матрицей.
     for (uint32_t variant = 1; variant <= 3; ++variant)
     {
-        ID3D12PipelineState* pipeline =
-            variant == 1 ? m_pipelineState.Get() : m_pipelineUv24.Get();
-        bool bound = false;
         for (const auto& draw : m_draws)
         {
             if (draw.layout != variant)
@@ -1487,96 +1967,72 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (cull && !SphereInside(planes, draw.center, draw.radius))
             {
                 ++stats.culled;
+                traceStaticDraw(draw, VisualTraceState::Culled);
                 if (dumpDraws)
-                    Msg("ph_cmp: dx12draw id=%u variant=%u state=culled",
-                        draw.visualId, variant);
+                    Msg("ph_cmp: dx12draw id=%u variant=%u state=culled shader_id=%u srv=%u surface='%s'",
+                        draw.visualId, variant, draw.shaderId, draw.descriptor,
+                        gameaux12::SurfaceModeName(draw.surface));
                 continue;
             }
-            if (!bound)
+            if (IsOverlay(draw.surface) || IsBlended(draw.surface))
             {
-                list->SetPipelineState(pipeline);
-                bound = true;
+                deferred.push_back({&draw, nullptr, nullptr, draw.surface, viewDepth(draw.center)});
+                continue;
             }
-            if (variant == 3)
-                list->SetGraphicsRoot32BitConstants(3, 16, draw.world, 0);
-            const bool textured =
-                draw.textureIndex != GameDx12StaticMaterial12::kNoTexture;
-            auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-            gpu.ptr += static_cast<UINT64>(textured ? draw.textureIndex + 1 : 0) *
-                       m_textureDescriptorSize;
-            list->SetGraphicsRootDescriptorTable(1, gpu);
-            const uint32_t mode = !textured ? 0u
-                                 : (!alphaTestDisabled && draw.alphaTest) ? 2u
-                                                                          : 1u;
-            const uint32_t material[] = {mode, draw.visualId, viewMode,
-                                         std::bit_cast<uint32_t>(threshold)};
-            list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
-            list->IASetVertexBuffers(0, 1, &draw.vertexView);
-            list->IASetIndexBuffer(&draw.indexView);
-            list->DrawIndexedInstanced(draw.icount, 1, 0, 0, 0);
-            ++stats.draws;
-            if (dumpDraws)
-                Msg("ph_cmp: dx12draw id=%u variant=%u state=drawn",
-                    draw.visualId, variant);
+            drawStatic(draw);
         }
     }
-    list->SetGraphicsRoot32BitConstants(3, 16, identity, 0);
 
     if (extras.session == LevelSession() && extras.epoch == LevelEpoch())
     {
+        // NativeFrame::Begin уже дождался fence выбранного слота.
         const uint64_t slotOffset = frameSlot * kTransformSlotBytes;
         auto* destination = static_cast<uint8_t*>(m_frameTransformsMapped) + slotOffset;
+        if (extras.poses.size() > gameaux12::kMaxFrameTransforms)
+            return Fail(reason, "skeletal poses exceed frame transform capacity");
         uint32_t next = static_cast<uint32_t>(extras.poses.size());
-        if (next > gameaux12::kMaxFrameTransforms)
-            return Fail(reason, "rigid pose exceeds frame transform capacity");
         if (next != 0)
             std::memcpy(destination, extras.poses.data(),
                         next * sizeof(DirectX::XMFLOAT4X4));
         list->SetGraphicsRootShaderResourceView(4,
             m_frameTransforms->GetGPUVirtualAddress() + slotOffset);
 
-        const auto drawMesh = [&](const AuxMesh& mesh, uint32_t id, bool detail,
-                                   uint32_t offset, uint32_t count)
-        {
-            auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-            gpu.ptr += static_cast<UINT64>(mesh.texture) * m_textureDescriptorSize;
-            list->SetGraphicsRootDescriptorTable(1, gpu);
-            const uint32_t mode = (mesh.cutout || detail) && !alphaTestDisabled ? 2u : 1u;
-            const uint32_t material[] = {mode, id, viewMode, std::bit_cast<uint32_t>(threshold)};
-            list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
-            list->SetGraphicsRoot32BitConstant(3, offset, 0);
-            list->IASetVertexBuffers(0, 1, &mesh.vb);
-            list->IASetIndexBuffer(&mesh.ib);
-            list->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
-        };
-
-        list->SetPipelineState(m_pipelineRigid.Get());
         for (const auto& object : extras.objects)
         {
+            if (object.boneCount == 0 || object.boneCount > gameaux12::kMaxBones ||
+                object.poseOffset > next || object.boneCount > next - object.poseOffset ||
+                object.firstMesh > extras.objectMeshes.size() ||
+                object.meshCount > extras.objectMeshes.size() - object.firstMesh)
+                continue;
             if (cull && !SphereInside(planes, object.center, object.radius))
             {
-                ++auxStats.rigidCulled;
+                ++(object.skinned ? auxStats.animatedCulled : auxStats.rigidCulled);
                 continue;
             }
-            ++auxStats.rigidVisible;
+            ++(object.skinned ? auxStats.animatedVisible : auxStats.rigidVisible);
             bool submitted = false;
-            for (const uint32_t mesh : std::span(extras.objectMeshes).subspan(
+            for (const uint32_t handle : std::span(extras.objectMeshes).subspan(
                      object.firstMesh, object.meshCount))
             {
-                drawMesh(m_auxMeshes[mesh], object.id, false, object.poseOffset, 1);
-                ++auxStats.rigidDraws;
-                if (object.id == extras.traceId)
-                    ++auxStats.tracedDraws;
+                if (handle >= m_auxMeshes.size())
+                    continue;
+                const auto& mesh = m_auxMeshes[handle];
+                if (mesh.skinned != object.skinned || mesh.requiredBones > object.boneCount)
+                    continue;
+                if (IsOverlay(mesh.surface) || IsBlended(mesh.surface))
+                    deferred.push_back({nullptr, &mesh, &object, mesh.surface, viewDepth(object.center)});
+                else
+                    drawObjectPart(mesh, object);
                 submitted = true;
             }
             if (submitted)
-                ++auxStats.rigidSubmitted;
+                ++(object.skinned ? auxStats.animatedSubmitted : auxStats.rigidSubmitted);
         }
 
-        list->SetPipelineState(m_pipelineDetail.Get());
         for (const auto& group : extras.details)
         {
-            if (group.mesh == gameaux12::kInvalidMesh)
+            if (group.mesh >= m_auxMeshes.size() || m_auxMeshes[group.mesh].skinned ||
+                m_auxMeshes[group.mesh].requiredBones != 1)
             {
                 auxStats.detailMissingMaterial += static_cast<uint32_t>(group.transforms.size());
                 continue;
@@ -1604,11 +2060,30 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (next > first)
             {
                 const uint32_t count = next - first;
-                drawMesh(mesh, group.mesh, true, first, count);
+                drawMesh(mesh, group.mesh, SurfaceMode::Cutout, first, count, m_pipelineDetail.Get());
                 auxStats.detailSubmitted += count;
                 ++auxStats.detailDraws;
             }
         }
+    }
+
+    // Сначала непрозрачные накладки, затем blended по глубине от дальних к ближним.
+    // Равные глубины сохраняют исходный порядок частей.
+    std::stable_sort(deferred.begin(), deferred.end(), [](const DeferredDraw& left,
+                                                         const DeferredDraw& right)
+    {
+        const bool leftBlended = IsBlended(left.surface);
+        const bool rightBlended = IsBlended(right.surface);
+        if (leftBlended != rightBlended)
+            return !leftBlended;
+        return leftBlended && left.depth > right.depth;
+    });
+    for (const auto& entry : deferred)
+    {
+        if (entry.draw != nullptr)
+            drawStatic(*entry.draw);
+        else
+            drawObjectPart(*entry.mesh, *entry.object);
     }
     stats.record_ms = Ms(recordStart);
     if (dumpDraws)
@@ -1674,8 +2149,9 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_frameConstants.Reset();
     m_textureHeap.Reset();
     m_pipelineUv24.Reset();
-    m_pipelineRigid.Reset();
+    m_pipelineSkeletal.Reset();
     m_pipelineDetail.Reset();
+    m_deferredPipelines = {};
     m_pipelineState.Reset();
     m_rootSignature.Reset();
     m_loaded = false;
@@ -1724,8 +2200,11 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
     m_copyStaging.Detach();
     m_frameTransforms.Detach();
     m_frameTransformsMapped = nullptr;
-    m_pipelineRigid.Detach();
+    m_pipelineSkeletal.Detach();
     m_pipelineDetail.Detach();
+    for (auto& pipelines : m_deferredPipelines)
+        for (auto& pipeline : pipelines.states)
+            pipeline.Detach();
     m_textureKeys.clear();
     m_auxGeometry.clear();
     m_auxMeshes.clear();
@@ -1766,80 +2245,93 @@ void GameDx12StaticScene12_ResolveMaterials(
     // level-шейдера разбирается один раз, а не на каждый visual.
     struct Binding12
     {
-        uint32_t textureIndex = GameDx12StaticMaterial12::kNoTexture;
-        bool alphaTest = false;
-        bool haveBinding = false;
+        GameDx12StaticMaterial12 material;
+        bool emptyRecord = false;
+        bool malformedRecord = false;
     };
     std::unordered_map<uint32_t, Binding12> bindings;
     std::unordered_map<std::string, uint32_t> textureIndex;
 
+    const auto resolve = [&](std::string_view shader, std::string_view textures)
+    {
+        GameDx12StaticMaterial12 material;
+        material.surface = gameaux12::ClassifySurface(shader);
+        material.wallmarkClamp = gameaux12::UsesWallmarkClamp(shader);
+        if (material.surface != SurfaceMode::Unsupported)
+        {
+            const std::string texture = gameaux12::CanonicalBaseTextureName(textures);
+            if (!texture.empty())
+            {
+                const auto [found, inserted] = textureIndex.emplace(
+                    texture, static_cast<uint32_t>(uniqueTextureNames.size()));
+                if (inserted)
+                    uniqueTextureNames.push_back(texture);
+                material.textureIndex = found->second;
+            }
+        }
+        return material;
+    };
+
+    uint32_t withTexture = 0;
+    uint32_t withoutRecord = 0;
+    uint32_t withoutSlash = 0;
+    const auto& selected = R1VisualSelection();
     for (size_t index = 0; index < pools.visuals.size(); ++index)
     {
         const auto& visual = pools.visuals[index];
+        if (R1VisualTraceSlot(selected, visual.id) != UINT8_MAX)
+        {
+            const bool hasOverride = !visual.shader_override.empty();
+            const auto record = hasOverride ? std::string_view{} :
+                xraylevel12::FindShaderBinding(levelBytes, visual.shader_id);
+            const size_t slash = record.find('/');
+            const std::string_view shader = hasOverride ? std::string_view(visual.shader_override) :
+                record.substr(0, slash);
+            const std::string_view textureList = hasOverride ? std::string_view(visual.texture_override) :
+                slash == record.npos ? std::string_view{} : record.substr(slash + 1);
+            const auto baseTexture = textureList.substr(0, textureList.find(','));
+            Msg("ph_dx12_f43_r1: static visual_id=%u type=%u state=source shader_id=%u "
+                "binding='%s' shader='%.*s' source_texture='%.*s' "
+                "swi=%d swi_id=%u world=%d",
+                visual.id, static_cast<unsigned>(visual.type), visual.shader_id,
+                hasOverride ? "ogf_texture" : "level_shaders",
+                static_cast<int>((std::min)(shader.size(), size_t{255})), shader.empty() ? "" : shader.data(),
+                static_cast<int>((std::min)(baseTexture.size(), size_t{255})),
+                baseTexture.empty() ? "" : baseTexture.data(),
+                visual.has_swi ? 1 : 0, visual.swi_id, visual.has_world ? 1 : 0);
+        }
         if (!visual.drawable)
             continue;
 
-        auto found = bindings.find(visual.shader_id);
-        if (found == bindings.end())
+        auto& material = materials[index];
+        if (!visual.shader_override.empty())
         {
-            Binding12 binding;
-            const std::string_view record =
-                xraylevel12::FindShaderBinding(levelBytes, visual.shader_id);
-            if (!record.empty())
+            // FBasicVisual::Load применяет парный OGF_TEXTURE конкретного
+            // visual поверх shader_id, даже если другие части делят shader_id.
+            material = resolve(visual.shader_override, visual.texture_override);
+            material.hasOverride = true;
+        }
+        else
+        {
+            const auto [found, inserted] = bindings.try_emplace(visual.shader_id);
+            auto& binding = found->second;
+            if (inserted)
             {
+                const std::string_view record =
+                    xraylevel12::FindShaderBinding(levelBytes, visual.shader_id);
+                // R4 LevelLoad делит запись по первым '/'.
                 const size_t slash = record.find('/');
+                binding.emptyRecord = record.empty();
+                binding.malformedRecord = !record.empty() && slash == record.npos;
                 if (slash != record.npos)
-                {
-                    const std::string_view shaderName = record.substr(0, slash);
-                    const std::string_view textures = record.substr(slash + 1);
-                    const std::string_view first =
-                        textures.substr(0, textures.find(','));
-                    binding.alphaTest =
-                        shaderName.find("aref") != std::string_view::npos;
-                    if (!first.empty())
-                    {
-                        Binding12 cached;
-                        const std::string name(first);
-                        const auto inserted = textureIndex.emplace(
-                            name, static_cast<uint32_t>(uniqueTextureNames.size()));
-                        if (inserted.second)
-                            uniqueTextureNames.push_back(name);
-                        binding.textureIndex = inserted.first->second;
-                        binding.haveBinding = true;
-                    }
-                }
+                    binding.material = resolve(record.substr(0, slash), record.substr(slash + 1));
             }
-            found = bindings.emplace(visual.shader_id, binding).first;
+            material = binding.material;
+            withoutRecord += binding.emptyRecord;
+            withoutSlash += binding.malformedRecord;
         }
-
-        GameDx12StaticMaterial12& material = materials[index];
-        material.textureIndex = found->second.textureIndex;
-        material.haveBinding = found->second.haveBinding;
-        material.alphaTest = found->second.alphaTest;
-    }
-
-    uint32_t withTexture = 0;
-    uint32_t withoutBinding = 0;
-    uint32_t withoutRecord = 0;
-    uint32_t withoutSlash = 0;
-    for (size_t index = 0; index < pools.visuals.size(); ++index)
-    {
-        if (!pools.visuals[index].drawable)
-            continue;
-        const auto& material = materials[index];
         if (material.textureIndex != GameDx12StaticMaterial12::kNoTexture)
-        {
             ++withTexture;
-            continue;
-        }
-        if (!material.haveBinding)
-            ++withoutBinding;
-        if (pools.visuals[index].shader_id == 0)
-            ++withoutRecord;
-        if (!xraylevel12::FindShaderBinding(levelBytes, pools.visuals[index].shader_id).empty() &&
-            xraylevel12::FindShaderBinding(levelBytes, pools.visuals[index].shader_id)
-                    .find('/') == std::string_view::npos)
-            ++withoutSlash;
     }
     Msg("ph_dx12_f41: materials drawable=%u textured=%u no_texture=%u "
         "distinct_shader_ids=%zu empty_record=%u record_without_slash=%u",

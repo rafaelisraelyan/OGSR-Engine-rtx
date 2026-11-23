@@ -17,6 +17,7 @@ namespace xraylevel12
 {
 constexpr uint32_t kOgfVersion = 4;
 constexpr uint32_t kOgfHeader = 1;
+constexpr uint32_t kOgfTexture = 2;
 constexpr uint32_t kOgfGcContainer = 21;
 constexpr uint32_t kOgfFastPath = 22;
 constexpr uint32_t kMtNormal = 0;
@@ -256,6 +257,8 @@ struct PoolVisual
     ReadError reject = ReadError::None;
 
     uint32_t shader_id = 0;
+    std::string texture_override;
+    std::string shader_override;
     uint32_t vb_id = 0;
     uint32_t vbase = 0;
     uint32_t vcount = 0;

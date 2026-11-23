@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -29,6 +30,9 @@ constexpr size_t maxStringLength = 255;
 static_assert(sizeof(ogf_header) == 44);
 static_assert(sizeof(Fobb) == 60);
 static_assert(sizeof(vertBoned1W) == 60);
+static_assert(sizeof(vertBoned2W) == 64);
+static_assert(sizeof(vertBoned3W) == 70);
+static_assert(sizeof(vertBoned4W) == 76);
 static_assert(sizeof(FSlideWindow) == 8);
 
 bool Fail(std::string& reason, const char* message)
@@ -194,21 +198,90 @@ std::string NormalizePath(std::string_view source, bool visualName = false)
     return result;
 }
 
-bool ReadMaterial(Bytes bytes, Mesh& mesh, std::string& reason)
+bool ReadMaterial(Bytes bytes, uint16_t levelShaderId, SkeletalPartSource& part,
+                  std::string& reason)
 {
+    if (bytes.data() == nullptr)
+    {
+        part.materialRejection = levelShaderId ? "ogf_level_shader_binding_unavailable" :
+            "ogf_missing_material";
+        return true;
+    }
     std::string_view textures;
     std::string_view shader;
     if (!ReadString(bytes, textures) || !ReadString(bytes, shader) ||
         !bytes.empty() || shader.empty())
         return Fail(reason, "ogf_material");
-    mesh.texture = NormalizePath(textures.substr(0, textures.find(',')));
-    if (mesh.texture.ends_with(".dds"))
-        mesh.texture.resize(mesh.texture.size() - 4);
-    if (mesh.texture.empty() || mesh.texture.size() > 180)
-        return Fail(reason, "ogf_material_texture");
-    std::string normalizedShader(shader);
-    std::transform(shader.begin(), shader.end(), normalizedShader.begin(), LowerAscii);
-    mesh.cutout = normalizedShader.find("aref") != std::string::npos;
+
+    auto& mesh = part.mesh;
+    mesh.shader.assign(shader);
+    mesh.surface = ClassifySurface(shader);
+    mesh.texture = CanonicalBaseTextureName(textures);
+    mesh.cutout = mesh.surface == SurfaceMode::Cutout || mesh.surface == SurfaceMode::OverlayCutout;
+    if (mesh.surface == SurfaceMode::Unsupported ||
+        (mesh.skinned && mesh.surface == SurfaceMode::Auto))
+        part.materialRejection = "ogf_unsupported_material: " + mesh.shader;
+    else if (mesh.texture.empty() || mesh.texture.size() > 180)
+        part.materialRejection = "ogf_material_texture";
+    return true;
+}
+
+Vertex MakeVertex(const vertBoned1W& source)
+{
+    return {{source.P.x, source.P.y, source.P.z}, {source.N.x, source.N.y, source.N.z},
+            {source.u, source.v}, {source.matrix}};
+}
+
+Vertex MakeVertex(const vertBoned2W& source)
+{
+    // В 2W хранится вес второй кости, как в get_pos_bones для R4.
+    return {{source.P.x, source.P.y, source.P.z}, {source.N.x, source.N.y, source.N.z},
+            {source.u, source.v}, {source.matrix0, source.matrix1}, {1.0f - source.w, source.w}};
+}
+
+Vertex MakeVertex(const vertBoned3W& source)
+{
+    return {{source.P.x, source.P.y, source.P.z}, {source.N.x, source.N.y, source.N.z},
+            {source.u, source.v}, {source.m[0], source.m[1], source.m[2]},
+            {source.w[0], source.w[1], 1.0f - source.w[0] - source.w[1]}};
+}
+
+Vertex MakeVertex(const vertBoned4W& source)
+{
+    return {{source.P.x, source.P.y, source.P.z}, {source.N.x, source.N.y, source.N.z},
+            {source.u, source.v}, {source.m[0], source.m[1], source.m[2], source.m[3]},
+            {source.w[0], source.w[1], source.w[2], 1.0f - source.w[0] - source.w[1] - source.w[2]}};
+}
+
+template<typename Source>
+bool ReadVertexRecords(Bytes bytes, uint32_t count, uint32_t boneCount, Mesh& mesh, std::string& reason)
+{
+    if (bytes.size() != sizeof(Source) * count)
+        return Fail(reason, "ogf_vertex_bounds");
+    mesh.vertices.reserve(count);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        Source source{};
+        if (!Read(bytes, source) || !Finite(source.P) || !Finite(source.N) ||
+            !Finite(source.u) || !Finite(source.v))
+            return Fail(reason, "ogf_vertex_values");
+        Vertex vertex = MakeVertex(source);
+        for (size_t influence = 0; influence < std::size(vertex.bones); ++influence)
+        {
+            if (vertex.bones[influence] >= boneCount)
+                return Fail(reason, "ogf_vertex_bone");
+            float& weight = vertex.weights[influence];
+            // Допуск нужен для округления остаточного веса при сложении.
+            if (!Finite(weight) || weight < -1.0e-6f || weight > 1.0f + 1.0e-6f)
+                return Fail(reason, "ogf_vertex_weight");
+            if (weight <= 0.0f)
+            {
+                weight = 0.0f;
+                vertex.bones[influence] = 0;
+            }
+        }
+        mesh.vertices.push_back(vertex);
+    }
     return true;
 }
 
@@ -218,29 +291,32 @@ bool ReadVertices(Bytes bytes, uint32_t boneCount, Mesh& mesh, std::string& reas
     uint32_t count = 0;
     if (!Read(bytes, format) || !Read(bytes, count))
         return Fail(reason, "ogf_vertex_header");
-    if (format == 2 || format == 3 || format == 4 ||
-        format == OGF_VERTEXFORMAT_FVF_2L || format == OGF_VERTEXFORMAT_FVF_3L ||
-        format == OGF_VERTEXFORMAT_FVF_4L)
-        return Fail(reason, "ogf_weighted_vertices");
-    if (format != OGF_VERTEXFORMAT_FVF_1L && format != 1)
-        return Fail(reason, "ogf_vertex_format");
-    if (count == 0 || count > 65536 || bytes.size() != sizeof(vertBoned1W) * count)
+    if (count == 0 || count > 65536)
         return Fail(reason, "ogf_vertex_bounds");
-    mesh.vertices.reserve(count);
-    for (uint32_t index = 0; index < count; ++index)
+    switch (format)
     {
-        vertBoned1W vertex;
-        if (!Read(bytes, vertex) || vertex.matrix >= boneCount)
-            return Fail(reason, "ogf_vertex_bone");
-        if (!Finite(vertex.P) || !Finite(vertex.N) ||
-            !Finite(vertex.u) || !Finite(vertex.v))
-            return Fail(reason, "ogf_vertex_values");
-        mesh.vertices.push_back({
-            {vertex.P.x, vertex.P.y, vertex.P.z},
-            {vertex.N.x, vertex.N.y, vertex.N.z},
-            {vertex.u, vertex.v}, vertex.matrix});
+    case 1:
+    case OGF_VERTEXFORMAT_FVF_1L:
+        return ReadVertexRecords<vertBoned1W>(bytes, count, boneCount, mesh, reason);
+    case 2:
+    case OGF_VERTEXFORMAT_FVF_2L:
+        if (mesh.skinned)
+            return ReadVertexRecords<vertBoned2W>(bytes, count, boneCount, mesh, reason);
+        break;
+    case 3:
+    case OGF_VERTEXFORMAT_FVF_3L:
+        if (mesh.skinned)
+            return ReadVertexRecords<vertBoned3W>(bytes, count, boneCount, mesh, reason);
+        break;
+    case 4:
+    case OGF_VERTEXFORMAT_FVF_4L:
+        if (mesh.skinned)
+            return ReadVertexRecords<vertBoned4W>(bytes, count, boneCount, mesh, reason);
+        break;
+    default:
+        return Fail(reason, "ogf_vertex_format");
     }
-    return true;
+    return Fail(reason, "ogf_weighted_vertices");
 }
 
 bool ReadIndices(Bytes bytes, Mesh& mesh, std::string& reason)
@@ -297,12 +373,13 @@ constexpr uint32_t skeletonChunks = (1u << OGF_HEADER) | (1u << OGF_CHILDREN) |
 constexpr uint32_t meshChunks = (1u << OGF_HEADER) | (1u << OGF_TEXTURE) |
                                 (1u << OGF_VERTICES) | (1u << OGF_INDICES) |
                                 (1u << OGF_SWIDATA) | (1u << OGF_ICONTAINER) |
-                                (1u << OGF_GCONTAINER);
+                                (1u << OGF_GCONTAINER) | (1u << OGF_VCONTAINER) |
+                                (1u << OGF_SWICONTAINER);
 }
 
-bool ParseRigidModel(Bytes source, std::vector<Mesh>& meshes, std::string& reason)
+bool ParseSkeletalModel(Bytes source, bool skinned, SkeletalModelSource& model, std::string& reason)
 {
-    meshes.clear();
+    model = {};
     reason.clear();
     if (source.empty() || source.size() > maxFileBytes)
         return Fail(reason, "ogf_file_budget");
@@ -311,7 +388,7 @@ bool ParseRigidModel(Bytes source, std::vector<Mesh>& meshes, std::string& reaso
     if (!ReadChunks(source, root, skeletonChunks, reason) ||
         !ReadHeader(root[OGF_HEADER], header, reason))
         return false;
-    if (header.type != MT_SKELETON_RIGID)
+    if (header.type != (skinned ? MT_SKELETON_ANIM : MT_SKELETON_RIGID))
         return Fail(reason, "ogf_root_type");
     if (root[OGF_CHILDREN_L].data() != nullptr)
         return Fail(reason, "ogf_linked_children");
@@ -322,7 +399,8 @@ bool ParseRigidModel(Bytes source, std::vector<Mesh>& meshes, std::string& reaso
     if (!ReadChunks(root[OGF_CHILDREN], children, 0, reason))
         return false;
 
-    std::vector<Mesh> parsed;
+    SkeletalModelSource parsed;
+    parsed.boneCount = boneCount;
     bool gap = false;
     for (Bytes child : children)
     {
@@ -339,26 +417,32 @@ bool ParseRigidModel(Bytes source, std::vector<Mesh>& meshes, std::string& reaso
             return false;
         if (header.type != MT_SKELETON_GEOMDEF_ST && header.type != MT_SKELETON_GEOMDEF_PM)
             return Fail(reason, "ogf_child_type");
-        if (chunks[OGF_GCONTAINER].data() != nullptr || chunks[OGF_ICONTAINER].data() != nullptr)
+        if (chunks[OGF_GCONTAINER].data() || chunks[OGF_ICONTAINER].data() ||
+            (skinned && chunks[OGF_VCONTAINER].data()))
             return Fail(reason, "ogf_shared_geometry");
-        Mesh mesh;
-        if (!ReadMaterial(chunks[OGF_TEXTURE], mesh, reason) ||
+        if (skinned && chunks[OGF_SWICONTAINER].data())
+            return Fail(reason, "ogf_shared_slide_windows");
+        SkeletalPartSource part;
+        auto& mesh = part.mesh;
+        mesh.skinned = skinned;
+        if (!ReadMaterial(chunks[OGF_TEXTURE], header.shader_id, part, reason) ||
             !ReadVertices(chunks[OGF_VERTICES], boneCount, mesh, reason) ||
             !ReadIndices(chunks[OGF_INDICES], mesh, reason))
             return false;
         if (header.type == MT_SKELETON_GEOMDEF_PM && !SelectHighestLod(chunks[OGF_SWIDATA], mesh, reason))
             return false;
-        parsed.push_back(std::move(mesh));
+        parsed.parts.push_back(std::move(part));
     }
-    if (parsed.empty())
+    if (parsed.parts.empty())
         return Fail(reason, "ogf_no_meshes");
-    meshes = std::move(parsed);
+    model = std::move(parsed);
     return true;
 }
 
-bool ReadRigidModel(const char* visualName, std::vector<Mesh>& meshes, std::string& reason)
+bool ReadSkeletalModel(const char* visualName, bool skinned,
+                       SkeletalModelSource& model, std::string& reason)
 {
-    meshes.clear();
+    model = {};
     reason.clear();
     if (!Device.OnMainThread())
         return Fail(reason, "ogf_wrong_thread");
@@ -394,8 +478,8 @@ bool ReadRigidModel(const char* visualName, std::vector<Mesh>& meshes, std::stri
         const std::unique_ptr<IReader, decltype(close)> reader(FS.r_open(path), close);
         if (reader == nullptr)
             return Fail(reason, "ogf_vfs_open");
-        return ParseRigidModel({static_cast<const uint8_t*>(reader->begin()), reader->length()},
-                               meshes, reason);
+        return ParseSkeletalModel({static_cast<const uint8_t*>(reader->begin()), reader->length()},
+                                  skinned, model, reason);
     }
     catch (const std::bad_alloc&)
     {

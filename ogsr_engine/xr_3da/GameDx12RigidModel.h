@@ -8,10 +8,22 @@
 
 namespace gameaux12
 {
-bool ParseRigidModel(std::span<const uint8_t> source, std::vector<Mesh>& meshes,
-                     std::string& reason);
-bool ReadRigidModel(const char* visualName, std::vector<Mesh>& meshes,
-                    std::string& reason);
+struct SkeletalPartSource
+{
+    Mesh mesh;
+    std::string materialRejection;
+};
+
+struct SkeletalModelSource
+{
+    uint32_t boneCount = 0;
+    std::vector<SkeletalPartSource> parts;
+};
+
+bool ParseSkeletalModel(std::span<const uint8_t> source, bool skinned,
+                        SkeletalModelSource& model, std::string& reason);
+bool ReadSkeletalModel(const char* visualName, bool skinned,
+                       SkeletalModelSource& model, std::string& reason);
 }
 
 #endif

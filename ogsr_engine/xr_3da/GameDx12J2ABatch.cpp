@@ -170,12 +170,13 @@ bool BinaryAlphaFromThm(const std::vector<uint8_t>& bytes,
         if (chunk == 0x812 && size >= 32)
         {
             constexpr uint32_t binaryAlphaFlag = 1u << 1;
-            constexpr uint32_t hasAlphaFlag = 1u << 25;
+            constexpr uint32_t alphaDxt1 = 1u;
             const uint32_t format = word(offset);
             const uint32_t flags = word(offset + 4);
-            const bool alpha = dds.format == DXGI_FORMAT_BC3_UNORM
-                ? format == 3 && (flags & (binaryAlphaFlag | hasAlphaFlag)) != 0
-                : format == 1 || (flags & binaryAlphaFlag) != 0;
+            // flHasAlpha описывает канал DDS, а выбор порогового теста
+            // определяется материалом или явным флагом бинарной альфы.
+            const bool alpha = (format == alphaDxt1 && dds.format == DXGI_FORMAT_BC1_UNORM) ||
+                               (flags & binaryAlphaFlag) != 0;
             return word(offset + 24) == dds.width && word(offset + 28) == dds.height &&
                    alpha;
         }
@@ -269,10 +270,10 @@ void GameDx12J2ABatch_ReadTextureNames(
             auto& entry = textures[index];
             entry.name = names[index];
             ++stats.decoded;
-            if (entry.name.empty() || entry.name.size() > 180 ||
+            if (entry.name.empty() || entry.name.size() > 255 ||
                 entry.name.find("..") != std::string::npos ||
                 entry.name.find_first_not_of(
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.\\") !=
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.#\\") !=
                     std::string::npos)
             {
                 --stats.decoded;
@@ -285,18 +286,19 @@ void GameDx12J2ABatch_ReadTextureNames(
                 ++stats.unsupported;
                 continue;
             }
-            const uint64_t budget = maxTotalBytes - totalBytes;
+            const uint64_t limit = (std::min)(maxTotalBytes - totalBytes, 16ull * 1024ull * 1024ull);
             const std::string ddsName = entry.name + ".dds";
             double openMs = 0.0;
             double copyMs = 0.0;
             j2bbatch12::ErrorInfo12 error;
             std::vector<uint8_t> bytes;
             const char* reason = "texture allocation failed";
-            if (!ReadVfsFile("DDS", ddsName.c_str(), (std::min)(budget, 16ull * 1024ull * 1024ull),
-                             bytes, error, openMs, copyMs) &&
-                !ReadVfsFile("DDS", ddsName.c_str(),
-                             (std::min)(budget, 16ull * 1024ull * 1024ull), bytes,
-                             error, openMs, copyMs, fsgame::game_textures))
+            // Совпадаем с порядком поиска CRender::texture_load в R4.
+            if (!ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs) &&
+                !ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs,
+                             fsgame::game_saves) &&
+                !ReadVfsFile("DDS", ddsName.c_str(), limit, bytes, error, openMs, copyMs,
+                             fsgame::game_textures))
             {
                 --stats.decoded;
                 ++stats.missing;

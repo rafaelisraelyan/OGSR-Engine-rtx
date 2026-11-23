@@ -962,7 +962,7 @@ void MakeSphere(const Bounds& bounds, float center[3], float& radius) noexcept
 // нельзя описать диапазоном пулов; причина остаётся в счётчике reject.
 bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
                     const std::vector<std::vector<SwiWindow>>* swiTables,
-                    PoolVisual& visual, uint32_t& rejectChunk) noexcept
+                    PoolVisual& visual, uint32_t& rejectChunk)
 {
     const uint64_t end = chunk.payload + chunk.size;
     uint64_t pos = chunk.payload;
@@ -1028,6 +1028,28 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
                     visual.header_bounds.maximum[2])
                 return false;
             has_header = true;
+        }
+        else if (type == kOgfTexture)
+        {
+            // FBasicVisual::Load переопределяет shader_id парой OGF_TEXTURE.
+            rejectChunk = type;
+            if (!visual.shader_override.empty())
+                return false;
+            constexpr size_t maxNameBytes = 256;
+            const char* begin = reinterpret_cast<const char*>(level.data() + data);
+            const char* textureEnd = begin + (std::min)(size_t{size}, maxNameBytes);
+            const char* textureZero = std::find(begin, textureEnd, '\0');
+            if (textureZero == textureEnd)
+                return false;
+            const char* shader = textureZero + 1;
+            const size_t remaining = size - static_cast<size_t>(shader - begin);
+            const char* shaderEnd = shader + (std::min)(remaining, maxNameBytes);
+            const char* shaderZero = std::find(shader, shaderEnd, '\0');
+            if (shaderZero == shader || shaderZero == shaderEnd)
+                return false;
+            visual.texture_override.assign(begin, textureZero);
+            visual.shader_override.assign(shader, shaderZero);
+            rejectChunk = 0;
         }
         else if (type == kOgfGcContainer)
         {
@@ -1366,7 +1388,7 @@ ReadError ReadLevelPools(std::span<const uint8_t> level_bytes,
                 ++candidate.visuals_drawable;
             else
                 ++candidate.visuals_rejected;
-            candidate.visuals.push_back(visual);
+            candidate.visuals.push_back(std::move(visual));
             pos = payload + size;
         }
 

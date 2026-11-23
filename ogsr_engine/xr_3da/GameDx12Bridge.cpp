@@ -1638,7 +1638,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         }
         if (sceneRecorded)
         {
-            draws = sceneStats.draws + auxDraws.rigidDraws + auxDraws.detailDraws;
+            draws = sceneStats.draws + auxDraws.rigidDraws + auxDraws.animatedDraws + auxDraws.detailDraws;
             state.staticSceneDraws = sceneStats.draws;
             timings.mode = "static";
             timings.recordMs = sceneStats.record_ms;
@@ -1651,11 +1651,27 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 return value != nullptr && std::strcmp(value, "1") == 0;
             }();
             if (sceneDetail && (state.nativeScenePresents % 60) == 0)
+            {
                 Msg("ph_dx12_f41: frame draws=%u culled=%u total=%u cull_ms=%.4f "
                     "record_ms=%.4f position=(%.3f,%.3f,%.3f)",
                     sceneStats.draws, sceneStats.culled, sceneStats.total,
                     sceneStats.cull_ms, sceneStats.record_ms,
                     position[0], position[1], position[2]);
+                const auto& level = sceneStats.surfaces;
+                const auto& objects = auxDraws.surfaces;
+                const auto& resources = state.staticScene.AuxResources();
+                Msg("ph_dx12_f43: surfaces static_opaque=%u static_cutout=%u "
+                    "static_overlay_opaque=%u static_overlay_cutout=%u static_overlay_blend=%u "
+                    "static_overlay_multiply=%u static_translucent=%u aux_opaque=%u aux_cutout=%u "
+                    "aux_overlay_opaque=%u aux_overlay_cutout=%u aux_overlay_blend=%u "
+                    "aux_overlay_multiply=%u aux_translucent=%u "
+                    "aux_missing_material=%u aux_unsupported_material=%u",
+                    level.opaque, level.cutout, level.overlayOpaque, level.overlayCutout,
+                    level.overlayBlend, level.overlayMultiply, level.translucent, objects.opaque,
+                    objects.cutout, objects.overlayOpaque, objects.overlayCutout, objects.overlayBlend,
+                    objects.overlayMultiply, objects.translucent, resources.missingMaterial,
+                    resources.unsupportedMaterial);
+            }
         }
         if (FAILED(hr))
             state.native.Cancel();
@@ -2475,6 +2491,9 @@ void LoadFullStaticScene(BridgeStateData& state)
     state.staticSceneSession = state.levelSession;
     state.staticSceneEpoch = state.captureEpoch;
     const auto& stats = state.staticScene.Stats();
+    Msg("ph_dx12_f43: materials overrides=%u fallback_opaque=%u missing_srv=%u unsupported=%u",
+        stats.material_overrides, stats.draws_without_texture, stats.material_missing_srv,
+        stats.unsupported_materials);
     Msg("ph_dx12_f41: ready level='%s' session=%llu epoch=%llu "
         "sources=%u draws_potential=%u total_ms=%.3f",
         state.levelName, static_cast<unsigned long long>(state.staticSceneSession),
