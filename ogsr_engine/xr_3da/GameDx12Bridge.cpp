@@ -153,6 +153,14 @@ struct BridgeStateData
     xr_vector<ISpatial*> lightQuery;
     xr_vector<ISpatial*> nearLightQuery;
     std::chrono::steady_clock::time_point nextLocalLightTrace{};
+    struct
+    {
+        uint64_t levelSession = 0;
+        uint64_t levelEpoch = 0;
+        uint32_t frames = 0;
+        Fvector anchor{};
+        gamelight12::LocalLight frozen;
+    } localLightProbe;
     GameDx12OffscreenPass12 offscreen;
     GameDx12NativeFrame12 native;
 
@@ -1617,6 +1625,12 @@ struct LightingDiagnostics
     bool sceneLog = false;
     bool traceNearest = false;
     uint64_t lightId = 0;
+    std::array<uint64_t, gamelight12::MaxLocalLightTrace> fixedIds{};
+    uint32_t fixedCount = 0;
+    bool freezeRecord = false;
+    uint32_t probeFrames = 0;
+    uint32_t probeDelay = 0;
+    gamelight12::Vec3 origin;
 };
 
 const LightingDiagnostics& LightingDiagnosticOptions()
@@ -1652,7 +1666,67 @@ const LightingDiagnostics& LightingDiagnosticOptions()
         }
         else if (const char* value = std::getenv("OGSR_DX12_GAME_TRACE_LIGHT_ID"))
             result.lightId = readId(value, value + std::strlen(value));
-        result.sceneLog = result.sceneLog || result.lightId != 0;
+        const auto readBounded = [&readId](const char* key, uint32_t maxValue)
+        {
+            const char* value = std::getenv(key);
+            return value ? static_cast<uint32_t>((std::min)(
+                readId(value, value + std::strlen(value)), uint64_t{maxValue})) : 0u;
+        };
+        result.probeFrames = readBounded("OGSR_DX12_GAME_LIGHT_PROBE_FRAMES", 600);
+        result.probeDelay = readBounded("OGSR_DX12_GAME_LIGHT_PROBE_DELAY", 3600);
+        result.freezeRecord = result.lightId != 0 && LightingFlag("OGSR_DX12_GAME_FREEZE_LIGHT_RECORD");
+        if (const char* first = std::getenv("OGSR_DX12_GAME_FIXED_LIGHT_IDS"); first && *first)
+        {
+            const char* cursor = first;
+            while (result.fixedCount < result.fixedIds.size())
+            {
+                const char* end = cursor + std::strcspn(cursor, ",");
+                const auto id = readId(cursor, end);
+                if (id == 0 || std::find(result.fixedIds.begin(), result.fixedIds.end(), id) != result.fixedIds.end())
+                {
+                    result.fixedCount = 0;
+                    break;
+                }
+                result.fixedIds[result.fixedCount++] = id;
+                if (*end == '\\0')
+                    break;
+                cursor = end + 1;
+                if (result.fixedCount == result.fixedIds.size())
+                {
+                    result.fixedCount = 0; // Лишний элемент или завершающая запятая.
+                    break;
+                }
+            }
+        }
+        if (result.fixedCount < 2 || result.freezeRecord)
+            result.fixedCount = 0;
+        if (const char* value = std::getenv("OGSR_DX12_GAME_LIGHT_PROBE_ORIGIN"))
+        {
+            gamelight12::Vec3 origin;
+            const char* end = value + std::strlen(value);
+            bool valid = true;
+            for (float* component : {&origin.x, &origin.y, &origin.z})
+            {
+                const auto parsed = std::from_chars(value, end, *component);
+                const bool last = component == &origin.z;
+                if (parsed.ec != std::errc{} || !std::isfinite(*component) ||
+                    (last ? parsed.ptr != end : parsed.ptr == end || *parsed.ptr != ','))
+                {
+                    valid = false;
+                    break;
+                }
+                value = parsed.ptr + (last ? 0 : 1);
+            }
+            if (valid)
+                result.origin = origin;
+        }
+        result.sceneLog = result.sceneLog || result.lightId != 0 || result.fixedCount != 0 || result.probeFrames != 0;
+        Msg("ph_dx12_f43fr2: diagnostics fixed_count=%u fixed_ids=(%llu,%llu,%llu) freeze_record=%d "
+            "probe_frames=%u probe_delay=%u probe_origin=(%.3f,%.3f,%.3f)",
+            result.fixedCount, static_cast<unsigned long long>(result.fixedIds[0]),
+            static_cast<unsigned long long>(result.fixedIds[1]), static_cast<unsigned long long>(result.fixedIds[2]),
+            result.freezeRecord ? 1 : 0, result.probeFrames, result.probeDelay,
+            result.origin.x, result.origin.y, result.origin.z);
         Msg("ph_dx12_f43fr1: diagnostics scene_log=%d trace_nearest=%d trace_light_id=%llu "
             "scene_log_arg=%d light_id_arg=%d light_id_arg_valid=%d scene_view='%s'",
             result.sceneLog ? 1 : 0, result.traceNearest && result.lightId == 0 ? 1 : 0,
@@ -1664,6 +1738,64 @@ const LightingDiagnostics& LightingDiagnosticOptions()
     return options;
 }
 
+void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics& options,
+                              const float position[3], gamelight12::FrameSnapshot& snapshot)
+{
+    using gamelight12::FrameSnapshot;
+    auto& probe = state.localLightProbe;
+    auto& lights = snapshot.localLights;
+    auto& count = snapshot.localCount;
+    count = 0;
+    snapshot.probeMode = options.freezeRecord ? FrameSnapshot::ProbeMode::FrozenRecord :
+        FrameSnapshot::ProbeMode::FixedSelection;
+    if (options.freezeRecord && probe.frozen.id != 0)
+    {
+        lights[count++] = probe.frozen;
+        return;
+    }
+
+    // Только диагностический путь. Запрос привязан к исходной точке
+    // комнаты и продолжает читать живые игровые источники при повороте.
+    constexpr float probeRadius = 24.0f;
+    g_SpatialSpace->q_sphere(state.nearLightQuery, 0, STYPE_LIGHTSOURCE, probe.anchor, probeRadius);
+    const bool limitShadows = ps_r2_ls_flags.test(R2FLAG_LIGHT_NO_DIST_SHADOWS);
+    for (ISpatial* entry : state.nearLightQuery)
+    {
+        const IRender_Light* source = entry->dcast_Light();
+        gamelight12::LocalLight candidate;
+        if (!source || gamelight12::ReadWorldLight(*source, candidate) != gamelight12::LocalRejection::None ||
+            (std::max)({candidate.color.x, candidate.color.y, candidate.color.z}) <= 0.0f)
+            continue;
+        if (options.freezeRecord)
+        {
+            if (candidate.id != options.lightId)
+                continue;
+            // Замороженная запись без карты, чтобы её вклад зависел только
+            // от данных GPU и выбранного пикселя.
+            candidate.castsShadow = false;
+            probe.frozen = candidate;
+            lights[count++] = candidate;
+            break;
+        }
+        if (std::find(options.fixedIds.begin(), options.fixedIds.begin() + options.fixedCount, candidate.id) ==
+            options.fixedIds.begin() + options.fixedCount)
+            continue;
+        const double dx = double{candidate.position.x} - position[0];
+        const double dy = double{candidate.position.y} - position[1];
+        const double dz = double{candidate.position.z} - position[2];
+        const double distanceSquared = dx * dx + dy * dy + dz * dz;
+        const double rangeSquared = double{candidate.range} * candidate.range;
+        const double luminance = 0.2126 * candidate.color.x + 0.7152 * candidate.color.y + 0.0722 * candidate.color.z;
+        candidate.selectionScore = luminance * rangeSquared / (rangeSquared + distanceSquared);
+        candidate.castsShadow = candidate.castsShadow && (!limitShadows || distanceSquared <= 10000.0);
+        lights[count++] = candidate;
+        if (count == options.fixedCount)
+            break;
+    }
+    std::sort(lights.begin(), lights.begin() + count,
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+}
+
 void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewProjection,
                         const float position[3], gamelight12::FrameSnapshot& snapshot)
 {
@@ -1671,9 +1803,27 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
     const auto& options = LightingDiagnosticOptions();
     const uint64_t traceLightId = options.lightId;
     snapshot.tracedLightId = traceLightId;
-    const bool traceRequested = traceLightId != 0 || options.traceNearest;
-    bool trace = false;
-    if (traceRequested)
+    snapshot.diagnosticOrigin = options.origin;
+    const bool overrideLights = options.fixedCount != 0 || options.freezeRecord;
+    const bool traceRequested = traceLightId != 0 || options.traceNearest || options.fixedCount != 0;
+    if (overrideLights || options.probeFrames != 0)
+    {
+        auto& probe = state.localLightProbe;
+        if (probe.levelSession != snapshot.levelSession || probe.levelEpoch != snapshot.levelEpoch)
+        {
+            probe = {};
+            probe.levelSession = snapshot.levelSession;
+            probe.levelEpoch = snapshot.levelEpoch;
+            probe.anchor.set(position[0], position[1], position[2]);
+        }
+        if (probe.frames < options.probeDelay + options.probeFrames)
+        {
+            snapshot.diagnosticBurst = probe.frames >= options.probeDelay;
+            ++probe.frames;
+        }
+    }
+    bool trace = snapshot.diagnosticBurst;
+    if (!trace && traceRequested)
     {
         const auto now = std::chrono::steady_clock::now();
         trace = now >= state.nextLocalLightTrace;
@@ -1776,14 +1926,20 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
             }
         }
 
+        const bool fixedTrace = traceLightId == 0 && options.fixedCount != 0;
         if (!trace || candidate.id == 0 || (traceLightId != 0 && candidate.id != traceLightId) ||
-            !std::isfinite(distanceSquared))
+            (fixedTrace && std::find(options.fixedIds.begin(), options.fixedIds.begin() + options.fixedCount,
+                candidate.id) == options.fixedIds.begin() + options.fixedCount) || !std::isfinite(distanceSquared))
             return;
         gamelight12::LocalLightTrace record;
         record.id = candidate.id;
         record.distance = static_cast<float>(std::sqrt(distanceSquared));
         record.radius = candidate.range;
         record.position = candidate.position;
+        record.direction = candidate.direction;
+        record.color = candidate.color;
+        record.outerCos = candidate.outerCos;
+        record.innerCos = candidate.innerCos;
         record.type = candidate.type;
         record.inFrustumQuery = inFrustum;
         record.inNearQuery = inNearQuery;
@@ -1823,29 +1979,45 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
     // При изменении ранга тот же набор света получает те же GPU-индексы.
     std::sort(snapshot.localLights.begin(), snapshot.localLights.begin() + snapshot.localCount,
         [](const auto& left, const auto& right) { return left.id < right.id; });
-    for (uint32_t index = 0; index < snapshot.localCount; ++index)
-        snapshot.localShadowCandidateCount += snapshot.localLights[index].castsShadow ? 1u : 0u;
-
-    if (trace && traceLightId != 0 && snapshot.localTraceCount == 0)
+    const auto slotOf = [&](uint64_t id)
     {
-        auto& record = snapshot.localTrace[snapshot.localTraceCount++];
-        record.id = traceLightId;
-        record.distance = record.radius = -1.0f;
-        record.rejection = LocalRejection::NotInSpatialQuery;
-    }
-    for (uint32_t index = 0; index < snapshot.localTraceCount; ++index)
+        for (uint32_t i = 0; i < snapshot.localCount; ++i)
+            if (snapshot.localLights[i].id == id)
+                return static_cast<int32_t>(i);
+        return int32_t{-1};
+    };
+    const auto addMissing = [&](uint64_t id)
     {
-        auto& record = snapshot.localTrace[index];
-        for (uint32_t light = 0; light < snapshot.localCount; ++light)
+        const auto begin = snapshot.localTrace.begin();
+        const auto end = begin + snapshot.localTraceCount;
+        if (std::find_if(begin, end, [id](const auto& entry) { return entry.id == id; }) == end &&
+            snapshot.localTraceCount < snapshot.localTrace.size())
         {
-            if (snapshot.localLights[light].id != record.id)
-                continue;
-            record.gpuSlot = static_cast<int32_t>(light);
-            break;
+            auto& record = snapshot.localTrace[snapshot.localTraceCount++];
+            record.id = id;
+            record.distance = record.radius = -1.0f;
+            record.rejection = LocalRejection::NotInSpatialQuery;
         }
-        if (record.candidate && record.gpuSlot < 0)
+    };
+    if (trace && traceLightId != 0)
+        addMissing(traceLightId);
+    else if (trace)
+        for (uint32_t i = 0; i < options.fixedCount; ++i)
+            addMissing(options.fixedIds[i]);
+
+    for (uint32_t i = 0; i < snapshot.localTraceCount; ++i)
+    {
+        auto& record = snapshot.localTrace[i];
+        record.productionSlot = slotOf(record.id);
+        if (record.candidate && record.productionSlot < 0)
             record.rejection = LocalRejection::LightingBudget;
     }
+    if (overrideLights)
+        OverrideDiagnosticLights(state, options, position, snapshot);
+    for (uint32_t i = 0; i < snapshot.localTraceCount; ++i)
+        snapshot.localTrace[i].gpuSlot = slotOf(snapshot.localTrace[i].id);
+    for (uint32_t i = 0; i < snapshot.localCount; ++i)
+        snapshot.localShadowCandidateCount += snapshot.localLights[i].castsShadow ? 1u : 0u;
 }
 
 gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,

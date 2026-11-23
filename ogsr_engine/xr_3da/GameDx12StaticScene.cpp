@@ -60,9 +60,14 @@ struct SceneFrameConstants
     DirectX::XMFLOAT4 waterWeather;
     DirectX::XMFLOAT4 waterSky;
     std::array<DirectX::XMFLOAT4X4, kLocalShadowLayers> localShadowViewProjection;
-    uint32_t diagnosticLight[4]; // Целевой GPU slot + 1 и признак явного ID.
+    uint32_t diagnosticLight[4]; // Целевой GPU slot + 1, явный ID, frame slot, номер кадра.
+    DirectX::XMFLOAT4 diagnosticOrigin;
 };
 static_assert(sizeof(LocalLightGpu) == 64);
+static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
+static_assert(offsetof(LocalLightGpu, directionOuterCos) == 16);
+static_assert(offsetof(LocalLightGpu, colorInnerCos) == 32);
+static_assert(offsetof(LocalLightGpu, type) == 48);
 static_assert(offsetof(SceneFrameConstants, lightingFlags) == 192);
 static_assert(offsetof(SceneFrameConstants, localLights) == 208);
 static_assert(offsetof(SceneFrameConstants, hemiColor) == 208 + sizeof(SceneFrameConstants::localLights));
@@ -70,9 +75,12 @@ static_assert(offsetof(SceneFrameConstants, localShadowViewProjection) ==
     offsetof(SceneFrameConstants, waterSky) + sizeof(DirectX::XMFLOAT4));
 static_assert(offsetof(SceneFrameConstants, diagnosticLight) ==
     offsetof(SceneFrameConstants, localShadowViewProjection) + sizeof(SceneFrameConstants::localShadowViewProjection));
+static_assert(offsetof(SceneFrameConstants, diagnosticOrigin) ==
+    offsetof(SceneFrameConstants, diagnosticLight) + 16);
 constexpr uint64_t kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint64_t kFrameConstantsSize = (sizeof(SceneFrameConstants) + kConstantAlignment - 1) &
     ~(kConstantAlignment - 1);
+static_assert(kFrameConstantsSize == 2048);
 constexpr uint64_t kFrameConstantsSlots = GameDx12NativeFrame12::kFrameCount;
 constexpr uint64_t kStagingBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t kStagingAlignment = 512ull;
@@ -83,8 +91,9 @@ constexpr uint32_t kShadowLayerRoot = 8;
 constexpr uint32_t kLocalShadowSrvRoot = 9;
 constexpr uint32_t kNullWaterDescriptor = kSunShadowDescriptor + 1;
 constexpr uint32_t kWaterSrvCount = 3;
-constexpr uint32_t kLocalShadowDescriptor = kNullWaterDescriptor +
+constexpr uint32_t kWaterDescriptorEnd = kNullWaterDescriptor +
     kWaterSrvCount * (1 + GameDx12NativeFrame12::kFrameCount);
+constexpr uint32_t kLocalShadowDescriptor = kWaterDescriptorEnd;
 constexpr uint32_t kHemiSrvRoot = 10;
 constexpr uint32_t kTerrainSrvRoot = 11;
 constexpr uint32_t kTerrainScaleRoot = 12;
@@ -275,8 +284,10 @@ bool SceneSunShadowsRequested()
         const char* lighting = std::getenv("OGSR_DX12_GAME_LIGHTING");
         const char* sun = std::getenv("OGSR_DX12_GAME_SUN");
         const char* shadows = std::getenv("OGSR_DX12_GAME_SHADOWS");
+        const char* sunShadows = std::getenv("OGSR_DX12_GAME_SUN_SHADOWS");
         return lighting && sun && shadows && std::strcmp(lighting, "1") == 0 &&
-            std::strcmp(sun, "1") == 0 && std::strcmp(shadows, "1") == 0;
+            std::strcmp(sun, "1") == 0 && std::strcmp(shadows, "1") == 0 &&
+            (!sunShadows || std::strcmp(sunShadows, "0") != 0);
     }();
     return enabled;
 }
@@ -415,6 +426,7 @@ cbuffer FrameCB : register(b0)
     float4 WaterSky;
     float4x4 LocalShadowViewProjection[LOCAL_SHADOW_LAYERS];
     uint4 DiagnosticLight;
+    float4 DiagnosticOrigin;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -886,7 +898,7 @@ float3 DebugLocalShadow(float3 position, float3 normal)
         }
         if (ViewMode == 5)
             return SampleLocalVisibility(coords, layer).xxx;
-        return frac((source.type.y) * float3(0.618f, 0.381f, 0.173f));
+        return frac((layer + 1) * float3(0.618f, 0.381f, 0.173f));
     }
     return float3(0.12f, 0.0f, 0.12f);
 }
@@ -901,7 +913,22 @@ float3 IndirectHemi(float3 normal, float bakedHemi)
     return pow(ambient + max(0.0f, HemiColor.rgb) * weight, 2.2f) - pow(ambient, 2.2f);
 }
 
-float3 LocalLighting(float3 normal, float3 position, bool diagnostic)
+float LocalFalloff(LocalLightData source, float3 toLight)
+{
+    // R4 plight_local: q-linear falloff, .95 радиуса уже в снимке.
+    return saturate(1.0f - max(0.1f, dot(toLight, toLight)) * source.positionInverseRangeSquared.w);
+}
+
+float LocalAngular(LocalLightData source, float3 normal, float3 lightDir)
+{
+    const float cone = source.type.x != 0 ?
+        smoothstep(source.directionOuterCos.w, source.colorInnerCos.w,
+                   dot(-lightDir, source.directionOuterCos.xyz)) : 1.0f;
+    const float cosine = saturate(dot(normal, lightDir));
+    return cone * cosine;
+}
+
+float3 LocalLighting(float3 normal, float3 position, bool diagnostic, bool withShadows)
 {
     float3 light = 0.0f;
     [loop]
@@ -911,19 +938,14 @@ float3 LocalLighting(float3 normal, float3 position, bool diagnostic)
             continue;
         const LocalLightData source = LocalLights[index];
         const float3 toLight = source.positionInverseRangeSquared.xyz - position;
-        const float distanceSquared = dot(toLight, toLight);
-        // R4 plight_local: q-linear falloff, .95 радиуса уже в снимке.
-        const float falloff = saturate(1.0f - max(0.1f, distanceSquared) * source.positionInverseRangeSquared.w);
+        const float falloff = LocalFalloff(source, toLight);
         if (falloff <= 0.0f)
             continue;
         const float3 lightDir = SafeDirection(toLight);
-        const float cone = source.type.x != 0 ?
-            smoothstep(source.directionOuterCos.w, source.colorInnerCos.w,
-                       dot(-lightDir, source.directionOuterCos.xyz)) : 1.0f;
-        const float cosine = saturate(dot(normal, lightDir));
-        if (cone > 0.0f && cosine > 0.0f)
-            light += source.colorInnerCos.rgb * (pow(falloff, 2.2f) * cone * cosine *
-                LocalVisibility(source, position, normal, lightDir));
+        const float angular = LocalAngular(source, normal, lightDir);
+        if (angular > 0.0f)
+            light += source.colorInnerCos.rgb * (pow(falloff, 2.2f) * angular *
+                (withShadows ? LocalVisibility(source, position, normal, lightDir) : 1.0f));
     }
     return light;
 }
@@ -1141,12 +1163,34 @@ float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         bakedHemi = baseColor.a; // BmmD terrain: alpha базового слоя перед detail.
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
+    if (ViewMode == 14)
+        return float4(ToDisplay(LocalLighting(n, input.world, true, false)), 1.0f);
+    if (ViewMode == 15 || ViewMode == 16)
+    {
+        const uint count = min(LightingFlags.z, (uint)MAX_LOCAL_LIGHTS);
+        if (DiagnosticLight.x == 0 || DiagnosticLight.x > count)
+            return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        if (ViewMode == 16)
+            return float4(DiagnosticLight.x / (float)MAX_LOCAL_LIGHTS,
+                          (DiagnosticLight.w & 255u) / 255.0f, DiagnosticLight.z / 2.0f, 1.0f);
+        const LocalLightData source = LocalLights[DiagnosticLight.x - 1];
+        const float3 toLight = source.positionInverseRangeSquared.xyz - input.world;
+        const float falloff = LocalFalloff(source, toLight);
+        const float3 lightDir = SafeDirection(toLight);
+        const float angular = LocalAngular(source, n, lightDir);
+        const float3 raw = source.colorInnerCos.rgb * (pow(falloff, 2.2f) * angular);
+        const float visibility = falloff > 0.0f && angular > 0.0f ?
+            LocalVisibility(source, input.world, n, lightDir) : 1.0f;
+        return float4(falloff, visibility, dot(raw * visibility, float3(0.2126f, 0.7152f, 0.0722f)), 1.0f);
+    }
+    if (ViewMode == 17)
+        return float4(saturate(0.5f + (input.world - DiagnosticOrigin.xyz) * (1.0f / 16.0f)), 1.0f);
     const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
         const float direct = dot(SunColor.rgb * sunCosine, luminance);
-        const float local = dot(LocalLighting(n, input.world, true), luminance);
+        const float local = dot(LocalLighting(n, input.world, true, true), luminance);
         const float3 display = ToDisplay(float3(direct, 0.0f, local));
         return float4(display.r, SunVisibility(input.world, n, sunCosine), display.b, 1.0f);
     }
@@ -1155,7 +1199,7 @@ float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     {
         if (LightingFlags.x != 0)
         {
-            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, false);
+            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, false, true);
             if (sunCosine > 0.0f)
                 light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine));
         }
@@ -1395,7 +1439,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 13ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 17ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -2300,19 +2344,23 @@ bool GameDx12StaticScene12::CreateTextures(
         auto local = base;
         local.ptr += static_cast<SIZE_T>(kLocalShadowDescriptor) * m_textureDescriptorSize;
         device->CreateShaderResourceView(m_localShadow.Get(), &localSrv, local);
-        for (uint32_t index = 0; index < kTerrainTextureCount; ++index)
-        {
-            auto nullTerrain = base;
-            nullTerrain.ptr += static_cast<SIZE_T>(kTerrainDescriptor + index) * m_textureDescriptorSize;
-            device->CreateShaderResourceView(nullptr, &nullSrv, nullTerrain);
-        }
-        for (uint32_t index = kNullWaterDescriptor; index < kSceneDescriptorCount; ++index)
+        // У воды, массива теней и terrain непересекающиеся интервалы.
+        for (uint32_t index = kNullWaterDescriptor; index < kWaterDescriptorEnd; ++index)
         {
             auto descriptor = base;
             descriptor.ptr += static_cast<SIZE_T>(index) * m_textureDescriptorSize;
             device->CreateShaderResourceView(nullptr,
                 (index - kNullWaterDescriptor) % kWaterSrvCount == 2 ? &shadowSrv : &nullSrv, descriptor);
         }
+        for (uint32_t index = kTerrainDescriptor; index < kSceneDescriptorCount; ++index)
+        {
+            auto descriptor = base;
+            descriptor.ptr += static_cast<SIZE_T>(index) * m_textureDescriptorSize;
+            device->CreateShaderResourceView(nullptr, &nullSrv, descriptor);
+        }
+        Msg("ph_dx12_f43fr2: local_shadow_srv t=6 slot=%u dimension=2d_array format=R32_FLOAT "
+            "slices=%u resource=%d water_end=%u terrain_start=%u", kLocalShadowDescriptor,
+            kLocalShadowLayers, m_localShadow ? 1 : 0, kWaterDescriptorEnd, kTerrainDescriptor);
     }
     if (textures.empty())
         return true;
@@ -3156,6 +3204,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     LocalShadowViews localShadowViews;
     const uint32_t viewMode = SceneViewMode();
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
+    constants.diagnosticLight[2] = frameSlot;
+    constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
+    constants.diagnosticOrigin = {lighting.diagnosticOrigin.x, lighting.diagnosticOrigin.y,
+        lighting.diagnosticOrigin.z, 0.0f};
     constants.viewProjection = Transpose(logicalViewProjection);
     constants.cameraPosition = {cameraPosition[0], cameraPosition[1], cameraPosition[2], 1.0f};
     if (lighting.enabled && lighting.levelSession == LevelSession() && lighting.levelEpoch == LevelEpoch())
@@ -3212,6 +3264,25 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             }
         }
     }
+    if (lighting.diagnosticBurst || lighting.localTraceCount != 0)
+    {
+        gamelight12::Vec3 direction;
+        gamelight12::NormalizeDirection(logicalViewProjection._14, logicalViewProjection._24,
+            logicalViewProjection._34, direction);
+        Msg("ph_dx12_f43fr2: frame=%llu slot=%u cb_offset=%llu view=%u probe_mode=%u "
+            "camera=(%.4f,%.4f,%.4f) forward=(%.6f,%.6f,%.6f) light_count=%u "
+            "candidate_count=%u sun=%u sun_map=%u sun_dir=(%.5f,%.5f,%.5f) sun_rgb=(%.5f,%.5f,%.5f) "
+            "ambient=(%.5f,%.5f,%.5f) hemi=(%.5f,%.5f,%.5f)",
+            static_cast<unsigned long long>(lighting.frame), frameSlot,
+            static_cast<unsigned long long>(frameSlot * kFrameConstantsSize), viewMode,
+            static_cast<unsigned>(lighting.probeMode), cameraPosition[0], cameraPosition[1], cameraPosition[2],
+            direction.x, direction.y, direction.z, constants.lightingFlags[2], lighting.localCandidateCount,
+            constants.lightingFlags[1], constants.lightingFlags[3],
+            constants.sunDirection.x, constants.sunDirection.y, constants.sunDirection.z,
+            constants.sunColor.x, constants.sunColor.y, constants.sunColor.z,
+            constants.ambient.x, constants.ambient.y, constants.ambient.z,
+            constants.hemiColor.x, constants.hemiColor.y, constants.hemiColor.z);
+    }
     for (uint32_t index = 0; index < lighting.localTraceCount; ++index)
     {
         const auto& trace = lighting.localTrace[index];
@@ -3247,6 +3318,21 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             trace.position.x, trace.position.y, trace.position.z,
             gpu ? gpu->x : 0.0f, gpu ? gpu->y : 0.0f, gpu ? gpu->z : 0.0f,
             gamelight12::LocalTraceReasonName(trace.rejection), shadowReason);
+        const auto record = selected ? constants.localLights[trace.gpuSlot] : LocalLightGpu{};
+        const bool packedIdMatches = selected && lighting.localLights[trace.gpuSlot].id == trace.id;
+        Msg("ph_dx12_f43fr2: light_record frame=%llu id=%llu production_slot=%d gpu_slot=%d packed_id_match=%d "
+            "source_dir=(%.6g,%.6g,%.6g,%.6g) source_rgb=(%.6g,%.6g,%.6g,%.6g) "
+            "gpu_pos_rsq=(%.6g,%.6g,%.6g,%.6g) gpu_dir=(%.6g,%.6g,%.6g,%.6g) "
+            "gpu_rgb=(%.6g,%.6g,%.6g,%.6g) gpu_type=(%u,%u,%u,%u)",
+            static_cast<unsigned long long>(lighting.frame), static_cast<unsigned long long>(trace.id),
+            trace.productionSlot, trace.gpuSlot, packedIdMatches ? 1 : 0,
+            trace.direction.x, trace.direction.y, trace.direction.z, trace.outerCos,
+            trace.color.x, trace.color.y, trace.color.z, trace.innerCos,
+            record.positionInverseRangeSquared.x, record.positionInverseRangeSquared.y,
+            record.positionInverseRangeSquared.z, record.positionInverseRangeSquared.w,
+            record.directionOuterCos.x, record.directionOuterCos.y, record.directionOuterCos.z, record.directionOuterCos.w,
+            record.colorInnerCos.x, record.colorInnerCos.y, record.colorInnerCos.z, record.colorInnerCos.w,
+            record.type[0], record.type[1], record.type[2], record.type[3]);
     }
     const auto normalTexture = m_textureKeys.find(gamewater12::WaterNormal);
     const bool waterView = viewMode == 11 || viewMode == 12;
@@ -3404,7 +3490,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     uint32_t boundTerrainSet = 0;
     float boundTerrainScale = 0.0f;
     bool waterPass = false;
-    const bool limitMaterialView = (viewMode == 1 || (viewMode >= 7 && viewMode <= 10) || viewMode == 13) &&
+    const bool limitMaterialView = (viewMode == 1 || (viewMode >= 7 && viewMode <= 10) || viewMode >= 13) &&
         R1VisualSelection()[0] != UINT32_MAX;
     const auto bindMaterial = [&](uint32_t descriptor, uint32_t id, SurfaceMode surface,
                                   bool wallmarkClamp, gameaux12::TransparentMaterial transparency,

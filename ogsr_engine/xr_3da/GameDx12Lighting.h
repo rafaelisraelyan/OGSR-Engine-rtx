@@ -110,6 +110,11 @@ struct LocalLightTrace
     Vec3 position;
     LocalType type = LocalType::Point;
     int32_t gpuSlot = -1;
+    int32_t productionSlot = -1;
+    Vec3 direction;
+    Vec3 color;
+    float outerCos = 0.0f;
+    float innerCos = 0.0f;
     LocalRejection rejection = LocalRejection::None;
     bool active = false;
     bool candidate = false;
@@ -143,6 +148,10 @@ struct FrameSnapshot
     uint32_t localCandidateCount = 0;
     uint32_t localShadowCandidateCount = 0;
     uint64_t tracedLightId = 0;
+    Vec3 diagnosticOrigin;
+    bool diagnosticBurst = false;
+    enum class ProbeMode : uint8_t { Live, FixedSelection, FrozenRecord };
+    ProbeMode probeMode = ProbeMode::Live;
     std::array<LocalLightTrace, MaxLocalLightTrace> localTrace{};
     uint32_t localTraceCount = 0;
 };
