@@ -1,0 +1,114 @@
+﻿[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$GameRoot,
+    [string]$Exe,
+    [switch]$R4,
+    [switch]$NoLitDecals,
+    [switch]$LegacyAlpha,
+    [switch]$NoWater,
+    [switch]$NoPuddles,
+    [switch]$NoDynamicSunShadows,
+    [switch]$NoLocalShadows,
+    [switch]$NoHemi,
+    [switch]$NoTerrainDetail,
+    [switch]$NoShadows,
+    [switch]$NoLocalLights,
+    [switch]$NoTransparency,
+    [uint32[]]$GeometryVisualId,
+    [Nullable[uint32]]$GeometryObjectId,
+    [switch]$SceneLog,
+    [switch]$Validation,
+    [uint64]$LightId,
+    [ValidateSet('Default','ShadowDepth','ShadowVisibility','ShadowSlot','Albedo','Normals',
+        'Lighting','Hemi','WaterNormals','WaterReflection','Material')]
+    [string]$View = 'Default'
+)
+
+$ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Exe)) {
+    $scriptDirectory = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory) -and $MyInvocation.MyCommand.Path) {
+        $scriptDirectory = Split-Path -LiteralPath $MyInvocation.MyCommand.Path -Parent
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory)) {
+        throw 'Укажите путь к xrEngine.exe через -Exe.'
+    }
+    $Exe = Join-Path $scriptDirectory '..\..\bin_x64\xrEngine.exe'
+}
+$gameRoot = (Resolve-Path -LiteralPath $GameRoot).Path
+$config = Join-Path $gameRoot 'fsgame.ltx'
+$appData = (Join-Path $gameRoot 'appdata') + '\'
+$save = Join-Path $appData 'savedgames\b23_jupiter.scop'
+
+foreach ($path in @($Exe, $config, $save)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Файл отсутствует: $path" }
+}
+$expectedAlias = '^\$app_data_root\$\s*=\s*true\s*\|\s*false\s*\|\s*' + [regex]::Escape($appData) + '\s*$'
+if (-not (Select-String -LiteralPath $config -Pattern $expectedAlias -Quiet)) {
+    throw ('Проверьте путь $app_data_root$ в {0}. Ожидается {1}' -f $config, $appData)
+}
+if (Get-Process -Name xrEngine -ErrorAction SilentlyContinue) { throw 'Закройте текущий экземпляр xrEngine.' }
+
+$arguments = @('-fsltx', 'fsgame.ltx', '-nogameintro', '-log')
+if (-not $R4) { $arguments += '-dx12_native_game' }
+$arguments += @('-start', 'server(b23_jupiter/single/alife/load)')
+
+$start = New-Object System.Diagnostics.ProcessStartInfo
+$start.FileName = (Resolve-Path -LiteralPath $Exe).Path
+$start.WorkingDirectory = $gameRoot
+$start.Arguments = $arguments -join ' '
+$start.UseShellExecute = $false
+
+$features = @{
+    STATIC_SCENE = '1'
+    RIGID = '1'
+    SKINNED = '1'
+    DETAILS = '1'
+    LIGHTING = '1'
+    SUN = '1'
+    LOCAL_LIGHTS = [int](-not $NoLocalLights)
+    SHADOWS = [int](-not $NoShadows)
+    TRANSPARENCY = [int](-not $NoTransparency)
+    LIT_DECALS = [int](-not $NoLitDecals)
+    SOURCE_ALPHA_TEST = [int](-not $LegacyAlpha)
+    WATER = [int](-not $NoWater -and -not $NoTransparency)
+    PUDDLES = [int](-not $NoPuddles -and -not $NoTransparency)
+    DYNAMIC_SUN_SHADOWS = [int](-not $NoDynamicSunShadows -and -not $NoShadows)
+    LOCAL_SHADOWS = [int](-not $NoShadows -and -not $NoLocalShadows -and -not $NoLocalLights)
+    HEMI = [int](-not $NoHemi)
+    TERRAIN_DETAIL = [int](-not $NoTerrainDetail)
+    SCENE_LOG = [int]($SceneLog.IsPresent -or $LightId -ne 0)
+    TRACE_LIGHTS = [int]$SceneLog.IsPresent
+    VALIDATION = [int]$Validation.IsPresent
+}
+foreach ($feature in $features.GetEnumerator()) {
+    $start.EnvironmentVariables['OGSR_DX12_GAME_' + $feature.Key] = [string]$feature.Value
+}
+$views = @{
+    Default = 0; Material = 1; ShadowDepth = 4; ShadowVisibility = 5; ShadowSlot = 6
+    Albedo = 7; Normals = 8; Lighting = 9; Hemi = 10; WaterNormals = 11; WaterReflection = 12
+}
+$start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
+$start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
+if ($LightId -ne 0) {
+    $start.EnvironmentVariables['OGSR_DX12_GAME_TRACE_LIGHT_ID'] = [string]$LightId
+}
+$start.EnvironmentVariables.Remove('OGSR_DX12_GAME_METRICS')
+$start.EnvironmentVariables.Remove('OGSR_DX12_NATIVE_CAPTURE_DIR')
+$start.EnvironmentVariables.Remove('OGSR_DX12_GAME_R1_VISUAL_ID')
+if ($GeometryVisualId) {
+    $start.EnvironmentVariables['OGSR_DX12_GAME_R1_VISUAL_ID'] = $GeometryVisualId -join ','
+}
+$start.EnvironmentVariables.Remove('OGSR_DX12_GAME_R1_OBJECT_ID')
+if ($null -ne $GeometryObjectId) {
+    $start.EnvironmentVariables['OGSR_DX12_GAME_R1_OBJECT_ID'] = [string]$GeometryObjectId
+}
+$engine = [System.Diagnostics.Process]::Start($start)
+try {
+    $engine.WaitForExit()
+    if ($engine.ExitCode -ne 0) { throw "xrEngine завершился с кодом $($engine.ExitCode)." }
+}
+finally {
+    $engine.Dispose()
+}

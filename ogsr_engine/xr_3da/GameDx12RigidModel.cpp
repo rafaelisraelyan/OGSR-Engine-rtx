@@ -216,7 +216,7 @@ bool ReadMaterial(Bytes bytes, uint16_t levelShaderId, SkeletalPartSource& part,
     auto& mesh = part.mesh;
     mesh.shader.assign(shader);
     mesh.surface = ClassifySurface(shader);
-    mesh.texture = CanonicalBaseTextureName(textures);
+    mesh.texture = SurfaceBaseTextureName(shader, textures);
     mesh.cutout = mesh.surface == SurfaceMode::Cutout || mesh.surface == SurfaceMode::OverlayCutout;
     if (mesh.surface == SurfaceMode::Unsupported ||
         (mesh.skinned && mesh.surface == SurfaceMode::Auto))

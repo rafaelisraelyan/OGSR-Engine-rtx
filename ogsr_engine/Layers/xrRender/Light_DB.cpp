@@ -6,6 +6,59 @@
 #include "R_light.h"
 #include "light_db.h"
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+#include "../../xr_3da/GameDx12Lighting.h"
+
+gamelight12::LocalRejection gamelight12::ReadWorldLight(const IRender_Light& source, LocalLight& output) noexcept
+{
+    const auto* lightSource = dynamic_cast<const light*>(&source);
+    if (!lightSource)
+        return LocalRejection::UnsupportedSource;
+
+    const auto& position = lightSource->position;
+    output.id = lightSource->Dx12Id();
+    output.position = {position.x, position.y, position.z};
+    output.active = lightSource->flags.bActive;
+    output.sourceShadow = lightSource->Dx12SourceCastsShadow();
+    output.range = lightSource->range * 0.95f; // Эффективный радиус accum_point/spot.
+    if (!output.active)
+        return LocalRejection::Inactive;
+    if (lightSource->flags.bStatic || lightSource->flags.bHudMode)
+        return LocalRejection::NotWorld;
+
+    const auto type = lightSource->flags.type;
+    if (type != IRender_Light::POINT && type != IRender_Light::SPOT)
+        return LocalRejection::UnsupportedType;
+
+    const auto& color = lightSource->color;
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+        !std::isfinite(position.z) || !std::isfinite(output.range) || output.range <= EPS_L ||
+        !DecodeLightColor(color.r, color.g, color.b, output.color))
+        return LocalRejection::InvalidData;
+
+    // export_to меняет flags.bShadow при R4 distance cull. Snapshot использует
+    // исходный флаг владельца и применяет ограничение расстояния для своей камеры.
+    output.shadowNear = lightSource->virtual_size;
+    output.shadowFar = lightSource->range + EPS_S;
+    output.castsShadow = output.sourceShadow && std::isfinite(output.shadowNear) &&
+        std::isfinite(output.shadowFar) && output.shadowNear > 0.0f &&
+        output.shadowNear < output.shadowFar;
+    if (type == IRender_Light::SPOT)
+    {
+        const auto& direction = lightSource->direction;
+        const float cone = lightSource->cone; // Полный угол проекции R4 в радианах.
+        if (!std::isfinite(cone) || cone <= EPS_L || cone > deg2rad(121.f) ||
+            !NormalizeDirection(direction.x, direction.y, direction.z, output.direction))
+            return LocalRejection::InvalidData;
+        output.type = LocalType::Spot;
+        output.outerCos = std::cos(cone * 0.5f);
+        // Плавный край аппроксимирует штатную проекционную текстуру R4.
+        output.innerCos = std::cos(cone * 0.4f);
+    }
+    return LocalRejection::None;
+}
+#endif
+
 CLight_DB::CLight_DB() {}
 
 CLight_DB::~CLight_DB() {}

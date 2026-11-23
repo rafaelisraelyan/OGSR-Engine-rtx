@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -33,6 +35,50 @@ inline std::string CanonicalShaderName(std::string_view shader)
     return name;
 }
 
+enum class TransparentMaterial : uint8_t
+{
+    None = 0,
+    Water = 2,
+    Glass = 3,
+};
+
+inline bool TransparencyEnabled()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_TRANSPARENCY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// Текстуру s_base задают normal-проходы соответствующих .s R4.
+// level.puddles загружается отдельной фазой и не является level visual.
+inline constexpr std::string_view WaterBaseTexture(std::string_view canonicalShader)
+{
+    if (canonicalShader == "effects_water")
+        return "water\\water_water";
+    if (canonicalShader == "effects_waterstuden")
+        return "water\\water_studen";
+    if (canonicalShader == "effects_waterryaska" || canonicalShader == "effects_waterunderground")
+        return "water\\water_ryaska1";
+    return {};
+}
+
+inline TransparentMaterial ClassifyTransparentMaterial(std::string_view shader)
+{
+    if (!TransparencyEnabled())
+        return TransparentMaterial::None;
+
+    const auto name = CanonicalShaderName(shader);
+    // Порядок групп соответствует sorting(2, false) и sorting(3, true) R4.
+    if (!WaterBaseTexture(name).empty())
+        return TransparentMaterial::Water;
+    if (name == "models_transparent" || name == "models_xwindows")
+        return TransparentMaterial::Glass;
+    return TransparentMaterial::None;
+}
+
 inline bool UsesWallmarkClamp(std::string_view shader)
 {
     const auto name = CanonicalShaderName(shader);
@@ -52,10 +98,12 @@ inline SurfaceMode ClassifySurface(std::string_view shader)
         return SurfaceMode::OverlayBlend;
     if (name == "effects_wallmarkset")
         return SurfaceMode::OverlayOpaque;
-    if (name == "models_transparent" || name == "models_xwindows")
+    if (name == "models_transparent" || name == "models_xwindows" ||
+        (TransparencyEnabled() && !WaterBaseTexture(name).empty()))
         return SurfaceMode::Translucent;
     if (name == "models_pautina" || name == "models_selflight_det_3_aref" ||
-        name.starts_with("models_xdistort"))
+        name.starts_with("models_xdistort") ||
+        (TransparencyEnabled() && name == "effects_water_puddles"))
         return SurfaceMode::Unsupported;
 
     if (name == "models_model" || name == "models_model_pn")
@@ -129,5 +177,16 @@ inline std::string CanonicalBaseTextureName(std::string_view textures)
         start = end + 1;
     }
     return name;
+}
+
+inline std::string SurfaceBaseTextureName(std::string_view shader, std::string_view textures)
+{
+    if (TransparencyEnabled())
+    {
+        const auto waterTexture = WaterBaseTexture(CanonicalShaderName(shader));
+        if (!waterTexture.empty())
+            return std::string(waterTexture);
+    }
+    return CanonicalBaseTextureName(textures);
 }
 }

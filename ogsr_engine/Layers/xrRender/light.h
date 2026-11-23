@@ -20,6 +20,14 @@ private:
     u32 m_xform_frame{};
 
 public:
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    u64 Dx12Id() const noexcept { return m_dx12Id; }
+    bool Dx12SourceCastsShadow() const noexcept { return b_originShadow; }
+
+private:
+    const u64 m_dx12Id;
+public:
+#endif
     struct
     {
         u32 type : 4;

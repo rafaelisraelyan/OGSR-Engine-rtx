@@ -4,7 +4,10 @@
 
 #include "GameDx12AuxGeometry.h"
 #include "GameDx12J2ABatch.h"
+#include "GameDx12Lighting.h"
+#include "GameDx12NativeFrame.h"
 #include "GameDx12Surface.h"
+#include "GameDx12Water.h"
 #include "dx12xrayasset.h"
 #include "dx12xraylevelgeometry.h"
 
@@ -57,9 +60,16 @@ struct GameDx12StaticMaterial12
 {
     static constexpr uint32_t kNoTexture = 0xFFFFFFFFu;
     uint32_t textureIndex = kNoTexture;
+    uint32_t hemiTextureIndex = kNoTexture;
+    std::array<uint32_t, 5> terrainTextures{}; // Маска и каналы R/G/B/A.
+    float terrainScale = 0.0f;
+    bool terrainBaseHemi = false;
     gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Auto;
     bool wallmarkClamp = false;
+    gameaux12::TransparentMaterial transparency = gameaux12::TransparentMaterial::None;
     bool hasOverride = false;
+    bool usesHemiLightmap = false;
+    bool checkAlphaCoverage = false;
 };
 
 class GameDx12StaticScene12
@@ -106,7 +116,24 @@ public:
         uint32_t draws = 0;
         uint32_t culled = 0;
         uint32_t total = 0;
+        uint32_t sunRigidDraws = 0;
+        uint32_t sunSkinnedDraws = 0;
+        uint32_t localShadowMaps = 0;
+        uint32_t localShadowDraws = 0;
         SurfaceStats surfaces;
+        uint32_t waterDraws = 0;
+        uint32_t puddleDraws = 0;
+        uint32_t staticShadowDraws = 0;
+        uint32_t dynamicShadowDraws = 0;
+        uint32_t spotShadowMaps = 0;
+        uint32_t pointShadowFaces = 0;
+        uint32_t shadowedLights = 0;
+        uint32_t sceneCopies = 0;
+        std::array<uint64_t, 3> shadowLightIds{};
+        std::array<uint32_t, 3> shadowLightFirstSlices{};
+        double shadowCpuMs = 0.0;
+        double sceneCpuMs = 0.0;
+        double waterCpuMs = 0.0;
         double cull_ms = 0.0;
         double record_ms = 0.0;
     };
@@ -152,15 +179,18 @@ public:
               const std::vector<GameDx12StaticMaterial12>& materials,
               std::string& reason);
 
-    bool RecordNativeFrame(ID3D12GraphicsCommandList* list, uint32_t frameSlot,
+    bool RecordNativeFrame(const GameDx12NativeFrame12::Recording& recording,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
                            const float cameraPosition[3], const gameaux12::Frame& extras,
+                           const gamelight12::FrameSnapshot& lighting,
+                           const gamewater12::Frame& water,
                            FrameStats12& stats, AuxStats& auxStats,
                            std::string& reason);
 
     bool RegisterMeshes(const GameDx12StaticSceneOwner12& owner,
                         std::span<const gameaux12::Mesh* const> sources,
                         std::vector<uint32_t>& handles, std::string& reason);
+    void SetPuddles(std::vector<gamewater12::Puddle> puddles) { m_puddles.swap(puddles); }
     const AuxStats& AuxResources() const noexcept { return m_auxResources; }
     uint64_t TextureFootprintBytes(std::span<const uint32_t> meshes) const;
 
@@ -198,10 +228,16 @@ private:
         uint32_t descriptor = kNullDescriptor;
         gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Opaque;
         bool wallmarkClamp = false;
+        gameaux12::TransparentMaterial transparency = gameaux12::TransparentMaterial::None;
         // 1 = TEXCOORD0 @28 (classic), 2 = TEXCOORD0 @24, 3 = flora с мировой
         // матрицей из OGF_TREEDEF2.
         uint8_t layout = 1;
         uint8_t traceSlot = UINT8_MAX;
+        bool vertexHemi = false;
+        uint32_t hemiDescriptor = kNullDescriptor;
+        uint32_t terrainSet = 0;
+        float terrainScale = 0.0f;
+        bool terrainBaseHemi = false;
         float world[16] = {1.0f, 0.0f, 0.0f, 0.0f,
                            0.0f, 1.0f, 0.0f, 0.0f,
                            0.0f, 0.0f, 1.0f, 0.0f,
@@ -211,6 +247,22 @@ private:
         // Предвычисленный VBV/IBV; адреса валидны после публикации пулов.
         D3D12_VERTEX_BUFFER_VIEW vertexView{};
         D3D12_INDEX_BUFFER_VIEW indexView{};
+    };
+
+    struct ShadowCasterNode
+    {
+        float minimum[3]{};
+        float maximum[3]{};
+        uint32_t first = 0;
+        uint32_t count = 0;
+        uint32_t left = 0;
+        uint32_t right = 0;
+    };
+
+    struct ShadowCasterTree
+    {
+        std::vector<uint32_t> draws;
+        std::vector<ShadowCasterNode> nodes;
     };
 
     struct Buffer12
@@ -241,6 +293,7 @@ private:
         float radius = 0.0f;
         gameaux12::SurfaceMode surface = gameaux12::SurfaceMode::Opaque;
         bool wallmarkClamp = false;
+        gameaux12::TransparentMaterial transparency = gameaux12::TransparentMaterial::None;
         bool skinned = false;
     };
 
@@ -259,8 +312,13 @@ private:
 
     bool Fail(std::string& reason, const char* text);
     bool Fail(std::string& reason, const std::string& text);
+    void BuildShadowCasterTrees();
+    uint32_t BuildShadowCasterNode(ShadowCasterTree& tree, uint32_t first, uint32_t count);
     bool CreatePipeline(ID3D12Device* device, std::string& reason);
+    bool CreateSunShadowPipeline(ID3D12Device* device, std::string& reason);
     bool CreateFrameConstants(ID3D12Device* device, std::string& reason);
+    bool CreateSunShadow(ID3D12Device* device, std::string& reason);
+    bool CreateLocalShadow(ID3D12Device* device, std::string& reason);
     bool CreateInstanceBuffer(ID3D12Device* device, std::string& reason);
     bool PrepareUpload(const GameDx12StaticSceneOwner12& owner,
                        std::span<const uint8_t> geomBytes,
@@ -279,6 +337,7 @@ private:
     std::vector<Buffer12> m_indexPools;
     std::vector<TextureGpu12> m_textures;
     std::vector<DrawSource12> m_draws;
+    std::array<ShadowCasterTree, 2> m_shadowCasters;
     std::unordered_map<std::string, uint32_t> m_textureKeys;
     std::vector<ComPtr<ID3D12Resource>> m_auxGeometry;
     std::vector<AuxMesh> m_auxMeshes;
@@ -296,8 +355,18 @@ private:
     ComPtr<ID3D12PipelineState> m_pipelineUv24;
     ComPtr<ID3D12PipelineState> m_pipelineSkeletal;
     ComPtr<ID3D12PipelineState> m_pipelineDetail;
+    ComPtr<ID3D12PipelineState> m_pipelinePuddle;
+    std::vector<gamewater12::Puddle> m_puddles;
     // classic, uv@24 (включая flora), skeletal
     std::array<DeferredPipelines, 3> m_deferredPipelines;
+    std::array<ComPtr<ID3D12PipelineState>, 2> m_sunShadowPipelines;
+    ComPtr<ID3D12PipelineState> m_sunShadowAuxPipeline;
+    ComPtr<ID3D12Resource> m_sunShadow;
+    ComPtr<ID3D12DescriptorHeap> m_sunShadowDsv;
+    ComPtr<ID3D12Resource> m_localShadow;
+    ComPtr<ID3D12DescriptorHeap> m_localShadowDsv;
+    UINT m_localShadowDsvStride = 0;
+    std::array<uint64_t, 3> m_previousLocalShadowLights{};
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
     ComPtr<ID3D12Resource> m_frameConstants;
     ComPtr<ID3D12Resource> m_frameTransforms;

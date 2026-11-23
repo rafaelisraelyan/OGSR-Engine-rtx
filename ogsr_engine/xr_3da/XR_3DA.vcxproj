@@ -343,6 +343,9 @@
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
     <ClInclude Include="GameDx12AuxGeometry.h" />
+    <ClInclude Include="GameDx12Lighting.h" />
+    <ClInclude Include="GameDx12Water.h" />
+    <ClInclude Include="GameDx12Surface.h" />
     <ClInclude Include="GameDx12GameVisuals.h" />
     <ClInclude Include="GameDx12LevelDetails.h" />
     <ClInclude Include="GameDx12RigidModel.h" />

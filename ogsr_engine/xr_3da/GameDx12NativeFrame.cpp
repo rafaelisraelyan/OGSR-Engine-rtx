@@ -1,9 +1,11 @@
 #include "stdafx.h"
 #include "GameDx12NativeFrame.h"
+#include "GameDx12Water.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include <cstdlib>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -73,7 +75,8 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
         return hr;
     m_rtvStride = owner.device.GetDescriptorHandleIncrementSize(descriptors.Type);
     descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    descriptors.NumDescriptors = 1;
+    descriptors.NumDescriptors = 2;
+    m_dsvStride = owner.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     hr = owner.device.CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(m_dsv.GetAddressOf()));
     if (FAILED(hr))
         return hr;
@@ -108,8 +111,10 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
 #endif
 
     const char* measure = std::getenv("OGSR_DX12_GAME_METRICS");
-    if (measure != nullptr && std::strcmp(measure, "1") == 0 &&
-        SUCCEEDED(owner.queue.GetTimestampFrequency(&m_timestampFrequency)) &&
+    const char* sceneLog = std::getenv("OGSR_DX12_GAME_SCENE_LOG");
+    m_measureFrame = (measure != nullptr && std::strcmp(measure, "1") == 0) ||
+        (sceneLog != nullptr && std::strcmp(sceneLog, "1") == 0);
+    if (m_measureFrame && SUCCEEDED(owner.queue.GetTimestampFrequency(&m_timestampFrequency)) &&
         m_timestampFrequency != 0)
     {
         D3D12_QUERY_HEAP_DESC query{};
@@ -164,7 +169,7 @@ HRESULT GameDx12NativeFrame12::CreateTargets(ID3D12Device& device,
     depth.Height = height;
     depth.DepthOrArraySize = 1;
     depth.MipLevels = 1;
-    depth.Format = depthFormat;
+    depth.Format = DXGI_FORMAT_R32_TYPELESS;
     depth.SampleDesc.Count = 1;
     depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear{};
@@ -175,7 +180,30 @@ HRESULT GameDx12NativeFrame12::CreateTargets(ID3D12Device& device,
         &clear, IID_PPV_ARGS(m_depth.GetAddressOf()));
     if (FAILED(hr))
         return hr;
-    device.CreateDepthStencilView(m_depth.Get(), nullptr, m_dsv->GetCPUDescriptorHandleForHeapStart());
+    D3D12_DEPTH_STENCIL_VIEW_DESC depthView{};
+    depthView.Format = depthFormat;
+    depthView.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    auto dsv = m_dsv->GetCPUDescriptorHandleForHeapStart();
+    device.CreateDepthStencilView(m_depth.Get(), &depthView, dsv);
+    dsv.ptr += m_dsvStride;
+    depthView.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+    device.CreateDepthStencilView(m_depth.Get(), &depthView, dsv);
+
+    if (gamewater12::WaterEnabled() || gamewater12::PuddlesEnabled())
+    {
+        auto colorCopy = depth;
+        colorCopy.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        colorCopy.Flags = D3D12_RESOURCE_FLAG_NONE;
+        for (auto& slot : m_slots)
+        {
+            const HRESULT copyHr = device.CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &colorCopy,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(slot.opaqueColor.GetAddressOf()));
+            if (FAILED(copyHr))
+                Msg("ph_dx12_f43e: water scene copy unavailable hr=0x%08X", static_cast<unsigned>(copyHr));
+        }
+    }
     m_width = width;
     m_height = height;
     return S_OK;
@@ -244,7 +272,10 @@ HRESULT GameDx12NativeFrame12::Resize(const Owner& owner, uint32_t width, uint32
     }
     m_depth.Reset();
     for (auto& slot : m_slots)
+    {
         slot.color.Reset();
+        slot.opaqueColor.Reset();
+    }
     hr = m_swapchain->ResizeBuffers(kFrameCount, width, height, colorFormat, 0);
     if (FAILED(hr))
         return hr;
@@ -274,9 +305,13 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     if (m_slot >= kFrameCount)
         return E_FAIL;
     auto& slot = m_slots[m_slot];
+    using Clock = std::chrono::steady_clock;
+    const auto waitStart = m_measureFrame ? Clock::now() : Clock::time_point{};
     HRESULT hr = Wait(owner, slot.fence);
     if (FAILED(hr))
         return hr;
+    const double slotFenceWaitMs = m_measureFrame ?
+        std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count() : 0.0;
     if (m_timingQueries && slot.timingPresent != 0)
     {
         const SIZE_T offset = m_slot * 2 * sizeof(uint64_t);
@@ -335,8 +370,40 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     slot.list->RSSetScissorRects(1, &area);
     slot.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
     slot.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    recording = {slot.list.Get(), m_slot, width, height};
+    recording = {slot.list.Get(), m_slot, width, height, rtv, dsv,
+                 {dsv.ptr + m_dsvStride}, slot.color.Get(), m_depth.Get(),
+                 slot.opaqueColor.Get(), &owner.device, slotFenceWaitMs};
     return S_OK;
+}
+
+void GameDx12NativeFrame12::Recording::BeginWater() const noexcept
+{
+    constexpr auto shaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    const D3D12_RESOURCE_BARRIER toCopy[] = {
+        ColorBarrier(color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        ColorBarrier(opaqueColor, shaderRead, D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    list->ResourceBarrier(2, toCopy);
+    list->CopyResource(opaqueColor, color);
+    const D3D12_RESOURCE_BARRIER toWater[] = {
+        ColorBarrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        ColorBarrier(opaqueColor, D3D12_RESOURCE_STATE_COPY_DEST, shaderRead),
+        ColorBarrier(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                     D3D12_RESOURCE_STATE_DEPTH_READ | shaderRead)
+    };
+    list->ResourceBarrier(3, toWater);
+    list->OMSetRenderTargets(1, &rtv, FALSE, &readOnlyDsv);
+}
+
+void GameDx12NativeFrame12::Recording::EndWater() const noexcept
+{
+    list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    const auto barrier = ColorBarrier(depth,
+        D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    list->ResourceBarrier(1, &barrier);
+    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
 }
 
 HRESULT GameDx12NativeFrame12::Cancel() noexcept
@@ -540,6 +607,7 @@ void GameDx12NativeFrame12::Quarantine() noexcept
     for (auto& slot : m_slots)
     {
         slot.color.Detach();
+        slot.opaqueColor.Detach();
         slot.allocator.Detach();
         slot.list.Detach();
     }

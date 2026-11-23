@@ -1,5 +1,25 @@
 #include "stdafx.h"
 #include "r4.h"
+#include "../../xr_3da/GameDx12Water.h"
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+std::vector<gamewater12::Puddle> gamewater12::CaptureLevelPuddles()
+{
+    const auto& source = RImplementation.LevelPuddles();
+    std::vector<Puddle> result;
+    result.reserve(source.size());
+    for (const auto& puddle : source)
+    {
+        static_assert(sizeof(puddle.xform) == sizeof(DirectX::XMFLOAT4X4));
+        Puddle snapshot{};
+        std::memcpy(&snapshot.world, &puddle.xform, sizeof(snapshot.world));
+        snapshot.height = puddle.height;
+        snapshot.radius = puddle.radius;
+        result.push_back(snapshot);
+    }
+    return result;
+}
+#endif
 
 #include "../xrRender/ResourceManager.h"
 #include "../xrRender/fbasicvisual.h"

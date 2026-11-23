@@ -8,6 +8,11 @@
 #include "tss_def.h"
 #include "TextureDescrManager.h"
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+#include <array>
+#include <string>
+#endif
+
 // refs
 class dx10ConstantBuffer;
 
@@ -96,6 +101,11 @@ private:
 public:
     CResourceManager() : bDeferredLoad(TRUE) {}
     ~CResourceManager();
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    bool ReadDeferredLevelAlphaSource(LPCSTR name, bool& blended);
+    bool ReadTerrainSource(LPCSTR shader, LPCSTR baseTexture, std::array<std::string, 4>& layerNames, float& detailScale);
+#endif
 
     void _GetMemoryUsage(u32& m_base, u32& c_base, u32& m_lmaps, u32& c_lmaps);
     void _DumpMemoryUsage();

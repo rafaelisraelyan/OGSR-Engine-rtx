@@ -143,6 +143,12 @@ private:
     };
     xr_vector<Puddle> current_level_puddles;
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+public:
+    const auto& LevelPuddles() const noexcept { return current_level_puddles; }
+private:
+#endif
+
     // Loading / Unloading
     void LoadBuffers(CStreamReader* fs, BOOL _alternative);
     void LoadVisuals(IReader* fs);

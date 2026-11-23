@@ -11,6 +11,8 @@
 #include "GameDx12J2APreparation.h"
 #include "GameDx12StaticScene.h"
 #include "GameDx12GameVisuals.h"
+#include "GameDx12Lighting.h"
+#include "GameDx12Water.h"
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
 #include "FS.h"
@@ -31,6 +33,9 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "Environment.h"
+#include "../Layers/xrRender/xrRender_console.h"
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -41,6 +46,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -144,6 +150,9 @@ struct BridgeStateData
     // пути: у неё своя загрузка, свои пулы и своя статистика.
     GameDx12StaticScene12 staticScene;
     gameaux12::GameVisuals gameVisuals;
+    xr_vector<ISpatial*> lightQuery;
+    xr_vector<ISpatial*> nearLightQuery;
+    std::chrono::steady_clock::time_point nextLocalLightTrace{};
     GameDx12OffscreenPass12 offscreen;
     GameDx12NativeFrame12 native;
 
@@ -155,6 +164,29 @@ struct BridgeStateData
     uint64_t rejectedFrames = 0;
     uint64_t nativeScenePresents = 0;
     std::chrono::steady_clock::time_point previousNativePresent{};
+    struct
+    {
+        std::chrono::steady_clock::time_point start{};
+        uint32_t frames = 0;
+        uint32_t gpuFrames = 0;
+        double frameCpuMs = 0;
+        double prepareCpuMs = 0;
+        double shadowCpuMs = 0;
+        double sceneCpuMs = 0;
+        double waterCpuMs = 0;
+        double gpuWaitMs = 0;
+        double presentMs = 0;
+        double gpuMs = 0;
+        uint64_t staticShadowDraws = 0;
+        uint64_t dynamicShadowDraws = 0;
+        uint64_t spotShadowMaps = 0;
+        uint64_t pointShadowFaces = 0;
+        uint64_t visibleLights = 0;
+        uint64_t shadowedLights = 0;
+        uint64_t lightCandidates = 0;
+        uint64_t shadowCandidates = 0;
+        uint64_t sceneCopies = 0;
+    } nativePerf;
     uint64_t prePolicyStorageDenied = 0;
     uint64_t prePolicyRetrievalHidden = 0;
     uint32_t width = 0;
@@ -1034,7 +1066,13 @@ bool EnsureInitialized()
     ComPtr<ID3D12Debug> debug;
     bool debugEnabled = false;
     bool gbvEnabled = false;
-    if (SUCCEEDED(::D3D12GetDebugInterface(IID_PPV_ARGS(debug.GetAddressOf()))))
+    // GBV подменяет шейдеры и добавляет GPU-команды. Обычный игровой кадр
+    // использует этот режим только по запросу. Диагностический мост сохраняет
+    // прежний режим проверки своего bootstrap.
+    const char* validation = std::getenv("OGSR_DX12_GAME_VALIDATION");
+    const bool wantValidation = !state.nativeRequested ||
+        (validation != nullptr && std::strcmp(validation, "1") == 0);
+    if (wantValidation && SUCCEEDED(::D3D12GetDebugInterface(IID_PPV_ARGS(debug.GetAddressOf()))))
     {
         debug->EnableDebugLayer();
         debugEnabled = true;
@@ -1568,6 +1606,283 @@ bool DrainNative(BridgeStateData& state, const char* stage)
     return false;
 }
 
+bool LightingFlag(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "1") == 0;
+}
+
+void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewProjection,
+                        const float position[3], gamelight12::FrameSnapshot& snapshot)
+{
+    using gamelight12::LocalRejection;
+    if (!g_SpatialSpace || !snapshot.localEnabled)
+        return;
+
+    Fmatrix view{};
+    static_assert(sizeof(view.m) == sizeof(viewProjection.m));
+    std::memcpy(view.m, viewProjection.m, sizeof(view.m));
+    CFrustum frustum{};
+    frustum.CreateFromMatrix(view, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+
+    // Отдельная область около камеры сохраняет свет, пересекающий ближнюю
+    // плоскость, даже если он отсутствует в видимом списке пространственной БД.
+    // Как в light::vis_prepare R4, учитываем enclosing sphere и запас near plane.
+    const Fvector eye{position[0], position[1], position[2]};
+    constexpr float nearGuard = 2.0f * VIEWPORT_NEAR;
+    struct ClearQuery
+    {
+        xr_vector<ISpatial*>& frustum;
+        xr_vector<ISpatial*>& nearLights;
+        ~ClearQuery() { frustum.clear(); nearLights.clear(); }
+    } clearQuery{state.lightQuery, state.nearLightQuery};
+    g_SpatialSpace->q_frustum(state.lightQuery, 0, STYPE_LIGHTSOURCE, frustum);
+    g_SpatialSpace->q_sphere(state.nearLightQuery, 0, STYPE_LIGHTSOURCE, eye, nearGuard);
+
+    static const uint64_t traceLightId = []
+    {
+        uint64_t id = 0;
+        const char* value = std::getenv("OGSR_DX12_GAME_TRACE_LIGHT_ID");
+        if (!value)
+            return id;
+        const char* end = value + std::strlen(value);
+        const auto parsed = std::from_chars(value, end, id);
+        return parsed.ec == std::errc{} && parsed.ptr == end ? id : uint64_t{0};
+    }();
+    static const bool traceRequested = traceLightId != 0 || LightingFlag("OGSR_DX12_GAME_TRACE_LIGHTS");
+    bool trace = false;
+    if (traceRequested)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        trace = now >= state.nextLocalLightTrace;
+        if (trace)
+            state.nextLocalLightTrace = now + std::chrono::seconds(3);
+    }
+
+    struct Priority
+    {
+        double score = 0.0;
+        bool cameraInside = false;
+    };
+    std::array<Priority, gamelight12::MaxLocalLights> priorities{};
+    const bool limitDistantShadows = ps_r2_ls_flags.test(R2FLAG_LIGHT_NO_DIST_SHADOWS);
+    const auto consider = [&](ISpatial* entry)
+    {
+        IRender_Light* source = entry->dcast_Light();
+        if (!source)
+            return;
+        gamelight12::LocalLight candidate{};
+        auto rejection = gamelight12::ReadWorldLight(*source, candidate);
+        const double dx = double{candidate.position.x} - position[0];
+        const double dy = double{candidate.position.y} - position[1];
+        const double dz = double{candidate.position.z} - position[2];
+        const double distanceSquared = dx * dx + dy * dy + dz * dz;
+        const double rangeSquared = double{candidate.range} * candidate.range;
+        const double luminance = 0.2126 * candidate.color.x +
+                                 0.7152 * candidate.color.y +
+                                 0.0722 * candidate.color.z;
+        if (rejection == LocalRejection::None && luminance <= 0.0)
+            rejection = LocalRejection::NoEnergy;
+        const bool eligible = rejection == LocalRejection::None;
+        bool cameraInside = false;
+        if (eligible)
+        {
+            candidate.castsShadow = candidate.castsShadow &&
+                (!limitDistantShadows || distanceSquared <= 10000.0);
+            const double eyeRange = double{candidate.range} + nearGuard;
+            const double axial = -(dx * candidate.direction.x + dy * candidate.direction.y +
+                dz * candidate.direction.z);
+            cameraInside = distanceSquared <= eyeRange * eyeRange &&
+                (candidate.type == gamelight12::LocalType::Point ||
+                 distanceSquared <= nearGuard * nearGuard ||
+                 (axial >= 0.0 && axial * axial >= distanceSquared * candidate.outerCos * candidate.outerCos));
+            ++snapshot.localCandidateCount;
+
+            const double score = luminance * rangeSquared / (rangeSquared + distanceSquared);
+            uint32_t insert = 0;
+            for (; insert < snapshot.localCount; ++insert)
+            {
+                const auto& current = priorities[insert];
+                if (cameraInside != current.cameraInside)
+                {
+                    if (cameraInside)
+                        break;
+                    continue;
+                }
+                if (score > current.score ||
+                    (score == current.score && candidate.id < snapshot.localLights[insert].id))
+                    break;
+            }
+            if (insert < snapshot.localLights.size())
+            {
+                if (snapshot.localCount < snapshot.localLights.size())
+                    ++snapshot.localCount;
+                for (uint32_t index = snapshot.localCount - 1; index > insert; --index)
+                {
+                    priorities[index] = priorities[index - 1];
+                    snapshot.localLights[index] = snapshot.localLights[index - 1];
+                }
+                priorities[insert] = {score, cameraInside};
+                snapshot.localLights[insert] = candidate;
+            }
+        }
+
+        if (!trace || candidate.id == 0 || (traceLightId != 0 && candidate.id != traceLightId) ||
+            !std::isfinite(distanceSquared))
+            return;
+        gamelight12::LocalLightTrace record;
+        record.id = candidate.id;
+        record.distance = static_cast<float>(std::sqrt(distanceSquared));
+        record.radius = candidate.range;
+        record.rejection = rejection;
+        record.active = candidate.active;
+        record.candidate = eligible;
+        record.cameraInside = cameraInside;
+        record.sourceShadow = candidate.sourceShadow;
+        record.shadowEligible = eligible && candidate.castsShadow;
+        uint32_t insert = 0;
+        for (; insert < snapshot.localTraceCount; ++insert)
+        {
+            const auto& other = snapshot.localTrace[insert];
+            if (record.distance < other.distance ||
+                (record.distance == other.distance && record.id < other.id))
+                break;
+        }
+        if (insert == snapshot.localTrace.size())
+            return;
+        if (snapshot.localTraceCount < snapshot.localTrace.size())
+            ++snapshot.localTraceCount;
+        for (uint32_t index = snapshot.localTraceCount - 1; index > insert; --index)
+            snapshot.localTrace[index] = snapshot.localTrace[index - 1];
+        snapshot.localTrace[insert] = record;
+    };
+
+    for (ISpatial* entry : state.lightQuery)
+        consider(entry);
+    for (ISpatial* entry : state.nearLightQuery)
+    {
+        // q_sphere сначала проверяет AABB. Уточняем его настоящей сферой.
+        const auto& sphere = entry->spatial.sphere;
+        const float radius = sphere.R + nearGuard;
+        if (!std::isfinite(radius) || radius <= 0.0f ||
+            eye.distance_to_sqr(sphere.P) > radius * radius ||
+            std::find(state.lightQuery.begin(), state.lightQuery.end(), entry) != state.lightQuery.end())
+            continue;
+        consider(entry);
+    }
+    for (uint32_t index = 0; index < snapshot.localCount; ++index)
+        snapshot.localShadowCandidateCount += snapshot.localLights[index].castsShadow ? 1u : 0u;
+
+    if (trace && traceLightId != 0 && snapshot.localTraceCount == 0)
+    {
+        auto& record = snapshot.localTrace[snapshot.localTraceCount++];
+        record.id = traceLightId;
+        record.distance = record.radius = -1.0f;
+        record.rejection = LocalRejection::NotInSpatialQuery;
+    }
+    for (uint32_t index = 0; index < snapshot.localTraceCount; ++index)
+    {
+        auto& record = snapshot.localTrace[index];
+        for (uint32_t light = 0; light < snapshot.localCount; ++light)
+        {
+            if (snapshot.localLights[light].id != record.id)
+                continue;
+            record.gpuSlot = static_cast<int32_t>(light);
+            break;
+        }
+        if (record.candidate && record.gpuSlot < 0)
+            record.rejection = LocalRejection::LightingBudget;
+    }
+}
+
+gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,
+                                           const DirectX::XMFLOAT4X4& viewProjection,
+                                           const float position[3])
+{
+    gamelight12::FrameSnapshot snapshot{};
+    snapshot.levelSession = state.levelSession;
+    snapshot.levelEpoch = state.captureEpoch;
+    snapshot.frame = Device.dwFrame;
+
+    static const bool lighting = LightingFlag("OGSR_DX12_GAME_LIGHTING");
+    if (!lighting || !g_pGamePersistent)
+        return snapshot;
+
+    const CEnvDescriptorMixer* env = g_pGamePersistent->Environment().CurrentEnv;
+    if (!env || !FiniteVector(env->ambient) || !std::isfinite(ps_r2_sun_lumscale_amb))
+        return snapshot;
+
+    // Ambient и оттенок отражённого света берутся из одного погодного снимка R4.
+    const float ambientScale = (std::max)(0.f, ps_r2_sun_lumscale_amb);
+    const auto ambient = [ambientScale](float value)
+    {
+        return (std::max)(value * 2.f, 0.001f) * ambientScale;
+    };
+    snapshot.ambient = {ambient(env->ambient.x), ambient(env->ambient.y), ambient(env->ambient.z)};
+    if (!std::isfinite(snapshot.ambient.x) || !std::isfinite(snapshot.ambient.y) ||
+        !std::isfinite(snapshot.ambient.z))
+        return snapshot;
+
+    static const bool hemi = LightingFlag("OGSR_DX12_GAME_HEMI");
+    if (hemi && std::isfinite(ps_r2_sun_lumscale_hemi))
+    {
+        const bool cop = g_pGamePersistent->Environment().USED_COP_WEATHER;
+        const float scale = 2.0f * (std::max)(0.0f, ps_r2_sun_lumscale_hemi);
+        const auto tint = [scale](float value)
+        {
+            return (std::max)(0.0f, value * 2.0f + EPS) * scale;
+        };
+        const auto& copColor = env->hemi_color_unmodded;
+        const auto& skyColor = env->sky_color;
+        snapshot.hemi = {tint(cop ? copColor.x : skyColor.x),
+                         tint(cop ? copColor.y : skyColor.y),
+                         tint(cop ? copColor.z : skyColor.z)};
+        snapshot.hemiEnabled = std::isfinite(snapshot.hemi.x) &&
+            std::isfinite(snapshot.hemi.y) && std::isfinite(snapshot.hemi.z);
+        if (!snapshot.hemiEnabled)
+            snapshot.hemi = {};
+    }
+
+    static const bool sun = LightingFlag("OGSR_DX12_GAME_SUN");
+    static const bool local = LightingFlag("OGSR_DX12_GAME_LOCAL_LIGHTS");
+    static const bool shadows = LightingFlag("OGSR_DX12_GAME_SHADOWS");
+    const auto& direction = env->sun_dir;
+    const auto& color = env->sun_color;
+    snapshot.enabled = true;
+    snapshot.sunEnabled = sun && ps_r2_ls_flags.test(R2FLAG_SUN) && direction.y < 0.0f &&
+        gamelight12::NormalizeDirection(direction.x, direction.y, direction.z, snapshot.sunDirection) &&
+        gamelight12::DecodeLightColor(color.x * ps_r2_sun_lumscale, color.y * ps_r2_sun_lumscale,
+                                      color.z * ps_r2_sun_lumscale, snapshot.sunColor) &&
+        (std::max)({snapshot.sunColor.x, snapshot.sunColor.y, snapshot.sunColor.z}) > 0.0f;
+    snapshot.localEnabled = local && !ps_r2_ls_flags_ext.test(R2FLAGEXT_DISABLE_LIGHT);
+    snapshot.shadowsEnabled = shadows && snapshot.sunEnabled;
+    CaptureLocalLights(state, viewProjection, position, snapshot);
+    return snapshot;
+}
+
+gamewater12::Frame CaptureWater()
+{
+    gamewater12::Frame snapshot{};
+    if ((!gamewater12::WaterEnabled() && !gamewater12::PuddlesEnabled()) || !g_pGamePersistent)
+        return snapshot;
+    const auto& environment = g_pGamePersistent->Environment();
+    const auto* env = environment.CurrentEnv;
+    if (!env || !std::isfinite(Device.fTimeGlobal) || !std::isfinite(env->wind_direction) ||
+        !std::isfinite(env->wind_velocity) || !std::isfinite(env->rain_density) ||
+        !std::isfinite(environment.wetness_factor))
+        return snapshot;
+    gamelight12::Vec3 sky;
+    if (!gamelight12::DecodeLightColor(env->sky_color.x, env->sky_color.y, env->sky_color.z, sky))
+        return snapshot;
+    const float wind = std::clamp(env->wind_velocity * 0.001f, 0.0f, 1.0f);
+    snapshot.weather = {Device.fTimeGlobal, wind * std::sin(env->wind_direction),
+        wind * std::cos(env->wind_direction), std::clamp(env->rain_density, 0.0f, 1.0f)};
+    snapshot.sky = {sky.x, sky.y, sky.z};
+    snapshot.wetness = std::clamp(environment.wetness_factor, 0.0f, 1.0f);
+    snapshot.valid = true;
+    return snapshot;
+}
+
 void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
 {
     if (state.nativeFailed)
@@ -1591,6 +1906,10 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     std::string reason;
     bool sceneRecorded = false;
     GameDx12StaticScene12::AuxStats auxDraws;
+    GameDx12StaticScene12::FrameStats12 sceneStats;
+    gamelight12::FrameSnapshot lighting;
+    static const bool sceneDetail = LightingFlag("OGSR_DX12_GAME_SCENE_LOG");
+    double prepareMs = 0.0;
     if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
         state.staticScene.LevelSession() == state.levelSession &&
         state.staticScene.LevelEpoch() == state.captureEpoch)
@@ -1617,16 +1936,19 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             for (auto& row : viewProjection.m)
                 row[0] *= sourceAspect / clientAspect;
         }
-        GameDx12StaticScene12::FrameStats12 sceneStats;
         try
         {
             const GameDx12StaticSceneOwner12 upload{
                 state.device.Get(), state.queue.Get(), state.fence.Get(), state.fenceEvent,
                 state.allocator.Get(), state.list.Get(), &state.fenceValue};
-            if (!state.gameVisuals.Prepare(*g_pGameLevel, position, state.staticScene, upload, reason) ||
+            lighting = CaptureLighting(state, viewProjection, position);
+            const bool prepared = state.gameVisuals.Prepare(*g_pGameLevel, position, state.staticScene, upload, reason);
+            if (sceneDetail)
+                prepareMs = elapsed(begin, FrameClock::now());
+            if (!prepared ||
                 !state.staticScene.RecordNativeFrame(
-                    recording.list, recording.slot, viewProjection, position,
-                    state.gameVisuals.Snapshot(), sceneStats, auxDraws, reason))
+                    recording, viewProjection, position, state.gameVisuals.Snapshot(),
+                    lighting, CaptureWater(), sceneStats, auxDraws, reason))
                 hr = E_FAIL;
             else
                 sceneRecorded = true;
@@ -1645,33 +1967,6 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             timings.snapshotMs = sceneStats.cull_ms;
             timings.serialMs = 0.0;
             timings.parallelMs = 0.0;
-            static const bool sceneDetail = []
-            {
-                const char* value = std::getenv("OGSR_DX12_GAME_SCENE_LOG");
-                return value != nullptr && std::strcmp(value, "1") == 0;
-            }();
-            if (sceneDetail && (state.nativeScenePresents % 60) == 0)
-            {
-                Msg("ph_dx12_f41: frame draws=%u culled=%u total=%u cull_ms=%.4f "
-                    "record_ms=%.4f position=(%.3f,%.3f,%.3f)",
-                    sceneStats.draws, sceneStats.culled, sceneStats.total,
-                    sceneStats.cull_ms, sceneStats.record_ms,
-                    position[0], position[1], position[2]);
-                const auto& level = sceneStats.surfaces;
-                const auto& objects = auxDraws.surfaces;
-                const auto& resources = state.staticScene.AuxResources();
-                Msg("ph_dx12_f43: surfaces static_opaque=%u static_cutout=%u "
-                    "static_overlay_opaque=%u static_overlay_cutout=%u static_overlay_blend=%u "
-                    "static_overlay_multiply=%u static_translucent=%u aux_opaque=%u aux_cutout=%u "
-                    "aux_overlay_opaque=%u aux_overlay_cutout=%u aux_overlay_blend=%u "
-                    "aux_overlay_multiply=%u aux_translucent=%u "
-                    "aux_missing_material=%u aux_unsupported_material=%u",
-                    level.opaque, level.cutout, level.overlayOpaque, level.overlayCutout,
-                    level.overlayBlend, level.overlayMultiply, level.translucent, objects.opaque,
-                    objects.cutout, objects.overlayOpaque, objects.overlayCutout, objects.overlayBlend,
-                    objects.overlayMultiply, objects.translucent, resources.missingMaterial,
-                    resources.unsupportedMaterial);
-            }
         }
         if (FAILED(hr))
             state.native.Cancel();
@@ -1721,6 +2016,52 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         return;
     }
     const auto count = state.native.PresentCount();
+    if (hr == S_OK && sceneRecorded && sceneDetail)
+    {
+        auto& perf = state.nativePerf;
+        if (perf.frames == 0)
+            perf.start = start;
+        ++perf.frames;
+        perf.frameCpuMs += elapsed(begin, presentStart);
+        perf.prepareCpuMs += prepareMs;
+        perf.shadowCpuMs += sceneStats.shadowCpuMs;
+        perf.sceneCpuMs += sceneStats.sceneCpuMs;
+        perf.waterCpuMs += sceneStats.waterCpuMs;
+        perf.gpuWaitMs += recording.slotFenceWaitMs;
+        perf.presentMs += elapsed(presentStart, presentEnd);
+        const auto& gpu = state.native.LastGpuTiming();
+        if (gpu.present != 0)
+        {
+            ++perf.gpuFrames;
+            perf.gpuMs += gpu.milliseconds;
+        }
+        perf.staticShadowDraws += sceneStats.staticShadowDraws;
+        perf.dynamicShadowDraws += sceneStats.dynamicShadowDraws;
+        perf.spotShadowMaps += sceneStats.spotShadowMaps;
+        perf.pointShadowFaces += sceneStats.pointShadowFaces;
+        perf.visibleLights += lighting.localCount;
+        perf.shadowedLights += sceneStats.shadowedLights;
+        perf.lightCandidates += lighting.localCandidateCount;
+        perf.shadowCandidates += lighting.localShadowCandidateCount;
+        perf.sceneCopies += sceneStats.sceneCopies;
+        if (presentEnd - perf.start >= std::chrono::seconds(3))
+        {
+            const double frames = perf.frames;
+            Msg("ph_dx12_f43f: perf frames=%u frame_wall_ms=%.3f frame_cpu_ms=%.3f prepare_cpu_ms=%.3f "
+                "shadow_cpu_ms=%.3f scene_cpu_ms=%.3f water_cpu_ms=%.3f static_shadow_draws=%.2f "
+                "dynamic_shadow_draws=%.2f spot_shadow_maps=%.2f point_shadow_faces=%.2f "
+                "visible_lights=%.2f shadowed_lights=%.2f light_candidates=%.2f shadow_candidates=%.2f "
+                "scene_copies=%.2f gpu_wait_ms=%.3f present_ms=%.3f gpu_ms=%.3f gpu_samples=%u validation=%d",
+                perf.frames, elapsed(perf.start, presentEnd) / frames, perf.frameCpuMs / frames,
+                perf.prepareCpuMs / frames, perf.shadowCpuMs / frames, perf.sceneCpuMs / frames,
+                perf.waterCpuMs / frames, perf.staticShadowDraws / frames, perf.dynamicShadowDraws / frames,
+                perf.spotShadowMaps / frames, perf.pointShadowFaces / frames, perf.visibleLights / frames,
+                perf.shadowedLights / frames, perf.lightCandidates / frames, perf.shadowCandidates / frames,
+                perf.sceneCopies / frames, perf.gpuWaitMs / frames, perf.presentMs / frames,
+                perf.gpuFrames == 0 ? 0.0 : perf.gpuMs / perf.gpuFrames, perf.gpuFrames, state.gbvEnabled ? 1 : 0);
+            perf = {};
+        }
+    }
     if (hr == S_OK && sceneRecorded)
         state.gameVisuals.LogPresent(count, state.fenceValue, auxDraws, state.staticScene.AuxResources());
     if (hr == S_OK && draws != 0)
@@ -2457,6 +2798,9 @@ void LoadFullStaticScene(BridgeStateData& state)
     std::vector<GameDx12StaticMaterial12> materials;
     GameDx12StaticScene12_ResolveMaterials(snapshot.levelBytes, pools,
                                            textureNames, materials);
+    if ((gamewater12::WaterEnabled() || gamewater12::PuddlesEnabled()) &&
+        std::find(textureNames.begin(), textureNames.end(), gamewater12::WaterNormal) == textureNames.end())
+        textureNames.emplace_back(gamewater12::WaterNormal);
     std::vector<GameDx12SceneTexture12> textures;
     GameDx12TextureReadStats12 textureStats;
     GameDx12J2ABatch_ReadTextureNames(textureNames, textures, textureStats,
@@ -2486,6 +2830,9 @@ void LoadFullStaticScene(BridgeStateData& state)
             loadReason.c_str());
         return;
     }
+
+    if (gamewater12::PuddlesEnabled())
+        state.staticScene.SetPuddles(gamewater12::CaptureLevelPuddles());
 
     state.staticSceneBound = true;
     state.staticSceneSession = state.levelSession;
@@ -2548,6 +2895,7 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
     state.nativeGameplayStarted = false;
     state.nativeScenePresents = 0;
     state.previousNativePresent = {};
+    state.nativePerf = {};
     state.levelActive = true;
     std::snprintf(state.levelName, sizeof(state.levelName), "%s",
                   levelName && levelName[0] ? levelName : "?");

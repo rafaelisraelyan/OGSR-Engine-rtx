@@ -58,6 +58,13 @@
 
 
 ## Thanks to: / Благодарим: ##
+
+**IX-Ray Team**
+
+Благодарим команду [IX-Ray](https://github.com/ixray-team/ixray-1.6-stcop) и участников проекта за развитие современного X-Ray 1.6 и DirectX 11-рендерера. При создании OGSR RTX мы используем IX-Ray как технический ориентир для реализации материалов, воды, луж, освещения, теней и других графических подсистем. Отдельные совместимые решения и фрагменты кода могут быть адаптированы для DirectX 12 с сохранением авторских уведомлений и условий соответствующих лицензий.
+
+Происхождение непосредственно перенесённого кода документируется в [реестре IX-Ray](../docs/third-party/ixray-provenance.md). [Лицензия IX-Ray](../LICENSES/IX-Ray-LICENSE.md)
+
 * [Im-dex](https://github.com/Im-dex)
 * [SkyLoader](https://github.com/SkyLoaderr)
 * [Shoker](https://github.com/ShokerStlk)

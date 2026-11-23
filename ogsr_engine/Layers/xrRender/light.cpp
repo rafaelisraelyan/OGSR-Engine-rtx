@@ -1,9 +1,21 @@
 #include "StdAfx.h"
 #include "light.h"
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+#include <atomic>
+
+namespace
+{
+std::atomic<u64> g_dx12LightIds{1};
+}
+#endif
+
 constexpr float RSQRTDIV2 = 0.70710678118654752440084436210485f;
 
 light::light(void) : ISpatial(g_SpatialSpace)
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    , m_dx12Id(g_dx12LightIds.fetch_add(1, std::memory_order_relaxed))
+#endif
 {
     spatial.type = STYPE_LIGHTSOURCE;
     spatial.dbg_name = "light";

@@ -9,6 +9,13 @@
 #include "blenders/blender.h"
 #include "blenders/blender_recorder.h"
 
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+#include "dxRenderDeviceRender.h"
+#include "../xrRenderPC_R4/blender_deffer_aref.h"
+#include "Blender_BmmD.h"
+#include <cmath>
+#endif
+
 namespace
 {
     template <class T>
@@ -25,6 +32,58 @@ namespace
         return false;
     }
 } // namespace
+
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+bool CResourceManager::ReadDeferredLevelAlphaSource(LPCSTR name, bool& blended)
+{
+    const auto found = m_blenders.find(name);
+    if (found == m_blenders.end())
+        return false;
+
+    const auto* blender = dynamic_cast<const CBlender_deffer_aref*>(found->second);
+    // Lua имеет приоритет над библиотекой blenders. В deferred-ветви aref
+    // и основной проход, и shadow pass используют r_alphatest_threshold.
+    if (!blender || _lua_HasShader(name))
+        return false;
+    blended = blender->oBlend.value != FALSE;
+    return true;
+}
+
+bool GameDx12ReadR4DeferredAlphaSource(LPCSTR name, bool& blended)
+{
+    // Чтение библиотеки выполняется на потоке владельца при загрузке уровня.
+    if (!Device.m_pRender)
+        return false;
+    auto* resources = dxRenderDeviceRender::Instance().Resources;
+    return resources && resources->ReadDeferredLevelAlphaSource(name, blended);
+}
+
+bool CResourceManager::ReadTerrainSource(LPCSTR shader, LPCSTR baseTexture,
+                                        std::array<std::string, 4>& layerNames, float& detailScale)
+{
+    const auto found = m_blenders.find(shader);
+    if (found == m_blenders.end())
+        return false;
+    const auto* blender = dynamic_cast<const CBlender_BmmD*>(found->second);
+    if (!blender || _lua_HasShader(shader))
+        return false;
+
+    // Порядок совпадает с s_dt_r/g/b/a в CBlender_BmmD::Compile.
+    layerNames = {blender->oR_Name, blender->oG_Name, blender->oB_Name, blender->oA_Name};
+    const float scale = m_textures_description.GetScale(shared_str(baseTexture));
+    detailScale = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+    return true;
+}
+
+bool GameDx12ReadR4TerrainSource(LPCSTR shader, LPCSTR baseTexture,
+                                 std::array<std::string, 4>& layerNames, float& detailScale)
+{
+    if (!Device.m_pRender)
+        return false;
+    auto* resources = dxRenderDeviceRender::Instance().Resources;
+    return resources && resources->ReadTerrainSource(shader, baseTexture, layerNames, detailScale);
+}
+#endif
 
 IBlender* CResourceManager::_GetBlender(LPCSTR Name)
 {
