@@ -44,6 +44,27 @@ R4 source paths ниже проверены в опубликованной ве
 
 **F4.2 checkpoint (21–22 Nov 2026):** F4.2 source code **published** at [HEAD `7d5dc1858922`](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/tree/feature/f42-game-visuals-details); tested code reported as `5bbf53966`. [Focused independent source inspection](dx12-f42-independent-source-review.md) reviewed rigid loading, frame snapshots, details and GPU lifecycle, with CPU preparation/performance instrumentation risk [#16](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/16). **Independent Windows/GPU execution and final production acceptance NOT DONE**, system TDR NOT RUN. Author reports feature-off Jupiter/Zaton exit=0 and native GBV 0 warnings in positive runs; no claim of full R4 rendering parity. [#14](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/14) remains open.
 
+### Уточнение оставшихся путей на 2026-11-24 (FR2 / F4.4)
+
+Проверенный исходный scope: [PR #22](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/pull/22), `35b463272f8a06e0036dbac5c9b4de5e26d3d62f`. Это дополнение к исторической таблице выше, а не утверждение о состоянии ещё не проверенных локальных веток. Native bridge вызывает CaptureLighting → GameVisuals.Prepare → RecordNativeFrame; наличие исходного R4 кода не означает его выполнение в новом кадре. Подэтапы закреплены в [roadmap §5](08-roadmap.md). Все перечисленные acceptance gates открыты.
+
+| Семейство | Статус для проверенного FR2 | Этап / проверка |
+|---|---|---|
+| Weighted NPC / rigid / details | PARTIAL, базовая поддержка есть; остаточные классы, позы, LOD, ветер и тени открыты | F4.3/F4.4-D/H, #17/#28/#32 |
+| Sun/local, water/puddles/materials | PARTIAL; один sun map, ограниченный local budget, SSR; FR2 descriptor fix, игровая приёмка открыта | F4.3, #32; CSM и parity lighting отдельно |
+| Classic particles/groups | MISSING в проверенном полном native frame path; детали оригинальной симуляции/материалов требуют инвентаризации | F4.4-A: emitter, fire/smoke/dust/sparks/explosion/splash |
+| Runtime bullet/blood/scorch + skeletal wallmarks | MISSING dedicated runtime path; static overlays PARTIAL, #13 отдельно | F4.4-B: hits on world/moving skeleton, lifetime |
+| Classic anomaly visuals | PARTIAL/UNKNOWN по отдельным игровым классам; particle/distortion render paths отсутствуют | F4.4-C: idle/awake/blowout/bolt, electric/fire/gravity/chemical/spatial/psy effects по gamedata |
+| Distortion / emissive special effects | MISSING dedicated distortion path; emissive/material support требует классификации | F4.4-C/G: heat haze, screen refraction, occlusion, bloom dependency |
+| Combat FX / tracer / viewmodel | UNKNOWN по индивидуальным классам, отдельный first-person render pass не найден | F4.4-D: tracer, muzzle, casings, debris, weapon HUD/scope |
+| Sky, fog, rain, lightning, lens flare, surge | PARTIAL/UNKNOWN; отдельная cloud R&D не принята в проверенном FR2; погодные inputs воды/света есть | F4.2-SKY/F4.4-E: #15/#21, day-night/overcast/rain/thunder/emission |
+| Native UI, fonts and scripted overlays | UNKNOWN, отдельный native UI backend не подтверждён | F4.4-F/H: menu, HUD, PDA, inventory, loading/text/resize |
+| Legacy postprocess and HDR composition | PARTIAL/UNKNOWN: упрощённый scene output; отдельные R4 postprocess passes не перенесены в проверенный full scene | F4.4-G: tone/exposure/bloom/AO/AA/DoF/vision/rain/psy/color effects по реальному R4 |
+| Native GR / render packets | PARTIAL: экспериментальный preparation skeleton, не GPU/Windows accepted; multi-list и full parity pending | F4.3-MT, #40 / #33–#39 |
+| New temporal/PBR/DXR and advanced VFX | DEFERRED development milestones, не пропущенные классические эффекты | F5/PBR/G/VFX/A-VFX, после соответствующего parity gate |
+
+Source entry points и matched scenarios — в основной таблице и §4; дополнительно проверить xrGame/CustomZone.cpp, FryupZone.cpp, GraviZone.cpp, TorridZone.cpp, ParticlesObject.cpp, Tracer.cpp и R4 phase dispatch. Не утверждать полный перечень anomaly assets без фактической gamedata. Не считать перенос завершённым только по компиляции или наличию render path.
+
 ## 3. Как построить машинно проверяемый реестр
 
 Первый инструмент — **source inventory**, затем **runtime trace diff**. Каждый `render_path` (а не только asset type) должен иметь запись:
