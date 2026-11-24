@@ -325,6 +325,28 @@ bool SceneLocalShadowsRequested()
     return enabled;
 }
 
+// Experimental policies are opt-in at the engine boundary; the FR3 launcher
+// enables them explicitly and exposes legacy A/B switches.
+bool SceneReceiverPlaneSunRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_RECEIVER_PLANE_SUN");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool SceneStableLocalPriorityRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_STABLE_LOCAL_PRIORITY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 DirectX::XMFLOAT4X4 SunShadowViewProjection(const float camera[3],
     const DirectX::XMFLOAT4X4& viewProjection, const gamelight12::Vec3& sunDirection)
 {
@@ -778,18 +800,71 @@ float3 SafeDirection(float3 value)
     return lengthSquared > 1.0e-12f ? value * rsqrt(lengthSquared) : 0.0f;
 }
 
-float SunVisibility(float3 position, float3 normal, float cosine)
+bool ProjectSunReceiver(float3 position, float3 normal, float cosine, out float3 coords)
 {
+    coords = 0.0f;
     if (LightingFlags.w == 0)
-        return 1.0f;
+        return false;
     const float3 receiver = position + normal * (0.025f * (1.0f - cosine));
     const float4 clipPosition = mul(float4(receiver, 1.0f), ShadowViewProjection);
+    if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
+        return false;
     const float3 projected = clipPosition.xyz / clipPosition.w;
-    const float2 uv = projected.xy * float2(0.5f, -0.5f) + 0.5f;
-    if (any(uv <= 0.0f) || any(uv >= 1.0f) || projected.z <= 0.0f || projected.z >= 1.0f)
+    coords = float3(projected.xy * float2(0.5f, -0.5f) + 0.5f, projected.z);
+    return all(isfinite(coords)) && all(coords > 0.0f) && all(coords < 1.0f);
+}
+
+// Orthographic receiver-plane correction: each comparison uses the depth
+// of the same geometric plane at the sampled texel center. The shading
+// normal is not a reliable plane normal on a smooth skinned surface.
+bool SunReceiverGradient(float3 planeNormal, out float2 gradient)
+{
+    gradient = 0.0f;
+    const float3 x = float3(ShadowViewProjection[0][0], ShadowViewProjection[1][0], ShadowViewProjection[2][0]);
+    const float3 y = float3(ShadowViewProjection[0][1], ShadowViewProjection[1][1], ShadowViewProjection[2][1]);
+    const float3 z = float3(ShadowViewProjection[0][2], ShadowViewProjection[1][2], ShadowViewProjection[2][2]);
+    const float x2 = dot(x, x), y2 = dot(y, y), z2 = dot(z, z);
+    const float nz = dot(planeNormal, z);
+    // Near-grazing or degenerate planes use the existing comparison sampler.
+    if (min(x2, min(y2, z2)) <= 1.0e-12f ||
+        abs(nz) <= 0.1f * sqrt(z2))
+        return false;
+    gradient = (-z2 / nz) * float2(2.0f * dot(planeNormal, x) / x2,
+                                  -2.0f * dot(planeNormal, y) / y2);
+    return all(isfinite(gradient));
+}
+
+float SunPlaneTap(int2 texel, float2 uv, float compareDepth, float2 gradient)
+{
+    texel = clamp(texel, int2(0, 0), int2(2047, 2047));
+    const float2 center = (float2(texel) + 0.5f) / 2048.0f;
+    const float depth = compareDepth + dot(center - uv, gradient);
+    return depth <= SunShadow.Load(int3(texel, 0)) ? 1.0f : 0.0f;
+}
+
+float SunPlaneVisibility(float2 uv, float compareDepth, float2 gradient)
+{
+    const float2 pixel = uv * 2048.0f - 0.5f;
+    const int2 base = int2(floor(pixel));
+    const float2 weight = frac(pixel);
+    const float a = SunPlaneTap(base, uv, compareDepth, gradient);
+    const float b = SunPlaneTap(base + int2(1, 0), uv, compareDepth, gradient);
+    const float c = SunPlaneTap(base + int2(0, 1), uv, compareDepth, gradient);
+    const float d = SunPlaneTap(base + int2(1, 1), uv, compareDepth, gradient);
+    return lerp(lerp(a, b, weight.x), lerp(c, d, weight.x), weight.y);
+}
+
+float SunVisibility(float3 position, float3 normal, float cosine, float3 planeNormal)
+{
+    float3 coords;
+    if (!ProjectSunReceiver(position, normal, cosine, coords))
         return 1.0f;
+    const float2 uv = coords.xy;
     const float nearestEdge = min(min(uv.x, uv.y), min(1.0f - uv.x, 1.0f - uv.y));
-    const float compareDepth = projected.z - 0.000015f;
+    const float compareDepth = coords.z - 0.000015f;
+    float2 gradient;
+    if (SunColor.w > 0.0f && SunReceiverGradient(planeNormal, gradient))
+        return lerp(1.0f, SunPlaneVisibility(uv, compareDepth, gradient), saturate(nearestEdge * 16.0f));
     float visibility = SunShadow.SampleCmpLevelZero(SunShadowSampler, uv, compareDepth);
     // Дополнительные две билинейные выборки только на границе тени.
     [branch]
@@ -803,14 +878,26 @@ float SunVisibility(float3 position, float3 normal, float cosine)
     return lerp(1.0f, visibility, saturate(nearestEdge * 16.0f));
 }
 
-bool ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
+)"
+R"(// Explicit reasons: no map is expected; a bad layer/projection is not.
+static const uint LOCAL_NO_MAP = 0;
+static const uint LOCAL_VALID = 1;
+static const uint LOCAL_OUTSIDE = 2;
+static const uint LOCAL_BAD_LAYER = 3;
+static const uint LOCAL_BAD_PROJECTION = 4;
+
+uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
                         out float3 coords, out uint layer)
 {
     coords = 0.0f;
     layer = 0;
     if (source.type.y == 0)
-        return false;
+        return LOCAL_NO_MAP;
     layer = source.type.y - 1;
+    // The fixed layout is two spot layers followed by six point faces.
+    if ((source.type.x == 0 && layer != 2) ||
+        (source.type.x == 1 && layer >= 2) || source.type.x > 1)
+        return LOCAL_BAD_LAYER;
     // Смещение задаётся в метрах. Грань point-карты выбирается уже
     // по смещённому приёмнику, который будет спроецирован в эту грань.
     const float3 lightPosition = source.positionInverseRangeSquared.xyz;
@@ -829,13 +916,15 @@ bool ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
             layer += delta.z >= 0.0f ? 4 : 5;
     }
     if (layer >= LOCAL_SHADOW_LAYERS)
-        return false;
+        return LOCAL_BAD_LAYER;
     const float4 clipPosition = mul(float4(receiver, 1.0f), LocalShadowViewProjection[layer]);
-    if (clipPosition.w <= 0.0f)
-        return false;
+    if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
+        return LOCAL_BAD_PROJECTION;
     const float3 projected = clipPosition.xyz / clipPosition.w;
     coords = float3(projected.xy * float2(0.5f, -0.5f) + 0.5f, projected.z);
-    return all(coords > 0.0f) && all(coords < 1.0f);
+    if (!all(isfinite(coords)))
+        return LOCAL_BAD_PROJECTION;
+    return all(coords > 0.0f) && all(coords < 1.0f) ? LOCAL_VALID : LOCAL_OUTSIDE;
 }
 
 float SampleLocalVisibility(float3 coords, uint layer)
@@ -861,7 +950,7 @@ float LocalVisibility(LocalLightData source, float3 position, float3 normal, flo
 {
     float3 coords;
     uint layer;
-    if (!ProjectLocalShadow(source, position, normal, lightDirection, coords, layer))
+    if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
         return 1.0f;
     return SampleLocalVisibility(coords, layer);
 }
@@ -885,7 +974,7 @@ float3 DebugLocalShadow(float3 position, float3 normal)
             continue;
         float3 coords;
         uint layer;
-        if (!ProjectLocalShadow(source, position, normal, lightDirection, coords, layer))
+        if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
             continue;
         const float3 sampleCoords = float3(coords.xy, layer);
         if (ViewMode == 4)
@@ -1037,8 +1126,9 @@ R"(float3 WaterReflection(float3 position, float3 normal, float3 direction, floa
                 const float2 edge = min(opaque.uv, 1.0f - opaque.uv);
                 const float confidence = saturate(min(edge.x, edge.y) * 10.0f) * (1.0f - step / 9.0f);
                 reflected = lerp(sky, OpaqueColor.SampleLevel(WallmarkSampler, opaque.uv, 0).rgb, confidence);
+                break;
             }
-            break;
+            // Rejected crossings do not terminate the bounded search.
         }
     }
     return reflected;
@@ -1130,7 +1220,8 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
     return lerp(baseLinear, decoded, 1.0f - smoothstep(1225.0f, 2500.0f, distanceSquared));
 }
 
-float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
+)"
+R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
     const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
     const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
@@ -1185,14 +1276,46 @@ float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     }
     if (ViewMode == 17)
         return float4(saturate(0.5f + (input.world - DiagnosticOrigin.xyz) * (1.0f / 16.0f)), 1.0f);
+    if (ViewMode == 18)
+    {
+        const uint count = min(LightingFlags.z, (uint)MAX_LOCAL_LIGHTS);
+        if (DiagnosticLight.x == 0 || DiagnosticLight.x > count)
+            return float4(1, 0, 1, 1);
+        const LocalLightData source = LocalLights[DiagnosticLight.x - 1];
+        const float3 delta = source.positionInverseRangeSquared.xyz - input.world;
+        const float3 direction = SafeDirection(delta);
+        if (LocalFalloff(source, delta) <= 0.0f || LocalAngular(source, n, direction) <= 0.0f)
+            return float4(0, 0, 0, 1);
+        float3 coords;
+        uint layer;
+        const uint status = ProjectLocalShadow(source, input.world, n, direction, coords, layer);
+        if (status == LOCAL_NO_MAP) return float4(1, 0, 0, 1);
+        if (status == LOCAL_OUTSIDE) return float4(1, 1, 0, 1);
+        if (status == LOCAL_BAD_LAYER) return float4(0, 1, 1, 1);
+        if (status == LOCAL_BAD_PROJECTION) return float4(1, 0, 1, 1);
+        return float4(0, 0.25f + 0.75f * SampleLocalVisibility(coords, layer), 0, 1);
+    }
     const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
+    // Geometric receiver plane, computed before the light-dependent branch.
+    const float3 planeNormal = SafeDirection(cross(ddx(input.world), ddy(input.world)));
+    if (ViewMode == 19 || ViewMode == 20)
+    {
+        float3 coords;
+        if (!ProjectSunReceiver(input.world, n, sunCosine, coords))
+            return float4(1, 0, 1, 1);
+        if (ViewMode == 19)
+            return float4(SunVisibility(input.world, n, sunCosine, planeNormal).xxx, 1);
+        const int2 texel = clamp(int2(coords.xy * 2048.0f), int2(0, 0), int2(2047, 2047));
+        const float delta = coords.z - 0.000015f - SunShadow.Load(int3(texel, 0));
+        return float4(saturate(delta * 1024.0f), saturate(-delta * 1024.0f), 0, 1);
+    }
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
         const float direct = dot(SunColor.rgb * sunCosine, luminance);
         const float local = dot(LocalLighting(n, input.world, true, true), luminance);
         const float3 display = ToDisplay(float3(direct, 0.0f, local));
-        return float4(display.r, SunVisibility(input.world, n, sunCosine), display.b, 1.0f);
+        return float4(display.r, SunVisibility(input.world, n, sunCosine, planeNormal), display.b, 1.0f);
     }
     float3 light = 1.0f;
     if ((TextureMode & 4) == 0)
@@ -1201,7 +1324,7 @@ float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         {
             light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, false, true);
             if (sunCosine > 0.0f)
-                light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine));
+                light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine, planeNormal));
         }
         else
         {
@@ -1378,6 +1501,7 @@ void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
 {
     const auto remembered = std::array{previous[0], previous[1], previous[2]};
     const uint32_t lightCount = constants.lightingFlags[2];
+    const bool stablePriority = SceneStableLocalPriorityRequested();
     std::array<uint32_t, kSpotShadowLayers + 1> winners;
     winners.fill(UINT32_MAX);
     for (uint32_t slot = 0; slot < winners.size(); ++slot)
@@ -1393,9 +1517,12 @@ void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
                 std::find(winners.begin(), winners.end(), index) != winners.end())
                 continue;
             const bool held = std::find(remembered.begin(), remembered.end(), light.id) != remembered.end();
-            const double score = light.selectionScore * (held ? 1.25 : 1.0);
+            // In the experimental policy nearVolume is a soft preference.
+            // It must not bypass retention of an already shadowed receiver.
+            const double score = light.selectionScore * (held ? 1.25 : 1.0) *
+                (stablePriority && light.nearVolume ? 1.25 : 1.0);
             if (best == UINT32_MAX ||
-                (light.nearVolume == lighting.localLights[best].nearVolume ?
+                (stablePriority || light.nearVolume == lighting.localLights[best].nearVolume ?
                     score > bestScore : light.nearVolume))
             {
                 best = index;
@@ -1439,7 +1566,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 17ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 20ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -3218,7 +3345,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         if (lighting.hemiEnabled)
             constants.hemiColor = {lighting.hemi.x, lighting.hemi.y, lighting.hemi.z, 1.0f};
         constants.sunDirection = {lighting.sunDirection.x, lighting.sunDirection.y, lighting.sunDirection.z, 0.0f};
-        constants.sunColor = {lighting.sunColor.x, lighting.sunColor.y, lighting.sunColor.z, 0.0f};
+        constants.sunColor = {lighting.sunColor.x, lighting.sunColor.y, lighting.sunColor.z,
+            SceneReceiverPlaneSunRequested() ? 1.0f : 0.0f};
         if (m_sunShadow != nullptr && (viewMode == 0 || viewMode >= 4) &&
             lighting.sunEnabled && lighting.shadowsEnabled)
         {
