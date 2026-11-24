@@ -71,6 +71,8 @@ private:
     Fvector dx12SkyPosition{};
     u32 dx12SkySamples = 0;
     u32 dx12SkyOpen = 0;
+    u32 dx12SkyCompletedOpen = 0;
+    bool dx12SkyHasCompleted = false;
 #endif
 
     Fvector approximate;

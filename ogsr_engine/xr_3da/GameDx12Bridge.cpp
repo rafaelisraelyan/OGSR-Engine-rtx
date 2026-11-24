@@ -2001,7 +2001,45 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
         }
     };
     if (trace && traceLightId != 0)
+    {
+        const auto begin = snapshot.localTrace.begin();
+        const auto end = begin + snapshot.localTraceCount;
+        if (std::find_if(begin, end, [traceLightId](const auto& entry)
+            { return entry.id == traceLightId; }) == end)
+        {
+            // Independent bounded box query diagnoses a missing ID without
+            // admitting lights or changing the production ranking.
+            xr_vector<ISpatial*> broad;
+            const Fvector extent{200.0f, 200.0f, 200.0f};
+            g_SpatialSpace->q_box(broad, 0, STYPE_LIGHTSOURCE, eye, extent);
+            bool found = false;
+            for (ISpatial* entry : broad)
+            {
+                auto* source = entry->dcast_Light();
+                gamelight12::LocalLight candidate{};
+                if (!source)
+                    continue;
+                const auto reason = gamelight12::ReadWorldLight(*source, candidate);
+                if (candidate.id != traceLightId)
+                    continue;
+                found = true;
+                u32 mask = frustum.getMask();
+                const auto& sphere = entry->spatial.sphere;
+                const bool intersects = frustum.testSphere(sphere.P,
+                    (std::max)(sphere.R, 0.5f), mask) != fcvNone;
+                Msg("ph_dx12_fr3: missing_light id=%llu broad_found=1 direct_frustum=%d "
+                    "reason=%s sphere=(%.3f,%.3f,%.3f,%.3f) range=%.3f active=%d",
+                    static_cast<unsigned long long>(traceLightId), intersects ? 1 : 0,
+                    gamelight12::LocalTraceReasonName(reason), sphere.P.x, sphere.P.y, sphere.P.z,
+                    sphere.R, candidate.range, candidate.active ? 1 : 0);
+                break;
+            }
+            if (!found)
+                Msg("ph_dx12_fr3: missing_light id=%llu broad_found=0 extent=200",
+                    static_cast<unsigned long long>(traceLightId));
+        }
         addMissing(traceLightId);
+    }
     else if (trace)
         for (uint32_t i = 0; i < options.fixedCount; ++i)
             addMissing(options.fixedIds[i]);

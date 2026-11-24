@@ -11,6 +11,9 @@ param(
     [switch]$NoDynamicSunShadows,
     [switch]$NoSunShadows,
     [switch]$NoLocalShadows,
+    [switch]$LegacyLocalPriority,
+    [switch]$LegacySunPCF,
+    [switch]$DetailSunShadows,
     [switch]$NoHemi,
     [switch]$NoTerrainDetail,
     [switch]$NoShadows,
@@ -32,14 +35,14 @@ param(
     [string]$ProbeOrigin,
     [ValidateSet('Default','ShadowDepth','ShadowVisibility','ShadowSlot','Albedo','Normals',
         'Lighting','Hemi','WaterNormals','WaterReflection','Material','LightTerms',
-        'LocalRaw','LocalProbe','LightIndex','WorldPosition')]
+        'LocalRaw','LocalProbe','LightIndex','WorldPosition','ShadowFailureReason','SunVisibility','SunDepthDelta','Ambient','SunDirect','LocalTotal','GeometricNormals','HDRClip')]
     [string]$View = 'Default'
 )
 
 $ErrorActionPreference = 'Stop'
 if ($FixedLightIds -and $FreezeLightRecord) { throw 'Выберите один режим фиксации света.' }
 if (($FixedLightIds -or $FreezeLightRecord) -and $NoLocalLights) { throw 'Для фиксации света требуется включённый local lighting.' }
-if (($FreezeLightRecord -or $View -in @('LocalProbe','LightIndex')) -and $LightId -eq 0) {
+if (($FreezeLightRecord -or $View -in @('LocalProbe','LightIndex','ShadowFailureReason')) -and $LightId -eq 0) {
     throw 'Для выбранного режима укажите -LightId.'
 }
 if ($FixedLightIds) {
@@ -124,6 +127,9 @@ $features = @{
     PUDDLES = [int](-not $NoPuddles -and -not $NoTransparency)
     DYNAMIC_SUN_SHADOWS = [int](-not $NoDynamicSunShadows -and -not $NoShadows -and -not $NoSunShadows)
     LOCAL_SHADOWS = [int](-not $NoShadows -and -not $NoLocalShadows -and -not $NoLocalLights)
+    STABLE_LOCAL_PRIORITY = [int](-not $LegacyLocalPriority)
+    RECEIVER_PLANE_SUN = [int](-not $LegacySunPCF)
+    DETAIL_SUN_SHADOWS = [int]($DetailSunShadows -and -not $NoShadows -and -not $NoSunShadows)
     HEMI = [int](-not $NoHemi)
     TERRAIN_DETAIL = [int](-not $NoTerrainDetail)
     SCENE_LOG = [int]($SceneLog.IsPresent -or $LightId -ne 0 -or $FixedLightIds -or $ProbeFrames -ne 0)
@@ -142,6 +148,8 @@ $views = @{
     Default = 0; Material = 1; ShadowDepth = 4; ShadowVisibility = 5; ShadowSlot = 6
     Albedo = 7; Normals = 8; Lighting = 9; Hemi = 10; WaterNormals = 11; WaterReflection = 12; LightTerms = 13
     LocalRaw = 14; LocalProbe = 15; LightIndex = 16; WorldPosition = 17
+    ShadowFailureReason = 18; SunVisibility = 19; SunDepthDelta = 20
+    Ambient = 21; SunDirect = 22; LocalTotal = 23; GeometricNormals = 24; HDRClip = 25
 }
 $start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
