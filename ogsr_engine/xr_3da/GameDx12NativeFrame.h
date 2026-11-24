@@ -14,6 +14,7 @@ class GameDx12NativeFrame12
 {
 public:
     static constexpr uint32_t kFrameCount = 2;
+    static constexpr uint32_t kShadowListCount = 9;
 
     struct Recording
     {
@@ -29,6 +30,12 @@ public:
         ID3D12Resource* opaqueColor = nullptr;
         ID3D12Device* device = nullptr;
         double slotFenceWaitMs = 0.0;
+        GameDx12NativeFrame12* frame = nullptr;
+
+        bool UsesShadowLists() const noexcept;
+        HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
+        HRESULT CloseShadowList(uint32_t index) const noexcept;
+        HRESULT BeginColorList() noexcept;
 
         void BeginWater() const noexcept;
         void EndWater() const noexcept;
@@ -69,12 +76,22 @@ public:
 private:
     template <typename T> using Ptr = Microsoft::WRL::ComPtr<T>;
 
+    struct AuxiliaryList
+    {
+        Ptr<ID3D12CommandAllocator> allocator;
+        Ptr<ID3D12GraphicsCommandList> list;
+        bool open = false;
+        bool recorded = false;
+    };
+
     struct Slot
     {
         Ptr<ID3D12Resource> color;
         Ptr<ID3D12Resource> opaqueColor;
         Ptr<ID3D12CommandAllocator> allocator;
         Ptr<ID3D12GraphicsCommandList> list;
+        std::array<AuxiliaryList, kShadowListCount> shadows;
+        AuxiliaryList colorPass;
         uint64_t fence = 0;
         uint64_t timingPresent = 0;
     };
@@ -83,7 +100,9 @@ private:
     HRESULT Resize(const Owner& owner, uint32_t width, uint32_t height);
     HRESULT CreateTargets(ID3D12Device& device, uint32_t width, uint32_t height);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t index) const noexcept;
-    bool RecordCapture(ID3D12Device& device, Slot& slot);
+    static HRESULT OpenList(AuxiliaryList& pair) noexcept;
+    static HRESULT CloseList(AuxiliaryList& pair) noexcept;
+    bool RecordCapture(ID3D12Device& device, Slot& slot, ID3D12GraphicsCommandList& list);
     HRESULT FinishCapture(const Owner& owner, uint64_t fence);
 
     std::array<Slot, kFrameCount> m_slots;
@@ -106,6 +125,9 @@ private:
     uint32_t m_height = 0;
     uint32_t m_slot = 0;
     uint64_t m_presentCount = 0;
+    ID3D12GraphicsCommandList* m_activeList = nullptr;
+    uint32_t m_shadowCount = 0;
+    bool m_separateShadowLists = false;
     bool m_recording = false;
     bool m_submitted = false;
     bool m_unknown = false;

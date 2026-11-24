@@ -3188,14 +3188,14 @@ void GameDx12StaticScene12::FramePreparation::Clear()
 }
 
 bool GameDx12StaticScene12::RecordNativeFrame(
-    const GameDx12NativeFrame12::Recording& recording,
+    GameDx12NativeFrame12::Recording recording,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const float cameraPosition[3], const gameaux12::Frame& extras,
     const gamelight12::FrameSnapshot& lighting,
     const gamewater12::Frame& water,
     FrameStats12& stats, AuxStats& auxStats, std::string& reason)
 {
-    const auto list = recording.list;
+    auto* list = recording.list;
     const uint32_t frameSlot = recording.slot;
     stats = FrameStats12{};
     auxStats = AuxStats{};
@@ -3644,23 +3644,28 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     }
     stats.cull_ms = Ms(cullStart);
 
-    list->SetGraphicsRootSignature(m_rootSignature.Get());
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D12DescriptorHeap* heaps[] = {m_textureHeap.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetGraphicsRootConstantBufferView(
-        0, m_frameConstants->GetGPUVirtualAddress() +
-               static_cast<uint64_t>(frameSlot) * kFrameConstantsSize);
-
+    const auto textureHeap = m_textureHeap.Get();
+    const auto heapGpu = textureHeap->GetGPUDescriptorHandleForHeapStart();
+    const auto frameCb = m_frameConstants->GetGPUVirtualAddress() +
+        static_cast<uint64_t>(frameSlot) * kFrameConstantsSize;
+    const auto transformOffset = frameSlot * kTransformSlotBytes;
+    const auto transformSrv = validExtras ? m_frameTransforms->GetGPUVirtualAddress() + transformOffset : 0;
+    const auto bindFrame = [&](ID3D12GraphicsCommandList* target)
+    {
+        target->SetGraphicsRootSignature(m_rootSignature.Get());
+        target->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12DescriptorHeap* heaps[] = {textureHeap};
+        target->SetDescriptorHeaps(1, heaps);
+        target->SetGraphicsRootConstantBufferView(0, frameCb);
+        if (validExtras)
+            target->SetGraphicsRootShaderResourceView(4, transformSrv);
+    };
     uint8_t* transformDestination = nullptr;
     if (validExtras)
     {
-        // Один и тот же защищённый fence слот используется в depth и color проходах.
-        const uint64_t slotOffset = frameSlot * kTransformSlotBytes;
-        transformDestination = static_cast<uint8_t*>(m_frameTransformsMapped) + slotOffset;
+        transformDestination = static_cast<uint8_t*>(m_frameTransformsMapped) + transformOffset;
         if (poseCount != 0)
             std::memcpy(transformDestination, extras.poses.data(), poseCount * sizeof(DirectX::XMFLOAT4X4));
-        list->SetGraphicsRootShaderResourceView(4, m_frameTransforms->GetGPUVirtualAddress() + slotOffset);
     }
 
     const float threshold = ps_r_alphatest_threshold;
@@ -3740,15 +3745,18 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             boundPipeline = pipeline;
         }
     };
-    auto nullWaterSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-    nullWaterSrv.ptr += static_cast<UINT64>(kNullWaterDescriptor) * m_textureDescriptorSize;
-    list->SetGraphicsRootDescriptorTable(7, nullWaterSrv);
-    const auto heapGpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
     auto nullTerrainSrv = heapGpu;
     nullTerrainSrv.ptr += static_cast<UINT64>(kTerrainDescriptor) * m_textureDescriptorSize;
-    list->SetGraphicsRootDescriptorTable(kHemiSrvRoot, heapGpu);
-    list->SetGraphicsRootDescriptorTable(kTerrainSrvRoot, nullTerrainSrv);
-    list->SetGraphicsRoot32BitConstant(kTerrainScaleRoot, 0u, 0);
+    const auto bindColorFrame = [&](ID3D12GraphicsCommandList* target)
+    {
+        bindFrame(target);
+        auto nullWaterSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+        nullWaterSrv.ptr += static_cast<UINT64>(kNullWaterDescriptor) * m_textureDescriptorSize;
+        target->SetGraphicsRootDescriptorTable(7, nullWaterSrv);
+        target->SetGraphicsRootDescriptorTable(kHemiSrvRoot, heapGpu);
+        target->SetGraphicsRootDescriptorTable(kTerrainSrvRoot, nullTerrainSrv);
+        target->SetGraphicsRoot32BitConstant(kTerrainScaleRoot, 0u, 0);
+    };
     uint32_t boundHemi = 0;
     uint32_t boundTerrainSet = 0;
     float boundTerrainScale = 0.0f;
@@ -3784,96 +3792,65 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
     };
 
-    uint32_t boundShadowDescriptor = UINT32_MAX;
-    const auto bindShadowMaterial = [&](uint32_t descriptor, SurfaceMode surface)
-    {
-        // Карта использует только alpha-test: для непрозрачной геометрии
-        // достаточно null SRV и общего MaterialCB.
-        if (descriptor == kNullDescriptor || !IsCutout(surface) || alphaTestDisabled)
-            descriptor = kNullDescriptor;
-        if (boundShadowDescriptor == descriptor)
-            return;
-        boundShadowDescriptor = descriptor;
-        auto gpu = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-        gpu.ptr += static_cast<UINT64>(descriptor) * m_textureDescriptorSize;
-        list->SetGraphicsRootDescriptorTable(1, gpu);
-        const uint32_t mode = descriptor == kNullDescriptor ? 0u : kSampleBase | kClipAlpha;
-        const uint32_t material[] = {mode, 0u, 0u, std::bit_cast<uint32_t>(threshold)};
-        list->SetGraphicsRoot32BitConstants(2, 4, material, 0);
-    };
-
     const float identity[16] = {1.0f, 0.0f, 0.0f, 0.0f,
                                 0.0f, 1.0f, 0.0f, 0.0f,
                                 0.0f, 0.0f, 1.0f, 0.0f,
                                 0.0f, 0.0f, 0.0f, 1.0f};
     bool worldIdentity = false;
-    const auto submitStaticGeometry = [&](const DrawSource12& draw, float clipShift, bool shadow = false)
+    const auto submitStaticGeometry = [&](const DrawSource12& draw, float clipShift)
     {
         if (draw.layout == 3 || !worldIdentity)
         {
             worldIdentity = draw.layout != 3;
             list->SetGraphicsRoot32BitConstants(3, 16, worldIdentity ? identity : draw.world, 0);
         }
-        if (shadow)
+        const bool waves = waterPass && gamewater12::WaterEnabled() &&
+            draw.surface == SurfaceMode::Translucent && draw.transparency == gameaux12::TransparentMaterial::Water;
+        const uint32_t geometry[] = {draw.layout == 3 ? 1u : 0u, std::bit_cast<uint32_t>(clipShift),
+                                     waves ? 1u : 0u};
+        list->SetGraphicsRoot32BitConstants(5, 3, geometry, 0);
+        if (draw.hemiDescriptor != kNullDescriptor && boundHemi != draw.hemiDescriptor)
         {
-            list->SetGraphicsRoot32BitConstant(5, draw.layout == 3 ? 1u : 0u, 0);
-            bindShadowMaterial(draw.descriptor, draw.surface);
+            auto hemiSrv = heapGpu;
+            hemiSrv.ptr += static_cast<UINT64>(draw.hemiDescriptor) * m_textureDescriptorSize;
+            list->SetGraphicsRootDescriptorTable(kHemiSrvRoot, hemiSrv);
+            boundHemi = draw.hemiDescriptor;
         }
-        else
+        if (draw.terrainSet != 0 && boundTerrainSet != draw.terrainSet)
         {
-            const bool waves = waterPass && gamewater12::WaterEnabled() &&
-                draw.surface == SurfaceMode::Translucent && draw.transparency == gameaux12::TransparentMaterial::Water;
-            const uint32_t geometry[] = {draw.layout == 3 ? 1u : 0u, std::bit_cast<uint32_t>(clipShift),
-                                         waves ? 1u : 0u};
-            list->SetGraphicsRoot32BitConstants(5, 3, geometry, 0);
-            if (draw.hemiDescriptor != kNullDescriptor && boundHemi != draw.hemiDescriptor)
-            {
-                auto hemiSrv = heapGpu;
-                hemiSrv.ptr += static_cast<UINT64>(draw.hemiDescriptor) * m_textureDescriptorSize;
-                list->SetGraphicsRootDescriptorTable(kHemiSrvRoot, hemiSrv);
-                boundHemi = draw.hemiDescriptor;
-            }
-            if (draw.terrainSet != 0 && boundTerrainSet != draw.terrainSet)
-            {
-                auto terrainSrv = nullTerrainSrv;
-                terrainSrv.ptr += static_cast<UINT64>(draw.terrainSet) * kTerrainTextureCount * m_textureDescriptorSize;
-                list->SetGraphicsRootDescriptorTable(kTerrainSrvRoot, terrainSrv);
-                boundTerrainSet = draw.terrainSet;
-            }
-            if (draw.terrainSet != 0 && boundTerrainScale != draw.terrainScale)
-            {
-                list->SetGraphicsRoot32BitConstant(kTerrainScaleRoot, std::bit_cast<uint32_t>(draw.terrainScale), 0);
-                boundTerrainScale = draw.terrainScale;
-            }
-            const uint32_t materialFlags = (draw.hemiDescriptor == kNullDescriptor ? 0u : kLightmapHemi) |
-                (draw.terrainSet == 0 ? 0u : kTerrainDetail) |
-                (draw.terrainBaseHemi ? kTerrainBaseHemi : 0u);
-            bindMaterial(draw.descriptor, draw.visualId, draw.surface, draw.wallmarkClamp, draw.transparency,
-                false, draw.vertexHemi, materialFlags, draw.traceSlot != UINT8_MAX);
+            auto terrainSrv = nullTerrainSrv;
+            terrainSrv.ptr += static_cast<UINT64>(draw.terrainSet) * kTerrainTextureCount * m_textureDescriptorSize;
+            list->SetGraphicsRootDescriptorTable(kTerrainSrvRoot, terrainSrv);
+            boundTerrainSet = draw.terrainSet;
         }
+        if (draw.terrainSet != 0 && boundTerrainScale != draw.terrainScale)
+        {
+            list->SetGraphicsRoot32BitConstant(kTerrainScaleRoot, std::bit_cast<uint32_t>(draw.terrainScale), 0);
+            boundTerrainScale = draw.terrainScale;
+        }
+        const uint32_t materialFlags = (draw.hemiDescriptor == kNullDescriptor ? 0u : kLightmapHemi) |
+            (draw.terrainSet == 0 ? 0u : kTerrainDetail) |
+            (draw.terrainBaseHemi ? kTerrainBaseHemi : 0u);
+        bindMaterial(draw.descriptor, draw.visualId, draw.surface, draw.wallmarkClamp, draw.transparency,
+            false, draw.vertexHemi, materialFlags, draw.traceSlot != UINT8_MAX);
         list->IASetVertexBuffers(0, 1, &draw.vertexView);
         list->IASetIndexBuffer(&draw.indexView);
         list->DrawIndexedInstanced(draw.icount, 1, 0, 0, 0);
     };
 
     const auto submitAuxGeometry = [&](const AuxMesh& mesh, uint32_t id, SurfaceMode surface,
-                                       uint32_t offset, uint32_t count, bool twoSided, bool shadow = false,
+                                       uint32_t offset, uint32_t count, bool twoSided,
                                        float skyHemi = 0.0f)
     {
         list->SetGraphicsRoot32BitConstant(3, offset, 0);
-        if (shadow)
-            bindShadowMaterial(mesh.descriptor, surface);
-        else
-        {
-            bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, twoSided,
-                false, skyHemi > 0.0f ? kObjectSkyHemi : 0u);
-            const bool waves = waterPass && gamewater12::WaterEnabled() &&
-                surface == SurfaceMode::Translucent && mesh.transparency == gameaux12::TransparentMaterial::Water;
-            const uint32_t geometry[] = {0u,
-                std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f),
-                waves ? 1u : 0u, std::bit_cast<uint32_t>(skyHemi)};
-            list->SetGraphicsRoot32BitConstants(5, static_cast<UINT>(std::size(geometry)), geometry, 0);
-        }
+        bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, twoSided,
+            false, skyHemi > 0.0f ? kObjectSkyHemi : 0u);
+        const bool waves = waterPass && gamewater12::WaterEnabled() &&
+            surface == SurfaceMode::Translucent && mesh.transparency == gameaux12::TransparentMaterial::Water;
+        const uint32_t geometry[] = {0u,
+            std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f),
+            waves ? 1u : 0u, std::bit_cast<uint32_t>(skyHemi)};
+        list->SetGraphicsRoot32BitConstants(5, static_cast<UINT>(std::size(geometry)), geometry, 0);
         worldIdentity = false;
         list->IASetVertexBuffers(0, 1, &mesh.vb);
         list->IASetIndexBuffer(&mesh.ib);
@@ -3886,48 +3863,87 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint32_t rigid = 0;
         uint32_t skinned = 0;
     };
-    const auto recordShadowMap = [&](D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size,
-                                     uint32_t projection, const FrustumPlane* shadowPlanes, bool dynamic)
+    const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
+        const FrustumPlane* shadowPlanes, bool dynamic)
     {
+        bindFrame(shadowList);
+        uint32_t boundDescriptor = UINT32_MAX;
+        bool identityBound = false;
+        const auto bindShadowMaterial = [&](uint32_t descriptor, SurfaceMode surface)
+        {
+            if (!IsCutout(surface) || alphaTestDisabled)
+                descriptor = kNullDescriptor;
+            if (boundDescriptor == descriptor)
+                return;
+            boundDescriptor = descriptor;
+            auto gpu = heapGpu;
+            gpu.ptr += static_cast<UINT64>(descriptor) * m_textureDescriptorSize;
+            shadowList->SetGraphicsRootDescriptorTable(1, gpu);
+            const uint32_t mode = descriptor == kNullDescriptor ? 0u : kSampleBase | kClipAlpha;
+            const uint32_t material[] = {mode, 0u, 0u, std::bit_cast<uint32_t>(threshold)};
+            shadowList->SetGraphicsRoot32BitConstants(2, 4, material, 0);
+        };
+        const auto submitStaticShadow = [&](const DrawSource12& draw)
+        {
+            if (draw.layout == 3 || !identityBound)
+            {
+                identityBound = draw.layout != 3;
+                shadowList->SetGraphicsRoot32BitConstants(3, 16, identityBound ? identity : draw.world, 0);
+            }
+            shadowList->SetGraphicsRoot32BitConstant(5, draw.layout == 3 ? 1u : 0u, 0);
+            bindShadowMaterial(draw.descriptor, draw.surface);
+            shadowList->IASetVertexBuffers(0, 1, &draw.vertexView);
+            shadowList->IASetIndexBuffer(&draw.indexView);
+            shadowList->DrawIndexedInstanced(draw.icount, 1, 0, 0, 0);
+        };
+        const auto submitAuxShadow = [&](const AuxMesh& mesh, const gameaux12::ObjectDraw& object)
+        {
+            shadowList->SetGraphicsRoot32BitConstant(3, object.poseOffset, 0);
+            bindShadowMaterial(mesh.descriptor, mesh.surface);
+            shadowList->IASetVertexBuffers(0, 1, &mesh.vb);
+            shadowList->IASetIndexBuffer(&mesh.ib);
+            shadowList->DrawIndexedInstanced(mesh.indices, 1, 0, 0, 0);
+        };
         ShadowDraws draws;
         const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size), 0.0f, 1.0f};
         const D3D12_RECT rect{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
-        list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
-        list->RSSetViewports(1, &viewport);
-        list->RSSetScissorRects(1, &rect);
-        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        list->SetGraphicsRoot32BitConstant(kShadowLayerRoot, projection, 0);
+        shadowList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        shadowList->RSSetViewports(1, &viewport);
+        shadowList->RSSetScissorRects(1, &rect);
+        shadowList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        shadowList->SetGraphicsRoot32BitConstant(kShadowLayerRoot, projection, 0);
         for (uint32_t layout = 0; layout < static_cast<uint32_t>(m_sunShadowPipelines.size()); ++layout)
         {
             const auto& tree = m_shadowCasters[layout];
             if (tree.nodes.empty())
                 continue;
-            list->SetPipelineState(m_sunShadowPipelines[layout].Get());
+            shadowList->SetPipelineState(m_sunShadowPipelines[layout].Get());
             if (usePrepared)
             {
                 for (const uint32_t index : prepared.shadows[projection].statics[layout])
                 {
-                    submitStaticGeometry(m_draws[index], 0.0f, true);
+                    submitStaticShadow(m_draws[index]);
                     ++draws.statics;
                 }
                 continue;
             }
             visitLegacyCasters(tree, shadowPlanes, [&](uint32_t index)
             {
-                submitStaticGeometry(m_draws[index], 0.0f, true);
+                submitStaticShadow(m_draws[index]);
                 ++draws.statics;
             });
         }
         if (dynamic && validExtras && m_sunShadowAuxPipeline != nullptr)
         {
-            list->SetPipelineState(m_sunShadowAuxPipeline.Get());
+            shadowList->SetPipelineState(m_sunShadowAuxPipeline.Get());
             if (usePrepared)
             {
                 for (const auto& packet : prepared.shadows[projection].objects)
                 {
                     const auto& object = snapshot.objects[packet.objectIndex];
                     const auto& mesh = snapshot.meshes[packet.meshIndex];
-                    submitAuxGeometry(mesh, object.id, mesh.surface, object.poseOffset, 1, false, true);
+                    submitAuxShadow(mesh, object);
                     ++(object.skinned ? draws.skinned : draws.rigid);
                 }
                 return draws;
@@ -3941,7 +3957,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     const auto* mesh = objectMesh(handle, object);
                     if (mesh == nullptr || !CastsSunShadow(mesh->surface))
                         continue;
-                    submitAuxGeometry(*mesh, object.id, mesh->surface, object.poseOffset, 1, false, true);
+                    submitAuxShadow(*mesh, object);
                     ++(object.skinned ? draws.skinned : draws.rigid);
                 }
             }
@@ -3960,37 +3976,90 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     // глубину и читает её в цветном проходе, начиная и завершая кадр в SRV.
     constexpr auto depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     constexpr auto sampleState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    if (constants.lightingFlags[3] != 0)
+    struct ShadowPass
     {
-        transitionShadow(m_sunShadow.Get(), sampleState, depthState);
-        const auto draws = recordShadowMap(m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart(),
-            kSunShadowSize, 0, sunPlanes, dynamicSun);
-        stats.sunRigidDraws = draws.rigid;
-        stats.sunSkinnedDraws = draws.skinned;
-        stats.staticShadowDraws += draws.statics;
-        stats.dynamicShadowDraws += draws.rigid + draws.skinned;
-        list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
-        transitionShadow(m_sunShadow.Get(), depthState, sampleState);
-    }
-    if (localShadowViews.count != 0)
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+        uint32_t size;
+        uint32_t projection;
+        const FrustumPlane* planes;
+        bool dynamic;
+    };
+    static_assert(GameDx12NativeFrame12::kShadowListCount == kLocalShadowLayers + 1);
+    std::array<ShadowPass, GameDx12NativeFrame12::kShadowListCount> passes{};
+    uint32_t passCount = 0;
+    const bool hasSun = constants.lightingFlags[3] != 0;
+    const bool hasLocal = localShadowViews.count != 0;
+    if (hasSun)
+        passes[passCount++] = {m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart(), kSunShadowSize,
+            0, sunPlanes, dynamicSun};
+    if (hasLocal)
     {
-        transitionShadow(m_localShadow.Get(), sampleState, depthState);
         auto dsv = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
         for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer, dsv.ptr += m_localShadowDsvStride)
-        {
-            if (!localShadowViews.active[layer])
-                continue;
-            const auto draws = recordShadowMap(dsv, kLocalShadowSize,
-                layer + 1, localShadowViews.frusta[layer].data(), true);
-            ++stats.localShadowMaps;
-            ++(layer < kSpotShadowLayers ? stats.spotShadowMaps : stats.pointShadowFaces);
-            stats.localShadowDraws += draws.statics + draws.rigid + draws.skinned;
-            stats.staticShadowDraws += draws.statics;
-            stats.dynamicShadowDraws += draws.rigid + draws.skinned;
-        }
-        list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
-        transitionShadow(m_localShadow.Get(), depthState, sampleState);
+            if (localShadowViews.active[layer])
+                passes[passCount++] = {dsv, kLocalShadowSize, layer + 1, localShadowViews.frusta[layer].data(), true};
     }
+    const auto accumulateShadows = [&](const ShadowPass& pass, const ShadowDraws& draws)
+    {
+        stats.staticShadowDraws += draws.statics;
+        stats.dynamicShadowDraws += draws.rigid + draws.skinned;
+        if (pass.projection == 0)
+        {
+            stats.sunRigidDraws = draws.rigid;
+            stats.sunSkinnedDraws = draws.skinned;
+        }
+        else
+        {
+            ++stats.localShadowMaps;
+            ++(pass.projection <= kSpotShadowLayers ? stats.spotShadowMaps : stats.pointShadowFaces);
+            stats.localShadowDraws += draws.statics + draws.rigid + draws.skinned;
+        }
+    };
+    if (passCount != 0 && recording.UsesShadowLists())
+    {
+        // Состояния карт задаёт владелец. Списки карт только пишут глубину.
+        if (hasSun)
+            transitionShadow(m_sunShadow.Get(), sampleState, depthState);
+        if (hasLocal)
+            transitionShadow(m_localShadow.Get(), sampleState, depthState);
+        for (uint32_t index = 0; index < passCount; ++index)
+        {
+            const auto& pass = passes[index];
+            ID3D12GraphicsCommandList* shadowList = nullptr;
+            if (FAILED(recording.OpenShadowList(index, shadowList)))
+                return Fail(reason, "failed to reset native shadow list");
+            const auto draws = recordShadowMap(shadowList, pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
+            if (FAILED(recording.CloseShadowList(index)))
+                return Fail(reason, "failed to close native shadow list");
+            accumulateShadows(pass, draws);
+        }
+        if (FAILED(recording.BeginColorList()))
+            return Fail(reason, "failed to start native color list");
+        list = recording.list;
+        stats.commandLists = passCount + 2;
+        if (hasSun)
+            transitionShadow(m_sunShadow.Get(), depthState, sampleState);
+        if (hasLocal)
+            transitionShadow(m_localShadow.Get(), depthState, sampleState);
+    }
+    else
+    {
+        for (uint32_t index = 0; index < passCount; ++index)
+        {
+            const auto& pass = passes[index];
+            auto* map = pass.projection == 0 ? m_sunShadow.Get() : m_localShadow.Get();
+            if (index == 0 || passes[index - 1].projection == 0)
+                transitionShadow(map, sampleState, depthState);
+            const auto draws = recordShadowMap(list, pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
+            accumulateShadows(pass, draws);
+            if (pass.projection == 0 || index + 1 == passCount)
+            {
+                list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+                transitionShadow(map, depthState, sampleState);
+            }
+        }
+    }
+    bindColorFrame(list);
     if (constants.lightingFlags[3] != 0 || localShadowViews.count != 0)
     {
         list->OMSetRenderTargets(1, &recording.rtv, FALSE, &recording.dsv);
@@ -4027,7 +4096,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                               uint32_t offset, uint32_t count, ID3D12PipelineState* regular, float skyHemi = 0.0f)
     {
         bindPipeline(surface, 2, regular);
-        submitAuxGeometry(mesh, id, surface, offset, count, regular == m_pipelineDetail.Get(), false, skyHemi);
+        submitAuxGeometry(mesh, id, surface, offset, count, regular == m_pipelineDetail.Get(), skyHemi);
         CountSurfaceDraw(auxStats.surfaces, surface);
     };
     const auto drawObjectPart = [&](const AuxMesh& mesh, const gameaux12::ObjectDraw& object)

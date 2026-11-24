@@ -129,6 +129,7 @@ public:
         uint32_t pointShadowFaces = 0;
         uint32_t shadowedLights = 0;
         uint32_t sceneCopies = 0;
+        uint32_t commandLists = 1;
         std::array<uint64_t, 3> shadowLightIds{};
         std::array<uint32_t, 3> shadowLightFirstSlices{};
         double shadowCpuMs = 0.0;
@@ -182,7 +183,7 @@ public:
               const std::vector<GameDx12StaticMaterial12>& materials,
               std::string& reason);
 
-    bool RecordNativeFrame(const GameDx12NativeFrame12::Recording& recording,
+    bool RecordNativeFrame(GameDx12NativeFrame12::Recording recording,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
                            const float cameraPosition[3], const gameaux12::Frame& extras,
                            const gamelight12::FrameSnapshot& lighting,

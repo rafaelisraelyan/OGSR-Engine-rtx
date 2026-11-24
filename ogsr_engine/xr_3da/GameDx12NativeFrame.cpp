@@ -80,18 +80,31 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     hr = owner.device.CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(m_dsv.GetAddressOf()));
     if (FAILED(hr))
         return hr;
+    const char* commandLists = std::getenv("OGSR_DX12_GAME_COMMAND_LISTS");
+    m_separateShadowLists = commandLists && std::strcmp(commandLists, "multi") == 0;
+    const auto createList = [&](auto& allocator, auto& list)
+    {
+        HRESULT result = owner.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(allocator.GetAddressOf()));
+        if (SUCCEEDED(result))
+            result = owner.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf()));
+        return SUCCEEDED(result) ? list->Close() : result;
+    };
     for (auto& slot : m_slots)
     {
-        hr = owner.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                   IID_PPV_ARGS(slot.allocator.GetAddressOf()));
+        hr = createList(slot.allocator, slot.list);
         if (FAILED(hr))
             return hr;
-        hr = owner.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                             slot.allocator.Get(), nullptr,
-                                             IID_PPV_ARGS(slot.list.GetAddressOf()));
-        if (FAILED(hr))
-            return hr;
-        hr = slot.list->Close();
+        if (!m_separateShadowLists)
+            continue;
+        for (auto& pair : slot.shadows)
+        {
+            hr = createList(pair.allocator, pair.list);
+            if (FAILED(hr))
+                return hr;
+        }
+        hr = createList(slot.colorPass.allocator, slot.colorPass.list);
         if (FAILED(hr))
             return hr;
     }
@@ -339,6 +352,8 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     if (FAILED(hr))
         return hr;
     m_recording = true;
+    m_activeList = slot.list.Get();
+    m_shadowCount = 0;
     if (m_timingQueries)
         slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * m_slot);
 
@@ -372,8 +387,79 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     slot.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     recording = {slot.list.Get(), m_slot, width, height, rtv, dsv,
                  {dsv.ptr + m_dsvStride}, slot.color.Get(), m_depth.Get(),
-                 slot.opaqueColor.Get(), &owner.device, slotFenceWaitMs};
+                 slot.opaqueColor.Get(), &owner.device, slotFenceWaitMs, this};
     return S_OK;
+}
+
+HRESULT GameDx12NativeFrame12::OpenList(AuxiliaryList& pair) noexcept
+{
+    if (pair.open || !pair.list)
+        return E_UNEXPECTED;
+    pair.recorded = false;
+    HRESULT hr = pair.allocator->Reset();
+    if (SUCCEEDED(hr))
+        hr = pair.list->Reset(pair.allocator.Get(), nullptr);
+    pair.open = SUCCEEDED(hr);
+    return hr;
+}
+
+HRESULT GameDx12NativeFrame12::CloseList(AuxiliaryList& pair) noexcept
+{
+    if (!pair.open)
+        return E_UNEXPECTED;
+    pair.open = false;
+    const HRESULT hr = pair.list->Close();
+    pair.recorded = SUCCEEDED(hr);
+    return hr;
+}
+
+bool GameDx12NativeFrame12::Recording::UsesShadowLists() const noexcept
+{
+    return frame && frame->m_separateShadowLists;
+}
+
+HRESULT GameDx12NativeFrame12::Recording::OpenShadowList(uint32_t index,
+    ID3D12GraphicsCommandList*& result) const noexcept
+{
+    result = nullptr;
+    if (!UsesShadowLists() || !frame->m_recording || slot != frame->m_slot ||
+        index != frame->m_shadowCount || index >= kShadowListCount ||
+        frame->m_activeList != frame->m_slots[slot].list.Get())
+        return E_UNEXPECTED;
+    auto& pair = frame->m_slots[slot].shadows[index];
+    const HRESULT hr = OpenList(pair);
+    if (SUCCEEDED(hr))
+    {
+        ++frame->m_shadowCount;
+        result = pair.list.Get();
+    }
+    return hr;
+}
+
+HRESULT GameDx12NativeFrame12::Recording::CloseShadowList(uint32_t index) const noexcept
+{
+    if (!UsesShadowLists() || !frame->m_recording || slot != frame->m_slot || index >= frame->m_shadowCount)
+        return E_UNEXPECTED;
+    return CloseList(frame->m_slots[slot].shadows[index]);
+}
+
+HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
+{
+    if (!UsesShadowLists() || !frame->m_recording || slot != frame->m_slot || frame->m_shadowCount == 0)
+        return E_UNEXPECTED;
+    auto& current = frame->m_slots[slot];
+    if (frame->m_activeList != current.list.Get())
+        return E_UNEXPECTED;
+    for (uint32_t index = 0; index < frame->m_shadowCount; ++index)
+        if (!current.shadows[index].recorded)
+            return E_UNEXPECTED;
+    frame->m_activeList = nullptr;
+    HRESULT hr = current.list->Close();
+    if (SUCCEEDED(hr))
+        hr = OpenList(current.colorPass);
+    if (SUCCEEDED(hr))
+        list = frame->m_activeList = current.colorPass.list.Get();
+    return hr;
 }
 
 void GameDx12NativeFrame12::Recording::BeginWater() const noexcept
@@ -410,11 +496,31 @@ HRESULT GameDx12NativeFrame12::Cancel() noexcept
 {
     if (!m_recording)
         return S_FALSE;
+    auto& slot = m_slots[m_slot];
+    HRESULT hr = S_OK;
+    for (uint32_t index = 0; index < m_shadowCount; ++index)
+    {
+        auto& pair = slot.shadows[index];
+        if (pair.open)
+        {
+            const HRESULT close = CloseList(pair);
+            if (FAILED(close))
+                hr = close;
+        }
+    }
+    if (m_activeList)
+    {
+        const HRESULT close = m_activeList == slot.list.Get() ? m_activeList->Close() : CloseList(slot.colorPass);
+        if (FAILED(close))
+            hr = close;
+    }
+    m_activeList = nullptr;
+    m_shadowCount = 0;
     m_recording = false;
-    return m_slots[m_slot].list->Close();
+    return hr;
 }
 
-bool GameDx12NativeFrame12::RecordCapture(ID3D12Device& device, Slot& slot)
+bool GameDx12NativeFrame12::RecordCapture(ID3D12Device& device, Slot& slot, ID3D12GraphicsCommandList& list)
 {
     if (!m_captureReadback)
     {
@@ -459,8 +565,8 @@ bool GameDx12NativeFrame12::RecordCapture(ID3D12Device& device, Slot& slot)
     source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     const auto toCopy = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
-    slot.list->ResourceBarrier(1, &toCopy);
-    slot.list->CopyTextureRegion(&capture, 0, 0, 0, &source, nullptr);
+    list.ResourceBarrier(1, &toCopy);
+    list.CopyTextureRegion(&capture, 0, 0, 0, &source, nullptr);
     return true;
 }
 
@@ -506,18 +612,23 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         return E_FAIL;
     }
     auto& slot = m_slots[m_slot];
+    if (!m_activeList || (m_shadowCount != 0 && m_activeList != slot.colorPass.list.Get()))
+    {
+        Cancel();
+        return E_UNEXPECTED;
+    }
     const bool sceneDrawn = sceneFrame != 0;
     if (m_timingQueries && sceneDrawn)
     {
         const uint32_t query = 2 * m_slot;
-        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
-        slot.list->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        m_activeList->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
+        m_activeList->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                                     query, 2, m_timingReadback.Get(), query * sizeof(uint64_t));
     }
     bool captured = false;
     if (m_capturePath[0] && sceneFrame >= captureSceneStart)
     {
-        captured = RecordCapture(owner.device, slot);
+        captured = RecordCapture(owner.device, slot, *m_activeList);
         if (!captured)
             m_capturePath[0] = L'\0';
     }
@@ -529,14 +640,21 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     const auto barrier = ColorBarrier(slot.color.Get(), captured ? D3D12_RESOURCE_STATE_COPY_SOURCE
                                                                   : D3D12_RESOURCE_STATE_RENDER_TARGET,
                                       D3D12_RESOURCE_STATE_PRESENT);
-    slot.list->ResourceBarrier(1, &barrier);
+    m_activeList->ResourceBarrier(1, &barrier);
+    // Один batch гарантирует порядок: начало кадра, карты, цвет и Present.
+    std::array<ID3D12CommandList*, kShadowListCount + 2> lists{};
+    uint32_t count = 0;
+    lists[count++] = slot.list.Get();
+    for (uint32_t index = 0; index < m_shadowCount; ++index)
+        lists[count++] = slot.shadows[index].list.Get();
+    if (m_shadowCount != 0)
+        lists[count++] = slot.colorPass.list.Get();
     const HRESULT close = Cancel();
     if (FAILED(close))
         return close;
 
     m_submitted = true;
-    ID3D12CommandList* lists[]{slot.list.Get()};
-    owner.queue.ExecuteCommandLists(1, lists);
+    owner.queue.ExecuteCommandLists(count, lists.data());
     if (m_presentCount == 79)
     {
         const char* probe = std::getenv("OGSR_DX12_GAME_NATIVE_REMOVE_DEVICE");
@@ -604,12 +722,21 @@ void GameDx12NativeFrame12::Quarantine() noexcept
     // Fence без подтверждения: ссылки живут до завершения процесса.
     m_unknown = true;
     m_recording = false;
+    m_activeList = nullptr;
+    m_shadowCount = 0;
     for (auto& slot : m_slots)
     {
         slot.color.Detach();
         slot.opaqueColor.Detach();
         slot.allocator.Detach();
         slot.list.Detach();
+        for (auto& pair : slot.shadows)
+        {
+            pair.allocator.Detach();
+            pair.list.Detach();
+        }
+        slot.colorPass.allocator.Detach();
+        slot.colorPass.list.Detach();
     }
     m_depth.Detach();
     m_dsv.Detach();
