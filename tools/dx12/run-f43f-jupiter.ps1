@@ -13,6 +13,9 @@ param(
     [switch]$NoLocalShadows,
     [switch]$LegacyLocalPriority,
     [switch]$LegacySunPCF,
+    [switch]$LegacySkyHemi,
+    [switch]$LegacyWaterSSR,
+    [switch]$LegacyFloraBounds,
     [switch]$DetailSunShadows,
     [switch]$NoHemi,
     [switch]$NoTerrainDetail,
@@ -129,6 +132,9 @@ $features = @{
     LOCAL_SHADOWS = [int](-not $NoShadows -and -not $NoLocalShadows -and -not $NoLocalLights)
     STABLE_LOCAL_PRIORITY = [int](-not $LegacyLocalPriority)
     RECEIVER_PLANE_SUN = [int](-not $LegacySunPCF)
+    LEGACY_SKY_HEMI = [int]$LegacySkyHemi.IsPresent
+    LEGACY_WATER_SSR = [int]$LegacyWaterSSR.IsPresent
+    LEGACY_FLORA_BOUNDS = [int]$LegacyFloraBounds.IsPresent
     DETAIL_SUN_SHADOWS = [int]($DetailSunShadows -and -not $NoShadows -and -not $NoSunShadows)
     HEMI = [int](-not $NoHemi)
     TERRAIN_DETAIL = [int](-not $NoTerrainDetail)

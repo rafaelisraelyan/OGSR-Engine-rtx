@@ -63,6 +63,7 @@ struct SceneFrameConstants
     std::array<DirectX::XMFLOAT4X4, kLocalShadowLayers> localShadowViewProjection;
     uint32_t diagnosticLight[4]; // Целевой GPU slot + 1, явный ID, frame slot, номер кадра.
     DirectX::XMFLOAT4 diagnosticOrigin;
+    uint32_t legacyWaterSsr;
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -78,6 +79,8 @@ static_assert(offsetof(SceneFrameConstants, diagnosticLight) ==
     offsetof(SceneFrameConstants, localShadowViewProjection) + sizeof(SceneFrameConstants::localShadowViewProjection));
 static_assert(offsetof(SceneFrameConstants, diagnosticOrigin) ==
     offsetof(SceneFrameConstants, diagnosticLight) + 16);
+static_assert(offsetof(SceneFrameConstants, legacyWaterSsr) ==
+    offsetof(SceneFrameConstants, diagnosticOrigin) + sizeof(DirectX::XMFLOAT4));
 constexpr uint64_t kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint64_t kFrameConstantsSize = (sizeof(SceneFrameConstants) + kConstantAlignment - 1) &
     ~(kConstantAlignment - 1);
@@ -516,6 +519,7 @@ cbuffer FrameCB : register(b0)
     float4x4 LocalShadowViewProjection[LOCAL_SHADOW_LAYERS];
     uint4 DiagnosticLight;
     float4 DiagnosticOrigin;
+    uint LegacyWaterSsr;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -903,10 +907,11 @@ bool SunReceiverGradient(float3 planeNormal, out float2 gradient)
 
 float SunPlaneTap(int2 texel, float2 uv, float compareDepth, float2 gradient)
 {
-    texel = clamp(texel, int2(0, 0), int2(2047, 2047));
     const float2 center = (float2(texel) + 0.5f) / 2048.0f;
     const float depth = compareDepth + dot(center - uv, gradient);
-    return depth <= SunShadow.Load(int3(texel, 0)) ? 1.0f : 0.0f;
+    // The hardware comparison sampler uses an opaque white border.
+    const float stored = any(texel < 0) || any(texel >= 2048) ? 1.0f : SunShadow.Load(int3(texel, 0));
+    return depth <= stored ? 1.0f : 0.0f;
 }
 
 float SunPlaneVisibility(float2 uv, float compareDepth, float2 gradient)
@@ -1195,7 +1200,8 @@ R"(float3 WaterReflection(float3 position, float3 normal, float3 direction, floa
                 reflected = lerp(sky, OpaqueColor.SampleLevel(WallmarkSampler, opaque.uv, 0).rgb, confidence);
                 break;
             }
-            // Rejected crossings do not terminate the bounded search.
+            if (LegacyWaterSsr != 0)
+                break;
         }
     }
     return reflected;
@@ -2950,15 +2956,17 @@ bool GameDx12StaticScene12::Load(
                     draw.world[element] = visual.world[element];
                 float center[3]{};
                 float radius = 0.0f;
-                if (!BuildTreeWorldBounds(visual, pools, geomBytes, center, radius))
+                static const bool legacyFloraBounds = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_FLORA_BOUNDS");
+                if (!legacyFloraBounds)
                 {
-                    Msg("ph_dx12_fr3: tree_bounds invalid visual=%u; retaining header bounds", visual.id);
-                }
-                else
-                {
-                    for (uint32_t axis = 0; axis < 3; ++axis)
-                        draw.center[axis] = center[axis];
-                    draw.radius = radius;
+                    if (BuildTreeWorldBounds(visual, pools, geomBytes, center, radius))
+                    {
+                        for (uint32_t axis = 0; axis < 3; ++axis)
+                            draw.center[axis] = center[axis];
+                        draw.radius = radius;
+                    }
+                    else
+                        Msg("ph_dx12_fr3: tree_bounds invalid visual=%u; retaining header bounds", visual.id);
                 }
             }
             m_draws.push_back(draw);
@@ -3408,6 +3416,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     FrustumPlane sunPlanes[6]{};
     LocalShadowViews localShadowViews;
     const uint32_t viewMode = SceneViewMode();
+    static const bool legacyWaterSsr = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_WATER_SSR");
+    constants.legacyWaterSsr = legacyWaterSsr ? 1u : 0u;
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
