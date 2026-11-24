@@ -92,6 +92,8 @@ struct GameDx12GRRangeStats12
     uint64_t completed = 0;
     uint64_t failures = 0;
     uint64_t unobservedFailures = 0;
+    double submitMs = 0.0;
+    double waitMs = 0.0;
 };
 bool GameDx12GR_RunRanges(uint32_t count, uint32_t grain,
     const gr::jobs::RangeCallback& callback, GameDx12GRRangeStats12& stats,

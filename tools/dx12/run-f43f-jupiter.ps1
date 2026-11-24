@@ -21,6 +21,8 @@ param(
     [switch]$SceneLog,
     [switch]$Validation,
     [ValidateSet('serial','parallel','verify')][string]$GR = 'serial',
+    [ValidatePattern('^(auto|[0-9]|1[0-6])$')][string]$GRWorkers = 'auto',
+    [ValidateRange(32,8192)][uint32]$GRGrain = 256,
     [uint64]$LightId,
     [string]$FixedLightIds,
     [switch]$FreezeLightRecord,
@@ -103,6 +105,8 @@ $start.UseShellExecute = $false
 $features = @{
     STATIC_SCENE = '1'
     GR = $GR
+    GR_WORKERS = $GRWorkers
+    GR_GRAIN = $GRGrain
     RIGID = '1'
     SKINNED = '1'
     DETAILS = '1'

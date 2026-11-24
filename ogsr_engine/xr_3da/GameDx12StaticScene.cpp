@@ -3391,7 +3391,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     }();
     if (grMode != renderprep12::Mode::Serial)
     {
-        constexpr uint32_t grain = 256;
+        static const uint32_t grain = []
+        {
+            const char* value = std::getenv("OGSR_DX12_GAME_GR_GRAIN");
+            if (!value || !*value)
+                return 256u;
+            char* end = nullptr;
+            const auto parsed = std::strtoul(value, &end, 10);
+            return *end == '\0' && parsed >= 32 && parsed <= 8192 ? static_cast<uint32_t>(parsed) : 256u;
+        }();
         // Explicit cap on temporary masks and ordered caster indices.
         constexpr size_t maxSources = 1u << 20;
         const size_t objectCount = validExtras ? extras.objects.size() : 0;
@@ -3531,11 +3539,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         if (lighting.frame % 120 == 0)
             Msg("ph_dx12_mt: frame=%llu mode=%s work_items=%u workers=%u participants_used=%u submitted=%llu completed=%llu "
-                "failures=%llu unobserved=%llu parallel_ms=%.6f verify_serial_ms=%.6f",
+                "failures=%llu unobserved=%llu grain=%u submit_ms=%.6f wait_ms=%.6f parallel_ms=%.6f verify_serial_ms=%.6f",
                 static_cast<unsigned long long>(lighting.frame), stats.grMode, workCount, grStats.backgroundWorkers, participantsUsed,
                 static_cast<unsigned long long>(grStats.submitted), static_cast<unsigned long long>(grStats.completed),
                 static_cast<unsigned long long>(grStats.failures), static_cast<unsigned long long>(grStats.unobservedFailures),
-                stats.grParallelMs, stats.grSerialMs);
+                grain, grStats.submitMs, grStats.waitMs, stats.grParallelMs, stats.grSerialMs);
     }
     stats.cull_ms = Ms(cullStart);
 

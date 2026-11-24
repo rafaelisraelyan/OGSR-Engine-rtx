@@ -19,6 +19,8 @@
 #include "gr/jobs/JobSystem.h"
 
 #include <algorithm>
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -34,7 +36,7 @@
 namespace
 {
 gr::jobs::JobSystem g_j2aJobs;
-bool g_j2aJobsReady = false;
+std::atomic<DWORD> g_grOwnerThread{0};
 
 using Clock = std::chrono::steady_clock;
 
@@ -134,11 +136,30 @@ bool ReadVfsFile(const char* name, uint64_t maxBytes,
 
 bool EnsureJobs(std::string& reason)
 {
-    if (g_j2aJobsReady)
+    DWORD expected = 0;
+    const DWORD currentThread = GetCurrentThreadId();
+    if (!g_grOwnerThread.compare_exchange_strong(expected, currentThread) && expected != currentThread)
+    {
+        reason = "GR operation outside renderer owner thread";
+        return false;
+    }
+    if (g_j2aJobs.IsInitialized())
         return true;
     gr::jobs::JobConfig config;
-    config.backgroundWorkers = 0;
-    config.automaticWorkers = true;
+    const char* workers = std::getenv("OGSR_DX12_GAME_GR_WORKERS");
+    if (workers && *workers && std::strcmp(workers, "auto") != 0)
+    {
+        const char* end = workers + std::strlen(workers);
+        uint32_t count = 0;
+        const auto parsed = std::from_chars(workers, end, count);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || count > 16)
+        {
+            reason = "GR_WORKERS must be auto or an integer from 0 through 16";
+            return false;
+        }
+        config.backgroundWorkers = count;
+        config.automaticWorkers = false;
+    }
     config.maxAutoBackgroundWorkers = 4;
     config.defaultGrainSize = 16;
     config.enableStats = true;
@@ -147,7 +168,8 @@ bool EnsureJobs(std::string& reason)
         reason = "GR JobSystem initialization failed";
         return false;
     }
-    g_j2aJobsReady = true;
+    Msg("ph_dx12_mt: GR owner=%lu worker_policy=%s background_workers=%u",
+        currentThread, config.automaticWorkers ? "auto" : "fixed", g_j2aJobs.GetBackgroundWorkerCount());
     return true;
 }
 
@@ -882,22 +904,39 @@ bool GameDx12GR_RunRanges(uint32_t count, uint32_t grain,
             return false;
         const auto before = g_j2aJobs.GetStats();
         stats.backgroundWorkers = before.backgroundWorkers;
-        bool ok = true;
+        std::exception_ptr submitError;
+        std::exception_ptr waitError;
+        const auto submitStart = Clock::now();
+        auto group = g_j2aJobs.CreateGroup();
         try
         {
-            // Synchronous GR API: callbacks are finished before return/rethrow.
-            g_j2aJobs.ParallelFor(count, grain, callback);
+            group.ParallelFor(count, grain, callback);
         }
         catch (...)
         {
-            ok = false;
+            submitError = std::current_exception();
         }
+        stats.submitMs = ElapsedMs(submitStart);
+        const auto waitStart = Clock::now();
+        try
+        {
+            group.Wait();
+        }
+        catch (...)
+        {
+            waitError = std::current_exception();
+        }
+        stats.waitMs = ElapsedMs(waitStart);
         const auto after = g_j2aJobs.GetStats();
         stats.submitted = after.tasksSubmitted - before.tasksSubmitted;
         stats.completed = after.tasksCompleted - before.tasksCompleted;
         stats.failures = after.jobFailures - before.jobFailures;
         stats.unobservedFailures = after.unobservedFailures - before.unobservedFailures;
-        if (!ok || stats.submitted == 0 || stats.submitted != stats.completed ||
+        if (submitError)
+            std::rethrow_exception(submitError);
+        if (waitError)
+            std::rethrow_exception(waitError);
+        if (stats.submitted == 0 || stats.submitted != stats.completed ||
             stats.failures != 0 || stats.unobservedFailures != 0)
         {
             reason = "GR native range submission/completion failed";
@@ -919,11 +958,16 @@ bool GameDx12GR_RunRanges(uint32_t count, uint32_t grain,
 
 void GameDx12J2A_Shutdown()
 {
-    if (g_j2aJobsReady)
+    const DWORD owner = g_grOwnerThread.load();
+    if (owner == 0)
+        return;
+    if (owner != GetCurrentThreadId())
     {
-        g_j2aJobs.Shutdown();
-        g_j2aJobsReady = false;
+        Msg("ph_dx12_mt: GR shutdown rejected outside owner thread");
+        return;
     }
+    g_j2aJobs.Shutdown();
+    g_grOwnerThread.store(0);
 }
 
 #endif // OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
