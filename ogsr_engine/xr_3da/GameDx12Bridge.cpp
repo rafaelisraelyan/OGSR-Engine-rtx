@@ -2196,11 +2196,11 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         {
             draws = sceneStats.draws + auxDraws.rigidDraws + auxDraws.animatedDraws + auxDraws.detailDraws;
             state.staticSceneDraws = sceneStats.draws;
-            timings.mode = "static";
+            timings.mode = sceneStats.grMode;
             timings.recordMs = sceneStats.record_ms;
             timings.snapshotMs = sceneStats.cull_ms;
-            timings.serialMs = 0.0;
-            timings.parallelMs = 0.0;
+            timings.serialMs = sceneStats.grSerialMs;
+            timings.parallelMs = sceneStats.grParallelMs;
         }
         if (FAILED(hr))
             state.native.Cancel();

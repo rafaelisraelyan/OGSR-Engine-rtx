@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "GameDx12StaticScene.h"
+#include "GameDx12J2APreparation.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
@@ -3356,6 +3357,186 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     FrustumPlane planes[6] = {};
     const bool cull = !SceneCullDisabled() && BuildFrustum(logicalViewProjection, planes);
     stats.total = static_cast<uint32_t>(m_draws.size());
+    const bool validExtras = extras.session == LevelSession() && extras.epoch == LevelEpoch();
+
+    // MT0–2 skeleton. Owner freezes the level registry and captured extras
+    // until this synchronous CPU phase completes. No CObject, FS, D3D calls,
+    // descriptor writes, live lighting query or shared append on workers.
+    // Keep the legacy traversal as both default serial path and fallback.
+    struct ShadowPreparation
+    {
+        std::array<std::vector<uint32_t>, 2> statics;
+        std::vector<uint8_t> objects;
+        bool operator==(const ShadowPreparation&) const = default;
+    };
+    struct FramePreparation
+    {
+        std::vector<uint8_t> statics;
+        std::vector<uint8_t> objects;
+        std::array<ShadowPreparation, kLocalShadowLayers + 1> shadows;
+        bool operator==(const FramePreparation&) const = default;
+    };
+    static_assert(std::tuple_size_v<decltype(m_shadowCasters)> == 2);
+    static_assert(std::tuple_size_v<decltype(m_sunShadowPipelines)> == 2);
+    FramePreparation prepared;
+    bool usePrepared = false;
+    static const renderprep12::Mode grMode = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_GR");
+        if (value && std::strcmp(value, "parallel") == 0)
+            return renderprep12::Mode::Parallel;
+        if (value && std::strcmp(value, "verify") == 0)
+            return renderprep12::Mode::Verify;
+        return renderprep12::Mode::Serial;
+    }();
+    if (grMode != renderprep12::Mode::Serial)
+    {
+        constexpr uint32_t grain = 256;
+        // Explicit cap on temporary masks and ordered caster indices.
+        constexpr size_t maxSources = 1u << 20;
+        const size_t objectCount = validExtras ? extras.objects.size() : 0;
+        std::string prepReason;
+        GameDx12GRRangeStats12 grStats;
+        uint32_t workCount = 0;
+        uint32_t participantsUsed = 0;
+        try
+        {
+            if (m_draws.size() > maxSources || objectCount > maxSources)
+                throw std::runtime_error("GR native preparation exceeds source cap");
+            const uint32_t staticBlocks = (static_cast<uint32_t>(m_draws.size()) + grain - 1) / grain;
+            const uint32_t objectBlocks = (static_cast<uint32_t>(objectCount) + grain - 1) / grain;
+            std::vector<uint32_t> shadowViews;
+            if (constants.lightingFlags[3] != 0)
+                shadowViews.push_back(0);
+            for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer)
+                if (localShadowViews.active[layer])
+                    shadowViews.push_back(layer + 1);
+            workCount = staticBlocks + objectBlocks + static_cast<uint32_t>(shadowViews.size());
+
+            const bool dynamicSun = SceneDynamicSunShadowsRequested();
+            const auto build = [&](FramePreparation& out, bool parallel)
+            {
+                out.statics.resize(m_draws.size());
+                out.objects.resize(objectCount);
+                // Same partition-independent results as F3.5 renderprep:
+                // write masks by source index, and one private list per view.
+                std::vector<uint32_t> workers(workCount, UINT32_MAX);
+                const auto process = [&](uint32_t begin, uint32_t end, uint32_t threadIndex)
+                {
+                    for (uint32_t task = begin; task < end; ++task)
+                    {
+                        if (task < staticBlocks)
+                        {
+                            const uint32_t first = task * grain;
+                            const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(m_draws.size()));
+                            for (uint32_t i = first; i < last; ++i)
+                                out.statics[i] = !cull || SphereInside(planes, m_draws[i].center, m_draws[i].radius);
+                        }
+                        else if (task < staticBlocks + objectBlocks)
+                        {
+                            const uint32_t first = (task - staticBlocks) * grain;
+                            const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(objectCount));
+                            for (uint32_t i = first; i < last; ++i)
+                                out.objects[i] = !cull || SphereInside(planes, extras.objects[i].center, extras.objects[i].radius);
+                        }
+                        else
+                        {
+                            const uint32_t projection = shadowViews[task - staticBlocks - objectBlocks];
+                            const auto* frustum = projection == 0 ? sunPlanes :
+                                localShadowViews.frusta[projection - 1].data();
+                            auto& view = out.shadows[projection];
+                            for (uint32_t layout = 0; layout < m_shadowCasters.size(); ++layout)
+                            {
+                                const auto& tree = m_shadowCasters[layout];
+                                if (tree.nodes.empty())
+                                    continue;
+                                auto& indices = view.statics[layout];
+                                const auto visit = [&](const auto& self, uint32_t index) -> void
+                                {
+                                    const auto& node = tree.nodes[index];
+                                    if (!BoxInside(frustum, node.minimum, node.maximum))
+                                        return;
+                                    if (node.count == 0)
+                                    {
+                                        self(self, node.left);
+                                        self(self, node.right);
+                                        return;
+                                    }
+                                    for (uint32_t offset = 0; offset < node.count; ++offset)
+                                    {
+                                        const uint32_t drawIndex = tree.draws[node.first + offset];
+                                        const auto& draw = m_draws[drawIndex];
+                                        if (SphereInside(frustum, draw.center, draw.radius))
+                                            indices.push_back(drawIndex);
+                                    }
+                                };
+                                visit(visit, 0);
+                            }
+                            const bool dynamic = projection != 0 || dynamicSun;
+                            if (dynamic && validExtras)
+                            {
+                                view.objects.resize(objectCount);
+                                for (uint32_t i = 0; i < objectCount; ++i)
+                                    view.objects[i] = SphereInside(frustum, extras.objects[i].center, extras.objects[i].radius);
+                            }
+                        }
+                        workers[task] = threadIndex;
+                    }
+                };
+                if (parallel)
+                {
+                    if (!GameDx12GR_RunRanges(workCount, 1, process, grStats, prepReason))
+                        return false;
+                }
+                else
+                    process(0, workCount, 0);
+                if (std::find(workers.begin(), workers.end(), UINT32_MAX) != workers.end())
+                    return false;
+                if (parallel)
+                {
+                    std::sort(workers.begin(), workers.end());
+                    participantsUsed = static_cast<uint32_t>(std::unique(workers.begin(), workers.end()) - workers.begin());
+                }
+                return true;
+            };
+            const auto parallelStart = Clock::now();
+            usePrepared = build(prepared, true);
+            stats.grParallelMs = Ms(parallelStart);
+            if (!usePrepared)
+                throw std::runtime_error(prepReason.empty() ? "incomplete GR frame preparation" : prepReason);
+            if (grMode == renderprep12::Mode::Verify)
+            {
+                const auto serialStart = Clock::now();
+                FramePreparation reference;
+                if (!build(reference, false) || !(reference == prepared))
+                    return Fail(reason, "GR native preparation serial/parallel mismatch");
+                stats.grSerialMs = Ms(serialStart);
+            }
+            stats.grMode = grMode == renderprep12::Mode::Verify ? "static-verify" : "static-parallel";
+        }
+        catch (...)
+        {
+            if (grMode == renderprep12::Mode::Verify)
+                return Fail(reason, "GR native verify failed; no partial frame submitted");
+            // RunRanges drains before return; discard all temporary outputs.
+            usePrepared = false;
+            stats.grMode = "static-serial-fallback";
+            static bool reported = false;
+            if (!reported)
+            {
+                Msg("ph_dx12_mt: GR preparation failed; using legacy serial traversal reason=%s",
+                    prepReason.empty() ? "exception_or_incomplete_plan" : prepReason.c_str());
+                reported = true;
+            }
+        }
+        if (lighting.frame % 120 == 0)
+            Msg("ph_dx12_mt: frame=%llu mode=%s work_items=%u workers=%u participants_used=%u submitted=%llu completed=%llu "
+                "failures=%llu unobserved=%llu parallel_ms=%.6f verify_serial_ms=%.6f",
+                static_cast<unsigned long long>(lighting.frame), stats.grMode, workCount, grStats.backgroundWorkers, participantsUsed,
+                static_cast<unsigned long long>(grStats.submitted), static_cast<unsigned long long>(grStats.completed),
+                static_cast<unsigned long long>(grStats.failures), static_cast<unsigned long long>(grStats.unobservedFailures),
+                stats.grParallelMs, stats.grSerialMs);
+    }
     stats.cull_ms = Ms(cullStart);
 
     list->SetGraphicsRootSignature(m_rootSignature.Get());
@@ -3366,7 +3547,6 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         0, m_frameConstants->GetGPUVirtualAddress() +
                static_cast<uint64_t>(frameSlot) * kFrameConstantsSize);
 
-    const bool validExtras = extras.session == LevelSession() && extras.epoch == LevelEpoch();
     uint8_t* transformDestination = nullptr;
     uint32_t poseCount = 0;
     if (validExtras)
@@ -3640,6 +3820,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (tree.nodes.empty())
                 continue;
             list->SetPipelineState(m_sunShadowPipelines[layout].Get());
+            if (usePrepared)
+            {
+                for (const uint32_t index : prepared.shadows[projection].statics[layout])
+                {
+                    submitStaticGeometry(m_draws[index], 0.0f, true);
+                    ++draws.statics;
+                }
+                continue;
+            }
             const auto visit = [&](const auto& self, uint32_t index) -> void
             {
                 const auto& node = tree.nodes[index];
@@ -3668,7 +3857,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             list->SetPipelineState(m_sunShadowAuxPipeline.Get());
             for (const auto& object : extras.objects)
             {
-                if (!SphereInside(shadowPlanes, object.center, object.radius))
+                if (usePrepared ? !prepared.shadows[projection].objects[&object - extras.objects.data()] :
+                    !SphereInside(shadowPlanes, object.center, object.radius))
                     continue;
                 for (const uint32_t handle : objectParts(object))
                 {
@@ -3794,7 +3984,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         {
             if (draw.layout != variant)
                 continue;
-            if (cull && !SphereInside(planes, draw.center, draw.radius))
+            if (usePrepared ? !prepared.statics[&draw - m_draws.data()] :
+                cull && !SphereInside(planes, draw.center, draw.radius))
             {
                 ++stats.culled;
                 traceStaticDraw(draw, VisualTraceState::Culled);
@@ -3821,7 +4012,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             const auto parts = objectParts(object);
             if (parts.empty())
                 continue;
-            if (cull && !SphereInside(planes, object.center, object.radius))
+            if (usePrepared ? !prepared.objects[&object - extras.objects.data()] :
+                cull && !SphereInside(planes, object.center, object.radius))
             {
                 ++(object.skinned ? auxStats.animatedCulled : auxStats.rigidCulled);
                 continue;

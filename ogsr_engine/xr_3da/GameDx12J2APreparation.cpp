@@ -869,6 +869,54 @@ bool GameDx12J2A_PrepareSceneFrame(
     }
 }
 
+bool GameDx12GR_RunRanges(uint32_t count, uint32_t grain,
+    const gr::jobs::RangeCallback& callback, GameDx12GRRangeStats12& stats,
+    std::string& reason)
+{
+    stats = {};
+    if (count == 0)
+        return true;
+    try
+    {
+        if (!EnsureJobs(reason))
+            return false;
+        const auto before = g_j2aJobs.GetStats();
+        stats.backgroundWorkers = before.backgroundWorkers;
+        bool ok = true;
+        try
+        {
+            // Synchronous GR API: callbacks are finished before return/rethrow.
+            g_j2aJobs.ParallelFor(count, grain, callback);
+        }
+        catch (...)
+        {
+            ok = false;
+        }
+        const auto after = g_j2aJobs.GetStats();
+        stats.submitted = after.tasksSubmitted - before.tasksSubmitted;
+        stats.completed = after.tasksCompleted - before.tasksCompleted;
+        stats.failures = after.jobFailures - before.jobFailures;
+        stats.unobservedFailures = after.unobservedFailures - before.unobservedFailures;
+        if (!ok || stats.submitted == 0 || stats.submitted != stats.completed ||
+            stats.failures != 0 || stats.unobservedFailures != 0)
+        {
+            reason = "GR native range submission/completion failed";
+            return false;
+        }
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        reason = error.what();
+        return false;
+    }
+    catch (...)
+    {
+        reason = "unknown GR native range failure";
+        return false;
+    }
+}
+
 void GameDx12J2A_Shutdown()
 {
     if (g_j2aJobsReady)

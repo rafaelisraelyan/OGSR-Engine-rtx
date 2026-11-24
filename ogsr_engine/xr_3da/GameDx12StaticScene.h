@@ -136,6 +136,9 @@ public:
         double waterCpuMs = 0.0;
         double cull_ms = 0.0;
         double record_ms = 0.0;
+        const char* grMode = "static-serial";
+        double grSerialMs = 0.0;
+        double grParallelMs = 0.0;
     };
 
     struct AuxStats

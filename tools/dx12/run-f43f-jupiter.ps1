@@ -20,6 +20,7 @@ param(
     [Nullable[uint32]]$GeometryObjectId,
     [switch]$SceneLog,
     [switch]$Validation,
+    [ValidateSet('serial','parallel','verify')][string]$GR = 'serial',
     [uint64]$LightId,
     [string]$FixedLightIds,
     [switch]$FreezeLightRecord,
@@ -101,6 +102,7 @@ $start.UseShellExecute = $false
 
 $features = @{
     STATIC_SCENE = '1'
+    GR = $GR
     RIGID = '1'
     SKINNED = '1'
     DETAILS = '1'

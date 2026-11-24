@@ -4,6 +4,7 @@
 
 #include <DirectXMath.h>
 #include "dx12renderprep.h"
+#include "gr/jobs/JobTypes.h"
 
 #include <cstdint>
 #include <string>
@@ -81,6 +82,20 @@ bool GameDx12J2A_RunForBridge(const char* levelName, uint64_t levelSession,
                               const DirectX::XMFLOAT4X4& projection,
                               GameDx12J2AResult12& result) noexcept;
 void GameDx12J2A_Shutdown();
+
+// Shared existing J2A/M23 GR pool. Owner-thread only, synchronous; callbacks
+// must be pure CPU work with disjoint output ranges and immutable inputs.
+struct GameDx12GRRangeStats12
+{
+    uint32_t backgroundWorkers = 0;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    uint64_t failures = 0;
+    uint64_t unobservedFailures = 0;
+};
+bool GameDx12GR_RunRanges(uint32_t count, uint32_t grain,
+    const gr::jobs::RangeCallback& callback, GameDx12GRRangeStats12& stats,
+    std::string& reason);
 
 // Общий GR pool линии DX12. Снимок уже принадлежит вызывающей стороне.
 bool GameDx12J2A_PrepareSceneFrame(
