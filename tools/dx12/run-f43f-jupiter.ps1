@@ -13,6 +13,16 @@ param(
     [switch]$NoLocalShadows,
     [switch]$LegacyLocalPriority,
     [switch]$LegacySunPCF,
+    [ValidateSet('Legacy','Performance','Balanced','Quality')][string]$SunShadowProfile = 'Legacy',
+    [ValidateRange(1,4)][uint32]$SunCascades,
+    [ValidateSet(1024,2048,4096)][uint32]$SunShadowResolution,
+    [ValidateRange(10,1000)][uint32]$SunShadowDistance,
+    [ValidateSet('Auto','Point','Bilinear','Legacy','ReceiverPlane','PCF3','PCF5','FR3')]
+    [string]$SunShadowFilter = 'Auto',
+    [switch]$NoSunNormalBias,
+    [switch]$NoSunConstantBias,
+    [switch]$NoSunRasterBias,
+    [switch]$NoSunSlopeBias,
     [switch]$LegacySkyHemi,
     [switch]$LegacyWaterSSR,
     [switch]$LegacyFloraBounds,
@@ -39,11 +49,17 @@ param(
     [string]$ProbeOrigin,
     [ValidateSet('Default','ShadowDepth','ShadowVisibility','ShadowSlot','Albedo','Normals',
         'Lighting','Hemi','WaterNormals','WaterReflection','Material','LightTerms',
-        'LocalRaw','LocalProbe','LightIndex','WorldPosition','ShadowFailureReason','SunVisibility','SunDepthDelta','Ambient','SunDirect','LocalTotal','GeometricNormals','HDRClip')]
+        'LocalRaw','LocalProbe','LightIndex','WorldPosition','ShadowFailureReason','SunVisibility','SunDepthDelta',
+        'Ambient','SunDirect','LocalTotal','GeometricNormals','HDRClip',
+        'SunShadowUV','SunReceiverDepth','SunStoredDepth','SunBias','SunSlope','SunPCFWeights','SunShadowTexelGrid',
+        'CascadeIndex','CascadeCoverage','CascadeBlend','CascadeTexelSize','CascadeDepth','ShadowCasterCount','SunShadowVisibility')]
     [string]$View = 'Default'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($LegacySunPCF -and $SunShadowFilter -notin @('Auto','Legacy')) {
+    throw 'Для -LegacySunPCF выберите Auto или Legacy.'
+}
 if ($FixedLightIds -and $FreezeLightRecord) { throw 'Выберите один режим фиксации света.' }
 if (($FixedLightIds -or $FreezeLightRecord) -and $NoLocalLights) { throw 'Для фиксации света требуется включённый local lighting.' }
 if (($FreezeLightRecord -or $View -in @('LocalProbe','LightIndex','ShadowFailureReason')) -and $LightId -eq 0) {
@@ -124,6 +140,12 @@ $features = @{
     LOCAL_LIGHTS = [int](-not $NoLocalLights)
     SHADOWS = [int](-not $NoShadows)
     SUN_SHADOWS = [int](-not $NoShadows -and -not $NoSunShadows)
+    SUN_PROFILE = $SunShadowProfile.ToLowerInvariant()
+    SUN_CASCADES = $SunCascades
+    SUN_RESOLUTION = $SunShadowResolution
+    SUN_DISTANCE = $SunShadowDistance
+    SUN_FILTER = $SunShadowFilter.ToLowerInvariant()
+    SUN_BIAS_MASK = 15 - [int]$NoSunNormalBias - 2 * [int]$NoSunConstantBias - 4 * [int]$NoSunRasterBias - 8 * [int]$NoSunSlopeBias
     TRANSPARENCY = [int](-not $NoTransparency)
     LIT_DECALS = [int](-not $NoLitDecals)
     SOURCE_ALPHA_TEST = [int](-not $LegacyAlpha)
@@ -158,6 +180,9 @@ $views = @{
     LocalRaw = 14; LocalProbe = 15; LightIndex = 16; WorldPosition = 17
     ShadowFailureReason = 18; SunVisibility = 19; SunDepthDelta = 20
     Ambient = 21; SunDirect = 22; LocalTotal = 23; GeometricNormals = 24; HDRClip = 25
+    SunShadowUV = 26; SunReceiverDepth = 27; SunStoredDepth = 28; SunBias = 29; SunSlope = 30
+    SunPCFWeights = 31; SunShadowTexelGrid = 32; CascadeIndex = 33; CascadeCoverage = 34
+    CascadeBlend = 35; CascadeTexelSize = 36; CascadeDepth = 37; ShadowCasterCount = 38; SunShadowVisibility = 19
 }
 $start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')

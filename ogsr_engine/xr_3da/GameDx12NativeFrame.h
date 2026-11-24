@@ -2,6 +2,8 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12ShadowViews.h"
+
 #include <array>
 #include <cstdint>
 #include <d3d12.h>
@@ -14,7 +16,7 @@ class GameDx12NativeFrame12
 {
 public:
     static constexpr uint32_t kFrameCount = 2;
-    static constexpr uint32_t kShadowListCount = 9;
+    static constexpr uint32_t kShadowListCount = game_shadow12::MaxViews;
 
     struct Recording
     {

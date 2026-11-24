@@ -47,7 +47,7 @@ inline bool MakeSunPlan(const DirectX::XMFLOAT4X4& cameraViewProjection, const f
 {
     using namespace DirectX;
     result = {};
-    if (count == 0 || count > MaxSunCascades || !ValidResolution(resolution) ||
+    if (!eye || count == 0 || count > MaxSunCascades || !ValidResolution(resolution) ||
         !std::isfinite(distance) || distance < 10.0f || distance > 1000.0f)
         return false;
     const XMVECTOR camera = XMVectorSet(eye[0], eye[1], eye[2], 1.0f);
@@ -120,7 +120,7 @@ inline bool MakeSunPlan(const DirectX::XMFLOAT4X4& cameraViewProjection, const f
         const float texel = 2.0f * radius / resolution;
         if (!std::isfinite(texel) || texel <= 0.0f)
             return false;
-        const auto snap = [texel, center](FXMVECTOR axis)
+        const auto snap = [texel, &center](FXMVECTOR axis)
         {
             const float value = XMVectorGetX(XMVector3Dot(center, axis));
             return std::round(value / texel) * texel;

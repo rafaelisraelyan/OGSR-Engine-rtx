@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "GameDx12StaticScene.h"
 #include "GameDx12J2APreparation.h"
+#include "GameDx12SunCascades.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
@@ -31,9 +32,9 @@ namespace
 using Clock = std::chrono::steady_clock;
 using gameaux12::SurfaceMode;
 
-constexpr uint32_t kSpotShadowLayers = 2;
-constexpr uint32_t kPointShadowFaces = 6;
-constexpr uint32_t kLocalShadowLayers = kSpotShadowLayers + kPointShadowFaces;
+constexpr uint32_t kSpotShadowLayers = game_shadow12::SpotLayers;
+constexpr uint32_t kPointShadowFaces = game_shadow12::PointFaces;
+constexpr uint32_t kLocalShadowLayers = game_shadow12::LocalLayers;
 constexpr uint32_t kLocalShadowSize = 1024;
 static_assert(kLocalShadowLayers == 8); // LOCAL_SHADOW_LAYERS в FrameCB.
 
@@ -50,7 +51,7 @@ struct SceneFrameConstants
 {
     DirectX::XMFLOAT4X4 viewProjection;
     DirectX::XMFLOAT4 cameraPosition;
-    DirectX::XMFLOAT4X4 shadowViewProjection;
+    std::array<DirectX::XMFLOAT4X4, game_shadow12::MaxSunCascades> sunShadowViewProjection;
     DirectX::XMFLOAT4 ambient;
     DirectX::XMFLOAT4 sunDirection;
     DirectX::XMFLOAT4 sunColor;
@@ -66,15 +67,21 @@ struct SceneFrameConstants
     uint32_t legacyWaterSsr;
     uint32_t sunFilter;
     uint32_t sunReceiverBiasMask;
+    uint32_t sunShadowResolution;
+    DirectX::XMFLOAT4 sunCameraForward; // w: 1 для выбора по camera-space depth.
+    std::array<DirectX::XMFLOAT4, game_shadow12::MaxSunCascades> sunCascadeData; // near, far, blend, world texel
+    std::array<float, game_shadow12::MaxSunCascades> sunDepthBias; // Нормализованный receiver bias по срезам.
+    uint32_t sunCasterCounts[4];
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
 static_assert(offsetof(LocalLightGpu, directionOuterCos) == 16);
 static_assert(offsetof(LocalLightGpu, colorInnerCos) == 32);
 static_assert(offsetof(LocalLightGpu, type) == 48);
-static_assert(offsetof(SceneFrameConstants, lightingFlags) == 192);
-static_assert(offsetof(SceneFrameConstants, localLights) == 208);
-static_assert(offsetof(SceneFrameConstants, hemiColor) == 208 + sizeof(SceneFrameConstants::localLights));
+static_assert(offsetof(SceneFrameConstants, sunShadowViewProjection) == 80);
+static_assert(offsetof(SceneFrameConstants, lightingFlags) == 384);
+static_assert(offsetof(SceneFrameConstants, localLights) == 400);
+static_assert(offsetof(SceneFrameConstants, hemiColor) == 400 + sizeof(SceneFrameConstants::localLights));
 static_assert(offsetof(SceneFrameConstants, localShadowViewProjection) ==
     offsetof(SceneFrameConstants, waterSky) + sizeof(DirectX::XMFLOAT4));
 static_assert(offsetof(SceneFrameConstants, diagnosticLight) ==
@@ -83,10 +90,13 @@ static_assert(offsetof(SceneFrameConstants, diagnosticOrigin) ==
     offsetof(SceneFrameConstants, diagnosticLight) + 16);
 static_assert(offsetof(SceneFrameConstants, legacyWaterSsr) ==
     offsetof(SceneFrameConstants, diagnosticOrigin) + sizeof(DirectX::XMFLOAT4));
+static_assert(offsetof(SceneFrameConstants, sunCameraForward) == offsetof(SceneFrameConstants, legacyWaterSsr) + 16);
+static_assert(offsetof(SceneFrameConstants, sunCascadeData) == offsetof(SceneFrameConstants, sunCameraForward) + 16);
+static_assert(offsetof(SceneFrameConstants, sunDepthBias) == offsetof(SceneFrameConstants, sunCascadeData) + 64);
 constexpr uint64_t kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint64_t kFrameConstantsSize = (sizeof(SceneFrameConstants) + kConstantAlignment - 1) &
     ~(kConstantAlignment - 1);
-static_assert(kFrameConstantsSize == 2048);
+static_assert(kFrameConstantsSize == 2304);
 constexpr uint64_t kFrameConstantsSlots = GameDx12NativeFrame12::kFrameCount;
 constexpr uint64_t kStagingBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t kStagingAlignment = 512ull;
@@ -118,7 +128,6 @@ constexpr uint32_t kLightmapHemi = 1024u;
 constexpr uint32_t kTerrainDetail = 2048u;
 constexpr uint32_t kTerrainBaseHemi = 4096u;
 constexpr uint32_t kObjectSkyHemi = 8192u;
-constexpr uint32_t kSunShadowSize = 2048;
 constexpr float kSunShadowRadius = 48.0f;
 // Центр ближней области приёмников в 20 м перед камерой. Глубина сохраняет
 // запас для удалённых от камеры, но расположенных выше по свету caster'ов.
@@ -426,6 +435,52 @@ uint32_t SceneSunFilter()
     return mode;
 }
 
+struct SunSettings
+{
+    uint32_t count;
+    uint32_t resolution;
+    uint32_t distance;
+    uint32_t biasMask;
+    const char* profile;
+};
+
+const SunSettings& SceneSunSettings()
+{
+    static const auto settings = []
+    {
+        const auto read = [](const char* name, uint32_t fallback, uint32_t min, uint32_t max)
+        {
+            const char* value = std::getenv(name);
+            if (!value)
+                return fallback;
+            const auto end = value + std::strlen(value);
+            uint32_t number = 0;
+            const auto result = std::from_chars(value, end, number);
+            return result.ec == std::errc{} && result.ptr == end && number >= min && number <= max ? number : fallback;
+        };
+        SunSettings result{1, game_shadow12::DefaultResolution, 0, 15, "legacy"};
+        if (const char* profile = std::getenv("OGSR_DX12_GAME_SUN_PROFILE"))
+        {
+            if (std::strcmp(profile, "performance") == 0)
+                result = {2, 1024, 100, 15, "performance"};
+            else if (std::strcmp(profile, "balanced") == 0)
+                result = {3, 2048, 160, 15, "balanced"};
+            else if (std::strcmp(profile, "quality") == 0)
+                result = {4, 2048, 160, 15, "quality"};
+        }
+        result.count = read("OGSR_DX12_GAME_SUN_CASCADES", result.count, 1, game_shadow12::MaxSunCascades);
+        const auto resolution = read("OGSR_DX12_GAME_SUN_RESOLUTION", result.resolution, 1024, 4096);
+        if (game_shadow12::ValidResolution(resolution))
+            result.resolution = resolution;
+        if (result.count > 1 && result.distance == 0)
+            result.distance = result.count == 2 ? 100u : 160u;
+        result.distance = read("OGSR_DX12_GAME_SUN_DISTANCE", result.distance, 10, 1000);
+        result.biasMask = read("OGSR_DX12_GAME_SUN_BIAS_MASK", result.biasMask, 0, 15);
+        return result;
+    }();
+    return settings;
+}
+
 bool SceneStableLocalPriorityRequested()
 {
     static const bool enabled = []
@@ -437,7 +492,7 @@ bool SceneStableLocalPriorityRequested()
 }
 
 DirectX::XMFLOAT4X4 SunShadowViewProjection(const float camera[3],
-    const DirectX::XMFLOAT4X4& viewProjection, const gamelight12::Vec3& sunDirection)
+    const DirectX::XMFLOAT4X4& viewProjection, const gamelight12::Vec3& sunDirection, uint32_t resolution)
 {
     using namespace DirectX;
     const XMVECTOR direction = XMVector3Normalize(XMVectorSet(sunDirection.x, sunDirection.y, sunDirection.z, 0.0f));
@@ -450,7 +505,7 @@ DirectX::XMFLOAT4X4 SunShadowViewProjection(const float camera[3],
     XMVECTOR center = XMVectorMultiplyAdd(forward, XMVectorReplicate(kSunShadowForward),
         XMVectorSet(camera[0], camera[1], camera[2], 1.0f));
     constexpr float diameter = 2.0f * kSunShadowRadius;
-    constexpr float texel = diameter / static_cast<float>(kSunShadowSize);
+    const float texel = diameter / static_cast<float>(resolution);
     const float centerX = XMVectorGetX(XMVector3Dot(center, right));
     const float centerY = XMVectorGetX(XMVector3Dot(center, vertical));
     center = XMVectorMultiplyAdd(right, XMVectorReplicate(std::round(centerX / texel) * texel - centerX), center);
@@ -525,7 +580,7 @@ cbuffer FrameCB : register(b0)
 {
     float4x4 ViewProjection;
     float4 CameraPosition;
-    float4x4 ShadowViewProjection;
+    float4x4 SunShadowViewProjection[4];
     float4 Ambient;
     float4 SunDirection;
     float4 SunColor;
@@ -541,6 +596,11 @@ cbuffer FrameCB : register(b0)
     uint LegacyWaterSsr;
     uint SunFilter;
     uint SunReceiverBiasMask;
+    uint SunShadowResolution;
+    float4 SunCameraForward;
+    float4 SunCascadeData[4];
+    float4 SunDepthBias;
+    uint4 SunCasterCounts;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -556,9 +616,13 @@ cbuffer ShadowLayerCB : register(b6)
 
 float4 ProjectShadow(float4 world)
 {
-    if (ShadowLayer == 0)
-        return mul(world, ShadowViewProjection);
-    return mul(world, LocalShadowViewProjection[ShadowLayer - 1]);
+    const uint slice = ShadowLayer & 3u;
+    const uint localSlice = (ShadowLayer - 4u) & 7u;
+    if (ShadowLayer < 4u)
+        return mul(world, SunShadowViewProjection[slice]);
+    if (ShadowLayer < 12u)
+        return mul(world, LocalShadowViewProjection[localSlice]);
+    return float4(0, 0, 2, 1);
 }
 
 // FXC размещает поля по порядку. VS и PS используют одну декларацию,
@@ -848,7 +912,7 @@ ShadowInterpolants shadowMain(float3 position : POSITION, float3 normal : NORMAL
 
 constexpr const char* kScenePixelShader = R"(
 Texture2D BaseColor : register(t0);
-Texture2D<float> SunShadow : register(t2);
+Texture2DArray<float> SunShadow : register(t2);
 Texture2DArray<float> LocalShadow : register(t6);
 Texture2D HemiLightmap : register(t7);
 Texture2D TerrainMask : register(t8);
@@ -903,14 +967,17 @@ float3 SunPlaneNormal(float3 dx, float3 dy)
     return SafeDirection(cross(dx / sx, dy / sy));
 }
 
-bool ProjectSunReceiver(float3 position, float3 normal, float cosine, out float3 coords)
+float SunNormalOffset(uint slice, float cosine)
 {
+    const float offset = SunCameraForward.w != 0.0f ? min(0.025f, 0.5f * SunCascadeData[slice].w) : 0.025f;
+    return (SunReceiverBiasMask & 1u) != 0 ? offset * (1.0f - cosine) : 0.0f;
+}
+
+bool ProjectSunReceiver(float3 position, float3 normal, float cosine, uint slice, out float3 coords)
+{
+    const float3 receiver = position + normal * SunNormalOffset(slice, cosine);
+    const float4 clipPosition = mul(float4(receiver, 1.0f), SunShadowViewProjection[slice]);
     coords = 0.0f;
-    if (LightingFlags.w == 0)
-        return false;
-    const float3 receiver = position + normal *
-        ((SunReceiverBiasMask & 1u) != 0 ? 0.025f * (1.0f - cosine) : 0.0f);
-    const float4 clipPosition = mul(float4(receiver, 1.0f), ShadowViewProjection);
     if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
         return false;
     const float3 projected = clipPosition.xyz / clipPosition.w;
@@ -921,12 +988,13 @@ bool ProjectSunReceiver(float3 position, float3 normal, float cosine, out float3
 // Orthographic receiver-plane correction: each comparison uses the depth
 // of the same geometric plane at the sampled texel center. The shading
 // normal is not a reliable plane normal on a smooth skinned surface.
-bool SunReceiverGradient(float3 planeNormal, out float2 gradient)
+bool SunReceiverGradient(float3 planeNormal, uint slice, out float2 gradient)
 {
     gradient = 0.0f;
-    const float3 x = float3(ShadowViewProjection[0][0], ShadowViewProjection[1][0], ShadowViewProjection[2][0]);
-    const float3 y = float3(ShadowViewProjection[0][1], ShadowViewProjection[1][1], ShadowViewProjection[2][1]);
-    const float3 z = float3(ShadowViewProjection[0][2], ShadowViewProjection[1][2], ShadowViewProjection[2][2]);
+    const float4x4 projection = SunShadowViewProjection[slice];
+    const float3 x = float3(projection[0][0], projection[1][0], projection[2][0]);
+    const float3 y = float3(projection[0][1], projection[1][1], projection[2][1]);
+    const float3 z = float3(projection[0][2], projection[1][2], projection[2][2]);
     const float x2 = dot(x, x), y2 = dot(y, y), z2 = dot(z, z);
     const float nz = dot(planeNormal, z);
     // Near-grazing or degenerate planes use the existing comparison sampler.
@@ -938,53 +1006,182 @@ bool SunReceiverGradient(float3 planeNormal, out float2 gradient)
     return all(isfinite(gradient));
 }
 
-float SunPlaneTap(int2 texel, float2 uv, float compareDepth, float2 gradient)
+float SunStoredDepth(int2 texel, uint slice)
 {
-    const float2 center = (float2(texel) + 0.5f) / 2048.0f;
-    const float depth = compareDepth + dot(center - uv, gradient);
-    // The hardware comparison sampler uses an opaque white border.
-    const float stored = any(texel < 0) || any(texel >= 2048) ? 1.0f : SunShadow.Load(int3(texel, 0));
-    return depth <= stored ? 1.0f : 0.0f;
+    // Белая граница совпадает с аппаратным comparison sampler.
+    return any(texel < 0) || any(texel >= (int)SunShadowResolution) ? 1.0f : SunShadow.Load(int4(texel, slice, 0));
 }
 
-float SunPlaneVisibility(float2 uv, float compareDepth, float2 gradient)
+float SunPlaneTap(int2 texel, float2 uv, float compareDepth, float2 gradient, uint slice)
 {
-    const float2 pixel = uv * 2048.0f - 0.5f;
+    const float2 center = (float2(texel) + 0.5f) / (float)SunShadowResolution;
+    return compareDepth + dot(center - uv, gradient) <= SunStoredDepth(texel, slice) ? 1.0f : 0.0f;
+}
+
+float SunPlaneVisibility(float2 uv, float compareDepth, float2 gradient, uint slice)
+{
+    const float2 pixel = uv * (float)SunShadowResolution - 0.5f;
     const int2 base = int2(floor(pixel));
     const float2 weight = frac(pixel);
-    const float a = SunPlaneTap(base, uv, compareDepth, gradient);
-    const float b = SunPlaneTap(base + int2(1, 0), uv, compareDepth, gradient);
-    const float c = SunPlaneTap(base + int2(0, 1), uv, compareDepth, gradient);
-    const float d = SunPlaneTap(base + int2(1, 1), uv, compareDepth, gradient);
+    const float a = SunPlaneTap(base, uv, compareDepth, gradient, slice);
+    const float b = SunPlaneTap(base + int2(1, 0), uv, compareDepth, gradient, slice);
+    const float c = SunPlaneTap(base + int2(0, 1), uv, compareDepth, gradient, slice);
+    const float d = SunPlaneTap(base + int2(1, 1), uv, compareDepth, gradient, slice);
     return lerp(lerp(a, b, weight.x), lerp(c, d, weight.x), weight.y);
 }
 
-float SunVisibility(float3 position, float3 normal, float cosine, float3 planeNormal)
+float SunFilterVisibility(float3 coords, float3 planeNormal, uint slice)
 {
-    float3 coords;
-    if (!ProjectSunReceiver(position, normal, cosine, coords))
-        return 1.0f;
     const float2 uv = coords.xy;
-    const float nearestEdge = min(min(uv.x, uv.y), min(1.0f - uv.x, 1.0f - uv.y));
-    const float compareDepth = coords.z - ((SunReceiverBiasMask & 2u) != 0 ? 0.000015f : 0.0f);
-    float2 gradient;
-    if ((SunFilter == 4 || SunFilter == 7) && SunReceiverGradient(planeNormal, gradient))
-        return lerp(1.0f, SunPlaneVisibility(uv, compareDepth, gradient), saturate(nearestEdge * 16.0f));
+    const float compareDepth = coords.z - SunDepthBias[slice];
+    float2 gradient = 0.0f;
+    if ((SunFilter == 4 || SunFilter == 7) && SunReceiverGradient(planeNormal, slice, gradient))
+        return SunPlaneVisibility(uv, compareDepth, gradient, slice);
     if (SunFilter == 1)
-        return lerp(1.0f, SunShadow.SampleCmpLevelZero(SunPointSampler, uv, compareDepth), saturate(nearestEdge * 16.0f));
-    float visibility = SunShadow.SampleCmpLevelZero(SunShadowSampler, uv, compareDepth);
-    if (SunFilter == 2)
-        return lerp(1.0f, visibility, saturate(nearestEdge * 16.0f));
+        return SunShadow.SampleCmpLevelZero(SunPointSampler, float3(uv, slice), compareDepth);
+    if (SunFilter == 5 || SunFilter == 6)
+    {
+        const int radius = SunFilter == 5 ? 1 : 2;
+        const float resolution = (float)SunShadowResolution;
+        const float2 center = floor(uv * resolution) + 0.5f;
+        float sum = 0;
+        [loop]
+        for (int y = -radius; y <= radius; ++y)
+            [loop]
+            for (int x = -radius; x <= radius; ++x)
+                sum += SunShadow.SampleCmpLevelZero(SunPointSampler,
+                    float3((center + float2(x, y)) / resolution, slice), compareDepth);
+        const int width = 2 * radius + 1;
+        return sum / (float)(width * width);
+    }
+    float visibility = SunShadow.SampleCmpLevelZero(SunShadowSampler, float3(uv, slice), compareDepth);
+    if (SunFilter == 2 || SunFilter == 4)
+        return visibility;
     // Дополнительные две билинейные выборки только на границе тени.
     [branch]
     if (visibility > 0.0f && visibility < 1.0f)
     {
-        const float2 offset = float2(0.75f, 0.5f) / 2048.0f;
+        const float2 offset = float2(0.75f, 0.5f) / (float)SunShadowResolution;
         visibility = (visibility +
-            SunShadow.SampleCmpLevelZero(SunShadowSampler, uv + offset, compareDepth) +
-            SunShadow.SampleCmpLevelZero(SunShadowSampler, uv - offset, compareDepth)) / 3.0f;
+            SunShadow.SampleCmpLevelZero(SunShadowSampler, float3(uv + offset, slice), compareDepth) +
+            SunShadow.SampleCmpLevelZero(SunShadowSampler, float3(uv - offset, slice), compareDepth)) / 3.0f;
     }
-    return lerp(1.0f, visibility, saturate(nearestEdge * 16.0f));
+    return visibility;
+}
+)"
+R"(
+struct SunSelection
+{
+    uint slice;
+    uint nextSlice;
+    float3 coords;
+    float3 nextCoords;
+    float blend;
+    float fade;
+};
+
+SunSelection SelectSun(float3 position, float3 normal, float cosine)
+{
+    SunSelection selected = (SunSelection)0;
+    selected.slice = selected.nextSlice = 4u;
+    const uint count = min(LightingFlags.w, 4u);
+    if (count == 0)
+        return selected;
+    const bool useDepth = SunCameraForward.w != 0.0f;
+    const float depth = dot(position - CameraPosition.xyz, SunCameraForward.xyz);
+    if (useDepth && (depth < SunCascadeData[0].x || depth > SunCascadeData[count - 1].y))
+        return selected;
+    [loop]
+    for (uint index = 0; index < count; ++index)
+    {
+        if (useDepth && depth > SunCascadeData[index].y)
+            continue;
+        if (ProjectSunReceiver(position, normal, cosine, index, selected.coords))
+        {
+            selected.slice = index;
+            break;
+        }
+    }
+    if (selected.slice >= count)
+        return selected;
+    if (!useDepth)
+    {
+        const float2 edge = min(selected.coords.xy, 1.0f - selected.coords.xy);
+        selected.fade = 1.0f - saturate(min(edge.x, edge.y) * 16.0f);
+        return selected;
+    }
+    const float4 primary = SunCascadeData[selected.slice];
+    const float4 farCascade = SunCascadeData[count - 1];
+    selected.fade = smoothstep(farCascade.z, farCascade.y, depth);
+    const uint next = selected.slice + 1;
+    if (next < count && depth > primary.z &&
+        ProjectSunReceiver(position, normal, cosine, next, selected.nextCoords))
+    {
+        selected.nextSlice = next;
+        selected.blend = smoothstep(primary.z, primary.y, depth);
+    }
+    return selected;
+}
+
+float SunSelectedVisibility(SunSelection selected, float3 planeNormal)
+{
+    if (selected.slice >= 4)
+        return 1.0f;
+    float visibility = SunFilterVisibility(selected.coords, planeNormal, selected.slice);
+    if (selected.nextSlice < 4)
+        visibility = lerp(visibility, SunFilterVisibility(selected.nextCoords, planeNormal, selected.nextSlice), selected.blend);
+    return lerp(visibility, 1.0f, selected.fade);
+}
+
+float SunVisibility(float3 position, float3 normal, float cosine, float3 planeNormal)
+{
+    return SunSelectedVisibility(SelectSun(position, normal, cosine), planeNormal);
+}
+
+float3 DebugSun(uint mode, SunSelection selected, float3 planeNormal, float cosine)
+{
+    const uint slice = selected.slice;
+    if (slice >= 4)
+        return float3(1, 0, 1);
+    const float3 coords = selected.coords;
+    const float resolution = (float)SunShadowResolution;
+    const float stored = SunStoredDepth(int2(coords.xy * resolution), slice);
+    const float bias = SunDepthBias[slice];
+    if (mode == 19)
+        return SunSelectedVisibility(selected, planeNormal).xxx;
+    if (mode == 20)
+    {
+        const float delta = coords.z - bias - stored;
+        return float3(saturate(delta * 1024.0f), saturate(-delta * 1024.0f), 0);
+    }
+    if (mode == 26) return float3(coords.xy, 0);
+    if (mode == 27 || mode == 37) return coords.zzz;
+    if (mode == 28) return stored.xxx;
+    if (mode == 29) return float3(saturate(SunNormalOffset(slice, cosine) * 40.0f), saturate(bias * 10000), 0);
+    if (mode == 30)
+    {
+        float2 gradient;
+        if (!SunReceiverGradient(planeNormal, slice, gradient))
+            return float3(1, 0, 1);
+        return float3(saturate(0.5f + gradient * 0.25f), 0);
+    }
+    const float2 weights = frac(coords.xy * resolution - 0.5f);
+    if (mode == 31) return float3(weights, weights.x * weights.y);
+    if (mode == 32)
+    {
+        const float2 texel = frac(coords.xy * resolution);
+        const float2 edge = min(texel, 1.0f - texel);
+        return step(0.1f, min(edge.x, edge.y)).xxx;
+    }
+    if (mode == 33)
+    {
+        const float3 colors[4] = {float3(1,0,0), float3(0,1,0), float3(0,0,1), float3(1,1,0)};
+        return selected.nextSlice < 4 ? lerp(colors[slice], colors[selected.nextSlice], selected.blend) : colors[slice];
+    }
+    if (mode == 34) return float3(0, 1.0f - selected.fade, selected.fade);
+    if (mode == 35) return float3(selected.blend, selected.fade, 0);
+    if (mode == 36) return saturate(SunCascadeData[slice].w * 2.0f).xxx;
+    return saturate(log2(1.0f + SunCasterCounts[slice]) / 16.0f).xxx;
 }
 
 )"
@@ -1334,7 +1531,8 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
 R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
     // Считаем производные плоскости до clip и ветвления на режимы материалов.
-    const float3 correctedPlaneNormal = SunPlaneNormal(ddx_fine(input.world), ddy_fine(input.world));
+    const float3 correctedPlaneNormal = SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ?
+        SunPlaneNormal(ddx_fine(input.world), ddy_fine(input.world)) : 0.0f;
     const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
     const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
     float4 baseColor = float4(0.72f, 0.72f, 0.76f, 1.0f);
@@ -1411,18 +1609,8 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     // Geometric receiver plane, computed before the light-dependent branch.
     const float3 planeNormal = SunFilter == 7 ? SafeDirection(cross(ddx(input.world), ddy(input.world))) :
         correctedPlaneNormal;
-    if (ViewMode == 19 || ViewMode == 20)
-    {
-        float3 coords;
-        if (!ProjectSunReceiver(input.world, n, sunCosine, coords))
-            return float4(1, 0, 1, 1);
-        if (ViewMode == 19)
-            return float4(SunVisibility(input.world, n, sunCosine, planeNormal).xxx, 1);
-        const int2 texel = clamp(int2(coords.xy * 2048.0f), int2(0, 0), int2(2047, 2047));
-        const float delta = coords.z - ((SunReceiverBiasMask & 2u) != 0 ? 0.000015f : 0.0f) -
-            SunShadow.Load(int3(texel, 0));
-        return float4(saturate(delta * 1024.0f), saturate(-delta * 1024.0f), 0, 1);
-    }
+    if (ViewMode == 19 || ViewMode == 20 || (ViewMode >= 26 && ViewMode <= 38))
+        return float4(DebugSun(ViewMode, SelectSun(input.world, n, sunCosine), planeNormal, sunCosine), 1);
     if (ViewMode == 21)
         return float4(ToDisplay(Ambient.rgb), 1);
     if (ViewMode == 22)
@@ -1693,7 +1881,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 25ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 38ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -2280,13 +2468,11 @@ bool GameDx12StaticScene12::CreateFrameConstants(ID3D12Device* device,
 
 bool GameDx12StaticScene12::CreateSunShadow(ID3D12Device* device, std::string& reason)
 {
+    const auto& settings = SceneSunSettings();
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC image{};
     image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    image.Width = kSunShadowSize;
-    image.Height = kSunShadowSize;
-    image.DepthOrArraySize = 1;
     image.MipLevels = 1;
     image.Format = DXGI_FORMAT_R32_TYPELESS;
     image.SampleDesc.Count = 1;
@@ -2294,28 +2480,54 @@ bool GameDx12StaticScene12::CreateSunShadow(ID3D12Device* device, std::string& r
     D3D12_CLEAR_VALUE clear{};
     clear.Format = DXGI_FORMAT_D32_FLOAT;
     clear.DepthStencil.Depth = 1.0f;
-    const HRESULT depthHr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &image,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(m_sunShadow.GetAddressOf()));
-    if (FAILED(depthHr))
+    const auto allocate = [&](uint32_t slices, uint32_t resolution)
     {
-        Msg("ph_dx12_f43b: sun_shadow stage=depth_resource hr=0x%08X format=R32_TYPELESS size=%u",
-            static_cast<unsigned>(depthHr), kSunShadowSize);
-        return Fail(reason, "sun shadow depth allocation failed");
+        image.Width = image.Height = resolution;
+        image.DepthOrArraySize = static_cast<UINT16>(slices);
+        ComPtr<ID3D12Resource> maps;
+        HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &image,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(maps.GetAddressOf()));
+        if (FAILED(hr))
+            return hr;
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        desc.NumDescriptors = slices;
+        ComPtr<ID3D12DescriptorHeap> views;
+        hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(views.GetAddressOf()));
+        if (FAILED(hr))
+            return hr;
+        auto handle = views->GetCPUDescriptorHandleForHeapStart();
+        const auto stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_D32_FLOAT;
+        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv.Texture2DArray.ArraySize = 1;
+        for (uint32_t slice = 0; slice < slices; ++slice, handle.ptr += stride)
+        {
+            dsv.Texture2DArray.FirstArraySlice = slice;
+            device->CreateDepthStencilView(maps.Get(), &dsv, handle);
+        }
+        m_sunShadowBytes = device->GetResourceAllocationInfo(0, 1, &image).SizeInBytes;
+        m_sunShadowResolution = resolution;
+        m_sunShadowSlices = slices;
+        m_sunShadowDsvStride = stride;
+        m_sunShadow = std::move(maps);
+        m_sunShadowDsv = std::move(views);
+        return S_OK;
+    };
+    HRESULT hr = allocate(settings.count, settings.resolution);
+    if (FAILED(hr) && (settings.count != 1 || settings.resolution != game_shadow12::DefaultResolution) &&
+        SUCCEEDED(device->GetDeviceRemovedReason()))
+    {
+        Msg("ph_dx12_csm: allocation fallback requested=%u/%u hr=0x%08X effective=1/2048",
+            settings.count, settings.resolution, static_cast<unsigned>(hr));
+        hr = allocate(1, game_shadow12::DefaultResolution);
     }
-    D3D12_DESCRIPTOR_HEAP_DESC desc{};
-    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    desc.NumDescriptors = 1;
-    const HRESULT dsvHr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(m_sunShadowDsv.GetAddressOf()));
-    if (FAILED(dsvHr))
+    if (FAILED(hr))
     {
-        Msg("ph_dx12_f43b: sun_shadow stage=dsv_heap hr=0x%08X format=D32_FLOAT",
-            static_cast<unsigned>(dsvHr));
+        Msg("ph_dx12_csm: allocation failed hr=0x%08X", static_cast<unsigned>(hr));
         return Fail(reason, "sun shadow DSV heap allocation failed");
     }
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
-    dsv.Format = DXGI_FORMAT_D32_FLOAT;
-    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    device->CreateDepthStencilView(m_sunShadow.Get(), &dsv, m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart());
     return true;
 }
 
@@ -2585,18 +2797,24 @@ bool GameDx12StaticScene12::CreateTextures(
                 IID_PPV_ARGS(m_textureHeap.GetAddressOf()))))
             return Fail(reason, "scene descriptor heap creation failed");
         m_textureDescriptorSize = device->GetDescriptorHandleIncrementSize(heap.Type);
+        if (m_textureDescriptorSize == 0 || (m_sunShadow &&
+            (m_sunShadowSlices == 0 || m_sunShadowSlices > game_shadow12::MaxSunCascades ||
+             m_sunShadow->GetDesc().DepthOrArraySize != m_sunShadowSlices)))
+            return Fail(reason, "invalid scene shadow descriptor layout");
         const auto base = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
         device->CreateShaderResourceView(nullptr, &nullSrv, base);
         auto shadowSrv = nullSrv;
         shadowSrv.Format = DXGI_FORMAT_R32_FLOAT;
         auto shadow = base;
         shadow.ptr += static_cast<SIZE_T>(kSunShadowDescriptor) * m_textureDescriptorSize;
-        device->CreateShaderResourceView(m_sunShadow.Get(), &shadowSrv, shadow);
+        auto arraySrv = shadowSrv;
+        arraySrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        arraySrv.Texture2DArray = {};
+        arraySrv.Texture2DArray.MipLevels = 1;
+        arraySrv.Texture2DArray.ArraySize = m_sunShadow ? m_sunShadowSlices : 1;
+        device->CreateShaderResourceView(m_sunShadow.Get(), &arraySrv, shadow);
 
-        auto localSrv = shadowSrv;
-        localSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        localSrv.Texture2DArray = {};
-        localSrv.Texture2DArray.MipLevels = 1;
+        auto localSrv = arraySrv;
         localSrv.Texture2DArray.ArraySize = kLocalShadowLayers;
         auto local = base;
         local.ptr += static_cast<SIZE_T>(kLocalShadowDescriptor) * m_textureDescriptorSize;
@@ -3046,7 +3264,8 @@ bool GameDx12StaticScene12::Load(
                 if (sunShadowsRequested)
                 {
                     if (CreateSunShadow(owner.device, shadowReason))
-                        Msg("ph_dx12_f43b: sun_shadow state=ready format=D32_FLOAT size=%u", kSunShadowSize);
+                        Msg("ph_dx12_f43b: sun_shadow state=ready format=D32_FLOAT size=%u slices=%u bytes=%llu",
+                            m_sunShadowResolution, m_sunShadowSlices, static_cast<unsigned long long>(m_sunShadowBytes));
                     else
                     {
                         m_sunShadow.Reset();
@@ -3456,15 +3675,17 @@ bool GameDx12StaticScene12::RecordNativeFrame(
 
     const auto cullStart = Clock::now();
     SceneFrameConstants constants{};
-    DirectX::XMFLOAT4X4 sunViewProjection{};
-    FrustumPlane sunPlanes[6]{};
+    game_shadow12::SunPlan sunPlan;
+    std::array<std::array<FrustumPlane, 6>, game_shadow12::MaxSunCascades> sunPlanes{};
     LocalShadowViews localShadowViews;
     const uint32_t viewMode = SceneViewMode();
     static const bool legacyWaterSsr = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_WATER_SSR");
     constants.legacyWaterSsr = legacyWaterSsr ? 1u : 0u;
     const uint32_t sunFilter = SceneSunFilter();
-    constants.sunFilter = sunFilter != 0 ? sunFilter : (SceneReceiverPlaneSunRequested() ? 7u : 3u);
-    constants.sunReceiverBiasMask = 3;
+    const auto& sunSettings = SceneSunSettings();
+    constants.sunFilter = sunFilter != 0 ? sunFilter : !SceneReceiverPlaneSunRequested() ? 3u : m_sunShadowSlices > 1 ? 2u : 7u;
+    constants.sunReceiverBiasMask = sunSettings.biasMask & 3u;
+    constants.sunShadowResolution = m_sunShadowResolution;
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
@@ -3485,12 +3706,40 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         if (m_sunShadow != nullptr && (viewMode == 0 || viewMode >= 4) &&
             lighting.sunEnabled && lighting.shadowsEnabled)
         {
-            sunViewProjection = SunShadowViewProjection(cameraPosition, logicalViewProjection, lighting.sunDirection);
-            if (FiniteMatrix(sunViewProjection) && BuildFrustum(sunViewProjection, sunPlanes))
+            const auto start = Clock::now();
+            const bool fitRequested = sunSettings.distance != 0 && m_sunShadowSlices == sunSettings.count;
+            bool fitted = fitRequested && game_shadow12::MakeSunPlan(logicalViewProjection, cameraPosition,
+                {lighting.sunDirection.x, lighting.sunDirection.y, lighting.sunDirection.z},
+                m_sunShadowSlices, m_sunShadowResolution, static_cast<float>(sunSettings.distance), sunPlan);
+            for (uint32_t slice = 0; slice < sunPlan.count; ++slice)
+                fitted &= BuildFrustum(sunPlan.cascades[slice].viewProjection, sunPlanes[slice].data());
+            if (!fitted)
             {
-                constants.shadowViewProjection = Transpose(sunViewProjection);
-                constants.lightingFlags[3] = 1u;
+                sunPlan = {};
+                auto& fallback = sunPlan.cascades[0];
+                fallback.viewProjection = SunShadowViewProjection(cameraPosition, logicalViewProjection,
+                    lighting.sunDirection, m_sunShadowResolution);
+                fallback.depthSpan = 192.0f - 0.1f;
+                fallback.radius = kSunShadowRadius;
+                fallback.texelWorld = 2.0f * kSunShadowRadius / m_sunShadowResolution;
+                if (FiniteMatrix(fallback.viewProjection) && BuildFrustum(fallback.viewProjection, sunPlanes[0].data()))
+                    sunPlan.count = 1;
+                if (fitRequested && lighting.frame % 120 == 0)
+                    Msg("ph_dx12_csm: fallback=invalid_cascade_plan active=%u", sunPlan.count);
             }
+            constants.lightingFlags[3] = sunPlan.count;
+            constants.sunCameraForward = {sunPlan.cameraForward.x, sunPlan.cameraForward.y,
+                sunPlan.cameraForward.z, fitted ? 1.0f : 0.0f};
+            for (uint32_t slice = 0; slice < sunPlan.count; ++slice)
+            {
+                const auto& cascade = sunPlan.cascades[slice];
+                constants.sunShadowViewProjection[slice] = Transpose(cascade.viewProjection);
+                constants.sunCascadeData[slice] = {cascade.splitNear, cascade.splitFar, cascade.blendStart, cascade.texelWorld};
+                // Сохраняем смещение в метрах при изменении глубины ортообъёма.
+                constants.sunDepthBias[slice] = (sunSettings.biasMask & 2u) != 0
+                    ? 0.000015f * (192.0f - 0.1f) / cascade.depthSpan : 0.0f;
+            }
+            stats.shadowCpuMs += Ms(start);
         }
         if (lighting.localEnabled)
         {
@@ -3616,6 +3865,33 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         static_cast<uint64_t>(frameSlot) * kFrameConstantsSize;
     std::memcpy(frameDestination, &constants, sizeof(constants));
 
+    struct ShadowPass
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+        uint32_t size;
+        game_shadow12::View view;
+        const FrustumPlane* planes;
+        bool dynamic;
+    };
+    static_assert(GameDx12NativeFrame12::kShadowListCount == game_shadow12::MaxViews);
+    std::array<ShadowPass, GameDx12NativeFrame12::kShadowListCount> passes{};
+    uint32_t passCount = 0;
+    const bool dynamicSun = SceneDynamicSunShadowsRequested();
+    if (sunPlan.count != 0)
+    {
+        auto dsv = m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t slice = 0; slice < sunPlan.count; ++slice, dsv.ptr += m_sunShadowDsvStride)
+            passes[passCount++] = {dsv, m_sunShadowResolution, {slice}, sunPlanes[slice].data(), dynamicSun};
+    }
+    if (localShadowViews.count != 0)
+    {
+        auto dsv = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer, dsv.ptr += m_localShadowDsvStride)
+            if (localShadowViews.active[layer])
+                passes[passCount++] = {dsv, kLocalShadowSize, {layer + game_shadow12::MaxSunCascades},
+                    localShadowViews.frusta[layer].data(), true};
+    }
+
     FrustumPlane planes[6] = {};
     const bool cull = !SceneCullDisabled() && BuildFrustum(logicalViewProjection, planes);
     stats.total = static_cast<uint32_t>(m_draws.size());
@@ -3656,9 +3932,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         const auto& mesh = snapshot.meshes[handle];
         return mesh.skinned == object.skinned && mesh.requiredBones <= object.boneCount ? &mesh : nullptr;
     };
-    static_assert(std::tuple_size_v<decltype(FramePreparation::shadows)> == kLocalShadowLayers + 1);
+    static_assert(std::tuple_size_v<decltype(FramePreparation::shadows)> == game_shadow12::MaxViews);
     static_assert(std::tuple_size_v<decltype(ShadowPreparation::statics)> == std::tuple_size_v<decltype(m_sunShadowPipelines)>);
-    const bool dynamicSun = SceneDynamicSunShadowsRequested();
     // Эталон Verify использует тот же обход, что и исходная serial запись.
     const auto visitLegacyCasters = [&](const ShadowCasterTree& tree, const FrustumPlane* frustum, const auto& emit)
     {
@@ -3694,8 +3969,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             return renderprep12::Mode::Verify;
         return renderprep12::Mode::Serial;
     }();
-    const uint32_t activeShadowViews = (constants.lightingFlags[3] != 0 ? 1u : 0u) + localShadowViews.count;
-    const bool packForRecording = recording.UsesParallelShadowLists() && activeShadowViews > 1;
+    const bool packForRecording = recording.UsesParallelShadowLists() && passCount > 1;
     if (grMode != renderprep12::Mode::Serial || packForRecording)
     {
         static const uint32_t grain = []
@@ -3720,14 +3994,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 throw std::runtime_error("GR native preparation exceeds source cap");
             const uint32_t staticBlocks = (static_cast<uint32_t>(snapshot.draws.size()) + grain - 1) / grain;
             const uint32_t objectBlocks = (static_cast<uint32_t>(objectCount) + grain - 1) / grain;
-            std::array<uint32_t, kLocalShadowLayers + 1> shadowViews{};
-            uint32_t shadowViewCount = 0;
-            if (constants.lightingFlags[3] != 0)
-                shadowViews[shadowViewCount++] = 0;
-            for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer)
-                if (localShadowViews.active[layer])
-                    shadowViews[shadowViewCount++] = layer + 1;
-            workCount = staticBlocks + objectBlocks + shadowViewCount;
+            workCount = staticBlocks + objectBlocks + passCount;
 
             const auto prepStart = Clock::now();
             prepared.Clear();
@@ -3761,9 +4028,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     }
                     else
                     {
-                        const uint32_t projection = shadowViews[task - staticBlocks - objectBlocks];
-                        const auto* frustum = projection == 0 ? sunPlanes :
-                            localShadowViews.frusta[projection - 1].data();
+                        const auto& pass = passes[task - staticBlocks - objectBlocks];
+                        const uint32_t projection = pass.view.projection;
+                        const auto* frustum = pass.planes;
                         auto& view = prepared.shadows[projection];
                         for (uint32_t layout = 0; layout < snapshot.casters.size(); ++layout)
                         {
@@ -3798,7 +4065,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                             };
                             visit(visit, 0, 0);
                         }
-                        if (projection != 0 || dynamicSun)
+                        if (pass.dynamic)
                         {
                             for (uint32_t i = 0; i < objectCount; ++i)
                             {
@@ -3848,10 +4115,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 if (validExtras)
                     for (const auto& object : extras.objects)
                         reference.objects.push_back(!cull || SphereInside(planes, object.center, object.radius));
-                for (uint32_t i = 0; i < shadowViewCount; ++i)
+                for (uint32_t i = 0; i < passCount; ++i)
                 {
-                    const uint32_t projection = shadowViews[i];
-                    const auto* frustum = projection == 0 ? sunPlanes : localShadowViews.frusta[projection - 1].data();
+                    const auto& pass = passes[i];
+                    const uint32_t projection = pass.view.projection;
+                    const auto* frustum = pass.planes;
                     auto& view = reference.shadows[projection];
                     for (uint32_t layout = 0; layout < m_shadowCasters.size(); ++layout)
                     {
@@ -3859,7 +4127,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                         if (!tree.nodes.empty())
                             visitLegacyCasters(tree, frustum, [&](uint32_t index) { view.statics[layout].push_back(index); });
                     }
-                    if ((projection != 0 || dynamicSun) && validExtras)
+                    if (pass.dynamic && validExtras)
                     {
                         for (const auto& object : extras.objects)
                         {
@@ -4155,7 +4423,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 const float scale = std::hypot(transform._11, transform._12, transform._13);
                 const float distance = std::hypot(center[0] - cameraPosition[0],
                     center[1] - cameraPosition[1], center[2] - cameraPosition[2]);
-                if (distance > 12.0f || !std::isfinite(scale) || !SphereInside(sunPlanes, center, mesh.radius * scale))
+                if (distance > 12.0f || !std::isfinite(scale) || !SphereInside(sunPlanes[0].data(), center, mesh.radius * scale))
                     continue;
                 std::memcpy(transformDestination + uint64_t{next} * sizeof(transform), &transform, sizeof(transform));
                 ++next;
@@ -4174,6 +4442,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint32_t statics = 0;
         uint32_t rigid = 0;
         uint32_t skinned = 0;
+        uint32_t detail = 0;
     };
     const FramePreparation& preparedPackets = prepared;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
@@ -4284,68 +4553,54 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             {
                 submitAuxShadow(snapshot.meshes[packet.mesh], SurfaceMode::Cutout, packet.first, packet.count);
                 ++draws.rigid;
+                draws.detail += packet.count;
             }
         }
         return draws;
-    };
-    const auto transitionShadow = [&](ID3D12Resource* map, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-    {
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition = {map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-        list->ResourceBarrier(1, &barrier);
     };
     const auto shadowRecordStart = Clock::now();
     // Карты принадлежат уровню. Одна прямая очередь последовательно записывает
     // глубину и читает её в цветном проходе, начиная и завершая кадр в SRV.
     constexpr auto depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     constexpr auto sampleState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    struct ShadowPass
+    const auto transitionShadows = [&](std::span<const ShadowPass> batch,
+        D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
     {
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv;
-        uint32_t size;
-        uint32_t projection;
-        const FrustumPlane* planes;
-        bool dynamic;
+        std::array<D3D12_RESOURCE_BARRIER, game_shadow12::MaxViews> barriers{};
+        for (size_t index = 0; index < batch.size(); ++index)
+        {
+            const auto view = batch[index].view;
+            auto* map = view.IsSun() ? m_sunShadow.Get() : m_localShadow.Get();
+            barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            // У обеих карт один mip и одна плоскость: subresource == slice.
+            barriers[index].Transition = {map, view.Slice(), before, after};
+        }
+        list->ResourceBarrier(static_cast<UINT>(batch.size()), barriers.data());
     };
-    static_assert(GameDx12NativeFrame12::kShadowListCount == kLocalShadowLayers + 1);
-    std::array<ShadowPass, GameDx12NativeFrame12::kShadowListCount> passes{};
-    uint32_t passCount = 0;
-    const bool hasSun = constants.lightingFlags[3] != 0;
-    const bool hasLocal = localShadowViews.count != 0;
-    if (hasSun)
-        passes[passCount++] = {m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart(), kSunShadowSize,
-            0, sunPlanes, dynamicSun};
-    if (hasLocal)
-    {
-        auto dsv = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
-        for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer, dsv.ptr += m_localShadowDsvStride)
-            if (localShadowViews.active[layer])
-                passes[passCount++] = {dsv, kLocalShadowSize, layer + 1, localShadowViews.frusta[layer].data(), true};
-    }
+    const auto activePasses = std::span(passes.data(), passCount);
+    std::array<ShadowDraws, game_shadow12::MaxSunCascades> sunDraws{};
     const auto accumulateShadows = [&](const ShadowPass& pass, const ShadowDraws& draws)
     {
         stats.staticShadowDraws += draws.statics;
         stats.dynamicShadowDraws += draws.rigid + draws.skinned;
-        if (pass.projection == 0)
+        if (pass.view.IsSun())
         {
-            stats.sunRigidDraws = draws.rigid;
-            stats.sunSkinnedDraws = draws.skinned;
+            stats.sunRigidDraws += draws.rigid;
+            stats.sunSkinnedDraws += draws.skinned;
+            sunDraws[pass.view.Slice()] = draws;
+            constants.sunCasterCounts[pass.view.Slice()] = draws.statics + draws.rigid + draws.skinned;
         }
         else
         {
             ++stats.localShadowMaps;
-            ++(pass.projection <= kSpotShadowLayers ? stats.spotShadowMaps : stats.pointShadowFaces);
+            ++(pass.view.Kind() == game_shadow12::ViewKind::SpotLight ? stats.spotShadowMaps : stats.pointShadowFaces);
             stats.localShadowDraws += draws.statics + draws.rigid + draws.skinned;
         }
     };
     if (passCount != 0 && recording.UsesShadowLists())
     {
         // Состояния карт задаёт владелец. Списки карт только пишут глубину.
-        if (hasSun)
-            transitionShadow(m_sunShadow.Get(), sampleState, depthState);
-        if (hasLocal)
-            transitionShadow(m_localShadow.Get(), sampleState, depthState);
+        transitionShadows(activePasses, sampleState, depthState);
         struct RecordResult
         {
             ShadowDraws draws;
@@ -4360,7 +4615,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (FAILED(recording.OpenShadowList(index, lists[index])))
                 return Fail(reason, "failed to reset native shadow list");
 
-        const bool parallelRecording = recording.UsesParallelShadowLists() && passCount > 1 && usePrepared;
+        const bool parallelRecording = recording.UsesParallelShadowLists() && passCount > 1 && usePrepared && sunPlan.count <= 1;
         const bool sample = lighting.frame % 120 == 0;
         const auto recordRange = [&](uint32_t first, uint32_t last, uint32_t)
         {
@@ -4373,7 +4628,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     result.thread = GetCurrentThreadId();
                     result.start = Clock::now();
                 }
-                result.draws = recordShadowMap(lists[index], pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
+                result.draws = recordShadowMap(lists[index], pass.dsv, pass.size, pass.view.projection, pass.planes, pass.dynamic);
                 result.closed = recording.CloseShadowList(index);
                 if (sample)
                     result.end = Clock::now();
@@ -4403,7 +4658,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             std::array<DWORD, GameDx12NativeFrame12::kShadowListCount> participants{};
             for (uint32_t index = 0; index < passCount; ++index)
             {
-                mask |= 1u << passes[index].projection;
+                mask |= 1u << passes[index].view.projection;
                 participants[index] = results[index].thread;
                 for (uint32_t prior = 0; prior < index; ++prior)
                     if (results[index].thread != results[prior].thread &&
@@ -4415,7 +4670,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             const auto used = static_cast<uint32_t>(std::unique(participants.begin(), end) - participants.begin());
             const char* effective = parallelRecording ? "parallel" : "multi";
             const char* fallback = recording.UsesParallelShadowLists() && !parallelRecording ?
-                (passCount < 2 ? "single_view" : "packets_unavailable") : "none";
+                (passCount < 2 ? "single_view" : !usePrepared ? "packets_unavailable" : "csm_sequential") : "none";
             Msg("ph_dx12_mt_record: frame=%llu mode=%s fallback=%s lists=%u views=%u mask=0x%x participants=%u "
                 "overlapping_pairs=%u workers=%u submitted=%llu completed=%llu submit_ms=%.6f wait_ms=%.6f",
                 static_cast<unsigned long long>(lighting.frame), effective, fallback, passCount + 2, passCount, mask,
@@ -4426,26 +4681,41 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             return Fail(reason, "failed to start native color list");
         list = recording.list;
         stats.commandLists = passCount + 2;
-        if (hasSun)
-            transitionShadow(m_sunShadow.Get(), depthState, sampleState);
-        if (hasLocal)
-            transitionShadow(m_localShadow.Get(), depthState, sampleState);
+        transitionShadows(activePasses, depthState, sampleState);
     }
     else
     {
-        for (uint32_t index = 0; index < passCount; ++index)
+        for (const auto& pass : activePasses)
         {
-            const auto& pass = passes[index];
-            auto* map = pass.projection == 0 ? m_sunShadow.Get() : m_localShadow.Get();
-            if (index == 0 || passes[index - 1].projection == 0)
-                transitionShadow(map, sampleState, depthState);
-            const auto draws = recordShadowMap(list, pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
+            const auto batch = std::span(&pass, 1);
+            transitionShadows(batch, sampleState, depthState);
+            const auto draws = recordShadowMap(list, pass.dsv, pass.size, pass.view.projection, pass.planes, pass.dynamic);
             accumulateShadows(pass, draws);
-            if (pass.projection == 0 || index + 1 == passCount)
-            {
-                list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
-                transitionShadow(map, depthState, sampleState);
-            }
+            list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+            transitionShadows(batch, depthState, sampleState);
+        }
+    }
+    std::memcpy(frameDestination + offsetof(SceneFrameConstants, sunCasterCounts),
+        constants.sunCasterCounts, sizeof(constants.sunCasterCounts));
+    if (sunPlan.count != 0 && lighting.frame % 120 == 0)
+    {
+        const float distance = constants.sunCameraForward.w != 0.0f ? sunPlan.cascades[sunPlan.count - 1].splitFar : 0.0f;
+        Msg("ph_dx12_csm: frame=%llu profile=%s cascade_count=%u active_cascades=%u resolution=%u shadow_distance=%.3f "
+            "total_draws=%u cpu_prep_ms=%.4f cpu_record_ms=%.4f memory_bytes=%llu",
+            static_cast<unsigned long long>(lighting.frame), sunSettings.profile, m_sunShadowSlices, sunPlan.count,
+            m_sunShadowResolution, distance, stats.staticShadowDraws + stats.dynamicShadowDraws,
+            stats.cull_ms, Ms(shadowRecordStart), static_cast<unsigned long long>(m_sunShadowBytes));
+        for (uint32_t slice = 0; slice < sunPlan.count; ++slice)
+        {
+            const auto& cascade = sunPlan.cascades[slice];
+            const auto& draws = sunDraws[slice];
+            Msg("ph_dx12_csm: slice=%u split=%.3f/%.3f blend=%.3f texel_m=%.5f center=(%.3f,%.3f,%.3f) "
+                "extent=%.3f depth_span=%.3f static=%u rigid_and_detail_draws=%u skinned=%u detail_instances=%u "
+                "draws=%u filter=%u receiver_bias_mask=%u receiver_depth_bias=%.8f",
+                slice, cascade.splitNear, cascade.splitFar, cascade.blendStart, cascade.texelWorld,
+                cascade.lightCenter.x, cascade.lightCenter.y, cascade.lightCenter.z, cascade.radius, cascade.depthSpan,
+                draws.statics, draws.rigid, draws.skinned, draws.detail, constants.sunCasterCounts[slice],
+                constants.sunFilter, constants.sunReceiverBiasMask, constants.sunDepthBias[slice]);
         }
     }
     bindColorFrame(list);

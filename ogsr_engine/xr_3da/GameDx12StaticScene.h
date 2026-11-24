@@ -288,7 +288,7 @@ private:
         std::vector<uint8_t> statics;
         std::vector<uint8_t> objects;
         // Sun, две карты spot и шесть граней point light.
-        std::array<ShadowPreparation, 9> shadows;
+        std::array<ShadowPreparation, game_shadow12::MaxViews> shadows;
         bool operator==(const FramePreparation&) const = default;
         void Clear();
     };
@@ -395,6 +395,10 @@ private:
     ComPtr<ID3D12PipelineState> m_sunShadowAuxPipeline;
     ComPtr<ID3D12Resource> m_sunShadow;
     ComPtr<ID3D12DescriptorHeap> m_sunShadowDsv;
+    uint32_t m_sunShadowResolution = 0;
+    uint32_t m_sunShadowSlices = 0;
+    UINT m_sunShadowDsvStride = 0;
+    uint64_t m_sunShadowBytes = 0;
     ComPtr<ID3D12Resource> m_localShadow;
     ComPtr<ID3D12DescriptorHeap> m_localShadowDsv;
     UINT m_localShadowDsvStride = 0;
