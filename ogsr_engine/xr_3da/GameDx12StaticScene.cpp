@@ -64,6 +64,8 @@ struct SceneFrameConstants
     uint32_t diagnosticLight[4]; // Целевой GPU slot + 1, явный ID, frame slot, номер кадра.
     DirectX::XMFLOAT4 diagnosticOrigin;
     uint32_t legacyWaterSsr;
+    uint32_t sunFilter;
+    uint32_t sunReceiverBiasMask;
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -407,6 +409,23 @@ bool SceneReceiverPlaneSunRequested()
     return enabled;
 }
 
+uint32_t SceneSunFilter()
+{
+    static const uint32_t mode = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_SUN_FILTER");
+        if (!value)
+            return 0u;
+        constexpr const char* names[] = {"auto", "point", "bilinear", "legacy",
+            "receiverplane", "pcf3", "pcf5", "fr3"};
+        for (uint32_t i = 0; i < std::size(names); ++i)
+            if (std::strcmp(value, names[i]) == 0)
+                return i;
+        return 0u;
+    }();
+    return mode;
+}
+
 bool SceneStableLocalPriorityRequested()
 {
     static const bool enabled = []
@@ -520,6 +539,8 @@ cbuffer FrameCB : register(b0)
     uint4 DiagnosticLight;
     float4 DiagnosticOrigin;
     uint LegacyWaterSsr;
+    uint SunFilter;
+    uint SunReceiverBiasMask;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -846,6 +867,7 @@ Texture2D<float> OpaqueDepth : register(t5);
 SamplerState BaseSampler : register(s0);
 SamplerState WallmarkSampler : register(s1);
 SamplerComparisonState SunShadowSampler : register(s2);
+SamplerComparisonState SunPointSampler : register(s3);
 
 cbuffer MaterialCB : register(b1)
 {
@@ -871,12 +893,23 @@ float3 SafeDirection(float3 value)
     return lengthSquared > 1.0e-12f ? value * rsqrt(lengthSquared) : 0.0f;
 }
 
+float3 SunPlaneNormal(float3 dx, float3 dy)
+{
+    // Сначала убираем масштаб производных, затем измеряем угол между ними.
+    const float sx = max(max(abs(dx.x), abs(dx.y)), abs(dx.z));
+    const float sy = max(max(abs(dy.x), abs(dy.y)), abs(dy.z));
+    if (!all(isfinite(float2(sx, sy))) || min(sx, sy) <= 0.0f)
+        return 0.0f;
+    return SafeDirection(cross(dx / sx, dy / sy));
+}
+
 bool ProjectSunReceiver(float3 position, float3 normal, float cosine, out float3 coords)
 {
     coords = 0.0f;
     if (LightingFlags.w == 0)
         return false;
-    const float3 receiver = position + normal * (0.025f * (1.0f - cosine));
+    const float3 receiver = position + normal *
+        ((SunReceiverBiasMask & 1u) != 0 ? 0.025f * (1.0f - cosine) : 0.0f);
     const float4 clipPosition = mul(float4(receiver, 1.0f), ShadowViewProjection);
     if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
         return false;
@@ -933,11 +966,15 @@ float SunVisibility(float3 position, float3 normal, float cosine, float3 planeNo
         return 1.0f;
     const float2 uv = coords.xy;
     const float nearestEdge = min(min(uv.x, uv.y), min(1.0f - uv.x, 1.0f - uv.y));
-    const float compareDepth = coords.z - 0.000015f;
+    const float compareDepth = coords.z - ((SunReceiverBiasMask & 2u) != 0 ? 0.000015f : 0.0f);
     float2 gradient;
-    if (SunColor.w > 0.0f && SunReceiverGradient(planeNormal, gradient))
+    if ((SunFilter == 4 || SunFilter == 7) && SunReceiverGradient(planeNormal, gradient))
         return lerp(1.0f, SunPlaneVisibility(uv, compareDepth, gradient), saturate(nearestEdge * 16.0f));
+    if (SunFilter == 1)
+        return lerp(1.0f, SunShadow.SampleCmpLevelZero(SunPointSampler, uv, compareDepth), saturate(nearestEdge * 16.0f));
     float visibility = SunShadow.SampleCmpLevelZero(SunShadowSampler, uv, compareDepth);
+    if (SunFilter == 2)
+        return lerp(1.0f, visibility, saturate(nearestEdge * 16.0f));
     // Дополнительные две билинейные выборки только на границе тени.
     [branch]
     if (visibility > 0.0f && visibility < 1.0f)
@@ -1296,6 +1333,8 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
 )"
 R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
+    // Считаем производные плоскости до clip и ветвления на режимы материалов.
+    const float3 correctedPlaneNormal = SunPlaneNormal(ddx_fine(input.world), ddy_fine(input.world));
     const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
     const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
     float4 baseColor = float4(0.72f, 0.72f, 0.76f, 1.0f);
@@ -1370,7 +1409,8 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     }
     const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
     // Geometric receiver plane, computed before the light-dependent branch.
-    const float3 planeNormal = SafeDirection(cross(ddx(input.world), ddy(input.world)));
+    const float3 planeNormal = SunFilter == 7 ? SafeDirection(cross(ddx(input.world), ddy(input.world))) :
+        correctedPlaneNormal;
     if (ViewMode == 19 || ViewMode == 20)
     {
         float3 coords;
@@ -1379,7 +1419,8 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         if (ViewMode == 19)
             return float4(SunVisibility(input.world, n, sunCosine, planeNormal).xxx, 1);
         const int2 texel = clamp(int2(coords.xy * 2048.0f), int2(0, 0), int2(2047, 2047));
-        const float delta = coords.z - 0.000015f - SunShadow.Load(int3(texel, 0));
+        const float delta = coords.z - ((SunReceiverBiasMask & 2u) != 0 ? 0.000015f : 0.0f) -
+            SunShadow.Load(int3(texel, 0));
         return float4(saturate(delta * 1024.0f), saturate(-delta * 1024.0f), 0, 1);
     }
     if (ViewMode == 21)
@@ -1950,7 +1991,10 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     shadowSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
     shadowSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     shadowSampler.ShaderRegister = 2;
-    const D3D12_STATIC_SAMPLER_DESC samplers[] = {sampler, wallmarkSampler, shadowSampler};
+    auto pointShadowSampler = shadowSampler;
+    pointShadowSampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    pointShadowSampler.ShaderRegister = 3;
+    const D3D12_STATIC_SAMPLER_DESC samplers[] = {sampler, wallmarkSampler, shadowSampler, pointShadowSampler};
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters = static_cast<UINT>(std::size(params));
@@ -3418,6 +3462,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const uint32_t viewMode = SceneViewMode();
     static const bool legacyWaterSsr = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_WATER_SSR");
     constants.legacyWaterSsr = legacyWaterSsr ? 1u : 0u;
+    const uint32_t sunFilter = SceneSunFilter();
+    constants.sunFilter = sunFilter != 0 ? sunFilter : (SceneReceiverPlaneSunRequested() ? 7u : 3u);
+    constants.sunReceiverBiasMask = 3;
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
