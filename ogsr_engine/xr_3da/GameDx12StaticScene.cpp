@@ -102,6 +102,12 @@ constexpr uint32_t kTerrainTextureCount = 5;
 constexpr uint32_t kMaxTerrainSets = 128;
 constexpr uint32_t kSceneDescriptorCount = kTerrainDescriptor +
     kTerrainTextureCount * (1 + kMaxTerrainSets);
+static_assert(kSunShadowDescriptor == kMaxTextures + 1);
+static_assert(kNullWaterDescriptor == kSunShadowDescriptor + 1);
+static_assert(kLocalShadowDescriptor == kNullWaterDescriptor +
+    kWaterSrvCount * (1 + GameDx12NativeFrame12::kFrameCount));
+static_assert(kTerrainDescriptor == kLocalShadowDescriptor + 1);
+static_assert(kSceneDescriptorCount > kTerrainDescriptor);
 constexpr uint32_t kLightmapHemi = 1024u;
 constexpr uint32_t kTerrainDetail = 2048u;
 constexpr uint32_t kTerrainBaseHemi = 4096u;
@@ -113,13 +119,63 @@ constexpr float kSunShadowRadius = 48.0f;
 constexpr float kSunShadowForward = 20.0f;
 constexpr uint64_t kMaxAuxGeometryBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kMaxAuxTextureBytes = 256ull * 1024 * 1024;
+constexpr uint32_t kDetailShadowInstances = 512;
 constexpr uint64_t kTransformSlotBytes =
-    gameaux12::kMaxFrameTransforms * sizeof(DirectX::XMFLOAT4X4);
+    (gameaux12::kMaxFrameTransforms + kDetailShadowInstances) * sizeof(DirectX::XMFLOAT4X4);
 static_assert(sizeof(DirectX::XMFLOAT4X4) == 4 * 4 * sizeof(float));
 constexpr uint64_t kMaxTextureBytes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxSceneTextureBytes = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr const char* kFallbackTextureName = "";
 constexpr uint8_t kMaxVisualTraceMessages = 12;
+
+// Use the very same vertex range and affine transform as the draw. OGF header
+// bounds may already be world-space; never transform them a second time.
+bool BuildTreeWorldBounds(const xraylevel12::PoolVisual& visual,
+    const xraylevel12::LevelPools& pools, std::span<const uint8_t> bytes,
+    float (&center)[3], float& radius)
+{
+    if (visual.vb_id >= pools.vertex_pools.size() || visual.vcount == 0)
+        return false;
+    const auto& pool = pools.vertex_pools[visual.vb_id];
+    if (!pool.supported || pool.stride < 3 * sizeof(float) ||
+        visual.vbase > pool.count || visual.vcount > pool.count - visual.vbase ||
+        pool.data_offset > bytes.size())
+        return false;
+    const uint64_t start = uint64_t{visual.vbase} * pool.stride;
+    const uint64_t size = uint64_t{visual.vcount} * pool.stride;
+    const uint64_t available = bytes.size() - pool.data_offset;
+    if (start > available || size > available - start)
+        return false;
+    double minimum[3] = {(std::numeric_limits<double>::max)(), (std::numeric_limits<double>::max)(), (std::numeric_limits<double>::max)()};
+    double maximum[3] = {-(std::numeric_limits<double>::max)(), -(std::numeric_limits<double>::max)(), -(std::numeric_limits<double>::max)()};
+    for (uint32_t i = 0; i < visual.vcount; ++i)
+    {
+        float p[3];
+        std::memcpy(p, bytes.data() + pool.data_offset + start + uint64_t{i} * pool.stride, sizeof(p));
+        for (uint32_t axis = 0; axis < 3; ++axis)
+        {
+            const double v = double{p[0]} * visual.world[axis] +
+                double{p[1]} * visual.world[4 + axis] +
+                double{p[2]} * visual.world[8 + axis] + visual.world[12 + axis];
+            if (!std::isfinite(v) || std::abs(v) > (std::numeric_limits<float>::max)() / 4.0)
+                return false;
+            minimum[axis] = (std::min)(minimum[axis], v);
+            maximum[axis] = (std::max)(maximum[axis], v);
+        }
+    }
+    double extent[3];
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        center[axis] = static_cast<float>((minimum[axis] + maximum[axis]) * 0.5);
+        extent[axis] = (std::max)(maximum[axis] - center[axis], center[axis] - minimum[axis]);
+    }
+    const double r = std::hypot(extent[0], extent[1], extent[2]);
+    // Small allowance for float GPU transform and BVH arithmetic.
+    const double scale = (std::max)({1.0, r, std::abs(double{center[0]}),
+        std::abs(double{center[1]}), std::abs(double{center[2]})});
+    radius = static_cast<float>(r + 1.0e-5 * scale);
+    return std::isfinite(radius);
+}
 
 bool HasPackedLightmapUv(const xraylevel12::PoolVisual& visual, const xraylevel12::LevelPools& pools)
 {
@@ -308,6 +364,16 @@ bool SceneDynamicSunShadowsRequested()
     {
         const char* value = std::getenv("OGSR_DX12_GAME_DYNAMIC_SUN_SHADOWS");
         return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool SceneDetailSunShadowsRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_DETAIL_SUN_SHADOWS");
+        return value && std::strcmp(value, "1") == 0;
     }();
     return enabled;
 }
@@ -1309,6 +1375,15 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         const float delta = coords.z - 0.000015f - SunShadow.Load(int3(texel, 0));
         return float4(saturate(delta * 1024.0f), saturate(-delta * 1024.0f), 0, 1);
     }
+    if (ViewMode == 21)
+        return float4(ToDisplay(Ambient.rgb), 1);
+    if (ViewMode == 22)
+        return float4(ToDisplay(SunColor.rgb * sunCosine *
+            SunVisibility(input.world, n, sunCosine, planeNormal)), 1);
+    if (ViewMode == 23)
+        return float4(ToDisplay(LocalLighting(n, input.world, false, true)), 1);
+    if (ViewMode == 24)
+        return float4(planeNormal * (dot(planeNormal, n) < 0.0f ? -0.5f : 0.5f) + 0.5f, 1);
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
@@ -1336,6 +1411,10 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     }
     if (ViewMode == 9)
         return float4(ToDisplay(light), 1.0f);
+    // Diagnostic HDR over-range: red marks a channel that would be clipped
+    // by the existing LDR final composition. No production exposure change.
+    if (ViewMode == 25)
+        return float4(saturate(max(baseColor.rgb * light - 1.0f, 0.0f)), 1);
     const float3 linearColor = saturate(baseColor.rgb * light);
     float alpha = (TextureMode & 8) != 0 ? baseColor.a : 1.0f;
     // Прозрачная вода до переноса R4 scene/depth/refraction: DDS alpha
@@ -1566,7 +1645,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 20ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 25ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -2096,7 +2175,7 @@ bool GameDx12StaticScene12::CreateSunShadowPipeline(ID3D12Device* device, std::s
             return false;
         }
     }
-    if (SceneDynamicSunShadowsRequested() || SceneLocalShadowsRequested())
+    if (SceneDynamicSunShadowsRequested() || SceneLocalShadowsRequested() || SceneDetailSunShadowsRequested())
     {
         ComPtr<ID3D10Blob> auxVertex;
         std::string auxReason;
@@ -2860,41 +2939,27 @@ bool GameDx12StaticScene12::Load(
             draw.transparency = material.transparency;
             draw.layout =
                 visual.layout == xraylevel12::VertexLayout12::UvAt24 ? 2 : 1;
+            for (int axis = 0; axis < 3; ++axis)
+                draw.center[axis] = visual.sphere_center[axis];
+            draw.radius = visual.sphere_radius;
             if (visual.has_world)
             {
-                // Flora: геометрия в локальных координатах, мир задаёт
-                // OGF_TREEDEF2. Центр сферы и радиус переводятся в мир здесь,
-                // чтобы culling работал по реальному положению дерева.
                 draw.layout = 3;
                 for (uint32_t element = 0; element < 16; ++element)
                     draw.world[element] = visual.world[element];
-                const float local[3] = {visual.sphere_center[0],
-                                        visual.sphere_center[1],
-                                        visual.sphere_center[2]};
-                draw.center[0] = local[0] * draw.world[0] +
-                                 local[1] * draw.world[4] +
-                                 local[2] * draw.world[8] + draw.world[12];
-                draw.center[1] = local[0] * draw.world[1] +
-                                 local[1] * draw.world[5] +
-                                 local[2] * draw.world[9] + draw.world[13];
-                draw.center[2] = local[0] * draw.world[2] +
-                                 local[1] * draw.world[6] +
-                                 local[2] * draw.world[10] + draw.world[14];
-                const float sx = std::sqrt(draw.world[0] * draw.world[0] +
-                                           draw.world[1] * draw.world[1] +
-                                           draw.world[2] * draw.world[2]);
-                const float sy = std::sqrt(draw.world[4] * draw.world[4] +
-                                           draw.world[5] * draw.world[5] +
-                                           draw.world[6] * draw.world[6]);
-                const float sz = std::sqrt(draw.world[8] * draw.world[8] +
-                                           draw.world[9] * draw.world[9] +
-                                           draw.world[10] * draw.world[10]);
-                const float scale = (std::max)(sx, (std::max)(sy, sz));
-                draw.radius = visual.sphere_radius * (scale > 0.0f ? scale : 1.0f);
+                float center[3]{};
+                float radius = 0.0f;
+                if (!BuildTreeWorldBounds(visual, pools, geomBytes, center, radius))
+                {
+                    Msg("ph_dx12_fr3: tree_bounds invalid visual=%u; retaining header bounds", visual.id);
+                }
+                else
+                {
+                    for (uint32_t axis = 0; axis < 3; ++axis)
+                        draw.center[axis] = center[axis];
+                    draw.radius = radius;
+                }
             }
-            for (int c = 0; c < 3; ++c)
-                draw.center[c] = visual.sphere_center[c];
-            draw.radius = visual.sphere_radius;
             m_draws.push_back(draw);
         }
         for (size_t slot = 0; slot < selected.size(); ++slot)
@@ -3808,6 +3873,49 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 }
             }
         }
+        // Optional bounded near-camera detail casters for the sun only.
+        // Their matrices live beyond the normal visible transform capacity.
+        // No camera-frustum rejection: an offscreen detail may cast into view.
+        if (projection == 0 && validExtras && SceneDetailSunShadowsRequested() &&
+            m_sunShadowAuxPipeline != nullptr)
+        {
+            list->SetPipelineState(m_sunShadowAuxPipeline.Get());
+            uint32_t next = gameaux12::kMaxFrameTransforms;
+            for (const auto& group : extras.details)
+            {
+                if (next == gameaux12::kMaxFrameTransforms + kDetailShadowInstances)
+                    break;
+                if (group.mesh >= m_auxMeshes.size())
+                    continue;
+                const auto& mesh = m_auxMeshes[group.mesh];
+                if (mesh.skinned || mesh.requiredBones != 1)
+                    continue;
+                const uint32_t first = next;
+                for (const auto& transform : group.transforms)
+                {
+                    if (next == gameaux12::kMaxFrameTransforms + kDetailShadowInstances)
+                        break;
+                    if (!FiniteMatrix(transform))
+                        continue;
+                    const float center[] = {transform._41, transform._42, transform._43};
+                    const float scale = std::hypot(transform._11, transform._12, transform._13);
+                    const float distance = std::hypot(center[0] - cameraPosition[0],
+                        center[1] - cameraPosition[1], center[2] - cameraPosition[2]);
+                    if (distance > 12.0f || !SphereInside(shadowPlanes, center, mesh.radius * scale))
+                        continue;
+                    std::memcpy(transformDestination + uint64_t{next} * sizeof(transform), &transform, sizeof(transform));
+                    ++next;
+                }
+                if (next != first)
+                {
+                    submitAuxGeometry(mesh, group.mesh, SurfaceMode::Cutout, first, next - first, true, true);
+                    ++draws.rigid; // Included in existing dynamic draw-call counter.
+                }
+            }
+            if (lighting.diagnosticBurst)
+                Msg("ph_dx12_fr3: detail_sun_shadow instances=%u cap=%u",
+                    next - gameaux12::kMaxFrameTransforms, kDetailShadowInstances);
+        }
         return draws;
     };
     const auto transitionShadow = [&](ID3D12Resource* map, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -4036,6 +4144,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             return;
         const auto copyStart = Clock::now();
         const uint32_t slotDescriptor = kNullWaterDescriptor + kWaterSrvCount * (1 + frameSlot);
+        // RecordNativeFrame validates frameSlot before recording. The reserved
+        // range is checked at compile time; no frame may write local-shadow t6.
+        static_assert(kWaterSrvCount == 3);
         const auto heapStart = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
         auto destination = heapStart;
         destination.ptr += static_cast<SIZE_T>(slotDescriptor) * m_textureDescriptorSize;

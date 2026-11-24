@@ -370,7 +370,7 @@ void CROS_impl::SampleDx12SkyHemi(const Fvector& position, const CObject& object
         const auto& sample = hdir[sampleOrder[dx12SkySamples]];
         Fvector direction;
         direction.set(sample[0], sample[1], sample[2]).normalize();
-        dx12SkyOpen += !g_pGameLevel->ObjectSpace.RayTest(position, direction, 50.f,
+        dx12SkyOpen += !g_pGameLevel->ObjectSpace.RayTest(dx12SkyPosition, direction, 50.f,
             collide::rqtStatic, nullptr, &object) ? 1u : 0u;
     }
     if (dx12SkySamples == lt_hemisamples)
