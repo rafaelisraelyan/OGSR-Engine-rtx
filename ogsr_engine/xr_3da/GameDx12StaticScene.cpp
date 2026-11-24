@@ -3175,6 +3175,18 @@ uint64_t GameDx12StaticScene12::TextureFootprintBytes(std::span<const uint32_t> 
     return bytes;
 }
 
+void GameDx12StaticScene12::FramePreparation::Clear()
+{
+    statics.clear();
+    objects.clear();
+    for (auto& shadow : shadows)
+    {
+        for (auto& layout : shadow.statics)
+            layout.clear();
+        shadow.objects.clear();
+    }
+}
+
 bool GameDx12StaticScene12::RecordNativeFrame(
     const GameDx12NativeFrame12::Recording& recording,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
@@ -3357,28 +3369,71 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     FrustumPlane planes[6] = {};
     const bool cull = !SceneCullDisabled() && BuildFrustum(logicalViewProjection, planes);
     stats.total = static_cast<uint32_t>(m_draws.size());
-    const bool validExtras = extras.session == LevelSession() && extras.epoch == LevelEpoch();
+    const bool validExtras = extras.session == LevelSession() && extras.epoch == LevelEpoch() &&
+        extras.registryGeneration == Generation();
+    if (validExtras && extras.poses.size() > gameaux12::kMaxFrameTransforms)
+        return Fail(reason, "skeletal poses exceed frame transform capacity");
 
-    // MT0–2 skeleton. Owner freezes the level registry and captured extras
-    // until this synchronous CPU phase completes. No CObject, FS, D3D calls,
-    // descriptor writes, live lighting query or shared append on workers.
-    // Keep the legacy traversal as both default serial path and fallback.
-    struct ShadowPreparation
+    // Общий снимок держит только неизменяемые представления опубликованных
+    // данных. Регистрация ресурсов и захват объектов закончены до его создания.
+    // Владелец не меняет регистр и снимок до выхода из всех GR-задач.
+    const struct PreparationSnapshot
     {
-        std::array<std::vector<uint32_t>, 2> statics;
-        std::vector<uint8_t> objects;
-        bool operator==(const ShadowPreparation&) const = default;
-    };
-    struct FramePreparation
+        uint64_t session, epoch, generation;
+        std::span<const DrawSource12> draws;
+        std::span<const ShadowCasterTree, 2> casters;
+        std::span<const gameaux12::ObjectDraw> objects;
+        std::span<const uint32_t> parts;
+        std::span<const AuxMesh> meshes;
+        uint32_t poseCount;
+    } snapshot{LevelSession(), LevelEpoch(), Generation(), m_draws, m_shadowCasters,
+        validExtras ? std::span(extras.objects) : std::span<const gameaux12::ObjectDraw>{},
+        validExtras ? std::span(extras.objectMeshes) : std::span<const uint32_t>{},
+        m_auxMeshes, validExtras ? static_cast<uint32_t>(extras.poses.size()) : 0};
+    const auto poseCount = snapshot.poseCount;
+    const auto objectParts = [&snapshot](const gameaux12::ObjectDraw& object) -> std::span<const uint32_t>
     {
-        std::vector<uint8_t> statics;
-        std::vector<uint8_t> objects;
-        std::array<ShadowPreparation, kLocalShadowLayers + 1> shadows;
-        bool operator==(const FramePreparation&) const = default;
+        if (object.generation == 0 || object.boneCount == 0 || object.boneCount > gameaux12::kMaxBones ||
+            object.poseOffset > snapshot.poseCount || object.boneCount > snapshot.poseCount - object.poseOffset ||
+            object.firstMesh > snapshot.parts.size() || object.meshCount > snapshot.parts.size() - object.firstMesh)
+            return {};
+        return snapshot.parts.subspan(object.firstMesh, object.meshCount);
     };
-    static_assert(std::tuple_size_v<decltype(m_shadowCasters)> == 2);
-    static_assert(std::tuple_size_v<decltype(m_sunShadowPipelines)> == 2);
-    FramePreparation prepared;
+    const auto objectMesh = [&snapshot](uint32_t handle, const gameaux12::ObjectDraw& object) -> const AuxMesh*
+    {
+        if (handle >= snapshot.meshes.size())
+            return nullptr;
+        const auto& mesh = snapshot.meshes[handle];
+        return mesh.skinned == object.skinned && mesh.requiredBones <= object.boneCount ? &mesh : nullptr;
+    };
+    static_assert(std::tuple_size_v<decltype(FramePreparation::shadows)> == kLocalShadowLayers + 1);
+    static_assert(std::tuple_size_v<decltype(ShadowPreparation::statics)> == std::tuple_size_v<decltype(m_sunShadowPipelines)>);
+    const bool dynamicSun = SceneDynamicSunShadowsRequested();
+    // Эталон Verify использует тот же обход, что и исходная serial запись.
+    const auto visitLegacyCasters = [&](const ShadowCasterTree& tree, const FrustumPlane* frustum, const auto& emit)
+    {
+        const auto visit = [&](const auto& self, uint32_t index) -> void
+        {
+            const auto& node = tree.nodes[index];
+            if (!BoxInside(frustum, node.minimum, node.maximum))
+                return;
+            if (node.count == 0)
+            {
+                self(self, node.left);
+                self(self, node.right);
+                return;
+            }
+            for (uint32_t offset = 0; offset < node.count; ++offset)
+            {
+                const uint32_t drawIndex = tree.draws[node.first + offset];
+                const auto& draw = m_draws[drawIndex];
+                if (SphereInside(frustum, draw.center, draw.radius))
+                    emit(drawIndex);
+            }
+        };
+        visit(visit, 0);
+    };
+    auto& prepared = m_preparedFrame;
     bool usePrepared = false;
     static const renderprep12::Mode grMode = []
     {
@@ -3402,122 +3457,164 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }();
         // Explicit cap on temporary masks and ordered caster indices.
         constexpr size_t maxSources = 1u << 20;
-        const size_t objectCount = validExtras ? extras.objects.size() : 0;
+        const size_t objectCount = snapshot.objects.size();
         std::string prepReason;
         GameDx12GRRangeStats12 grStats;
         uint32_t workCount = 0;
         uint32_t participantsUsed = 0;
         try
         {
-            if (m_draws.size() > maxSources || objectCount > maxSources)
+            if (snapshot.draws.size() > maxSources || objectCount > maxSources || snapshot.parts.size() > maxSources)
                 throw std::runtime_error("GR native preparation exceeds source cap");
-            const uint32_t staticBlocks = (static_cast<uint32_t>(m_draws.size()) + grain - 1) / grain;
+            const uint32_t staticBlocks = (static_cast<uint32_t>(snapshot.draws.size()) + grain - 1) / grain;
             const uint32_t objectBlocks = (static_cast<uint32_t>(objectCount) + grain - 1) / grain;
-            std::vector<uint32_t> shadowViews;
+            std::array<uint32_t, kLocalShadowLayers + 1> shadowViews{};
+            uint32_t shadowViewCount = 0;
             if (constants.lightingFlags[3] != 0)
-                shadowViews.push_back(0);
+                shadowViews[shadowViewCount++] = 0;
             for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer)
                 if (localShadowViews.active[layer])
-                    shadowViews.push_back(layer + 1);
-            workCount = staticBlocks + objectBlocks + static_cast<uint32_t>(shadowViews.size());
+                    shadowViews[shadowViewCount++] = layer + 1;
+            workCount = staticBlocks + objectBlocks + shadowViewCount;
 
-            const bool dynamicSun = SceneDynamicSunShadowsRequested();
-            const auto build = [&](FramePreparation& out, bool parallel)
-            {
-                out.statics.resize(m_draws.size());
-                out.objects.resize(objectCount);
-                // Same partition-independent results as F3.5 renderprep:
-                // write masks by source index, and one private list per view.
-                std::vector<uint32_t> workers(workCount, UINT32_MAX);
-                const auto process = [&](uint32_t begin, uint32_t end, uint32_t threadIndex)
-                {
-                    for (uint32_t task = begin; task < end; ++task)
-                    {
-                        if (task < staticBlocks)
-                        {
-                            const uint32_t first = task * grain;
-                            const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(m_draws.size()));
-                            for (uint32_t i = first; i < last; ++i)
-                                out.statics[i] = !cull || SphereInside(planes, m_draws[i].center, m_draws[i].radius);
-                        }
-                        else if (task < staticBlocks + objectBlocks)
-                        {
-                            const uint32_t first = (task - staticBlocks) * grain;
-                            const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(objectCount));
-                            for (uint32_t i = first; i < last; ++i)
-                                out.objects[i] = !cull || SphereInside(planes, extras.objects[i].center, extras.objects[i].radius);
-                        }
-                        else
-                        {
-                            const uint32_t projection = shadowViews[task - staticBlocks - objectBlocks];
-                            const auto* frustum = projection == 0 ? sunPlanes :
-                                localShadowViews.frusta[projection - 1].data();
-                            auto& view = out.shadows[projection];
-                            for (uint32_t layout = 0; layout < m_shadowCasters.size(); ++layout)
-                            {
-                                const auto& tree = m_shadowCasters[layout];
-                                if (tree.nodes.empty())
-                                    continue;
-                                auto& indices = view.statics[layout];
-                                const auto visit = [&](const auto& self, uint32_t index) -> void
-                                {
-                                    const auto& node = tree.nodes[index];
-                                    if (!BoxInside(frustum, node.minimum, node.maximum))
-                                        return;
-                                    if (node.count == 0)
-                                    {
-                                        self(self, node.left);
-                                        self(self, node.right);
-                                        return;
-                                    }
-                                    for (uint32_t offset = 0; offset < node.count; ++offset)
-                                    {
-                                        const uint32_t drawIndex = tree.draws[node.first + offset];
-                                        const auto& draw = m_draws[drawIndex];
-                                        if (SphereInside(frustum, draw.center, draw.radius))
-                                            indices.push_back(drawIndex);
-                                    }
-                                };
-                                visit(visit, 0);
-                            }
-                            const bool dynamic = projection != 0 || dynamicSun;
-                            if (dynamic && validExtras)
-                            {
-                                view.objects.resize(objectCount);
-                                for (uint32_t i = 0; i < objectCount; ++i)
-                                    view.objects[i] = SphereInside(frustum, extras.objects[i].center, extras.objects[i].radius);
-                            }
-                        }
-                        workers[task] = threadIndex;
-                    }
-                };
-                if (parallel)
-                {
-                    if (!GameDx12GR_RunRanges(workCount, 1, process, grStats, prepReason))
-                        return false;
-                }
-                else
-                    process(0, workCount, 0);
-                if (std::find(workers.begin(), workers.end(), UINT32_MAX) != workers.end())
-                    return false;
-                if (parallel)
-                {
-                    std::sort(workers.begin(), workers.end());
-                    participantsUsed = static_cast<uint32_t>(std::unique(workers.begin(), workers.end()) - workers.begin());
-                }
-                return true;
-            };
             const auto parallelStart = Clock::now();
-            usePrepared = build(prepared, true);
+            prepared.Clear();
+            prepared.statics.resize(snapshot.draws.size());
+            prepared.objects.resize(objectCount);
+            auto& workers = m_preparationParticipants;
+            workers.assign(workCount, UINT32_MAX);
+            const auto process = [&](uint32_t begin, uint32_t end, uint32_t threadIndex)
+            {
+                for (uint32_t task = begin; task < end; ++task)
+                {
+                    if (task < staticBlocks)
+                    {
+                        const uint32_t first = task * grain;
+                        const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(snapshot.draws.size()));
+                        for (uint32_t i = first; i < last; ++i)
+                        {
+                            const auto& draw = snapshot.draws[i];
+                            prepared.statics[i] = !cull || SphereInside(planes, draw.center, draw.radius);
+                        }
+                    }
+                    else if (task < staticBlocks + objectBlocks)
+                    {
+                        const uint32_t first = (task - staticBlocks) * grain;
+                        const uint32_t last = (std::min)(first + grain, static_cast<uint32_t>(objectCount));
+                        for (uint32_t i = first; i < last; ++i)
+                        {
+                            const auto& object = snapshot.objects[i];
+                            prepared.objects[i] = !cull || SphereInside(planes, object.center, object.radius);
+                        }
+                    }
+                    else
+                    {
+                        const uint32_t projection = shadowViews[task - staticBlocks - objectBlocks];
+                        const auto* frustum = projection == 0 ? sunPlanes :
+                            localShadowViews.frusta[projection - 1].data();
+                        auto& view = prepared.shadows[projection];
+                        for (uint32_t layout = 0; layout < snapshot.casters.size(); ++layout)
+                        {
+                            const auto& tree = snapshot.casters[layout];
+                            if (tree.nodes.empty())
+                                continue;
+                            auto& indices = view.statics[layout];
+                            const auto visit = [&](const auto& self, uint32_t index, uint32_t depth) -> void
+                            {
+                                if (index >= tree.nodes.size() || depth > 32)
+                                    throw std::runtime_error("invalid shadow BVH child");
+                                const auto& node = tree.nodes[index];
+                                if (!BoxInside(frustum, node.minimum, node.maximum))
+                                    return;
+                                if (node.count == 0)
+                                {
+                                    self(self, node.left, depth + 1);
+                                    self(self, node.right, depth + 1);
+                                    return;
+                                }
+                                if (node.first > tree.draws.size() || node.count > tree.draws.size() - node.first)
+                                    throw std::runtime_error("invalid shadow BVH leaf");
+                                for (uint32_t offset = 0; offset < node.count; ++offset)
+                                {
+                                    const uint32_t drawIndex = tree.draws[node.first + offset];
+                                    if (drawIndex >= snapshot.draws.size())
+                                        throw std::runtime_error("invalid static shadow handle");
+                                    const auto& draw = snapshot.draws[drawIndex];
+                                    if (SphereInside(frustum, draw.center, draw.radius))
+                                        indices.push_back(drawIndex);
+                                }
+                            };
+                            visit(visit, 0, 0);
+                        }
+                        if (projection != 0 || dynamicSun)
+                        {
+                            for (uint32_t i = 0; i < objectCount; ++i)
+                            {
+                                const auto& object = snapshot.objects[i];
+                                if (!SphereInside(frustum, object.center, object.radius))
+                                    continue;
+                                for (const uint32_t handle : objectParts(object))
+                                {
+                                    const auto* mesh = objectMesh(handle, object);
+                                    if (mesh && CastsSunShadow(mesh->surface))
+                                    {
+                                        if (view.objects.size() == maxSources)
+                                            throw std::runtime_error("GR native shadow packet cap exceeded");
+                                        view.objects.push_back({i, handle});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    workers[task] = threadIndex;
+                }
+            };
+            usePrepared = GameDx12GR_RunRanges(workCount, 1, process, grStats, prepReason) &&
+                std::find(workers.begin(), workers.end(), UINT32_MAX) == workers.end() &&
+                snapshot.session == LevelSession() && snapshot.epoch == LevelEpoch() && snapshot.generation == Generation();
             stats.grParallelMs = Ms(parallelStart);
             if (!usePrepared)
                 throw std::runtime_error(prepReason.empty() ? "incomplete GR frame preparation" : prepReason);
+            std::sort(workers.begin(), workers.end());
+            participantsUsed = static_cast<uint32_t>(std::unique(workers.begin(), workers.end()) - workers.begin());
             if (grMode == renderprep12::Mode::Verify)
             {
                 const auto serialStart = Clock::now();
-                FramePreparation reference;
-                if (!build(reference, false) || !(reference == prepared))
-                    return Fail(reason, "GR native preparation serial/parallel mismatch");
+                auto& reference = m_referenceFrame;
+                reference.Clear();
+                for (const auto& draw : m_draws)
+                    reference.statics.push_back(!cull || SphereInside(planes, draw.center, draw.radius));
+                if (validExtras)
+                    for (const auto& object : extras.objects)
+                        reference.objects.push_back(!cull || SphereInside(planes, object.center, object.radius));
+                for (uint32_t i = 0; i < shadowViewCount; ++i)
+                {
+                    const uint32_t projection = shadowViews[i];
+                    const auto* frustum = projection == 0 ? sunPlanes : localShadowViews.frusta[projection - 1].data();
+                    auto& view = reference.shadows[projection];
+                    for (uint32_t layout = 0; layout < m_shadowCasters.size(); ++layout)
+                    {
+                        const auto& tree = m_shadowCasters[layout];
+                        if (!tree.nodes.empty())
+                            visitLegacyCasters(tree, frustum, [&](uint32_t index) { view.statics[layout].push_back(index); });
+                    }
+                    if ((projection != 0 || dynamicSun) && validExtras)
+                    {
+                        for (const auto& object : extras.objects)
+                        {
+                            if (!SphereInside(frustum, object.center, object.radius))
+                                continue;
+                            for (const uint32_t handle : objectParts(object))
+                            {
+                                const auto* mesh = objectMesh(handle, object);
+                                if (mesh && CastsSunShadow(mesh->surface))
+                                    view.objects.push_back({static_cast<uint32_t>(&object - extras.objects.data()), handle});
+                            }
+                        }
+                    }
+                }
+                if (!(reference == prepared))
+                    return Fail(reason, "GR native preparation differs from legacy traversal");
                 stats.grSerialMs = Ms(serialStart);
             }
             stats.grMode = grMode == renderprep12::Mode::Verify ? "static-verify" : "static-parallel";
@@ -3556,37 +3653,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                static_cast<uint64_t>(frameSlot) * kFrameConstantsSize);
 
     uint8_t* transformDestination = nullptr;
-    uint32_t poseCount = 0;
     if (validExtras)
     {
-        if (extras.poses.size() > gameaux12::kMaxFrameTransforms)
-            return Fail(reason, "skeletal poses exceed frame transform capacity");
         // Один и тот же защищённый fence слот используется в depth и color проходах.
         const uint64_t slotOffset = frameSlot * kTransformSlotBytes;
         transformDestination = static_cast<uint8_t*>(m_frameTransformsMapped) + slotOffset;
-        poseCount = static_cast<uint32_t>(extras.poses.size());
         if (poseCount != 0)
-            std::memcpy(transformDestination, extras.poses.data(),
-                        poseCount * sizeof(DirectX::XMFLOAT4X4));
-        list->SetGraphicsRootShaderResourceView(4,
-            m_frameTransforms->GetGPUVirtualAddress() + slotOffset);
+            std::memcpy(transformDestination, extras.poses.data(), poseCount * sizeof(DirectX::XMFLOAT4X4));
+        list->SetGraphicsRootShaderResourceView(4, m_frameTransforms->GetGPUVirtualAddress() + slotOffset);
     }
-    const auto objectParts = [&](const gameaux12::ObjectDraw& object) -> std::span<const uint32_t>
-    {
-        if (object.generation == 0 || object.boneCount == 0 || object.boneCount > gameaux12::kMaxBones ||
-            object.poseOffset > poseCount || object.boneCount > poseCount - object.poseOffset ||
-            object.firstMesh > extras.objectMeshes.size() ||
-            object.meshCount > extras.objectMeshes.size() - object.firstMesh)
-            return {};
-        return std::span(extras.objectMeshes).subspan(object.firstMesh, object.meshCount);
-    };
-    const auto objectMesh = [&](uint32_t handle, const gameaux12::ObjectDraw& object) -> const AuxMesh*
-    {
-        if (handle >= m_auxMeshes.size())
-            return nullptr;
-        const auto& mesh = m_auxMeshes[handle];
-        return mesh.skinned == object.skinned && mesh.requiredBones <= object.boneCount ? &mesh : nullptr;
-    };
 
     const float threshold = ps_r_alphatest_threshold;
     const bool alphaTestDisabled = SceneAlphaTestDisabled();
@@ -3837,36 +3912,29 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 }
                 continue;
             }
-            const auto visit = [&](const auto& self, uint32_t index) -> void
+            visitLegacyCasters(tree, shadowPlanes, [&](uint32_t index)
             {
-                const auto& node = tree.nodes[index];
-                if (!BoxInside(shadowPlanes, node.minimum, node.maximum))
-                    return;
-                if (node.count == 0)
-                {
-                    self(self, node.left);
-                    self(self, node.right);
-                    return;
-                }
-                for (uint32_t offset = 0; offset < node.count; ++offset)
-                {
-                    const auto& draw = m_draws[tree.draws[node.first + offset]];
-                    if (SphereInside(shadowPlanes, draw.center, draw.radius))
-                    {
-                        submitStaticGeometry(draw, 0.0f, true);
-                        ++draws.statics;
-                    }
-                }
-            };
-            visit(visit, 0);
+                submitStaticGeometry(m_draws[index], 0.0f, true);
+                ++draws.statics;
+            });
         }
         if (dynamic && validExtras && m_sunShadowAuxPipeline != nullptr)
         {
             list->SetPipelineState(m_sunShadowAuxPipeline.Get());
+            if (usePrepared)
+            {
+                for (const auto& packet : prepared.shadows[projection].objects)
+                {
+                    const auto& object = snapshot.objects[packet.objectIndex];
+                    const auto& mesh = snapshot.meshes[packet.meshIndex];
+                    submitAuxGeometry(mesh, object.id, mesh.surface, object.poseOffset, 1, false, true);
+                    ++(object.skinned ? draws.skinned : draws.rigid);
+                }
+                return draws;
+            }
             for (const auto& object : extras.objects)
             {
-                if (usePrepared ? !prepared.shadows[projection].objects[&object - extras.objects.data()] :
-                    !SphereInside(shadowPlanes, object.center, object.radius))
+                if (!SphereInside(shadowPlanes, object.center, object.radius))
                     continue;
                 for (const uint32_t handle : objectParts(object))
                 {
@@ -3896,7 +3964,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     {
         transitionShadow(m_sunShadow.Get(), sampleState, depthState);
         const auto draws = recordShadowMap(m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart(),
-            kSunShadowSize, 0, sunPlanes, SceneDynamicSunShadowsRequested());
+            kSunShadowSize, 0, sunPlanes, dynamicSun);
         stats.sunRigidDraws = draws.rigid;
         stats.sunSkinnedDraws = draws.skinned;
         stats.staticShadowDraws += draws.statics;

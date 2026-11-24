@@ -495,6 +495,7 @@ bool GameVisuals::Prepare(IGame_Level& level, const float eye[3], GameDx12Static
         Reset();
     m_frame.session = scene.LevelSession();
     m_frame.epoch = scene.LevelEpoch();
+    m_frame.registryGeneration = scene.Generation();
     m_frame.traceId = TraceId();
     m_frame.objects.clear();
     m_frame.objectMeshes.clear();
@@ -524,6 +525,7 @@ void GameVisuals::Reset()
 void GameVisuals::InvalidateFrame(uint64_t epoch)
 {
     m_frame.epoch = epoch;
+    m_frame.registryGeneration = 0;
     m_frame.objects.clear();
     m_frame.objectMeshes.clear();
     m_frame.poses.clear();

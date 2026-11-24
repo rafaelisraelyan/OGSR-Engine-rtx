@@ -268,6 +268,34 @@ private:
         std::vector<ShadowCasterNode> nodes;
     };
 
+    struct ShadowObjectPacket
+    {
+        uint32_t objectIndex;
+        uint32_t meshIndex;
+        bool operator==(const ShadowObjectPacket&) const = default;
+    };
+
+    struct ShadowPreparation
+    {
+        std::array<std::vector<uint32_t>, 2> statics;
+        std::vector<ShadowObjectPacket> objects;
+        bool operator==(const ShadowPreparation&) const = default;
+    };
+
+    struct FramePreparation
+    {
+        std::vector<uint8_t> statics;
+        std::vector<uint8_t> objects;
+        // Sun, две карты spot и шесть граней point light.
+        std::array<ShadowPreparation, 9> shadows;
+        bool operator==(const FramePreparation&) const = default;
+        void Clear();
+    };
+
+    FramePreparation m_preparedFrame;
+    FramePreparation m_referenceFrame;
+    std::vector<uint32_t> m_preparationParticipants;
+
     struct Buffer12
     {
         ComPtr<ID3D12Resource> resource;

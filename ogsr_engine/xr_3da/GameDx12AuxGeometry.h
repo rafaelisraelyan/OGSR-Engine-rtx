@@ -66,6 +66,7 @@ struct Frame
 {
     uint64_t session = 0;
     uint64_t epoch = 0;
+    uint64_t registryGeneration = 0;
     uint32_t traceId = UINT32_MAX;
     std::vector<ObjectDraw> objects;
     std::vector<uint32_t> objectMeshes;
