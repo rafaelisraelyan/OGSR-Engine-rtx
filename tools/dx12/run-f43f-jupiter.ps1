@@ -105,10 +105,10 @@ $start.UseShellExecute = $false
 
 $features = @{
     STATIC_SCENE = '1'
-    GR = $GR
-    GR_WORKERS = $GRWorkers
+    GR = $GR.ToLowerInvariant()
+    GR_WORKERS = $GRWorkers.ToLowerInvariant()
     GR_GRAIN = $GRGrain
-    COMMAND_LISTS = $CommandLists
+    COMMAND_LISTS = $CommandLists.ToLowerInvariant()
     RIGID = '1'
     SKINNED = '1'
     DETAILS = '1'

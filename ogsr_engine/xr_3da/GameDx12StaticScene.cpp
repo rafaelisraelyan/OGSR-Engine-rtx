@@ -3747,11 +3747,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     };
     auto nullTerrainSrv = heapGpu;
     nullTerrainSrv.ptr += static_cast<UINT64>(kTerrainDescriptor) * m_textureDescriptorSize;
+    auto nullWaterSrv = heapGpu;
+    nullWaterSrv.ptr += static_cast<UINT64>(kNullWaterDescriptor) * m_textureDescriptorSize;
     const auto bindColorFrame = [&](ID3D12GraphicsCommandList* target)
     {
         bindFrame(target);
-        auto nullWaterSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-        nullWaterSrv.ptr += static_cast<UINT64>(kNullWaterDescriptor) * m_textureDescriptorSize;
         target->SetGraphicsRootDescriptorTable(7, nullWaterSrv);
         target->SetGraphicsRootDescriptorTable(kHemiSrvRoot, heapGpu);
         target->SetGraphicsRootDescriptorTable(kTerrainSrvRoot, nullTerrainSrv);

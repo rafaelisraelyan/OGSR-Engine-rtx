@@ -16,6 +16,7 @@
 #include "j2a_r6_fault.h"
 #endif
 
+#include "gr/jobs/JobGroup.h"
 #include "gr/jobs/JobSystem.h"
 
 #include <algorithm>
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <new>
 #include <stdexcept>

@@ -194,6 +194,7 @@ struct BridgeStateData
         uint64_t lightCandidates = 0;
         uint64_t shadowCandidates = 0;
         uint64_t sceneCopies = 0;
+        uint64_t commandLists = 0;
     } nativePerf;
     uint64_t prePolicyStorageDenied = 0;
     uint64_t prePolicyRetrievalHidden = 0;
@@ -2278,6 +2279,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         perf.lightCandidates += lighting.localCandidateCount;
         perf.shadowCandidates += lighting.localShadowCandidateCount;
         perf.sceneCopies += sceneStats.sceneCopies;
+        perf.commandLists += sceneStats.commandLists;
         if (presentEnd - perf.start >= std::chrono::seconds(3))
         {
             const double frames = perf.frames;
@@ -2285,13 +2287,13 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 "shadow_cpu_ms=%.3f scene_cpu_ms=%.3f water_cpu_ms=%.3f static_shadow_draws=%.2f "
                 "dynamic_shadow_draws=%.2f spot_shadow_maps=%.2f point_shadow_faces=%.2f "
                 "visible_lights=%.2f shadowed_lights=%.2f light_candidates=%.2f shadow_candidates=%.2f "
-                "scene_copies=%.2f gpu_wait_ms=%.3f present_ms=%.3f gpu_ms=%.3f gpu_samples=%u validation=%d",
+                "scene_copies=%.2f command_lists=%.2f gpu_wait_ms=%.3f present_ms=%.3f gpu_ms=%.3f gpu_samples=%u validation=%d",
                 perf.frames, elapsed(perf.start, presentEnd) / frames, perf.frameCpuMs / frames,
                 perf.prepareCpuMs / frames, perf.shadowCpuMs / frames, perf.sceneCpuMs / frames,
                 perf.waterCpuMs / frames, perf.staticShadowDraws / frames, perf.dynamicShadowDraws / frames,
                 perf.spotShadowMaps / frames, perf.pointShadowFaces / frames, perf.visibleLights / frames,
                 perf.shadowedLights / frames, perf.lightCandidates / frames, perf.shadowCandidates / frames,
-                perf.sceneCopies / frames, perf.gpuWaitMs / frames, perf.presentMs / frames,
+                perf.sceneCopies / frames, perf.commandLists / frames, perf.gpuWaitMs / frames, perf.presentMs / frames,
                 perf.gpuFrames == 0 ? 0.0 : perf.gpuMs / perf.gpuFrames, perf.gpuFrames, state.gbvEnabled ? 1 : 0);
             perf = {};
         }
