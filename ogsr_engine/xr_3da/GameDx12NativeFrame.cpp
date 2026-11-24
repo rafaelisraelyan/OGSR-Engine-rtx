@@ -81,7 +81,8 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     if (FAILED(hr))
         return hr;
     const char* commandLists = std::getenv("OGSR_DX12_GAME_COMMAND_LISTS");
-    m_separateShadowLists = commandLists && std::strcmp(commandLists, "multi") == 0;
+    m_parallelShadowLists = commandLists && std::strcmp(commandLists, "parallel") == 0;
+    m_separateShadowLists = m_parallelShadowLists || (commandLists && std::strcmp(commandLists, "multi") == 0);
     const auto createList = [&](auto& allocator, auto& list)
     {
         HRESULT result = owner.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -416,6 +417,11 @@ HRESULT GameDx12NativeFrame12::CloseList(AuxiliaryList& pair) noexcept
 bool GameDx12NativeFrame12::Recording::UsesShadowLists() const noexcept
 {
     return frame && frame->m_separateShadowLists;
+}
+
+bool GameDx12NativeFrame12::Recording::UsesParallelShadowLists() const noexcept
+{
+    return frame && frame->m_parallelShadowLists;
 }
 
 HRESULT GameDx12NativeFrame12::Recording::OpenShadowList(uint32_t index,

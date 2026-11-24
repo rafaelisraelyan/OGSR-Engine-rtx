@@ -3444,7 +3444,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             return renderprep12::Mode::Verify;
         return renderprep12::Mode::Serial;
     }();
-    if (grMode != renderprep12::Mode::Serial)
+    const uint32_t activeShadowViews = (constants.lightingFlags[3] != 0 ? 1u : 0u) + localShadowViews.count;
+    const bool packForRecording = recording.UsesParallelShadowLists() && activeShadowViews > 1;
+    if (grMode != renderprep12::Mode::Serial || packForRecording)
     {
         static const uint32_t grain = []
         {
@@ -3477,7 +3479,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     shadowViews[shadowViewCount++] = layer + 1;
             workCount = staticBlocks + objectBlocks + shadowViewCount;
 
-            const auto parallelStart = Clock::now();
+            const auto prepStart = Clock::now();
             prepared.Clear();
             prepared.statics.resize(snapshot.draws.size());
             prepared.objects.resize(objectCount);
@@ -3569,10 +3571,19 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     workers[task] = threadIndex;
                 }
             };
-            usePrepared = GameDx12GR_RunRanges(workCount, 1, process, grStats, prepReason) &&
-                std::find(workers.begin(), workers.end(), UINT32_MAX) == workers.end() &&
+            bool complete = true;
+            if (grMode == renderprep12::Mode::Serial)
+            {
+                process(0, workCount, 0);
+                stats.grSerialMs = Ms(prepStart);
+            }
+            else
+            {
+                complete = GameDx12GR_RunRanges(workCount, 1, process, grStats, prepReason);
+                stats.grParallelMs = Ms(prepStart);
+            }
+            usePrepared = complete && std::find(workers.begin(), workers.end(), UINT32_MAX) == workers.end() &&
                 snapshot.session == LevelSession() && snapshot.epoch == LevelEpoch() && snapshot.generation == Generation();
-            stats.grParallelMs = Ms(parallelStart);
             if (!usePrepared)
                 throw std::runtime_error(prepReason.empty() ? "incomplete GR frame preparation" : prepReason);
             std::sort(workers.begin(), workers.end());
@@ -3617,7 +3628,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     return Fail(reason, "GR native preparation differs from legacy traversal");
                 stats.grSerialMs = Ms(serialStart);
             }
-            stats.grMode = grMode == renderprep12::Mode::Verify ? "static-verify" : "static-parallel";
+            if (grMode == renderprep12::Mode::Verify)
+                stats.grMode = "static-verify";
+            else if (grMode == renderprep12::Mode::Parallel)
+                stats.grMode = "static-parallel";
+            else
+                stats.grMode = "static-serial-packets";
         }
         catch (...)
         {
@@ -3636,7 +3652,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         if (lighting.frame % 120 == 0)
             Msg("ph_dx12_mt: frame=%llu mode=%s work_items=%u workers=%u participants_used=%u submitted=%llu completed=%llu "
-                "failures=%llu unobserved=%llu grain=%u submit_ms=%.6f wait_ms=%.6f parallel_ms=%.6f verify_serial_ms=%.6f",
+                "failures=%llu unobserved=%llu grain=%u submit_ms=%.6f wait_ms=%.6f parallel_ms=%.6f serial_ms=%.6f",
                 static_cast<unsigned long long>(lighting.frame), stats.grMode, workCount, grStats.backgroundWorkers, participantsUsed,
                 static_cast<unsigned long long>(grStats.submitted), static_cast<unsigned long long>(grStats.completed),
                 static_cast<unsigned long long>(grStats.failures), static_cast<unsigned long long>(grStats.unobservedFailures),
@@ -3863,6 +3879,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint32_t rigid = 0;
         uint32_t skinned = 0;
     };
+    const FramePreparation& preparedPackets = prepared;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
         const FrustumPlane* shadowPlanes, bool dynamic)
@@ -3921,7 +3938,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             shadowList->SetPipelineState(m_sunShadowPipelines[layout].Get());
             if (usePrepared)
             {
-                for (const uint32_t index : prepared.shadows[projection].statics[layout])
+                for (const uint32_t index : preparedPackets.shadows[projection].statics[layout])
                 {
                     submitStaticShadow(m_draws[index]);
                     ++draws.statics;
@@ -3939,7 +3956,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             shadowList->SetPipelineState(m_sunShadowAuxPipeline.Get());
             if (usePrepared)
             {
-                for (const auto& packet : prepared.shadows[projection].objects)
+                for (const auto& packet : preparedPackets.shadows[projection].objects)
                 {
                     const auto& object = snapshot.objects[packet.objectIndex];
                     const auto& mesh = snapshot.meshes[packet.meshIndex];
@@ -4022,16 +4039,81 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             transitionShadow(m_sunShadow.Get(), sampleState, depthState);
         if (hasLocal)
             transitionShadow(m_localShadow.Get(), sampleState, depthState);
+        struct RecordResult
+        {
+            ShadowDraws draws;
+            HRESULT closed = E_PENDING;
+            DWORD thread = 0;
+            Clock::time_point start{};
+            Clock::time_point end{};
+        };
+        std::array<ID3D12GraphicsCommandList*, GameDx12NativeFrame12::kShadowListCount> lists{};
+        std::array<RecordResult, GameDx12NativeFrame12::kShadowListCount> results{};
+        for (uint32_t index = 0; index < passCount; ++index)
+            if (FAILED(recording.OpenShadowList(index, lists[index])))
+                return Fail(reason, "failed to reset native shadow list");
+
+        const bool parallelRecording = recording.UsesParallelShadowLists() && passCount > 1 && usePrepared;
+        const bool sample = lighting.frame % 120 == 0;
+        const auto recordRange = [&](uint32_t first, uint32_t last, uint32_t)
+        {
+            for (uint32_t index = first; index < last; ++index)
+            {
+                const auto& pass = passes[index];
+                auto& result = results[index];
+                if (sample)
+                {
+                    result.thread = GetCurrentThreadId();
+                    result.start = Clock::now();
+                }
+                result.draws = recordShadowMap(lists[index], pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
+                result.closed = recording.CloseShadowList(index);
+                if (sample)
+                    result.end = Clock::now();
+            }
+        };
+        GameDx12GRRangeStats12 recordStats;
+        if (parallelRecording)
+        {
+            std::string taskReason;
+            // RunRanges ждёт все принятые callbacks и на ошибке. После возврата
+            // Cancel может безопасно закрыть оставшиеся открытыми списки.
+            if (!GameDx12GR_RunRanges(passCount, 1, recordRange, recordStats, taskReason))
+                return Fail(reason, "native shadow recording failed: " + taskReason);
+        }
+        else
+            recordRange(0, passCount, 0);
         for (uint32_t index = 0; index < passCount; ++index)
         {
-            const auto& pass = passes[index];
-            ID3D12GraphicsCommandList* shadowList = nullptr;
-            if (FAILED(recording.OpenShadowList(index, shadowList)))
-                return Fail(reason, "failed to reset native shadow list");
-            const auto draws = recordShadowMap(shadowList, pass.dsv, pass.size, pass.projection, pass.planes, pass.dynamic);
-            if (FAILED(recording.CloseShadowList(index)))
+            if (FAILED(results[index].closed))
                 return Fail(reason, "failed to close native shadow list");
-            accumulateShadows(pass, draws);
+            accumulateShadows(passes[index], results[index].draws);
+        }
+        if (sample)
+        {
+            uint32_t mask = 0;
+            uint32_t overlap = 0;
+            std::array<DWORD, GameDx12NativeFrame12::kShadowListCount> participants{};
+            for (uint32_t index = 0; index < passCount; ++index)
+            {
+                mask |= 1u << passes[index].projection;
+                participants[index] = results[index].thread;
+                for (uint32_t prior = 0; prior < index; ++prior)
+                    if (results[index].thread != results[prior].thread &&
+                        results[index].start < results[prior].end && results[prior].start < results[index].end)
+                        ++overlap;
+            }
+            const auto end = participants.begin() + passCount;
+            std::sort(participants.begin(), end);
+            const auto used = static_cast<uint32_t>(std::unique(participants.begin(), end) - participants.begin());
+            const char* effective = parallelRecording ? "parallel" : "multi";
+            const char* fallback = recording.UsesParallelShadowLists() && !parallelRecording ?
+                (passCount < 2 ? "single_view" : "packets_unavailable") : "none";
+            Msg("ph_dx12_mt_record: frame=%llu mode=%s fallback=%s lists=%u views=%u mask=0x%x participants=%u "
+                "overlapping_pairs=%u workers=%u submitted=%llu completed=%llu submit_ms=%.6f wait_ms=%.6f",
+                static_cast<unsigned long long>(lighting.frame), effective, fallback, passCount + 2, passCount, mask,
+                used, overlap, recordStats.backgroundWorkers, static_cast<unsigned long long>(recordStats.submitted),
+                static_cast<unsigned long long>(recordStats.completed), recordStats.submitMs, recordStats.waitMs);
         }
         if (FAILED(recording.BeginColorList()))
             return Fail(reason, "failed to start native color list");

@@ -23,7 +23,7 @@ param(
     [ValidateSet('serial','parallel','verify')][string]$GR = 'serial',
     [ValidatePattern('^(auto|[0-9]|1[0-6])$')][string]$GRWorkers = 'auto',
     [ValidateRange(32,8192)][uint32]$GRGrain = 256,
-    [ValidateSet('legacy','multi')][string]$CommandLists = 'legacy',
+    [ValidateSet('legacy','multi','parallel')][string]$CommandLists = 'legacy',
     [uint64]$LightId,
     [string]$FixedLightIds,
     [switch]$FreezeLightRecord,

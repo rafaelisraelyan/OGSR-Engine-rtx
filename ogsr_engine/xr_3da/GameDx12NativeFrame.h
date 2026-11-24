@@ -33,6 +33,7 @@ public:
         GameDx12NativeFrame12* frame = nullptr;
 
         bool UsesShadowLists() const noexcept;
+        bool UsesParallelShadowLists() const noexcept;
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
         HRESULT CloseShadowList(uint32_t index) const noexcept;
         HRESULT BeginColorList() noexcept;
@@ -128,6 +129,7 @@ private:
     ID3D12GraphicsCommandList* m_activeList = nullptr;
     uint32_t m_shadowCount = 0;
     bool m_separateShadowLists = false;
+    bool m_parallelShadowLists = false;
     bool m_recording = false;
     bool m_submitted = false;
     bool m_unknown = false;
