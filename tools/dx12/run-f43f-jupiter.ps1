@@ -25,6 +25,7 @@ param(
     [uint32[]]$GeometryVisualId,
     [Nullable[uint32]]$GeometryObjectId,
     [switch]$SceneLog,
+    [switch]$Metrics,
     [switch]$Validation,
     [ValidateSet('serial','parallel','verify')][string]$GR = 'serial',
     [ValidatePattern('^(auto|[0-9]|1[0-6])$')][string]$GRWorkers = 'auto',
@@ -141,6 +142,7 @@ $features = @{
     SCENE_LOG = [int]($SceneLog.IsPresent -or $LightId -ne 0 -or $FixedLightIds -or $ProbeFrames -ne 0)
     TRACE_LIGHTS = [int]$SceneLog.IsPresent
     VALIDATION = [int]$Validation.IsPresent
+    METRICS = [int]$Metrics.IsPresent
     FIXED_LIGHT_IDS = [string]$FixedLightIds
     FREEZE_LIGHT_RECORD = [int]$FreezeLightRecord.IsPresent
     LIGHT_PROBE_FRAMES = $ProbeFrames
@@ -162,7 +164,6 @@ $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
 if ($LightId -ne 0) {
     $start.EnvironmentVariables['OGSR_DX12_GAME_TRACE_LIGHT_ID'] = [string]$LightId
 }
-$start.EnvironmentVariables.Remove('OGSR_DX12_GAME_METRICS')
 $start.EnvironmentVariables.Remove('OGSR_DX12_NATIVE_CAPTURE_DIR')
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_R1_VISUAL_ID')
 if ($GeometryVisualId) {
