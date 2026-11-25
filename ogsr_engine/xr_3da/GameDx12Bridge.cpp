@@ -2289,6 +2289,17 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         return;
     }
     const auto count = state.native.PresentCount();
+    const auto& completedGpu = state.native.LastGpuTiming();
+    if (completedGpu.present != 0 && completedGpu.present % 120 == 0 && completedGpu.shadowMask != 0)
+    {
+        Msg("ph_dx12_csm: gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f shadow_mask=0x%x",
+            static_cast<unsigned long long>(completedGpu.present), completedGpu.milliseconds,
+            completedGpu.shadowMilliseconds, completedGpu.sceneMilliseconds, completedGpu.shadowMask);
+        for (uint32_t slice = 0; slice < game_shadow12::MaxSunCascades; ++slice)
+            if ((completedGpu.shadowMask & (1u << slice)) != 0)
+                Msg("ph_dx12_csm: gpu_present=%llu slice=%u gpu_ms=%.6f",
+                    static_cast<unsigned long long>(completedGpu.present), slice, completedGpu.viewMilliseconds[slice]);
+    }
     if (hr == S_OK && sceneRecorded && sceneDetail)
     {
         auto& perf = state.nativePerf;
@@ -2355,7 +2366,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             Msg("ph_dx12_metrics: frame=%llu present=%llu fence=%llu slot=%u draws=%u camera_hash=%016llX "
                 "position=(%.3f,%.3f,%.3f) direction=(%.3f,%.3f,%.3f) mode=%s frame_ms=%.6f begin_wait_ms=%.6f "
                 "snapshot_ms=%.6f serial_ms=%.6f parallel_ms=%.6f record_ms=%.6f "
-                "present_ms=%.6f gpu_present=%llu gpu_ms=%.6f",
+                "present_ms=%.6f gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f",
                 static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
                 static_cast<unsigned long long>(state.fenceValue), recording.slot, draws,
                 static_cast<unsigned long long>(state.lastMatrixHash),
@@ -2363,7 +2374,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z,
                 timings.mode, frameMs, elapsed(start, begin),
                 timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
-                elapsed(presentStart, presentEnd), static_cast<unsigned long long>(gpu.present), gpu.milliseconds);
+                elapsed(presentStart, presentEnd), static_cast<unsigned long long>(gpu.present), gpu.milliseconds,
+                gpu.shadowMilliseconds, gpu.sceneMilliseconds);
         }
         if (frames == 1 || frames == 30 || frames % 120 == 0)
         {

@@ -4,6 +4,7 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include <algorithm>
 #include <cstdlib>
 #include <chrono>
 #include <cstdio>
@@ -133,7 +134,7 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     {
         D3D12_QUERY_HEAP_DESC query{};
         query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query.Count = 2 * kFrameCount;
+        query.Count = kTimingQueriesPerSlot * kFrameCount;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC readback{};
@@ -328,18 +329,37 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count() : 0.0;
     if (m_timingQueries && slot.timingPresent != 0)
     {
-        const SIZE_T offset = m_slot * 2 * sizeof(uint64_t);
-        const D3D12_RANGE range{offset, offset + 2 * sizeof(uint64_t)};
+        constexpr SIZE_T timingSize = kTimingQueriesPerSlot * sizeof(uint64_t);
+        const SIZE_T offset = m_slot * timingSize;
+        const D3D12_RANGE range{offset, offset + timingSize};
         void* mapped = nullptr;
         if (SUCCEEDED(m_timingReadback->Map(0, &range, &mapped)))
         {
-            uint64_t ticks[2];
+            uint64_t ticks[kTimingQueriesPerSlot];
             std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, sizeof(ticks));
             if (ticks[1] >= ticks[0])
             {
                 m_lastGpuTiming.present = slot.timingPresent;
-                m_lastGpuTiming.milliseconds = 1000.0 * static_cast<double>(ticks[1] - ticks[0]) /
-                                               static_cast<double>(m_timestampFrequency);
+                const double tickMs = 1000.0 / static_cast<double>(m_timestampFrequency);
+                m_lastGpuTiming.milliseconds = tickMs * static_cast<double>(ticks[1] - ticks[0]);
+                if (slot.timingScene && ticks[3] >= ticks[2])
+                    m_lastGpuTiming.sceneMilliseconds = tickMs * static_cast<double>(ticks[3] - ticks[2]);
+                uint64_t firstShadow = UINT64_MAX, lastShadow = 0;
+                for (uint32_t view = 0; view < kShadowListCount; ++view)
+                {
+                    if ((slot.timingShadowMask & (1u << view)) == 0)
+                        continue;
+                    const uint64_t first = ticks[4 + 2 * view];
+                    const uint64_t last = ticks[5 + 2 * view];
+                    if (last < first)
+                        continue;
+                    firstShadow = (std::min)(firstShadow, first);
+                    lastShadow = (std::max)(lastShadow, last);
+                    m_lastGpuTiming.shadowMask |= 1u << view;
+                    m_lastGpuTiming.viewMilliseconds[view] = tickMs * static_cast<double>(last - first);
+                }
+                if (m_lastGpuTiming.shadowMask != 0)
+                    m_lastGpuTiming.shadowMilliseconds = tickMs * static_cast<double>(lastShadow - firstShadow);
             }
             const D3D12_RANGE noWrite{};
             m_timingReadback->Unmap(0, &noWrite);
@@ -355,8 +375,10 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     m_recording = true;
     m_activeList = slot.list.Get();
     m_shadowCount = 0;
+    m_timingShadowMask = 0;
+    m_timingScene = false;
     if (m_timingQueries)
-        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * m_slot);
+        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kTimingQueriesPerSlot * m_slot);
 
     const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_PRESENT,
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -466,6 +488,28 @@ HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
     if (SUCCEEDED(hr))
         list = frame->m_activeList = current.colorPass.list.Get();
     return hr;
+}
+
+void GameDx12NativeFrame12::Recording::SetShadowTimingMask(uint32_t mask) const noexcept
+{
+    if (frame && frame->m_timingQueries)
+        frame->m_timingShadowMask = mask & ((1u << kShadowListCount) - 1u);
+}
+
+void GameDx12NativeFrame12::Recording::StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept
+{
+    if (frame && projection < kShadowListCount && (frame->m_timingShadowMask & (1u << projection)) != 0)
+        target.EndQuery(frame->m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            kTimingQueriesPerSlot * slot + 4 + 2 * projection + (end ? 1 : 0));
+}
+
+void GameDx12NativeFrame12::Recording::StampSceneStart() const noexcept
+{
+    if (frame && frame->m_timingQueries)
+    {
+        frame->m_timingScene = true;
+        list->EndQuery(frame->m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kTimingQueriesPerSlot * slot + 2);
+    }
 }
 
 void GameDx12NativeFrame12::Recording::BeginWater() const noexcept
@@ -626,10 +670,19 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     const bool sceneDrawn = sceneFrame != 0;
     if (m_timingQueries && sceneDrawn)
     {
-        const uint32_t query = 2 * m_slot;
+        const uint32_t query = kTimingQueriesPerSlot * m_slot;
         m_activeList->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
-        m_activeList->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                    query, 2, m_timingReadback.Get(), query * sizeof(uint64_t));
+        const auto resolve = [&](uint32_t first, uint32_t count)
+        {
+            m_activeList->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                first, count, m_timingReadback.Get(), first * sizeof(uint64_t));
+        };
+        if (m_timingScene)
+            m_activeList->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 3);
+        resolve(query, m_timingScene ? 4u : 2u);
+        for (uint32_t view = 0; view < kShadowListCount; ++view)
+            if ((m_timingShadowMask & (1u << view)) != 0)
+                resolve(query + 4 + 2 * view, 2);
     }
     bool captured = false;
     if (m_capturePath[0] && sceneFrame >= captureSceneStart)
@@ -689,7 +742,11 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     {
         ++m_presentCount;
         if (m_timingQueries && sceneDrawn)
+        {
             slot.timingPresent = m_presentCount;
+            slot.timingShadowMask = m_timingShadowMask;
+            slot.timingScene = m_timingScene;
+        }
         if (captured)
         {
             Msg("ph_dx12_capture: sequence=%u present=%llu scene_frame=%llu fence=%llu slot=%u",

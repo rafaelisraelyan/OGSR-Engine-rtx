@@ -4443,12 +4443,27 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint32_t rigid = 0;
         uint32_t skinned = 0;
         uint32_t detail = 0;
+        uint32_t detailDraws = 0;
+        uint64_t hash = 14695981039346656037ull;
     };
+    const bool sampleCsm = lighting.frame % 120 == 0;
+    uint32_t timingMask = 0;
+    for (uint32_t index = 0; index < passCount; ++index)
+        timingMask |= 1u << passes[index].view.projection;
+    recording.SetShadowTimingMask(timingMask);
     const FramePreparation& preparedPackets = prepared;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
         const FrustumPlane* shadowPlanes, bool dynamic)
     {
+        recording.StampShadow(*shadowList, projection, false);
+        ShadowDraws draws;
+        const auto mix = [&](uint32_t value)
+        {
+            draws.hash = (draws.hash ^ value) * 1099511628211ull;
+        };
+        if (sampleCsm)
+            mix(projection);
         bindFrame(shadowList);
         uint32_t boundDescriptor = UINT32_MAX;
         bool identityBound = false;
@@ -4468,6 +4483,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         };
         const auto submitStaticShadow = [&](const DrawSource12& draw)
         {
+            if (sampleCsm)
+            {
+                mix(static_cast<uint32_t>(&draw - snapshot.draws.data()));
+                mix(draw.visualId);
+                mix(draw.descriptor);
+                mix(draw.icount);
+            }
             if (draw.layout == 3 || !identityBound)
             {
                 identityBound = draw.layout != 3;
@@ -4481,13 +4503,19 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         };
         const auto submitAuxShadow = [&](const AuxMesh& mesh, SurfaceMode surface, uint32_t first, uint32_t count)
         {
+            if (sampleCsm)
+            {
+                mix(static_cast<uint32_t>(&mesh - snapshot.meshes.data()));
+                mix(mesh.descriptor);
+                mix(first);
+                mix(count);
+            }
             shadowList->SetGraphicsRoot32BitConstant(3, first, 0);
             bindShadowMaterial(mesh.descriptor, surface);
             shadowList->IASetVertexBuffers(0, 1, &mesh.vb);
             shadowList->IASetIndexBuffer(&mesh.ib);
             shadowList->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
         };
-        ShadowDraws draws;
         const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size), 0.0f, 1.0f};
         const D3D12_RECT rect{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
         shadowList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
@@ -4554,8 +4582,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 submitAuxShadow(snapshot.meshes[packet.mesh], SurfaceMode::Cutout, packet.first, packet.count);
                 ++draws.rigid;
                 draws.detail += packet.count;
+                ++draws.detailDraws;
             }
         }
+        recording.StampShadow(*shadowList, projection, true);
         return draws;
     };
     const auto shadowRecordStart = Clock::now();
@@ -4615,8 +4645,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (FAILED(recording.OpenShadowList(index, lists[index])))
                 return Fail(reason, "failed to reset native shadow list");
 
-        const bool parallelRecording = recording.UsesParallelShadowLists() && passCount > 1 && usePrepared && sunPlan.count <= 1;
-        const bool sample = lighting.frame % 120 == 0;
+        const bool parallelRecording = recording.UsesParallelShadowLists() && passCount > 1 && usePrepared;
+        const bool sample = sampleCsm;
         const auto recordRange = [&](uint32_t first, uint32_t last, uint32_t)
         {
             for (uint32_t index = first; index < last; ++index)
@@ -4670,7 +4700,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             const auto used = static_cast<uint32_t>(std::unique(participants.begin(), end) - participants.begin());
             const char* effective = parallelRecording ? "parallel" : "multi";
             const char* fallback = recording.UsesParallelShadowLists() && !parallelRecording ?
-                (passCount < 2 ? "single_view" : !usePrepared ? "packets_unavailable" : "csm_sequential") : "none";
+                (passCount < 2 ? "single_view" : "packets_unavailable") : "none";
             Msg("ph_dx12_mt_record: frame=%llu mode=%s fallback=%s lists=%u views=%u mask=0x%x participants=%u "
                 "overlapping_pairs=%u workers=%u submitted=%llu completed=%llu submit_ms=%.6f wait_ms=%.6f",
                 static_cast<unsigned long long>(lighting.frame), effective, fallback, passCount + 2, passCount, mask,
@@ -4697,7 +4727,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     }
     std::memcpy(frameDestination + offsetof(SceneFrameConstants, sunCasterCounts),
         constants.sunCasterCounts, sizeof(constants.sunCasterCounts));
-    if (sunPlan.count != 0 && lighting.frame % 120 == 0)
+    if (sunPlan.count != 0 && sampleCsm)
     {
         const float distance = constants.sunCameraForward.w != 0.0f ? sunPlan.cascades[sunPlan.count - 1].splitFar : 0.0f;
         Msg("ph_dx12_csm: frame=%llu profile=%s cascade_count=%u active_cascades=%u resolution=%u shadow_distance=%.3f "
@@ -4710,14 +4740,16 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             const auto& cascade = sunPlan.cascades[slice];
             const auto& draws = sunDraws[slice];
             Msg("ph_dx12_csm: slice=%u split=%.3f/%.3f blend=%.3f texel_m=%.5f center=(%.3f,%.3f,%.3f) "
-                "extent=%.3f depth_span=%.3f static=%u rigid_and_detail_draws=%u skinned=%u detail_instances=%u "
-                "draws=%u filter=%u receiver_bias_mask=%u receiver_depth_bias=%.8f",
+                "extent=%.3f depth_span=%.3f static=%u rigid=%u skinned=%u detail_instances=%u detail_draws=%u "
+                "draws=%u hash=%016llx filter=%u receiver_bias_mask=%u receiver_depth_bias=%.8f",
                 slice, cascade.splitNear, cascade.splitFar, cascade.blendStart, cascade.texelWorld,
                 cascade.lightCenter.x, cascade.lightCenter.y, cascade.lightCenter.z, cascade.radius, cascade.depthSpan,
-                draws.statics, draws.rigid, draws.skinned, draws.detail, constants.sunCasterCounts[slice],
+                draws.statics, draws.rigid - draws.detailDraws, draws.skinned, draws.detail, draws.detailDraws,
+                constants.sunCasterCounts[slice], static_cast<unsigned long long>(draws.hash),
                 constants.sunFilter, constants.sunReceiverBiasMask, constants.sunDepthBias[slice]);
         }
     }
+    recording.StampSceneStart();
     bindColorFrame(list);
     if (constants.lightingFlags[3] != 0 || localShadowViews.count != 0)
     {

@@ -39,6 +39,9 @@ public:
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
         HRESULT CloseShadowList(uint32_t index) const noexcept;
         HRESULT BeginColorList() noexcept;
+        void SetShadowTimingMask(uint32_t mask) const noexcept;
+        void StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept;
+        void StampSceneStart() const noexcept;
 
         void BeginWater() const noexcept;
         void EndWater() const noexcept;
@@ -57,6 +60,10 @@ public:
     {
         uint64_t present = 0;
         double milliseconds = 0;
+        double sceneMilliseconds = 0;
+        double shadowMilliseconds = 0;
+        uint32_t shadowMask = 0;
+        std::array<double, kShadowListCount> viewMilliseconds{};
     };
 
     GameDx12NativeFrame12() = default;
@@ -78,6 +85,8 @@ public:
 
 private:
     template <typename T> using Ptr = Microsoft::WRL::ComPtr<T>;
+    // Пары для кадра, основного прохода и каждого projection ID.
+    static constexpr uint32_t kTimingQueriesPerSlot = 4 + 2 * kShadowListCount;
 
     struct AuxiliaryList
     {
@@ -97,6 +106,8 @@ private:
         AuxiliaryList colorPass;
         uint64_t fence = 0;
         uint64_t timingPresent = 0;
+        uint32_t timingShadowMask = 0;
+        bool timingScene = false;
     };
 
     HRESULT Wait(const Owner& owner, uint64_t value) noexcept;
@@ -130,6 +141,8 @@ private:
     uint64_t m_presentCount = 0;
     ID3D12GraphicsCommandList* m_activeList = nullptr;
     uint32_t m_shadowCount = 0;
+    uint32_t m_timingShadowMask = 0;
+    bool m_timingScene = false;
     bool m_separateShadowLists = false;
     bool m_parallelShadowLists = false;
     bool m_recording = false;
