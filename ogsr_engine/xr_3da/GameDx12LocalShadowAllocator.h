@@ -18,7 +18,7 @@ struct LocalCandidate
     uint64_t id = 0;
     double score = 0;
     bool spot = false;
-    bool near = false;
+    bool nearCamera = false;
     bool eligible = false;
 };
 struct LocalAllocationState
@@ -73,7 +73,7 @@ inline LocalAllocation AllocateLocalShadows(std::span<const LocalCandidate> inpu
         for (uint32_t s = 0; s < oldSlots; ++s)
             held |= SpotSlot(s) == c.spot && previous.owners[s] == c.id;
         scores[i] = (std::min)(c.score, (std::numeric_limits<double>::max)() / 4) *
-            (held ? 1.25 : 1.0) * (stablePriority && c.near ? 1.25 : 1.0);
+            (held ? 1.25 : 1.0) * (stablePriority && c.nearCamera ? 1.25 : 1.0);
     }
     // Select winners by type first, before assigning physical slots.
     std::array<uint32_t, MaxLocalSlots> ranked{};
@@ -86,7 +86,7 @@ inline LocalAllocation AllocateLocalShadows(std::span<const LocalCandidate> inpu
             if (!out.eligibleCandidates[i] || selected[i] || input[i].spot != SpotSlot(s))
                 continue;
             const bool better = best == NoCandidate ||
-                (!stablePriority && input[i].near != input[best].near ? input[i].near :
+                (!stablePriority && input[i].nearCamera != input[best].nearCamera ? input[i].nearCamera :
                     scores[i] > scores[best] || (scores[i] == scores[best] && input[i].id < input[best].id));
             if (better) best = i;
         }
