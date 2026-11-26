@@ -2,10 +2,13 @@
 param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [switch]$Sequential,
+    [switch]$DescriptorTestsOnly,
+    [switch]$CsmWarpOnly,
     [string]$JobLibrary
 )
 
 $ErrorActionPreference = 'Stop'
+if ($DescriptorTestsOnly -and $CsmWarpOnly) { throw 'Выберите один режим тестирования.' }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $output = New-Item -ItemType Directory -Path $OutputDirectory
 $engine = Join-Path $root 'ogsr_engine/xr_3da'
@@ -41,58 +44,68 @@ $warpArgs = @()
 if ($Sequential) { $warpArgs = @('--sequential') }
 Push-Location -LiteralPath $output.FullName
 try {
-    & $cl @common "$PSScriptRoot/test-f43-csm-math.cpp" /Fe:csm-math.exe 2>&1 | Tee-Object -FilePath math-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./csm-math.exe 2>&1 | Tee-Object -FilePath math.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-local-shadow.cpp" /Fe:local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-csm-sampling-reference.cpp" /Fe:csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f44-particle-packets.cpp" /Fe:particle-packets.exe 2>&1 | Tee-Object -FilePath particle-packets-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./particle-packets.exe 2>&1 | Tee-Object -FilePath particle-packets.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f44-particle-draw-plan.cpp" /Fe:particle-draw-plan.exe 2>&1 | Tee-Object -FilePath particle-draw-plan-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./particle-draw-plan.exe 2>&1 | Tee-Object -FilePath particle-draw-plan.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f44-particle-materials.cpp" /Fe:particle-materials.exe 2>&1 | Tee-Object -FilePath particle-materials-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./particle-materials.exe 2>&1 | Tee-Object -FilePath particle-materials.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f45-ui-commands.cpp" /Fe:ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-pcf-pairs.cpp" /Fe:pcf-pairs.exe 2>&1 | Tee-Object -FilePath pcf-pairs-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./pcf-pairs.exe 2>&1 | Tee-Object -FilePath pcf-pairs.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-adaptive-shadow.cpp" /Fe:adaptive-shadow.exe 2>&1 | Tee-Object -FilePath adaptive-shadow-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./adaptive-shadow.exe 2>&1 | Tee-Object -FilePath adaptive-shadow.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-shadow-pages.cpp" /Fe:shadow-pages.exe 2>&1 | Tee-Object -FilePath shadow-pages-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./shadow-pages.exe 2>&1 | Tee-Object -FilePath shadow-pages.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-shadow-page-resources-warp.cpp" /Fe:shadow-page-resources-warp.exe /link d3d12.lib dxgi.lib dxguid.lib 2>&1 | Tee-Object -FilePath shadow-page-resources-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./shadow-page-resources-warp.exe 2>&1 | Tee-Object -FilePath shadow-page-resources-warp.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-local-light-capture.cpp" /Fe:local-light-capture.exe 2>&1 | Tee-Object -FilePath local-light-capture-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./local-light-capture.exe 2>&1 | Tee-Object -FilePath local-light-capture.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & $cl @common "$PSScriptRoot/test-f43-shadow-address.cpp" /Fe:shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address-build.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & ./shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address.log
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    if ($DescriptorTestsOnly) {
+        & $cl @common "$PSScriptRoot/test-f43-shadow-descriptors.cpp" /Fe:shadow-descriptors.exe 2>&1 |
+            Tee-Object -FilePath shadow-descriptors-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./shadow-descriptors.exe 2>&1 | Tee-Object -FilePath shadow-descriptors.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $warpArgs = @('--page-table')
+    }
+    elseif (!$CsmWarpOnly) {
+        & $cl @common "$PSScriptRoot/test-f43-csm-math.cpp" /Fe:csm-math.exe 2>&1 | Tee-Object -FilePath math-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./csm-math.exe 2>&1 | Tee-Object -FilePath math.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-local-shadow.cpp" /Fe:local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-csm-sampling-reference.cpp" /Fe:csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f44-particle-packets.cpp" /Fe:particle-packets.exe 2>&1 | Tee-Object -FilePath particle-packets-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./particle-packets.exe 2>&1 | Tee-Object -FilePath particle-packets.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f44-particle-draw-plan.cpp" /Fe:particle-draw-plan.exe 2>&1 | Tee-Object -FilePath particle-draw-plan-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./particle-draw-plan.exe 2>&1 | Tee-Object -FilePath particle-draw-plan.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f44-particle-materials.cpp" /Fe:particle-materials.exe 2>&1 | Tee-Object -FilePath particle-materials-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./particle-materials.exe 2>&1 | Tee-Object -FilePath particle-materials.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f45-ui-commands.cpp" /Fe:ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-pcf-pairs.cpp" /Fe:pcf-pairs.exe 2>&1 | Tee-Object -FilePath pcf-pairs-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./pcf-pairs.exe 2>&1 | Tee-Object -FilePath pcf-pairs.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-adaptive-shadow.cpp" /Fe:adaptive-shadow.exe 2>&1 | Tee-Object -FilePath adaptive-shadow-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./adaptive-shadow.exe 2>&1 | Tee-Object -FilePath adaptive-shadow.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-shadow-pages.cpp" /Fe:shadow-pages.exe 2>&1 | Tee-Object -FilePath shadow-pages-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./shadow-pages.exe 2>&1 | Tee-Object -FilePath shadow-pages.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-shadow-page-resources-warp.cpp" /Fe:shadow-page-resources-warp.exe /link d3d12.lib dxgi.lib dxguid.lib 2>&1 | Tee-Object -FilePath shadow-page-resources-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./shadow-page-resources-warp.exe 2>&1 | Tee-Object -FilePath shadow-page-resources-warp.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-local-light-capture.cpp" /Fe:local-light-capture.exe 2>&1 | Tee-Object -FilePath local-light-capture-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./local-light-capture.exe 2>&1 | Tee-Object -FilePath local-light-capture.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $cl @common "$PSScriptRoot/test-f43-shadow-address.cpp" /Fe:shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
         $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','dxguid.lib','user32.lib'

@@ -100,12 +100,12 @@ void Require(HRESULT hr, const char* operation)
     }
 }
 
-ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* target)
+ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* target, UINT flags = 0)
 {
     ComPtr<ID3DBlob> bytecode;
     ComPtr<ID3DBlob> errors;
     const HRESULT hr = D3DCompile(source, std::strlen(source), "csm-sampling.hlsl", nullptr, nullptr,
-        entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bytecode, &errors);
+        entry, target, flags | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bytecode, &errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
     Require(hr, "compile shadow sampling shader");
@@ -169,7 +169,7 @@ struct ShadowSamplingPass
     UINT stride = 0;
 
     ShadowSamplingPass(ID3D12Device& device, ID3D12Resource* sun, uint32_t sunSlices,
-        ID3D12Resource* local, uint32_t localSlices, Mutation mutation)
+        ID3D12Resource* local, uint32_t localSlices, Mutation mutation, bool pageTable = false)
     {
         constexpr char vertex[] = R"(
 float4 vs(uint id : SV_VertexID) : SV_Position
@@ -250,18 +250,36 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
 }
 )";
         pixel.erase(std::remove(pixel.begin(),pixel.end(),'\r'),pixel.end());
-        Mutate(pixel,mutation);
+        if (pageTable)
+        {
+            pixel.resize(pixel.find("float4 probe(float4 pixel"));
+            pixel.insert(0, "#define OGSR_DX12_SHADOW_PAGE_TABLE 1\n");
+            pixel += R"(
+float4 probe(float4 pixel : SV_Position) : SV_Target
+{
+    uint layer = uint(pixel.x);
+    uint4 address = LocalShadowMatrices[layer].address;
+    float visibility = SampleLocalVisibility(float3(.5, .5, LocalLights[0].colorInnerCos.w), layer);
+    return float4(visibility, ValidLocalAddress(address) ? 1 : 0, 0, 1);
+}
+)";
+        }
+        else
+            Mutate(pixel,mutation);
         const auto vs = Compile(vertex, "vs", "vs_5_0");
-        const auto ps = Compile(pixel.c_str(), "probe", "ps_5_0");
-        if (mutation == Mutation::None) VerifyFrameAbi(*ps.Get());
+        const auto ps = Compile(pixel.c_str(), "probe", pageTable ? "ps_5_1" : "ps_5_0",
+            pageTable ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0);
+        if (!pageTable && mutation == Mutation::None) VerifyFrameAbi(*ps.Get());
 
         D3D12_DESCRIPTOR_RANGE ranges[2]{};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = 1;
         ranges[0].BaseShaderRegister = 2;
         ranges[1] = ranges[0];
-        ranges[1].BaseShaderRegister = 6;
-        D3D12_ROOT_PARAMETER params[5]{};
+        ranges[1].BaseShaderRegister = pageTable ? 0 : 6;
+        ranges[1].RegisterSpace = pageTable ? 1 : 0;
+        ranges[1].NumDescriptors = pageTable ? UINT32_MAX : 1;
+        D3D12_ROOT_PARAMETER params[6]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -273,7 +291,9 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         params[3].Descriptor.ShaderRegister = 13;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[4].Descriptor.ShaderRegister = 14;
-        rootDesc.NumParameters = 5;
+        params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[5].Descriptor.ShaderRegister = 15;
+        rootDesc.NumParameters = pageTable ? 6 : 5;
         rootDesc.pParameters = params;
         D3D12_STATIC_SAMPLER_DESC samplers[2]{};
         for (uint32_t i = 0; i < 2; ++i)
@@ -315,7 +335,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
 
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 2;
+        heapDesc.NumDescriptors = pageTable ? 6 : 2;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srv)),
             "create shadow sampling SRV heap");
@@ -341,6 +361,39 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         cb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         Require(device.CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &cb,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&constants)), "frame CB allocation");
+    }
+
+    void DrawPages(ID3D12Device& device, ID3D12GraphicsCommandList& list, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+        game_shadow12::ShadowDescriptors::Binding binding, std::span<const LocalShadowGpuProjection> data)
+    {
+        SceneFrameConstants frame{};
+        frame.localShadowConfig[0] = static_cast<uint32_t>(data.size());
+        frame.localShadowConfig[1] = binding.pageCount;
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{};
+        Require(constants->Map(0, &noRead, &mapped), "page probe constants");
+        std::memcpy(mapped, &frame, sizeof(frame));
+        constants->Unmap(0, nullptr);
+        LocalLightGpu light{};
+        light.colorInnerCos.w = .5f;
+        Require(lights.Write(device, std::span<const LocalLightGpu>(&light, 1)), "page probe light");
+        Require(projections.Write(device, data), "page probe addresses");
+        ID3D12DescriptorHeap* heaps[] = {srv.Get()};
+        list.SetDescriptorHeaps(1, heaps);
+        list.SetPipelineState(pipeline.Get());
+        list.SetGraphicsRootSignature(root.Get());
+        list.SetGraphicsRootConstantBufferView(0, constants->GetGPUVirtualAddress());
+        list.SetGraphicsRootDescriptorTable(2, binding.table);
+        list.SetGraphicsRootShaderResourceView(5, binding.shapes);
+        list.SetGraphicsRootShaderResourceView(3, lights.Address());
+        list.SetGraphicsRootShaderResourceView(4, projections.Address());
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT viewport{0, 0, 8, 1, 0, 1};
+        const D3D12_RECT rect{0, 0, 8, 1};
+        list.RSSetViewports(1, &viewport);
+        list.RSSetScissorRects(1, &rect);
+        list.OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
     }
 
     void Draw(ID3D12GraphicsCommandList& list, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
@@ -725,8 +778,147 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     return result;
 }
 
+void RunPages(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner)
+{
+    using namespace game_shadow12;
+    Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", "legacy") == 0, "legacy command list");
+    auto& device = owner.device;
+    std::array<ShadowPageResources, Frame::kFrameCount> pages;
+    ShadowSamplingPass pass(device, nullptr, 1, nullptr, 1, Mutation::None, true);
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *pass.srv.Get(), 2), "page table initialize");
+    for (uint32_t i = 0; i < pages.size(); ++i)
+        Require(pages[i].Initialize(device, owner.fence, i), "page arena initialize");
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "page probe frame initialize");
+    const std::array<ShadowPageShape, 2> shapes{{{128, 6}, {256, 9}}};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, Frame::kFrameCount> tables{};
+    constexpr std::array<uint32_t, 8> expected{
+        0xff00ff00, 0xff00ffff, 0xff00ffff, 0xff00ff00,
+        0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff};
+
+    for (uint32_t variant = 0; variant < 5; ++variant)
+    {
+        Frame::Recording recording;
+        Check(frame.Begin(window, owner, recording) == S_OK, "begin page probe");
+        auto& arena = pages[recording.slot];
+        AdaptivePlan logical{1, 1, 1, variant + 1, UINT64_MAX, 0,
+            {{1,1,128,128,1},{2,1,256,256,1},{3,1,128,128,1},{4,1,256,256,1}}};
+        Require(arena.Prepare(logical, shapes, UINT64_MAX, UINT64_MAX, owner.fenceValue + 1), "prepare two pages");
+        ShadowAddressPlan addresses;
+        ShadowDescriptors::Binding binding;
+        Require(recording.StageShadowPages(descriptors, arena, addresses, binding), "stage native page table");
+        Check(binding.pageCount == 2 && addresses.views.size() == 4, "two physical pages and four projections");
+        if (variant == 0)
+        {
+            Require(frame.Cancel(), "cancel staged native page table");
+            Check(!arena.PreparedPlan() && arena.CurrentBytes() == 0, "cancel keeps physical arena unpublished");
+            continue;
+        }
+        tables[recording.slot] = binding.table;
+        std::array<LocalShadowGpuProjection, 8> gpu{};
+        for (size_t i = 0; i < addresses.views.size(); ++i)
+        {
+            const auto& address = addresses.views[i];
+            ShadowPageResources::View physical;
+            Check(arena.GetView(addresses.pageIds[address.page], address.slice, physical), "physical shadow view");
+            constexpr auto sampled = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            constexpr auto writing = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            Transition(*recording.list, *physical.resource, sampled, writing, address.slice);
+            recording.list->ClearDepthStencilView(physical.dsv, D3D12_CLEAR_FLAG_DEPTH,
+                (i == 0 || i == 3) ? .25f : .75f, 0, 0, nullptr);
+            Transition(*recording.list, *physical.resource, writing, sampled, address.slice);
+            gpu[i].address.page = address.page;
+            gpu[i].address.slice = address.slice;
+            gpu[i].address.resolution = address.resolution;
+        }
+        gpu[4] = gpu[0]; gpu[4].address.page = binding.pageCount;
+        gpu[5] = gpu[0]; gpu[5].address.slice = 6;
+        gpu[6] = gpu[1]; gpu[6].address.slice = 9;
+        gpu[7] = gpu[0]; gpu[7].address.resolution = 256;
+        if (variant == 2)
+            gpu[0].address.page ^= 1;
+        if (variant == 3)
+            gpu[0].address.slice ^= 1;
+        if (variant == 4)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE source{};
+            Check(arena.GetPreparedPageSrv(addresses.pageIds[gpu[0].address.page ^ 1], source), "wrong descriptor source");
+            auto destination = pass.srv->GetCPUDescriptorHandleForHeapStart();
+            const auto start = pass.srv->GetGPUDescriptorHandleForHeapStart();
+            destination.ptr += static_cast<SIZE_T>(binding.table.ptr - start.ptr) + gpu[0].address.page * pass.stride;
+            device.CopyDescriptorsSimple(1, destination, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+
+        pass.DrawPages(device, *recording.list, recording.rtv, binding, gpu);
+        Readback pixels(device, recording.color->GetDesc(), 1);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        pixels.Copy(*recording.list, *recording.color, 0);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Require(frame.Present(owner, 0), "submit descriptor probe through native frame");
+        Require(frame.Drain(owner), "drain page probe");
+        Check(!arena.PreparedPlan() && arena.CurrentBytes() > 0, "native Signal publishes physical arena");
+
+        uint32_t mismatchMask = 0;
+        for (uint32_t i = 0; i < expected.size(); ++i)
+        {
+            const auto actual = pixels.Pixel(0, i, 0);
+            if (actual != expected[i])
+            {
+                mismatchMask |= 1u << i;
+                std::printf("page variant=%u x=%u addr=%u/%u/%u actual=%08x expected=%08x\n",
+                    variant, i, gpu[i].address.page, gpu[i].address.slice, gpu[i].address.resolution,
+                    actual, expected[i]);
+            }
+        }
+        const uint32_t targetMask = variant == 1 ? 0 : variant == 4 ? 0b101 : 0b001;
+        Check(mismatchMask == targetMask, "production page control/mutation readback mask");
+        if (variant > 1)
+            std::printf("MUTATION KILLED: %s\n", variant == 2 ? "page" : variant == 3 ? "slice" : "descriptor");
+    }
+    Check(tables[0].ptr && tables[1].ptr && tables[0].ptr != tables[1].ptr, "distinct ranges for two native slots");
+    // Держим реальный Signal в очереди, пока второй слот растёт или откатывается.
+    ComPtr<ID3D12Fence> gate;
+    Require(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "descriptor gate");
+    const auto fenceValue = owner.fenceValue + 1;
+    AdaptivePlan inFlight{1,1,1,100,UINT64_MAX,0,{{1,1,128,128,1},{2,1,256,256,1}}};
+    Require(pages[0].Prepare(inFlight, shapes, UINT64_MAX, UINT64_MAX, fenceValue), "in-flight arena");
+    ShadowAddressPlan staged;
+    ShadowDescriptors::Binding active;
+    Require(descriptors.Stage(owner.fence, 0, pages[0], staged, active), "in-flight range");
+    Require(owner.queue.Wait(gate.Get(), 1), "hold descriptor fence");
+    struct OpenGate
+    {
+        ID3D12Fence& fence;
+        ~OpenGate() { fence.Signal(1); }
+    } openGate{*gate.Get()};
+    Require(owner.queue.Signal(&owner.fence, fenceValue), "signal in-flight descriptors");
+    owner.fenceValue = fenceValue;
+    Require(descriptors.CommitSubmitted(owner.fence, fenceValue), "track queued signal");
+    Check(owner.fence.GetCompletedValue() < fenceValue, "descriptor fence still pending");
+    ShadowDescriptors::Binding rejected;
+    Check(descriptors.Stage(owner.fence, 0, pages[0], staged, rejected) == DXGI_ERROR_WAS_STILL_DRAWING,
+        "in-flight slot cannot be overwritten");
+
+    const std::array<ShadowPageShape, 3> growing{{shapes[0], shapes[1], {512, 6}}};
+    inFlight.lights.push_back({3,1,512,512,1});
+    Require(pages[1].Prepare(inFlight, growing, UINT64_MAX, UINT64_MAX, fenceValue + 1), "grow other slot");
+    Check(descriptors.Stage(owner.fence, 1, pages[1], staged, rejected) == E_OUTOFMEMORY && !rejected.table.ptr,
+        "growth cannot overlap a live range");
+    Require(pages[1].CancelUnsubmitted(), "rollback rejected growth");
+    inFlight.lights.pop_back();
+    Require(pages[1].Prepare(inFlight, shapes, UINT64_MAX, UINT64_MAX, fenceValue + 1), "fit other slot");
+    Require(descriptors.Stage(owner.fence, 1, pages[1], staged, rejected), "other slot fits while first is live");
+    Check(active.table.ptr != rejected.table.ptr, "in-flight ranges are disjoint");
+    Require(descriptors.CancelUnsubmitted(), "discard unsubmitted descriptor range");
+    Require(gate->Signal(1), "release queued descriptor fence");
+    Require(frame.Drain(owner), "drain descriptor lifetime probe");
+    std::puts("PASS: physical 128x128x6 / 256x256x9, divergent sampling, bounds, two slots, cancel/commit, gated lifetime");
+}
+
 int main(int argc, char** argv)
 {
+    ComPtr<ID3D12InfoQueue> messages;
     try
     {
         ComPtr<ID3D12Debug> debug;
@@ -741,7 +933,6 @@ int main(int argc, char** argv)
         Require(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "WARP adapter");
         ComPtr<ID3D12Device> device;
         Require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "WARP device");
-        ComPtr<ID3D12InfoQueue> messages;
         Require(device.As(&messages), "D3D12 info queue");
         messages->ClearStorageFilter();
         messages->ClearRetrievalFilter();
@@ -762,27 +953,33 @@ int main(int argc, char** argv)
         const Frame::Owner owner{*device.Get(), *queue.Get(), *fence.Get(), event, value};
         Check(_putenv_s("OGSR_DX12_CLEAR", "0,0,0") == 0, "set clear color");
         const bool sequentialOnly = argc > 1 && std::strcmp(argv[1], "--sequential") == 0;
-        const std::array<std::array<uint32_t, 2>, 6> configurations{{
-            {1,8}, {2,0}, {3,8}, {4,8}, {4,16}, {4,24}
-        }};
-        for (const auto& config : configurations)
+        const bool pageTableOnly = argc > 1 && std::strcmp(argv[1], "--page-table") == 0;
+        if (pageTableOnly)
+            RunPages(window, *factory.Get(), owner);
+        else
         {
-            const uint32_t cascades = config[0], locals = config[1];
-            const auto legacy = Run(window, *factory.Get(), owner, "legacy", cascades, locals);
-            const auto multi = Run(window, *factory.Get(), owner, "multi", cascades, locals);
-            Check(legacy == multi, "legacy/multi readback parity");
-            if (!sequentialOnly)
+            const std::array<std::array<uint32_t, 2>, 6> configurations{{
+                {1,8}, {2,0}, {3,8}, {4,8}, {4,16}, {4,24}
+            }};
+            for (const auto& config : configurations)
             {
-                const auto parallel = Run(window, *factory.Get(), owner, "parallel", cascades, locals, cascades - 1);
-                Check(legacy == parallel, "legacy/parallel readback parity");
+                const uint32_t cascades = config[0], locals = config[1];
+                const auto legacy = Run(window, *factory.Get(), owner, "legacy", cascades, locals);
+                const auto multi = Run(window, *factory.Get(), owner, "multi", cascades, locals);
+                Check(legacy == multi, "legacy/multi readback parity");
+                if (!sequentialOnly)
+                {
+                    const auto parallel = Run(window, *factory.Get(), owner, "parallel", cascades, locals, cascades - 1);
+                    Check(legacy == parallel, "legacy/parallel readback parity");
+                }
+                std::printf("PASS: cascades=%u local=%u\n", cascades, locals);
             }
-            std::printf("PASS: cascades=%u local=%u\n", cascades, locals);
+            // Compile and execute each mutated copy; only the targeted GPU mismatch
+            // is accepted. Compile, PSO, device and fence failures propagate.
+            for (const Mutation mutation : {Mutation::ForceSunZero, Mutation::SwapSun,
+                Mutation::ReverseCompare, Mutation::WrongNext, Mutation::DisableBlend, Mutation::WrongLocal})
+                Run(window,*factory.Get(),owner,"legacy",4,24,0,mutation);
         }
-        // Compile and execute each mutated copy; only the targeted GPU mismatch
-        // is accepted. Compile, PSO, device and fence failures propagate.
-        for (const Mutation mutation : {Mutation::ForceSunZero, Mutation::SwapSun,
-            Mutation::ReverseCompare, Mutation::WrongNext, Mutation::DisableBlend, Mutation::WrongLocal})
-            Run(window,*factory.Get(),owner,"legacy",4,24,0,mutation);
         DestroyWindow(window);
         CloseHandle(event);
         uint32_t problems = 0;
@@ -813,11 +1010,25 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts("PASS: WARP Debug Layer + GBV, sun/local sampling, PCF 1-7, GPU mutations, ABI, readback parity, resize, cancel, GR fault drain");
+        std::puts(pageTableOnly ? "PASS: WARP Debug Layer + GBV, physical page descriptor table" :
+            "PASS: WARP Debug Layer + GBV, sun/local sampling, PCF 1-8, GPU mutations, ABI, readback parity, resize, cancel, GR fault drain");
         return 0;
     }
     catch (const std::exception& error)
     {
+        if (messages)
+            for (uint64_t i = 0; i < messages->GetNumStoredMessages(); ++i)
+            {
+                SIZE_T size = 0;
+                if (FAILED(messages->GetMessage(i, nullptr, &size)) || size < sizeof(D3D12_MESSAGE))
+                    continue;
+                std::vector<unsigned char> storage(size);
+                auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                if (SUCCEEDED(messages->GetMessage(i, message, &size)) &&
+                    message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING &&
+                    message->ID != D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE)
+                    std::fprintf(stderr, "D3D12 %u: %s\n", message->ID, message->pDescription);
+            }
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
     }
