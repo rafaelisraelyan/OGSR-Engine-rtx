@@ -20,7 +20,7 @@ param(
     [ValidateRange(1,4)][uint32]$SunCascades,
     [ValidateSet(1024,2048,4096)][uint32]$SunShadowResolution,
     [ValidateRange(10,1000)][uint32]$SunShadowDistance,
-    [ValidateSet('Auto','Point','Bilinear','Legacy','ReceiverPlane','PCF3','PCF5','FR3')]
+    [ValidateSet('Auto','Point','Bilinear','Legacy','ReceiverPlane','PCF3','PCF5','FR3','PCF7')]
     [string]$SunShadowFilter = 'Auto',
     [switch]$NoSunNormalBias,
     [switch]$NoSunConstantBias,

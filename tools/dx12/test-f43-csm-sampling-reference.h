@@ -49,21 +49,25 @@ inline double Linear(double u, double v, double z, double gradient = 0)
         }
     return sum;
 }
+inline double Box(uint32_t slice, double u, double v, double z, int radius)
+{
+    const int x0 = static_cast<int>(std::floor(u * Size));
+    const int y0 = static_cast<int>(std::floor(v * Size));
+    double sum = 0;
+    for (int y = y0-radius; y <= y0+radius; ++y)
+        for (int x = x0-radius; x <= x0+radius; ++x)
+            sum += z <= Texel(slice,x,y) ? 1.0 : 0.0;
+    const int width = radius*2+1;
+    return sum / (width*width);
+}
 inline double Filter(uint32_t mode, Probe p, bool slope)
 {
     const double z = p.z - Bias;
     const int x0 = static_cast<int>(std::floor(p.u * Size));
     const int y0 = static_cast<int>(std::floor(p.v * Size));
     if (mode == 1) return Compare(x0,y0,z);
-    if (mode == 5 || mode == 6)
-    {
-        const int radius = mode == 5 ? 1 : 2;
-        double sum = 0;
-        for (int y = y0-radius; y <= y0+radius; ++y)
-            for (int x = x0-radius; x <= x0+radius; ++x) sum += Compare(x,y,z);
-        const int width = radius*2+1;
-        return sum / (width*width);
-    }
+    if (mode == 5 || mode == 6 || mode == 8)
+        return Box(0,p.u,p.v,z,mode == 5 ? 1 : mode == 6 ? 2 : 3);
     const double base = Linear(p.u,p.v,z,slope && (mode == 4 || mode == 7) ? -4.0 : 0.0);
     if (mode == 3 && base > 0 && base < 1)
         return (base + Linear(p.u+.75/Size,p.v+.5/Size,z) +
@@ -92,11 +96,18 @@ inline Expected Pixel(uint32_t x,uint32_t y,uint32_t sun,uint32_t local,uint32_t
     }
     if (x >= sun && x < sun+local) return {{LocalDepth(x-sun),1,0,1},Local};
     if (x >= sun) return {{0,0,1,1},Inactive,1};
-    const double visible = SunDepth(x) >= .5-Bias ? 1 : 0;
+    // Wide 7x7 reaches patterned rows and white border even in the
+    // primary/overlap probes. Compute the original fixture projection.
+    const double u = .25 + .0625 * (x + (y == 2 ? .875 : .5));
+    const auto visibility = [&](uint32_t slice) {
+        return filter == 8 ? Box(slice,u,.6875,.5-Bias,3) :
+            (SunDepth(slice) >= .5-Bias ? 1.0 : 0.0);
+    };
+    const double visible = visibility(x);
     if (y == 2)
     {
         const bool next = x+1 < sun;
-        const double neighbor = next && SunDepth(x+1) >= .5-Bias ? 1 : 0;
+        const double neighbor = next ? visibility(x+1) : 0.0;
         // Exact midpoint of smoothstep interval [0.75,1].
         const double blended = next ? (visible+neighbor)*.5 : (visible+1)*.5;
         return {{blended,next?(x+2)/255.0:0,next?.5:0,next?0:.5},Overlap,1};

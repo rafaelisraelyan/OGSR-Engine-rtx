@@ -542,7 +542,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
 
     std::vector<uint32_t> result;
     uint32_t mismatches = 0;
-    const uint32_t frameCount = mutation == Mutation::None ? 7u : 1u;
+    const uint32_t frameCount = mutation == Mutation::None ? 8u : 1u;
     for (uint32_t index = 0; index < frameCount; ++index)
     {
         const int windowSize = index < 3 ? 48 : 64;

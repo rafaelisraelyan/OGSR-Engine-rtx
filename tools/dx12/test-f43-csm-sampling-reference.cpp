@@ -45,7 +45,7 @@ int main()
                 }
     for (unsigned n = 1; n <= 4; ++n)
         for (unsigned l : {0u, 8u, 16u, 24u})
-            for (unsigned f = 1; f <= 7; ++f)
+            for (unsigned f = 1; f <= 8; ++f)
                 for (unsigned y = 1; y <= 5; ++y)
                     for (unsigned x = 0; x < (std::max)(n + l + 1, 8u); ++x)
                         for (double a : ref::Pixel(x, y, n, l, f).rgba)

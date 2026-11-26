@@ -427,7 +427,7 @@ uint32_t SceneSunFilter()
         if (!value)
             return 0u;
         constexpr const char* names[] = {"auto", "point", "bilinear", "legacy",
-            "receiverplane", "pcf3", "pcf5", "fr3"};
+            "receiverplane", "pcf3", "pcf5", "fr3", "pcf7"};
         for (uint32_t i = 0; i < std::size(names); ++i)
             if (std::strcmp(value, names[i]) == 0)
                 return i;
@@ -1064,18 +1064,29 @@ float SunFilterVisibility(float3 coords, float3 planeNormal, uint slice)
         return SunPlaneVisibility(uv, compareDepth, gradient, slice);
     if (SunFilter == 1)
         return SunShadow.SampleCmpLevelZero(SunPointSampler, float3(uv, slice), compareDepth);
-    if (SunFilter == 5 || SunFilter == 6)
+    if (SunFilter == 5 || SunFilter == 6 || SunFilter == 8)
     {
-        const int radius = SunFilter == 5 ? 1 : 2;
+        // Pair adjacent texels per axis. A midpoint comparison sample
+        // averages two binary comparisons; a 2x2 pair represents four.
+        // Weight the unpaired final row/column once, preserving the
+        // original snapped, uniform box kernel and white-border semantics.
+        const int radius = SunFilter == 5 ? 1 : SunFilter == 6 ? 2 : 3;
         const float resolution = (float)SunShadowResolution;
         const float2 center = floor(uv * resolution) + 0.5f;
         float sum = 0;
         [loop]
-        for (int y = -radius; y <= radius; ++y)
+        for (int y = -radius; y <= radius; y += 2)
+        {
+            const float wy = y < radius ? 2.0f : 1.0f;
             [loop]
-            for (int x = -radius; x <= radius; ++x)
-                sum += SunShadow.SampleCmpLevelZero(SunPointSampler,
-                    float3((center + float2(x, y)) / resolution, slice), compareDepth);
+            for (int x = -radius; x <= radius; x += 2)
+            {
+                const float wx = x < radius ? 2.0f : 1.0f;
+                const float2 offset = float2(x, y) + 0.5f * (float2(wx, wy) - 1.0f);
+                sum += wx * wy * SunShadow.SampleCmpLevelZero(SunShadowSampler,
+                    float3((center + offset) / resolution, slice), compareDepth);
+            }
+        }
         const int width = 2 * radius + 1;
         return sum / (float)(width * width);
     }
