@@ -1,5 +1,40 @@
 # 08 — План работ
 
+> **Актуальная рабочая ветка DX12:** `experiment/f43-csm-r2-c`.
+> **Дата сверки:** 2026-11-27. Проверенный HEAD перед этим docs-only обновлением: `97fa173f6a229dd1575d752f71a82c275b2cbf99`; последний source HEAD: `2b04d3619bc6558f6ad8d257fa01e51e72102e34` (F4.3-P0-B3c1).
+> **Область сверки:** экспериментальная ветка DX12, не текущий production `prypiat`. На момент сверки ветки имеют 105/72 уникальных коммита соответственно (merge-base `01bcc0b7ad4ec858b5f72987248e747309c9beda`). Не выполнять автоматический merge/rebase. Это не разрешение на интеграцию в prypiat.
+> **Приоритет источника:** текущая сводка ниже и актуальная матрица F имеют приоритет над датированными историческими статусами и гейтами в этом файле. История сохраняется, но не используется как задание на повторную реализацию. Source-only, CPU PASS, WARP, hardware runtime и независимая приёмка — разные статусы.
+> **Параллельные треки:** V (clouds), P (PhysX), DX11 и другие направления сохранены с их последними документированными статусами; их отдельные рабочие ветки в этой сверке не проверялись. Не считать их состояния актуальными на 2026-11-27 без отдельной сверки.
+
+## Текущий статус и ближайшая работа — 2026-11-27
+
+**Цель:** полноценный игровой native DX12 renderer с сохранением оригинальной логики, ресурсов и модификаций, затем hybrid raster + DXR. Не отдельная техническая демонстрация.
+
+**Точка продолжения:** F4.3-P0-B3c1 source integrated; адаптивные физические страницы ещё не используются в игровом кадре. **Следующее действие — Windows Baseline Validation на актуальном source HEAD**, затем B3c2. До подтверждения сборки/тестов не считать накопленные изменения GPU-validated.
+
+| Приоритет | Следующий результат | Зависимость |
+|---|---|---|
+| 1 | Windows baseline: чистая Release x64 feature-on/off, текущие CPU tests и WARP с Debug Layer/GBV, включая изменённый ABI и все GPU mutations | Текущий source HEAD; исправить обнаруженные регрессии, не ослабляя проверки |
+| 2 | F4.3-P0-B3c2: самостоятельный компонент fenced shader-visible descriptor management, page table и fallback | Baseline; существующие material heap, frame owner, физические страницы |
+| 3 | F4.3-P0-B3d: динамический список shadow views, GR, command-list pool, timestamp queries и page-local transitions | B3c2; сохранение CSM и legacy banked path |
+| 4 | F4.3: включение adaptive multi-page runtime, global budget, physical-denial policy и game/hardware A/B | B3c2/B3d; корректные ownership/Signal/Cancel/Quarantine |
+| 5 | Clustered Lighting: conservative overlap, variable-length lists, no silent truncation | Корректный light/shadow ABI и adaptive runtime; исследование можно начать раньше |
+| Параллельно | F4.4-A2b.2 particles; F4.5-A IUIRender/fonts/menu/frame modes | Согласованные общие контракты ресурсов; без конкурирующих heap/queue/registry |
+| Далее | F4.5-B/C/D, остальные raster/material/HDR/temporal/DLSS, F6, hybrid DXR | Гейты готовности соответствующих подсистем; G0–G2 research может идти отдельно |
+
+Подробные статусы, ограничения и критерии: [актуальная матрица F](#актуальная-матрица-dx12-экспериментальная-ветка-2026-11-27). Обязательный [ADR модульности](dx12-modular-production-adr.md) и [AGENTS.md](../AGENTS.md) применяются ко всем новым DX12 изменениям.
+
+### Архитектурные правила текущей разработки
+
+- Production First: не переносить искусственные квоты прототипа в production; реальный аппаратный/OS бюджет, representability, проверка переполнений, backpressure и размер batch допустимы.
+- Модульность: Bridge/StaticScene сохраняют orchestration и точки интеграции; существенные новые подсистемы выделять постепенно, без blanket rewrite и пустых абстракций.
+- Единые frame/queue/fence owners, generation handles, immutable GR inputs, deterministic ordering, deferred release и quarantine при неизвестном завершении GPU.
+- Legacy Materials по умолчанию, Enhanced PBR опционально; оригинальные XML/LTX/Lua/OGF/DDS и DX11/R4 не ломать.
+- Microsoft DirectX documentation/specs, NVIDIA SDK docs и проверяемые исходники OGSR/IX-Ray — основа решений; не подменять проверку API предположениями.
+- Код, тесты и evidence привязывать к точным SHA; отсутствие Windows/GPU проверки указывать явно.
+
+### Историческая шапка (снимок 2026-11-11; не текущий план экспериментальной ветки)
+
 > **Актуальная ветка документа:** `prypiat` (форк ветки CoP `main_cop_cs`).
 > **Дата обновления планов:** 2026-11-11 (F4.0-J1 postmerge GPU ACCEPTED WITH NOTES; J2A R7 CPU-only production ACCEPTED WITH NOTES at `b484f8d795cfdbe37ea29e2282c1f4d18035e648`; J2B-M0 independent Codex PASS WITH NOTES and Tech Lead CPU compatibility ACCEPTED WITH NOTES; **project owner AUTHORIZED J2B-M1 CPU-only implementation with iterative Git commits and push to dedicated GitHub feature branch (2026-11-11)**, NOT direct unreviewed integration into `prypiat`; **J2B M2/M3 GPU implementation and J3 HOLD**, cloud/PhysX workstreams unchanged).
 > **Облачный трек V на 2026-11-11:** статические режимы, погодный timeline и прерывания технически пройдены; 01C-A-R1 shipping-contract proxy PASS WITH NOTES; **01C-B NEXT**, V-Q4 игровой composite **BLOCKED** до game-owned native DX12 frame/HDR/depth. Подробнее — V-WEATHER.
@@ -9,15 +44,15 @@
 
 ### Порядок сопровождения roadmap — решение 2026-11-10, уточнение владельца 2026-11-11
 
-**Единственный ответственный за актуализацию `docs/08-roadmap.md` — ChatGPT в роли технического руководителя проекта (Tech Lead).** Владелец проекта определяет приоритеты и даёт отдельное разрешение на production integration. **DeepSeek** реализует код, проводит сборки/тесты и передаёт исходники, логи и воспроизводимые доказательства. **Codex** выполняет независимое READ-ONLY ревью крупных и критических изменений; он не обязан и не должен менять roadmap в рамках ревью.
+**Единственный ответственный за актуализацию `docs/08-roadmap.md` — ChatGPT в роли технического руководителя проекта (Tech Lead).** Владелец определяет приоритеты и отдельно разрешает production integration. По решению владельца 2026-11-27 **Codex — основной исполнитель дальнейшей разработки экспериментального DX12:** реализация, сборки MSVC/FXC/DXC по применимости, CPU/WARP/hardware tests, согласованные игровые прогоны, публикация коммитов и evidence. **ChatGPT — архитектура, технические задания, независимое ревью diff/тестов/логов и roadmap.** Codex может выполнять отдельные независимые READ-ONLY задания, но не утверждает собственную реализацию как независимый reviewer. DeepSeek и другие исполнители — только по отдельной задаче; исторические роли в старых отчётах сохранены. Не изменять roadmap в рамках обычного задания Codex без отдельного поручения.
 
 **Обязательная периодичность: после КАЖДОГО выполненного задания и КАЖДОГО подтверждённого обновления проекта**, о котором стало известно техлиду в активном обсуждении. Включает завершённые этапы и подэтапы, новые commits/PR/merge, поставки тестовых результатов, независимые ревью, выявленные дефекты, BLOCKED/HOLD и изменения ранее принятых решений. Не ждать окончания большого направления: при получении очередного результата техлид самостоятельно проверяет и обновляет roadmap в той же рабочей сессии, не перекладывая ведение на DeepSeek, Codex или владельца.
 
-**Порядок обновления:** сверить свежий `origin/prypiat` / Git HEAD и при необходимости соответствующую рабочую ветку, точный source/tree pin, состав production и test-only изменений, статус сборок/проверок, реальные evidence и независимый verdict. Затем внести **отдельный docs-only коммит** в `prypiat` и сообщить владельцу ссылку на коммит и краткое изменение статусов. Для каждого затронутого этапа фиксировать дату, ID, подтверждённый результат, источники/артефакты, ограничения, открытые риски, условия следующего гейта и ссылки на кодовые изменения; если доказательств недостаточно — честно указывать `IN PROGRESS`, `UNVERIFIED`, `NOT RUN`, `BLOCKED` или `HOLD` вместо объявления PASS.
+**Порядок обновления:** сверить актуальный HEAD соответствующей рабочей ветки (для native DX12 — `origin/experiment/f43-csm-r2-c`; `origin/prypiat` отдельно при необходимости), точный source/tree pin, состав production и test-only изменений, статус сборок/проверок, реальные evidence и независимый verdict. Затем внести **отдельный docs-only коммит** в проверенной рабочей ветке; для экспериментального DX12 — `experiment/f43-csm-r2-c`, не `prypiat` и сообщить владельцу ссылку на коммит и краткое изменение статусов. Для каждого затронутого этапа фиксировать дату, ID, подтверждённый результат, источники/артефакты, ограничения, открытые риски, условия следующего гейта и ссылки на кодовые изменения; если доказательств недостаточно — честно указывать `IN PROGRESS`, `UNVERIFIED`, `NOT RUN`, `BLOCKED` или `HOLD` вместо объявления PASS.
 
 **Правило приёмки неизменно:** нельзя повышать статус по одному заявлению агента, промежуточному PASS или без соответствующего review/evidence; явно различать READ-ONLY review, source/CPU pre-review, авторские Windows/GPU evidence, независимое подтверждение, production commit и post-merge acceptance. Исторические результаты сохраняются; documentation-only обновление не разрешает production merge и не закрывает HOLD. При конфликте Git HEAD/blob SHA обновление прекращается до повторной сверки, без перезаписи чужих правок. **Автоматического фонового мониторинга нет**: события вне активного обсуждения будут учтены при следующем обращении к техлиду.
 
-**Текущий контроль:** J2B-M0 CPU compatibility accepted with notes: 9/105/106/107 supported by `ReadVisual`/debug-flat `BuildXrayLevelAsset12` per author real-asset logs, independently Codex-reviewed source/evidence; no independent game-payload replay. **J2B-M1 CPU-only IMPLEMENTATION AUTHORIZED in a published GitHub feature branch**, from fresh current `origin/prypiat` (at authorization HEAD `1ba4999dce60d12bab7c012ddb23e0a00bfda5b1`, recheck), with **incremental substantive commits and ordinary pushes**. Standalone worktree is optional, not a requirement to keep code uncommitted: protect other local WIP, never reset/force-push; branch stays available for review and history is preserved without squash. Scope: harden three test-only P3 (false determinism PASS/short read/BCrypt errors), immutable owner-thread snapshot and four-result all-or-nothing CPU batch, existing single GR pool with safe partial Submit/Wait/drain, OOM/exception/session invalidation and measured loading phase; no GPU handles/upload/Draw. **Direct merge/push of M1 changes to `prypiat` remains REVIEW HOLD** until reproducible Windows/CPU/game evidence, independent Codex READ-ONLY review and explicit owner + Tech Lead merge authorization. **M2 four-slot GPU registry, M3 four GPU Draw, J3 HOLD**. Roadmap changed by ChatGPT only; cloud and PhysX workstreams unchanged.
+**Исторический контроль prypiat / J2B на 2026-11-11 (не текущий гейт экспериментальной ветки):** J2B-M0 CPU compatibility accepted with notes: 9/105/106/107 supported by `ReadVisual`/debug-flat `BuildXrayLevelAsset12` per author real-asset logs, independently Codex-reviewed source/evidence; no independent game-payload replay. **J2B-M1 CPU-only IMPLEMENTATION AUTHORIZED in a published GitHub feature branch**, from fresh current `origin/prypiat` (at authorization HEAD `1ba4999dce60d12bab7c012ddb23e0a00bfda5b1`, recheck), with **incremental substantive commits and ordinary pushes**. Standalone worktree is optional, not a requirement to keep code uncommitted: protect other local WIP, never reset/force-push; branch stays available for review and history is preserved without squash. Scope: harden three test-only P3 (false determinism PASS/short read/BCrypt errors), immutable owner-thread snapshot and four-result all-or-nothing CPU batch, existing single GR pool with safe partial Submit/Wait/drain, OOM/exception/session invalidation and measured loading phase; no GPU handles/upload/Draw. **Direct merge/push of M1 changes to `prypiat` remains REVIEW HOLD** until reproducible Windows/CPU/game evidence, independent Codex READ-ONLY review and explicit owner + Tech Lead merge authorization. **M2 four-slot GPU registry, M3 four GPU Draw, J3 HOLD**. Roadmap changed by ChatGPT only; cloud and PhysX workstreams unchanged.
 
 **Конечная техническая цель:** сохранить стабильный DX11/R4 и поэтапно получить
 **нативный DirectX 12**, затем **аппаратный DXR** (сначала RT-тени, затем — при
@@ -51,7 +86,7 @@ F4.0 развивать самостоятельный physically based material
 DXR. IX-Ray 1.6 STCoP — референс для архитектуры (см. F4-PBR ниже),
 но не готовый DX12 renderer; PBR не блокирует F4.0 и первые G3-тени.
 
-**Актуальный графический статус (2026-11-06):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — независимо принят standalone real-asset GPU Draw (`a1c751274`); J1.2A Round 2 — source/owner-lifetime (`c4a95c39`); J1.2B Round 2 — source-only RTV/depth/submit/readback (`3a9b7c926`). **F4.0-J1 Asset Recovery R3 — ACCEPTED как VFS/CPU compatibility gate:** после установки оригинальной CoP в новой проверке обнаружено 41 архивное хранилище, core files Jupiter/Zaton/Pripyat читаются через production VFS, `XRLC_version=14`, `CFORM=4`, реальные `fsL_VISUALS`/`fsL_SECTORS` и `ReadVisual` на drawable `MT_NORMAL` leaf проходят CPU-only checks. Оригинальный runtime не запускался; in-game OGSR DX12 Draw, GPU readback и R4 Present **NOT TESTED / BLOCKED до J1 runtime**. R2 фиксирует прежнее состояние неполного payload и не отменяется; R3 его supersedes. **F4.0-J1 R1 runtime attempt (2026-11-06) — BLOCKED:** изолированный OGSR x64 DX11/R4 достиг Zaton `LevelResources load completed`, но `g_pGameLevel->bReady` не достигнут из-за `bind_stalker.script:125` → `set_callback` (Lua/engine contract mismatch, `callback.actor_before_death` отсутствует в enum и Lua exporter). Caller откатан; DX12 game Draw/readback и R4 Present parity NOT TESTED. **J1 Runtime Compatibility R2 (2026-11-06) — DX11/R4 GAMEPLAY PASS:** уменьшенный compatible loose OGSR overlay (9 scripts/21 configs) и CoP archive fallback устранили R1 Lua fatal без изменения engine; пройдены Zaton New Game, Jupiter save load, level teardown/reload. Clean shutdown не подтверждён, feature-on runtime в R2 не запускался — это исторический статус R2. **F4.0-J1 First In-Game DX12 Readback R2 (2026-11-06): GPU EVIDENCE PASS** — реальный Jupiter sector 129 → root 17431 → leaf 9, игровой ViewProjection, один DX12 DrawIndexedInstanced(1314), fence 3, D32, 10 623 ненулевых пикселя PNG, GBV PASS, R4 Present и clean bridge shutdown; независимый пересчёт PNG и hashes PASS. **Исторически (на момент R2) production patch ещё не был закоммичен; принятый R2B source интегрирован позднее коммитом `656652be7` (2026-11-07).** **F4.0-J1 R2A diagnostic hardening (2026-11-07):** независимые hash/PNG/CPU-oracle и source-level проверки техлида **PASS WITH NOTES**: explicit level/session/epoch, zero-coverage image gate, readback buffer layout, long PNG-path fail-closed; реальный повторный Draw/Jupiter readback и GBV PASS по Windows evidence. **Codex review завершён: REQUEST CHANGES (P2)** — при reset до диагностического Draw `captureEpoch` и `geometry.LevelEpoch` обновляются, а `diagnosticLevelEpoch` остаётся старым, блокируя identity gate в той же сессии. GPU evidence R2/R2A не опровергнуто. **R2B fix и повторный review PENDING; production integration HOLD**; feature-off runtime и TDR в R2A NOT TESTED. F4.0 и GR game parallel recording J2/J3 впереди.
+**Исторический графический статус (2026-11-06; последующие результаты ниже):** G1B Game Bridge — source-only в Git (`bb62c00ac`); J1.1 — независимо принят standalone real-asset GPU Draw (`a1c751274`); J1.2A Round 2 — source/owner-lifetime (`c4a95c39`); J1.2B Round 2 — source-only RTV/depth/submit/readback (`3a9b7c926`). **F4.0-J1 Asset Recovery R3 — ACCEPTED как VFS/CPU compatibility gate:** после установки оригинальной CoP в новой проверке обнаружено 41 архивное хранилище, core files Jupiter/Zaton/Pripyat читаются через production VFS, `XRLC_version=14`, `CFORM=4`, реальные `fsL_VISUALS`/`fsL_SECTORS` и `ReadVisual` на drawable `MT_NORMAL` leaf проходят CPU-only checks. Оригинальный runtime не запускался; in-game OGSR DX12 Draw, GPU readback и R4 Present **NOT TESTED / BLOCKED до J1 runtime**. R2 фиксирует прежнее состояние неполного payload и не отменяется; R3 его supersedes. **F4.0-J1 R1 runtime attempt (2026-11-06) — BLOCKED:** изолированный OGSR x64 DX11/R4 достиг Zaton `LevelResources load completed`, но `g_pGameLevel->bReady` не достигнут из-за `bind_stalker.script:125` → `set_callback` (Lua/engine contract mismatch, `callback.actor_before_death` отсутствует в enum и Lua exporter). Caller откатан; DX12 game Draw/readback и R4 Present parity NOT TESTED. **J1 Runtime Compatibility R2 (2026-11-06) — DX11/R4 GAMEPLAY PASS:** уменьшенный compatible loose OGSR overlay (9 scripts/21 configs) и CoP archive fallback устранили R1 Lua fatal без изменения engine; пройдены Zaton New Game, Jupiter save load, level teardown/reload. Clean shutdown не подтверждён, feature-on runtime в R2 не запускался — это исторический статус R2. **F4.0-J1 First In-Game DX12 Readback R2 (2026-11-06): GPU EVIDENCE PASS** — реальный Jupiter sector 129 → root 17431 → leaf 9, игровой ViewProjection, один DX12 DrawIndexedInstanced(1314), fence 3, D32, 10 623 ненулевых пикселя PNG, GBV PASS, R4 Present и clean bridge shutdown; независимый пересчёт PNG и hashes PASS. **Исторически (на момент R2) production patch ещё не был закоммичен; принятый R2B source интегрирован позднее коммитом `656652be7` (2026-11-07).** **F4.0-J1 R2A diagnostic hardening (2026-11-07):** независимые hash/PNG/CPU-oracle и source-level проверки техлида **PASS WITH NOTES**: explicit level/session/epoch, zero-coverage image gate, readback buffer layout, long PNG-path fail-closed; реальный повторный Draw/Jupiter readback и GBV PASS по Windows evidence. **Codex review завершён: REQUEST CHANGES (P2)** — при reset до диагностического Draw `captureEpoch` и `geometry.LevelEpoch` обновляются, а `diagnosticLevelEpoch` остаётся старым, блокируя identity gate в той же сессии. GPU evidence R2/R2A не опровергнуто. **R2B fix и повторный review PENDING; production integration HOLD**; feature-off runtime и TDR в R2A NOT TESTED. F4.0 и GR game parallel recording J2/J3 впереди.
 
 **Сверка PhysX на 2026-11-06 (параллельный трек P):** предыдущий независимый аудит **P3.3-G4.2-R1 — EXPERIMENTAL PASS WITH NOTES** по переданному review-пакету; **G5 Real Gameplay Readiness — PLANNED / NOT ACCEPTED**. В отличие от ранее принятого evidence, GitHub commit `a02eca549b05e057a9fe6c1542bd0d5d9918a7d8` не найден при отдельном запросе к репозиторию; интеграция именно этого SHA в удалённую ветку **UNVERIFIED**. Это не новая независимая проверка архивов, Windows runtime и push. Полная provenance и матрица G5 приведены в разделе P.
 
@@ -644,7 +679,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 ---
 
-## Этап F — Нативный DX12 (standalone реализован; игровой DX12 ещё не принят)
+## Этап F — Нативный DX12 (игровой raster-путь реализован частично; полный F не принят)
 
 **Цель:** запустить CoP с настоящим D3D12-backend и сохранить рабочий DX11.
 **Приоритет:** стратегический для DXR · **Риск:** высокий · **Оценка срока:**
@@ -668,7 +703,100 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | **F5 — temporal и совместимость** | DX12-обёртки для выбранных DLSS/FSR, jitter, history reset, upscale input/output, прицел 3DSS, ImGui, Tracy/PIX/RenderDoc, HDR/ReShade там, где поддерживается. | DLSS/FSR fallback без device loss, нет ошибок resize/async lifetime и серьёзного ghosting. |
 | **F6 — стабилизация** | Измеренная настройка/расширение прототипа parallel command recording из F3.5, memory budgeting/residency, CPU/GPU profiling, regression suite. | Без известных GPU validation errors, сравнение GPU ms/CPU ms/VRAM на нескольких сценах, контролируемый rollback DX11. |
 
-**Актуальный статус подэтапов F — 2026-11-06** (ветка `prypiat`; сверка по
+### Актуальная матрица DX12 — экспериментальная ветка 2026-11-27
+
+Основание: source HEAD `2b04d3619bc6558f6ad8d257fa01e51e72102e34`, docs HEAD `97fa173f6a229dd1575d752f71a82c275b2cbf99`, профильные отчёты и исходники. В этой сверке новые сборки/тесты не выполнялись; старые отчёты не означают PASS текущего HEAD.
+
+| Этап | Состояние | Доказательства и оставшиеся гейты |
+|---|---|---|
+| F0/F1 | ACCEPTED (исторически) | [Аудит](dx12-port-audit.md), [ADR](dx12-architecture-adr.md), актуальное [правило модульности](dx12-modular-production-adr.md). |
+| F2/F3 | Standalone foundation implemented / historical PASS | [Bootstrap](dx12-f2-bootstrap.md), [first frame](dx12-f2-first-frame.md), [real asset](dx12-f3-6a-xray-asset-bridge.md). Не полный игровой backend. |
+| F3.5 / native GR | Source integrated; historical CPU/WARP/runtime evidence | [GR architecture](dx12-f3-5-architecture-adr.md), [MT validation](dx12-f43-mt-native-validation.md), [CSM GR runtime](dx12-f43-csm-gr-runtime.md). Owner capture + immutable snapshots, serial/parallel/verify, ordered legacy/multi/parallel recording. Полный scene scaling, MT6 и актуальные тесты открыты. |
+| F4.0 | Game vertical slice implemented; historical runtime evidence | [Vertical slice](dx12-f40-b-gameplay-vertical-slice.md), [M23 report](dx12-j2b-m23-four-visual.md). Старые J2B M2/M3/J3 HOLD относятся к историческому контролю prypiat, не к наличию GPU draw/GR в экспериментальной ветке. Не объявлять независимую production acceptance M2/M3/J3 без её отдельного evidence. |
+| F4.1 | Static level rendering implemented; historical runtime PASS as reported | [F4.1 report](dx12-f41-implementation-report.md). Jupiter: 20 880 visual records, 10 514 drawable objects, 341 textures, historical Debug/GBV PASS. Не все material/LOD/vegetation families и уровни подтверждены. |
+| F4.2 | Game rigid visuals/details implemented in part; historical runtime evidence | [F4.2 report](dx12-f42-game-owned-visuals-and-details.md). Jupiter/Zaton, rigid pose, details instancing, resize/reload and simulated RemoveDevice; weighted skinning, wind, blended/distortion, real TDR and full parity remain open. |
+| F4.3 | IN PROGRESS | CSM/local lights, GR and shadow pages; details below. |
+| F4.4 | IN PROGRESS | CPU capture, draw plan and DDS eligibility; no native particle draws yet. |
+| F4.5 | IN PROGRESS | UI command core/overlay seam; native producers and HUD rendering not integrated. |
+| F4-PBR | PLANNED / full implementation not verified | Legacy/Enhanced material contract; audit existing material shading before expanding. |
+| F5/F6 | PLANNED / NOT ACCEPTED | HDR/temporal/motion vectors/upscaling, profiling, residency, lifecycle and runtime parity. |
+| G0–G5 | PLANNED / NOT ACCEPTED | Hardware DXR capabilities → baseline BLAS/TLAS → ray pass → RT shadows → dynamic/material support → optional reflections/GI; no mandatory PBR conversion. Research G0–G2 may be independent of full F. |
+
+### F4.3 — Lighting, CSM, Adaptive Local Shadows (current work)
+
+| Work package | Status on reviewed source / evidence | Next gate |
+|---|---|---|
+| CSM/GR baseline | Historical WARP PASS and real Jupiter parallel recording on `1b2b545f30dafe6f3d774ed9d021dbd355c8be2a`; [runtime report](dx12-f43-csm-gr-runtime.md) | Historical game run: 14 lists/12 views/3 participants, forced close after 70s; no GPU timestamps/runtime GBV or clean shutdown confirmation. Checkerboard root-cause/visual fix not accepted. |
+| R2-C sampling hardening | `6c4fe804`: CPU reference 50 986 checks PASS as reported; six real HLSL mutations authored | [Hardening](dx12-f43-csm-r2-sampling-hardening.md); MSVC/FXC/WARP mutation execution pending; compile/PSO/GPU failure must not count as killed mutation. |
+| Legacy local banked shadows | `a438fb2c`: source implemented, historical CPU allocator PASS | [Banked path](dx12-f43-lsa-banked-shadows.md); hardware/runtime validation after ABI changes. |
+| P0-A paired box PCF | `cd8ee6a4`: CPU 240 000 comparisons PASS as reported; PCF3/5/7 | Actual shader/WARP and GPU precision/timing pending; mode 8 added, preserve modes 1–7. |
+| P0-B1 | `19e5d9b7`: logical policy, 2048 synthetic candidates CPU PASS | Real demand, global budget and physical allocation integration. |
+| P0-B2a | `8137ef36`: CPU frame-slot placement PASS | Complete groups, stable ranges and actual whole-page accounting; Windows/runtime pending. |
+| P0-B2b | `ded6a3b7`: physical D3D12 page owner source implemented | WARP fixture authored not executed; not wired to native frame. |
+| P0-B3a | `71f14be5`: t13/t14 growable structured uploads, FrameCB stride 768 | Current shader reflection/Windows/GPU pending. |
+| P0-B3b | `33b4a994`: remove top-16 / candidate mask for supported world point/spot lights; 8192 synthetic capture records CPU PASS | Native spatial capture/high-density scene pending; legacy shadow bank limits remain. |
+| P0-B3c1 | `2b04d361`: 80-byte projection records; 256 pages/2048 projections CPU address test PASS | Current single bound physical page 0. Updated sampling reference and Windows tests not run on this revision. |
+| P0-B3c2 | NEXT after baseline validation | Focused descriptor component, compatible material heap/versioning, SM5.1+ nonuniform indexing where supported, actual ResourceBindingTier/capacity, slot fence and legacy fallback. |
+| P0-B3d | PLANNED | Variable projection scheduling, page-local DSV/barriers, growable GR recording/timestamp storage, deterministic serial/parallel parity. |
+| Adaptive native runtime | PLANNED | Actual Prepare/Commit/Cancel/Quarantine with native queue Signal, cross-slot budget, explicit physical denial policy, real multi-page sampling and render evidence. |
+| Clustered Lighting | PLANNED | Conservative overlap, variable-length lists, no silent per-cluster truncation; compare against brute-force reference and measure dense scenes. |
+| P1 / DXR shadows | PLANNED | Caster visibility/LOD/invalidation and safe caching; optional DXR visibility without double shadowing. |
+
+Authoritative implementation details and Microsoft API references: [Hybrid Shadow Evolution](dx12-f43-hybrid-shadow-evolution.md). Current legacy physical caps: 3 banks / 24 local layers / 9 shadowed local sources / 28 total views, 32-bit timing mask; dynamic light capture does not remove these. Unmapped local shadows may leak by default; `-SuppressUnmappedLocalLights` is a diagnostic A/B, not the final pressure policy. Shading still loops over all admitted lights per pixel. Do not claim improved FPS or complete adaptive shadows before measurement.
+
+### F4.4 — Native particles (current work)
+
+| Work package | Status and next gate |
+|---|---|
+| A1 — original quad capture | `9ce6ab9f`: owned snapshot and GR CPU packet preparation, portable CPU PASS; actual R4 producer/Windows diagnostic runtime pending. Active-system inventory is not visible/submitted parity. [Capture](dx12-f44-a1-particle-capture.md). |
+| A2a — draw plan | `790142d6`: original six blend contracts and batch planning, CPU PASS; no GPU rendering. [Draw plan](dx12-f44-a2a-particle-draw-plan.md). |
+| A2b.1 — material inventory | `42e44166`, `36fd6a46`: source metadata and sequential DDS eligibility, remove 128-texture / aggregate 32 MiB quotas. Synthetic 1024 unique textures CPU PASS; not actual DDS readback or GPU cache. [Materials](dx12-f44-a2b1-particle-materials.md). |
+| A2b.2 — GPU material/cache | NEXT for F4.4: existing frame/descriptor/texture ownership, six classic PSO/blend contracts (SET opaque/deferred distinct), actual uploads and draw/readback, alpha/depth/order/lifetime checks. No generic-alpha substitution. |
+| Production capture / rendering | PLANNED: remove total scene caps through checked growable storage; audit non-ps_active/attached effects, simulation cadence, original ordering, visibility, soft particles, fog/HDR, distortion and HUD. Real campfire/smoke/anomaly/combat and R4 parity; zero eligible quads is not rendering PASS. |
+
+Remaining caps: A1 32 768 quads, 1024 emitters, 4096 visuals and VFS 16 MiB per DDS; 4096 quads per batch is granularity, not a scene-wide limit. No Windows/GPU evidence for A1/A2 changes in the reviewed reports.
+
+### F4.5 — Native HUD/UI (current work)
+
+| Work package | Status and next gate |
+|---|---|
+| Architecture | `6ade4372`: three domains (screen UI, depth-aware item UI, HUD 3D), original XML/LTX/Lua/input, screen UI after upscale, future HUDless Color/UI alpha. [ADR](dx12-f45-hud-ui-architecture.md). |
+| A — command core | `17aeb652`: ordered owned UI commands, material identity, overlay seam and extracted menu render-only section; CPU test 100 003 draws / 600 019 vertices PASS as reported. [Command core](dx12-f45-a-ui-command-core.md). Overlay seam not invoked by game runtime. |
+| A — native producers/backend | NEXT for F4.5: original IUIRender/font producers, real material registry/PSOs/uploads and draw recording; no-level startup/loading/menu, HUD2D, inventory/PDA/console/dialogs/input/resize. Remove forced startup menu close only with replacement flow. |
+| B — HUD3D | PLANNED: real hands/weapon/attachments, skinning, HUD FOV/depth/motion vectors, lighting, muzzle effects. `3d7b8041`: required IX-Ray-inspired HUD Contact Shadows, no dependency on DXR. |
+| C — optics/detectors/video | PLANNED: scope depth, depth-aware item UI, dynamic textures and composition. |
+| D — acceptance | PLANNED: interactive native UI in all application states, original asset compatibility, R4 parity, hardware/GBV, lifecycle/performance. |
+
+No native UI rendering, menu regression, Windows/WARP/GPU PASS is claimed for command core. Preserve separate screen and world/HUD depth domains; validate actual R4 order and future temporal/upscale contracts.
+
+### Технический долг и архитектурные зависимости F
+
+| Item | Current condition | Planned treatment |
+|---|---|---|
+| Bridge / StaticScene | 4444 / 5653 lines at source baseline; mixed responsibilities | Incremental feature-oriented extraction under [Modular ADR](dx12-modular-production-adr.md), start B3c2. No file-length quota or blanket rewrite. |
+| Descriptor heap / texture registry | StaticScene `kMaxTextures=16384`, fixed heap ranges, 16 MiB texture read caps | Shared scalable, fenced descriptor/texture ownership, actual hardware limits, checked memory budget and streaming; no separate competing registry. |
+| Shadow views and timings | Fixed array and 32-bit mask | B3d variable storage/recording and query pool with checked ranges and fences. |
+| Particle snapshots | Fixed diagnostic total counts | Dynamic checked allocation/backpressure; maintain original batch semantics. |
+| HUD and no-level frames | Bridge requires loaded level, native path skips R4 render callbacks and forces startup menu closed | F4.5-A native frame modes and render-only producers; preserve game logic and DX11. |
+| Geometry/materials | Partial skinning, vegetation, transparency and legacy material coverage | Feature-specific modules and evidence; retain legacy compatibility, optional PBR. |
+| Memory and lifetime | Physical page owner exists; global cross-slot budget/descriptor lifetime still pending | Actual budget and safe retirement; never use present count as fence. Two frame slots are not an artificial scene quota. |
+
+### Windows Baseline Validation — ближайший обязательный гейт
+
+1. Sync the experimental branch with ordinary fast-forward and record exact tested SHA/tree, working-tree state, build properties and binary hashes; protect other worktrees and prypiat.
+2. Clean Release x64 feature-on and feature-off with actual MSVC/SDK; verify native bridge/camera flags, shader compilation and R4 compatibility. Record compiler/SDK and commands.
+3. Execute current [combined runner](../tools/dx12/test-f43-csm.ps1): CSM math/reference, local allocator/capture, paired PCF, adaptive policy/pages/addresses, particle packets/draw/materials, UI commands, physical page resource WARP and CSM WARP. Check actual runner options and all exit codes. Use Debug Layer/GBV and full InfoQueue with discarded/hidden counts; no false PASS via filtering.
+4. Preserve exact current ABI reflection, all eight current filter modes where applicable, six real HLSL mutation cases (actual execution and intended mismatch), all readback pixels, legacy/multi/parallel parity, GR accepted/completed and observed error handling. Check current fixture expected counters rather than hard-code historical 7/7 or 8/8 without source audit.
+5. If tests fail, fix minimal root cause, preserve assertions and independent oracle, rerun affected and regression tests. Publish logs and evidence; no new feature work on an unexplained build/GPU correctness failure. No game launch until separately agreed; hardware/game runtime remains a distinct gate.
+6. After baseline: B3c2 → B3d → adaptive runtime → hardware and game A/B (Jupiter, dense lights, resize/reload/shutdown, Debug/GBV separately from profiling). Capture actual GPU timings, CPU frametimes, memory budget/usage and visual parity; no claim of performance from CPU fixture or theoretical sample count.
+
+**Current verdict:** historical evidence preserved; current baseline NOT RUN / not accepted. Documentation update is not a new implementation/test result.
+
+### Исторические статусы F — снимок 2026-11-06 (prypiat)
+
+Следующая таблица и ранние J1/J2/J3 гейты оставлены для provenance и истории. Для экспериментальной ветки действует текущая матрица выше, а не прежние HOLD/PLANNED. Решения о production merge остаются отдельными. 
+
+**Исторический статус подэтапов F — 2026-11-06** (ветка `prypiat`; сверка по
 исходникам, отдельным независимым review и Git-коммитам до `1c2b5752`;
 VFS Readiness R2 — внешний evidence-пакет, а не production-изменение):
 
@@ -705,7 +833,7 @@ VFS Readiness R2 — внешний evidence-пакет, а не production-из
 | **F5 — temporal / upscaling DX12** | ◻ Не принят / впереди | Игровой DX12 temporal history, jitter, DLSS/FSR integration и history reset не подтверждены. |
 | **F6 — стабилизация** | ◻ Не принят / впереди | Измерение реального игрового CPU/GPU frametime, memory residency и FPS; standalone profiling не является F6 PASS. |
 
-**Ближайшая работа после Asset Recovery R3 PASS:** создать отдельный тестовый OGSR runtime без модификации оригинальной CoP, подтвердить штатную загрузку Jupiter и DX11/R4 baseline, затем выполнить строго opt-in **F4.0-J1 serial in-game DX12 Draw** для provenance `sector 0 → root 16926 → MT_NORMAL leaf 275` с настоящей игровой камерой, identity world, depth, owner submit/fence/readback и R4 Present. Это отдельный GPU gate, не следствие CPU PASS. Затем F4.0-J2/J3 — подключить существующий GR Job System к игровой CPU-подготовке и параллельной записи command lists. R4/DX11 сохраняется; ни F4.0, ни полный F4 пока не приняты.
+**Историческая ближайшая работа после Asset Recovery R3 PASS (не текущая задача):** создать отдельный тестовый OGSR runtime без модификации оригинальной CoP, подтвердить штатную загрузку Jupiter и DX11/R4 baseline, затем выполнить строго opt-in **F4.0-J1 serial in-game DX12 Draw** для provenance `sector 0 → root 16926 → MT_NORMAL leaf 275` с настоящей игровой камерой, identity world, depth, owner submit/fence/readback и R4 Present. Это отдельный GPU gate, не следствие CPU PASS. Затем F4.0-J2/J3 — подключить существующий GR Job System к игровой CPU-подготовке и параллельной записи command lists. R4/DX11 сохраняется; ни F4.0, ни полный F4 пока не приняты.
 
 ### F3.2 — GR Job System: сначала только DX12 (решение 2026-10-18)
 
@@ -801,7 +929,7 @@ Multithreaded Renderer Foundation до F4. Ссылки F3.3/F3.4/F3.5 в таб
 
 **Ограничения, сохраняемые без изменений:** ручной визуальный осмотр окна, интерактивный minimize/restore и специализированный race detector (TSan) **не выполнены**; отсутствие гонок не доказано. Синтетические замеры F3.2C.2 — не FPS и не игровой рендер.
 
-### F4.0 — ранний вертикальный срез: первый игровой кадр на DX12 (PLANNED)
+### F4.0 — ранний вертикальный срез: первый игровой кадр на DX12 (исторический план)
 
 **Новая приоритетная цель после принятия F3.5.6A–C:** как можно раньше
 увидеть реальную локацию **S.T.A.L.K.E.R.: Call of Pripyat / OGSR**
@@ -1646,6 +1774,8 @@ recording prototype **до F4**. F6 стабилизирует и оптимиз
 H1–H3 — после указанных RT-рубежей. Реализованных оптимизаций этапа H пока нет.
 
 ## Порядок выполнения и зависимости
+
+> Историческая общая схема ниже сохраняет стратегический порядок F/G. Актуальные оперативные зависимости F4.3–F4.5 и ближайший Windows baseline указаны в начале документа и в актуальной матрице F; ранние этапы не требуют повторной реализации.
 
 ```text
 База CoP / DX11:
@@ -2505,12 +2635,16 @@ CoP/модовых материалах, **не подтверждены в на
 
 ### F4.5 — Native DX12 HUD / UI (production design)
 
+> Историческое архитектурное дополнение; текущий статус по A–D — в актуальной матрице F выше.
+
 [Architecture and source investigation](dx12-f45-hud-ui-architecture.md), pinned to 36fd6a4670fc79d8daa837860db56631d390be3b. **IMPLEMENTATION STARTED (A command core, not native UI rendering).** A: native menu/loading/game UI frame modes, actual UI and font backend; B: animated first-person HUD with correct transforms/depth/skin and required HUD Contact Shadows (IX-Ray-inspired screen-space ray marching using HUD depth/projection; sun and relevant local-light visibility, stable filtering, no 2D UI occlusion; DXR optional later); C: scopes, 3D item UI, dynamic textures/video and composition; D: runtime parity/lifecycle/performance. No new prototype scene quotas, no second swapchain, no R4 UI framebuffer copy. Retain XML/LTX/Lua and input behavior. Native frame must support no-level menu/loading, preserve single owner and fence/descriptor lifetimes, and stop relying on forced startup menu close once native UI exists. Existing R4 and prypiat remain unchanged. Windows/GPU NOT RUN.
 
 **F4.5-B contact-shadow gate:** required alongside animated hands/weapon, not postponed to DXR. See [HUD Contact Shadows design and acceptance](dx12-f45-hud-ui-architecture.md#f45-b--hud-contact-shadows-required). Reference IX-Ray `7b74303e`; tune quality and sampling against actual OGSR assets, without copying hard-coded reference parameters. PLANNED / NOT IMPLEMENTED; Windows/GPU NOT RUN.
 
 
 ### F4.3 — Hybrid shadow evolution (IX-Ray comparison, production)
+
+> Исторические incremental checkpoints, сохранены для provenance. Текущий порядок B3c2/B3d и baseline — в актуальной матрице F выше.
 
 [Implementation plan and current PCF delta](dx12-f43-hybrid-shadow-evolution.md). Preserve 1–4 CSM, receiver-plane mode, immutable GR preparation and ordered per-view DX12 recording. P0: paired comparison-sampler box PCF3/5 and new PCF7 (source implemented; CPU math PASS; GPU pending). P0-B1 adaptive logical admission/resolution planner implemented and CPU-tested (2048 synthetic candidates; GPU/runtime still banked). P0 next: physical adaptive local shadow allocation (resolution/coverage/hysteresis, budgeted pages, point groups atomic, eliminate fixed candidate and bank topology quotas; no silent fail-open), scalable light admission and per-view metadata/recording. P1: caster visibility, guard bands, vegetation/LOD and depth reuse only when proven safe. F4.5-B retains HUD contact shadows; DXR contact/soft shadows later. No replacement of existing CSM/GR architecture. Windows/GPU acceptance pending.
 
