@@ -351,13 +351,13 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         slot.timingPresent = 0;
     }
     slot.timingViews.clear();
-    if (m_timestampFrequency && (!slot.timingQueries || timingViews > slot.timingCapacity))
+    if (m_timestampFrequency && !slot.timingQueries)
     {
         if (timingViews > (UINT32_MAX - 4) / 2)
             return E_INVALIDARG;
         D3D12_QUERY_HEAP_DESC query{};
         query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query.Count = 4 + 2 * timingViews;
+        query.Count = 4;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC readback{};
@@ -376,7 +376,7 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         {
             slot.timingQueries = std::move(queries);
             slot.timingReadback = std::move(buffer);
-            slot.timingCapacity = timingViews;
+            slot.timingCapacity = 0;
         }
         else
         {
@@ -384,6 +384,12 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
             slot.timingReadback.Reset();
             Msg("ph_dx12_native: GPU timestamps unavailable");
         }
+    }
+    if (slot.timingQueries && timingViews)
+    {
+        hr = PrepareShadowTiming(owner.device, slot, timingViews);
+        if (FAILED(hr))
+            return hr;
     }
     hr = slot.allocator->Reset();
     if (FAILED(hr))
@@ -520,6 +526,56 @@ HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
     return hr;
 }
 
+HRESULT GameDx12NativeFrame12::PrepareShadowTiming(ID3D12Device& device, Slot& slot, uint32_t views) noexcept
+{
+    if (views <= slot.timingCapacity)
+        return S_OK;
+    D3D12_QUERY_HEAP_DESC query{};
+    query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query.Count = 2 * views;
+    Ptr<ID3D12QueryHeap> queries;
+    auto hr = device.CreateQueryHeap(&query, IID_PPV_ARGS(queries.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+    auto desc = slot.timingReadback->GetDesc();
+    desc.Width = (4ull + query.Count) * sizeof(uint64_t);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    Ptr<ID3D12Resource> buffer;
+    hr = device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(buffer.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+    slot.shadowQueries = std::move(queries);
+    slot.timingReadback = std::move(buffer);
+    slot.timingCapacity = views;
+    return S_OK;
+}
+
+HRESULT GameDx12NativeFrame12::Recording::ReserveShadowStorage(uint32_t views) const noexcept
+{
+    if (!frame || !frame->m_recording || frame->m_slot != slot || !device || views > (UINT32_MAX - 4) / 2)
+        return E_INVALIDARG;
+    auto& current = frame->m_slots[slot];
+    if (UsesShadowLists())
+    {
+        try
+        {
+            current.shadows.reserve(views);
+            while (current.shadows.size() < views)
+            {
+                AuxiliaryList candidate;
+                const auto create = CreateList(*device, candidate.allocator, candidate.list);
+                if (FAILED(create))
+                    return create;
+                current.shadows.push_back(std::move(candidate));
+            }
+        }
+        catch (const std::exception&) { return E_OUTOFMEMORY; }
+    }
+    return current.timingQueries ? PrepareShadowTiming(*device, current, views) : S_OK;
+}
+
 HRESULT GameDx12NativeFrame12::Recording::SetShadowTimingViews(std::span<const uint32_t> ids) const noexcept
 {
     if (!frame || !frame->m_recording || frame->m_slot != slot)
@@ -527,9 +583,12 @@ HRESULT GameDx12NativeFrame12::Recording::SetShadowTimingViews(std::span<const u
     auto& current = frame->m_slots[slot];
     if (!current.timingQueries)
         return S_FALSE;
-    if (ids.size() > current.timingCapacity || !std::is_sorted(ids.begin(), ids.end()) ||
+    if (ids.size() > (UINT32_MAX - 4) / 2 || !std::is_sorted(ids.begin(), ids.end()) ||
         std::adjacent_find(ids.begin(), ids.end()) != ids.end())
         return E_INVALIDARG;
+    const auto capacity = PrepareShadowTiming(*device, current, static_cast<uint32_t>(ids.size()));
+    if (FAILED(capacity))
+        return capacity;
     try { current.timingViews.assign(ids.begin(), ids.end()); }
     catch (const std::exception&) { return E_OUTOFMEMORY; }
     return S_OK;
@@ -543,8 +602,8 @@ void GameDx12NativeFrame12::Recording::StampShadow(ID3D12GraphicsCommandList& ta
     const auto& ids = current.timingViews;
     const auto it = std::lower_bound(ids.begin(), ids.end(), projection);
     if (it != ids.end() && *it == projection)
-        target.EndQuery(current.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-            4 + 2 * static_cast<uint32_t>(it - ids.begin()) + (end ? 1 : 0));
+        target.EndQuery(current.shadowQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            2 * static_cast<uint32_t>(it - ids.begin()) + (end ? 1 : 0));
 }
 
 void GameDx12NativeFrame12::Recording::StampSceneStart() const noexcept
@@ -765,7 +824,8 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
             m_activeList->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 3);
         resolve(query, m_timingScene ? 4u : 2u);
         if (!slot.timingViews.empty())
-            resolve(4, 2 * static_cast<uint32_t>(slot.timingViews.size()));
+            m_activeList->ResolveQueryData(slot.shadowQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                0, 2 * static_cast<uint32_t>(slot.timingViews.size()), slot.timingReadback.Get(), 4 * sizeof(uint64_t));
     }
     bool captured = false;
     if (m_capturePath[0] && sceneFrame >= captureSceneStart)
@@ -914,6 +974,7 @@ void GameDx12NativeFrame12::Quarantine() noexcept
         slot.colorPass.allocator.Detach();
         slot.colorPass.list.Detach();
         slot.timingQueries.Detach();
+        slot.shadowQueries.Detach();
         slot.timingReadback.Detach();
     }
     m_depth.Detach();

@@ -69,6 +69,15 @@ public:
         D3D12_GPU_VIRTUAL_ADDRESS shapes = 0;
     };
 
+    uint32_t Available(uint32_t slot, uint64_t complete) const noexcept
+    {
+        if (!heap_ || unknown_ || pending_ || slot >= slots_.size() || complete == UINT64_MAX ||
+            slots_[slot].fence > complete)
+            return 0;
+        const auto& other = slots_[1 - slot];
+        return capacity_ - prefix_ - (other.fence > complete ? other.range.count : 0);
+    }
+
     HRESULT Stage(ID3D12Fence& fence, uint32_t slot, ShadowPageResources& pages,
         ShadowAddressPlan& addresses, Binding& binding) try
     {
@@ -83,11 +92,21 @@ public:
             return DXGI_ERROR_WAS_STILL_DRAWING;
 
         ShadowAddressPlan staged;
-        if (!pages.BuildPreparedAddresses(staged) || staged.pageIds.empty() || staged.pageIds.size() > UINT32_MAX)
+        if (!pages.BuildPreparedAddresses(staged) || staged.pageIds.size() > UINT32_MAX)
             return E_INVALIDARG;
         const auto plan = pages.PreparedPlan();
         if (plan->next.fence <= done)
             return E_INVALIDARG;
+
+        if (staged.pageIds.empty())
+        {
+            pending_ = &pages;
+            pendingSlot_ = slot;
+            staged_ = {{}, plan->next.fence};
+            addresses = std::move(staged);
+            binding = {};
+            return S_OK;
+        }
 
         const auto& other = slots_[1 - slot];
         ShadowDescriptorRange range;

@@ -45,6 +45,7 @@ public:
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
         HRESULT CloseShadowList(uint32_t index) const noexcept;
         HRESULT BeginColorList() noexcept;
+        HRESULT ReserveShadowStorage(uint32_t views) const noexcept;
         HRESULT SetShadowTimingViews(std::span<const uint32_t> projections) const noexcept;
         void StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept;
         void StampSceneStart() const noexcept;
@@ -79,7 +80,7 @@ public:
 
     HRESULT Initialize(HWND window, IDXGIFactory2& factory, const Owner& owner);
     HRESULT Begin(HWND window, const Owner& owner, Recording& recording,
-        uint32_t timingViews = kShadowListCount);
+        uint32_t timingViews = 0);
     // Owner only, after all scene/color work, before Present. Borrowed list
     // is valid only until Cancel/Present. Never use the initial Recording
     // after BeginColorList has switched the active command list.
@@ -119,7 +120,7 @@ private:
         Ptr<ID3D12CommandAllocator> allocator;
         Ptr<ID3D12GraphicsCommandList> list;
         std::vector<AuxiliaryList> shadows;
-        Ptr<ID3D12QueryHeap> timingQueries;
+        Ptr<ID3D12QueryHeap> timingQueries, shadowQueries;
         Ptr<ID3D12Resource> timingReadback;
         std::vector<uint32_t> timingViews;
         uint32_t timingCapacity = 0;
@@ -129,6 +130,7 @@ private:
         bool timingScene = false;
     };
 
+    static HRESULT PrepareShadowTiming(ID3D12Device& device, Slot& slot, uint32_t views) noexcept;
     HRESULT Wait(const Owner& owner, uint64_t value) noexcept;
     HRESULT Resize(const Owner& owner, uint32_t width, uint32_t height);
     HRESULT CreateTargets(ID3D12Device& device, uint32_t width, uint32_t height);

@@ -36,7 +36,7 @@ inline bool ValidPageSpec(const ShadowPageSpec& s) noexcept
 // completion quarantine the arena. No GPU depth contents are cached here.
 inline bool BuildShadowPagePlan(const AdaptivePlan& logical, std::span<const ShadowPageSpec> specs,
     uint64_t pageBudget, uint32_t slot, uint64_t completedFence, uint64_t submitFence,
-    const ShadowArena* previous, ShadowPagePlan& out)
+    const ShadowArena* previous, ShadowPagePlan& out, uint32_t pageCapacity = UINT32_MAX)
 {
     constexpr auto max = (std::numeric_limits<uint64_t>::max)();
     if (!logical.session || !logical.epoch || !logical.policyRevision || !logical.frame ||
@@ -97,7 +97,7 @@ inline bool BuildShadowPagePlan(const AdaptivePlan& logical, std::span<const Sha
         return a.faces != b.faces ? a.faces > b.faces : a.id < b.id;
     });
     const auto activate = [&](ShadowPage p) -> bool {
-        if (p.spec.bytes > pageBudget-plan.bytes) return false;
+        if (pages.size() >= pageCapacity || p.spec.bytes > pageBudget-plan.bytes) return false;
         active.emplace(p.id,pages.size());
         pages.push_back({p,std::vector<uint8_t>(p.spec.slices)});
         plan.bytes += p.spec.bytes;
@@ -141,7 +141,7 @@ inline bool BuildShadowPagePlan(const AdaptivePlan& logical, std::span<const Sha
                 if (!active.count(w.page.id) && SamePageSpec(w.page.spec,spec) && activate(w.page))
                 { place(pages.back(),a,0); break; }
         if (assigned.count(a.id)) continue;
-        if (spec.bytes <= pageBudget-plan.bytes)
+        if (pages.size() < pageCapacity && spec.bytes <= pageBudget-plan.bytes)
         {
             if (next.nextPage == max) return false;
             const uint64_t id = next.nextPage++;

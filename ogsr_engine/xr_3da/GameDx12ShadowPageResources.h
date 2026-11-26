@@ -195,7 +195,7 @@ public:
     // old pages remain alive during staging to permit transactional rollback.
     // A failed Prepare never publishes any new resources or placement.
     HRESULT Prepare(const AdaptivePlan& logical, std::span<const ShadowPageShape> shapes,
-        uint64_t pageBudget, uint64_t additionalHeadroom, uint64_t submitFence)
+        uint64_t pageBudget, uint64_t additionalHeadroom, uint64_t submitFence, uint32_t pageCapacity = UINT32_MAX)
     {
         if (!device_ || unknown_ || pending_) return E_UNEXPECTED;
         uint64_t completed = 0;
@@ -215,7 +215,7 @@ public:
             }
             auto staged = std::make_unique<Pending>();
             if (!BuildShadowPagePlan(logical,specs,pageBudget,slot_,completed,submitFence,
-                current_.fence ? &current_ : nullptr,staged->plan)) return E_INVALIDARG;
+                current_.fence ? &current_ : nullptr,staged->plan,pageCapacity)) return E_INVALIDARG;
             uint64_t newBytes = 0;
             for (const auto& p : staged->plan.next.pages)
             {
@@ -281,6 +281,7 @@ public:
 
     const ShadowPagePlan* PreparedPlan() const noexcept { return pending_ ? &pending_->plan : nullptr; }
     uint64_t CurrentBytes() const noexcept { return bytes_; }
+    const ShadowArena& CurrentArena() const noexcept { return current_; }
 
     // Build the descriptor ordinal / logical projection mapping from actual
     // staged resources, not the nominal adaptive assignment. Only usable
