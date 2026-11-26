@@ -5,6 +5,7 @@ param(
     [string]$Exe,
     [switch]$R4,
     [switch]$NoLitDecals,
+    [switch]$ParticleCapture,
     [switch]$LegacyAlpha,
     [switch]$NoWater,
     [switch]$NoPuddles,
@@ -130,6 +131,7 @@ $start.UseShellExecute = $false
 
 $features = @{
     STATIC_SCENE = '1'
+    PARTICLE_CAPTURE = [int]$ParticleCapture.IsPresent
     GR = $GR.ToLowerInvariant()
     GR_WORKERS = $GRWorkers.ToLowerInvariant()
     GR_GRAIN = $GRGrain

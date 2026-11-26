@@ -1,6 +1,10 @@
 #include "stdafx.h"
 
 #include "ParticleEffect.h"
+#include "ParticleGroup.h"
+#include "../../xr_3da/GameDx12ParticleCapture.h"
+#include "../../xr_3da/fmesh.h"
+#include <unordered_set>
 #include <xmmintrin.h>
 
 #include "HUDInitializer.h"
@@ -571,5 +575,143 @@ void CParticleEffect::Render(CBackend& cmd_list, float, bool)
                 }
             }
         }
+    }
+}
+
+// Native DX12 capture boundary. The original R4 Render and simulation paths
+// above are unchanged; use exactly the same geometry producer on the owner.
+void PS::CaptureNativeParticleRoots(std::span<IRenderVisual* const> roots, gameparticle12::Snapshot& snapshot)
+{
+    using namespace gameparticle12;
+    if (ps_r2_ls_flags_ext.test(R2FLAGEXT_DISABLE_PARTICLES))
+        return;
+
+    std::unordered_set<const IRenderVisual*> visited;
+    std::vector<FVF::LIT> scratch;
+    const auto visit = [&](auto&& self, IRenderVisual* visual, uint32_t depth) -> void
+    {
+        if (!visual) return;
+        if (depth >= 16 || visited.size() >= MaxVisuals ||
+            snapshot.emitters.size() >= MaxEmitters || snapshot.quads.size() >= MaxQuads)
+        {
+            ++snapshot.counts.budget;
+            return;
+        }
+        if (!visited.insert(visual).second)
+        {
+            ++snapshot.counts.duplicate;
+            return;
+        }
+        ++snapshot.counts.visited;
+        if (visual->getType() == MT_PARTICLE_GROUP)
+        {
+            auto* group = dynamic_cast<CParticleGroup*>(visual);
+            if (!group) { ++snapshot.counts.invalid; return; }
+            for (const auto& item : group->items)
+            {
+                if (visited.size() >= MaxVisuals || snapshot.emitters.size() >= MaxEmitters ||
+                    snapshot.quads.size() >= MaxQuads)
+                {
+                    ++snapshot.counts.budget;
+                    break;
+                }
+                self(self, item._effect, depth + 1);
+                for (auto* child : item._children_related)
+                {
+                    if (visited.size() >= MaxVisuals || snapshot.emitters.size() >= MaxEmitters ||
+                        snapshot.quads.size() >= MaxQuads)
+                    {
+                        ++snapshot.counts.budget;
+                        break;
+                    }
+                    self(self, child, depth + 1);
+                }
+                for (auto* child : item._children_free)
+                {
+                    if (visited.size() >= MaxVisuals || snapshot.emitters.size() >= MaxEmitters ||
+                        snapshot.quads.size() >= MaxQuads)
+                    {
+                        ++snapshot.counts.budget;
+                        break;
+                    }
+                    self(self, child, depth + 1);
+                }
+            }
+            return;
+        }
+        if (visual->getType() != MT_PARTICLE_EFFECT)
+        {
+            ++snapshot.counts.unsupported;
+            return;
+        }
+        auto* effect = dynamic_cast<CParticleEffect*>(visual);
+        if (!effect || !effect->m_Def) { ++snapshot.counts.invalid; return; }
+        if (effect->GetHudMode()) { ++snapshot.counts.hud; return; }
+        const auto& def = *effect->m_Def;
+        if (!def.m_Flags.is(CPEDef::dfSprite)) { ++snapshot.counts.unsupported; return; }
+        if (def.m_Flags.is(CPEDef::dfFramed) &&
+            (def.m_Frame.m_iFrameDimX <= 0 || def.m_Frame.m_iFrameCount <= 0 ||
+             !std::isfinite(def.m_Frame.m_fTexSize.x) || !std::isfinite(def.m_Frame.m_fTexSize.y)))
+        {
+            ++snapshot.counts.invalid;
+            return;
+        }
+        PAPI::Particle* particles = nullptr;
+        u32 count = 0;
+        ParticleManager()->GetParticles(effect->GetHandleEffect(), particles, count);
+        if (!count) { ++snapshot.counts.empty; return; }
+        if (!particles) { ++snapshot.counts.invalid; return; }
+        snapshot.counts.sourceQuads += count;
+
+        Emitter emitter;
+        if (!*def.m_Name || !*def.m_ShaderName || !*def.m_TextureName)
+        {
+            ++snapshot.counts.invalid;
+            return;
+        }
+        emitter.effect = *def.m_Name;
+        emitter.shader = *def.m_ShaderName;
+        emitter.texture = *def.m_TextureName;
+        emitter.flags = def.m_Flags.get();
+        emitter.cull = !def.m_Flags.is(CPEDef::dfCulling) ? Cull::None :
+            def.m_Flags.is(CPEDef::dfCullCCW) ? Cull::CCW : Cull::CW;
+        if (!ValidEmitter(emitter)) { ++snapshot.counts.invalid; return; }
+        emitter.first = static_cast<uint32_t>(snapshot.quads.size());
+        emitter.count = (std::min)(count, MaxQuads - emitter.first);
+        snapshot.counts.truncatedQuads += count - emitter.count;
+        if (!emitter.count) { ++snapshot.counts.budget; return; }
+
+        // Copy in bounded chunks using original FVF::LIT; never reinterpret
+        // live simulation data as GPU vertices or retain a manager pointer.
+        constexpr uint32_t Chunk = 4096;
+        for (uint32_t first = 0; first < emitter.count;)
+        {
+            const uint32_t batch = (std::min)(Chunk, emitter.count - first);
+            scratch.resize(batch * 4u);
+            ParticleRenderStream(*effect, particles, scratch.data(), first, first + batch);
+            for (uint32_t q = 0; q < batch; ++q)
+            {
+                Quad quad{};
+                for (uint32_t v = 0; v < 4; ++v)
+                {
+                    const auto& src = scratch[q * 4 + v];
+                    quad[v] = {src.p.x, src.p.y, src.p.z, src.color, src.t.x, src.t.y};
+                }
+                snapshot.quads.push_back(quad);
+            }
+            first += batch;
+        }
+        snapshot.emitters.push_back(std::move(emitter));
+    };
+    for (auto* root : roots)
+    {
+        if (visited.size() >= MaxVisuals || snapshot.emitters.size() >= MaxEmitters ||
+            snapshot.quads.size() >= MaxQuads)
+        {
+            ++snapshot.counts.budget;
+            break;
+        }
+        ++snapshot.counts.roots;
+        visit(visit, root, 0);
     }
 }

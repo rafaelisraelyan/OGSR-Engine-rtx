@@ -13,6 +13,10 @@
 #include "GameDx12GameVisuals.h"
 #include "GameDx12Lighting.h"
 #include "GameDx12Water.h"
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+#include "GameDx12ParticleCapture.h"
+#include "PS_instance.h"
+#endif
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE
 #include "FS.h"
@@ -2133,6 +2137,114 @@ gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,
     return snapshot;
 }
 
+// Diagnostic F4.4-A1 only. Do not advance simulation or submit GPU work.
+// Sample on the original camera before seqFrameMT; all live pointers die
+// before the shared GR pool sees the immutable quad snapshot.
+void CaptureNativeParticleDiagnostics(uint64_t session, uint64_t epoch)
+{
+    static const bool enabled = []
+    {
+        const char* flag = std::getenv("OGSR_DX12_GAME_PARTICLE_CAPTURE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!enabled || !g_pGamePersistent || Device.dwFrame % 120 != 0)
+        return;
+    try
+    {
+        using namespace gameparticle12;
+        Snapshot snapshot;
+        snapshot.session = session;
+        snapshot.epoch = epoch;
+        snapshot.frame = Device.dwFrame;
+        {
+            std::vector<IRenderVisual*> roots;
+            roots.reserve((std::min)(static_cast<size_t>(MaxVisuals), g_pGamePersistent->ps_active.size()));
+            for (auto* instance : g_pGamePersistent->ps_active)
+            {
+                if (roots.size() >= MaxVisuals) { ++snapshot.counts.budget; break; }
+                if (!instance || instance->Locked() || !instance->renderable.visual ||
+                    instance->renderable_Invisible() || instance->renderable_HUD() ||
+                    g_pGamePersistent->ps_destroy.find(instance) != g_pGamePersistent->ps_destroy.end())
+                    continue;
+                roots.push_back(instance->renderable.visual);
+            }
+            PS::CaptureNativeParticleRoots(roots, snapshot);
+        }
+        if (!ValidLayout(snapshot))
+        {
+            Msg("ph_dx12_particles: state=rejected reason=invalid_snapshot");
+            return;
+        }
+        std::vector<uint8_t> valid(snapshot.quads.size(), 255u);
+        const uint32_t count = static_cast<uint32_t>(valid.size());
+        const char* requested = std::getenv("OGSR_DX12_GAME_GR");
+        const bool verify = requested && std::strcmp(requested, "verify") == 0;
+        const bool parallel = verify || (requested && std::strcmp(requested, "parallel") == 0);
+        GameDx12GRRangeStats12 gr{};
+        std::string reason;
+        if (parallel && count)
+        {
+            const auto classify = [&](uint32_t first, uint32_t last, uint32_t)
+            {
+                ClassifyRange(snapshot.quads, valid, first, last);
+            };
+            if (!GameDx12GR_RunRanges(count, 256, classify, gr, reason))
+            {
+                Msg("ph_dx12_particles: state=rejected reason=gr_failure detail='%s'", reason.c_str());
+                return;
+            }
+        }
+        else
+            ClassifyRange(snapshot.quads, valid, 0, count);
+        Prepared prepared;
+        if (!BuildPackets(snapshot, session, epoch, valid, prepared))
+        {
+            Msg("ph_dx12_particles: state=rejected reason=packet_validation");
+            return;
+        }
+        if (verify)
+        {
+            std::vector<uint8_t> serial(count);
+            ClassifyRange(snapshot.quads, serial, 0, count);
+            Prepared reference;
+            if (serial != valid || !BuildPackets(snapshot, session, epoch, serial, reference) ||
+                !(reference == prepared))
+            {
+                Msg("ph_dx12_particles: state=rejected reason=gr_verify_mismatch");
+                return;
+            }
+        }
+        const auto& c = snapshot.counts;
+        Msg("ph_dx12_particles: state=captured_only session=%llu epoch=%llu frame=%llu active=%u "
+            "roots=%u visited=%u duplicate=%u hud=%u empty=%u unsupported=%u invalid=%u budget=%u "
+            "source_quads=%llu truncated_quads=%llu copied_quads=%u invalid_quads=%u emitters=%u "
+            "packets=%u vertices=%u indices=%u gr=%s gr_submitted=%llu gr_completed=%llu",
+            static_cast<unsigned long long>(session), static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(snapshot.frame), static_cast<unsigned>(g_pGamePersistent->ps_active.size()),
+            c.roots, c.visited, c.duplicate, c.hud, c.empty, c.unsupported, c.invalid, c.budget,
+            static_cast<unsigned long long>(c.sourceQuads), static_cast<unsigned long long>(c.truncatedQuads),
+            count, prepared.invalidQuads, static_cast<unsigned>(snapshot.emitters.size()),
+            static_cast<unsigned>(prepared.packets.size()), static_cast<unsigned>(prepared.vertices.size()),
+            static_cast<unsigned>(prepared.indices.size()), verify ? "verify" : parallel && count ? "parallel" : "serial",
+            static_cast<unsigned long long>(gr.submitted), static_cast<unsigned long long>(gr.completed));
+        // Bounded material inventory; not a claim that the shader is supported.
+        for (size_t i = 0; i < (std::min)(snapshot.emitters.size(), size_t{12}); ++i)
+        {
+            const auto& e = snapshot.emitters[i];
+            Msg("ph_dx12_particles: material_pending effect='%s' shader='%s' texture='%s' flags=0x%x cull=%u quads=%u",
+                e.effect.c_str(), e.shader.c_str(), e.texture.c_str(), e.flags, static_cast<unsigned>(e.cull), e.count);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        Msg("ph_dx12_particles: state=rejected reason=exception detail='%s'", e.what());
+    }
+    catch (...)
+    {
+        Msg("ph_dx12_particles: state=rejected reason=unknown_exception");
+    }
+}
+
 gamewater12::Frame CaptureWater()
 {
     gamewater12::Frame snapshot{};
@@ -2192,7 +2304,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         float position[]{Device.vCameraPosition.x,
                          Device.vCameraPosition.y,
                          Device.vCameraPosition.z};
-        if (FlyCameraMatrix(flyTransform, state.captureSequence, position))
+        const bool flyCamera = FlyCameraMatrix(flyTransform, state.captureSequence, position);
+        if (flyCamera)
         {
             std::memcpy(&viewProjection, flyTransform.m, sizeof(viewProjection));
         }
@@ -2215,6 +2328,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 state.device.Get(), state.queue.Get(), state.fence.Get(), state.fenceEvent,
                 state.allocator.Get(), state.list.Get(), &state.fenceValue};
             lighting = CaptureLighting(state, viewProjection, position);
+            if (!flyCamera)
+                CaptureNativeParticleDiagnostics(state.levelSession, state.captureEpoch);
             const bool prepared = state.gameVisuals.Prepare(*g_pGameLevel, position, state.staticScene, upload, reason);
             if (sceneDetail)
                 prepareMs = elapsed(begin, FrameClock::now());
