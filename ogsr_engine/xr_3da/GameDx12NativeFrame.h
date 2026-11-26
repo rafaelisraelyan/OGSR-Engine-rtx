@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -44,7 +45,7 @@ public:
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
         HRESULT CloseShadowList(uint32_t index) const noexcept;
         HRESULT BeginColorList() noexcept;
-        void SetShadowTimingMask(uint32_t mask) const noexcept;
+        HRESULT SetShadowTimingViews(std::span<const uint32_t> projections) const noexcept;
         void StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept;
         void StampSceneStart() const noexcept;
 
@@ -67,8 +68,8 @@ public:
         double milliseconds = 0;
         double sceneMilliseconds = 0;
         double shadowMilliseconds = 0;
-        uint32_t shadowMask = 0;
-        std::array<double, kShadowListCount> viewMilliseconds{};
+        struct View { uint32_t projection; double milliseconds; };
+        std::vector<View> views;
     };
 
     GameDx12NativeFrame12() = default;
@@ -77,7 +78,8 @@ public:
     ~GameDx12NativeFrame12();
 
     HRESULT Initialize(HWND window, IDXGIFactory2& factory, const Owner& owner);
-    HRESULT Begin(HWND window, const Owner& owner, Recording& recording);
+    HRESULT Begin(HWND window, const Owner& owner, Recording& recording,
+        uint32_t timingViews = kShadowListCount);
     // Owner only, after all scene/color work, before Present. Borrowed list
     // is valid only until Cancel/Present. Never use the initial Recording
     // after BeginColorList has switched the active command list.
@@ -99,7 +101,8 @@ private:
 
     template <typename T> using Ptr = Microsoft::WRL::ComPtr<T>;
     // Пары для кадра, основного прохода и каждого projection ID.
-    static constexpr uint32_t kTimingQueriesPerSlot = 4 + 2 * kShadowListCount;
+    static HRESULT CreateList(ID3D12Device& device, Ptr<ID3D12CommandAllocator>& allocator,
+        Ptr<ID3D12GraphicsCommandList>& list) noexcept;
 
     struct AuxiliaryList
     {
@@ -115,11 +118,14 @@ private:
         Ptr<ID3D12Resource> opaqueColor;
         Ptr<ID3D12CommandAllocator> allocator;
         Ptr<ID3D12GraphicsCommandList> list;
-        std::array<AuxiliaryList, kShadowListCount> shadows;
+        std::vector<AuxiliaryList> shadows;
+        Ptr<ID3D12QueryHeap> timingQueries;
+        Ptr<ID3D12Resource> timingReadback;
+        std::vector<uint32_t> timingViews;
+        uint32_t timingCapacity = 0;
         AuxiliaryList colorPass;
         uint64_t fence = 0;
         uint64_t timingPresent = 0;
-        uint32_t timingShadowMask = 0;
         bool timingScene = false;
     };
 
@@ -137,8 +143,6 @@ private:
     Ptr<ID3D12DescriptorHeap> m_rtv;
     Ptr<ID3D12DescriptorHeap> m_dsv;
     Ptr<ID3D12Resource> m_depth;
-    Ptr<ID3D12QueryHeap> m_timingQueries;
-    Ptr<ID3D12Resource> m_timingReadback;
     Ptr<ID3D12Resource> m_captureReadback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_captureLayout{};
     wchar_t m_capturePath[MAX_PATH]{};
@@ -154,7 +158,7 @@ private:
     uint64_t m_presentCount = 0;
     ID3D12GraphicsCommandList* m_activeList = nullptr;
     uint32_t m_shadowCount = 0;
-    uint32_t m_timingShadowMask = 0;
+    std::vector<ID3D12CommandList*> m_submitLists;
     bool m_timingScene = false;
     bool m_separateShadowLists = false;
     bool m_parallelShadowLists = false;

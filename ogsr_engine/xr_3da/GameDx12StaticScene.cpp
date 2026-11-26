@@ -4659,10 +4659,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint64_t hash = 14695981039346656037ull;
     };
     const bool sampleCsm = lighting.frame % 120 == 0;
-    uint32_t timingMask = 0;
+    std::array<uint32_t, game_shadow12::MaxViews> timingIds{};
     for (uint32_t index = 0; index < passCount; ++index)
-        timingMask |= 1u << passes[index].view.projection;
-    recording.SetShadowTimingMask(timingMask);
+        timingIds[index] = passes[index].view.projection;
+    std::sort(timingIds.begin(), timingIds.begin() + passCount);
+    recording.SetShadowTimingViews(std::span(timingIds.data(), passCount));
     const FramePreparation& preparedPackets = prepared;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,

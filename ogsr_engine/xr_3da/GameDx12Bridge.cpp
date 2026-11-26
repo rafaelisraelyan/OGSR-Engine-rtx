@@ -2461,22 +2461,21 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     const auto count = state.native.PresentCount();
     const auto& completedGpu = state.native.LastGpuTiming();
-    if (completedGpu.present != 0 && completedGpu.present % 120 == 0 && completedGpu.shadowMask != 0)
+    if (completedGpu.present != 0 && completedGpu.present % 120 == 0 && !completedGpu.views.empty())
     {
-        Msg("ph_dx12_csm: gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f shadow_mask=0x%x",
+        Msg("ph_dx12_csm: gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f shadow_views=%zu",
             static_cast<unsigned long long>(completedGpu.present), completedGpu.milliseconds,
-            completedGpu.shadowMilliseconds, completedGpu.sceneMilliseconds, completedGpu.shadowMask);
-        for (uint32_t projection = 0; projection < game_shadow12::MaxViews; ++projection)
-            if ((completedGpu.shadowMask & (1u << projection)) != 0)
+            completedGpu.shadowMilliseconds, completedGpu.sceneMilliseconds, completedGpu.views.size());
+        for (const auto& timing : completedGpu.views)
             {
-                const game_shadow12::View view{projection};
+                const game_shadow12::View view{timing.projection};
                 if (view.IsSun())
                     Msg("ph_dx12_csm: gpu_present=%llu slice=%u gpu_ms=%.6f",
-                        static_cast<unsigned long long>(completedGpu.present), view.Slice(), completedGpu.viewMilliseconds[projection]);
+                        static_cast<unsigned long long>(completedGpu.present), view.Slice(), timing.milliseconds);
                 else
                     Msg("ph_dx12_lsa: gpu_present=%llu slice=%u kind=%u gpu_ms=%.6f",
                         static_cast<unsigned long long>(completedGpu.present), view.Slice(),
-                        static_cast<unsigned>(view.Kind()), completedGpu.viewMilliseconds[projection]);
+                        static_cast<unsigned>(view.Kind()), timing.milliseconds);
             }
     }
     if (hr == S_OK && sceneRecorded && sceneDetail)

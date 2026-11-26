@@ -85,29 +85,14 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     const char* commandLists = std::getenv("OGSR_DX12_GAME_COMMAND_LISTS");
     m_parallelShadowLists = commandLists && std::strcmp(commandLists, "parallel") == 0;
     m_separateShadowLists = m_parallelShadowLists || (commandLists && std::strcmp(commandLists, "multi") == 0);
-    const auto createList = [&](auto& allocator, auto& list)
-    {
-        HRESULT result = owner.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(allocator.GetAddressOf()));
-        if (SUCCEEDED(result))
-            result = owner.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf()));
-        return SUCCEEDED(result) ? list->Close() : result;
-    };
     for (auto& slot : m_slots)
     {
-        hr = createList(slot.allocator, slot.list);
+        hr = CreateList(owner.device, slot.allocator, slot.list);
         if (FAILED(hr))
             return hr;
         if (!m_separateShadowLists)
             continue;
-        for (auto& pair : slot.shadows)
-        {
-            hr = createList(pair.allocator, pair.list);
-            if (FAILED(hr))
-                return hr;
-        }
-        hr = createList(slot.colorPass.allocator, slot.colorPass.list);
+        hr = CreateList(owner.device, slot.colorPass.allocator, slot.colorPass.list);
         if (FAILED(hr))
             return hr;
     }
@@ -130,32 +115,9 @@ HRESULT GameDx12NativeFrame12::Initialize(HWND window, IDXGIFactory2& factory,
     const char* sceneLog = std::getenv("OGSR_DX12_GAME_SCENE_LOG");
     m_measureFrame = (measure != nullptr && std::strcmp(measure, "1") == 0) ||
         (sceneLog != nullptr && std::strcmp(sceneLog, "1") == 0);
-    if (m_measureFrame && SUCCEEDED(owner.queue.GetTimestampFrequency(&m_timestampFrequency)) &&
-        m_timestampFrequency != 0)
-    {
-        D3D12_QUERY_HEAP_DESC query{};
-        query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query.Count = kTimingQueriesPerSlot * kFrameCount;
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC readback{};
-        readback.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        readback.Width = query.Count * sizeof(uint64_t);
-        readback.Height = 1;
-        readback.DepthOrArraySize = 1;
-        readback.MipLevels = 1;
-        readback.SampleDesc.Count = 1;
-        readback.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(owner.device.CreateQueryHeap(&query, IID_PPV_ARGS(m_timingQueries.GetAddressOf()))) ||
-            FAILED(owner.device.CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &readback, D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr, IID_PPV_ARGS(m_timingReadback.GetAddressOf()))))
-        {
-            m_timingQueries.Reset();
-            m_timingReadback.Reset();
-            Msg("ph_dx12_native: GPU timestamps unavailable");
-        }
-    }
+    m_timestampFrequency = 0;
+    if (m_measureFrame && FAILED(owner.queue.GetTimestampFrequency(&m_timestampFrequency)))
+        m_timestampFrequency = 0;
     return S_OK;
 }
 
@@ -311,10 +273,22 @@ HRESULT GameDx12NativeFrame12::Recording::StageShadowPages(game_shadow12::Shadow
     return hr;
 }
 
-HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording& recording)
+HRESULT GameDx12NativeFrame12::CreateList(ID3D12Device& device, Ptr<ID3D12CommandAllocator>& allocator,
+    Ptr<ID3D12GraphicsCommandList>& list) noexcept
+{
+    auto hr = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf()));
+    if (SUCCEEDED(hr))
+        hr = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(list.GetAddressOf()));
+    return SUCCEEDED(hr) ? list->Close() : hr;
+}
+
+HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording& recording, uint32_t timingViews)
 {
     recording = {};
-    m_lastGpuTiming = {};
+    m_lastGpuTiming.present = 0;
+    m_lastGpuTiming.milliseconds = m_lastGpuTiming.sceneMilliseconds = m_lastGpuTiming.shadowMilliseconds = 0;
+    m_lastGpuTiming.views.clear();
     if (!m_swapchain || !m_depth || m_unknown || m_recording)
         return E_FAIL;
     RECT rect{};
@@ -341,16 +315,16 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         return hr;
     const double slotFenceWaitMs = m_measureFrame ?
         std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count() : 0.0;
-    if (m_timingQueries && slot.timingPresent != 0)
+    if (slot.timingQueries && slot.timingPresent)
     {
-        constexpr SIZE_T timingSize = kTimingQueriesPerSlot * sizeof(uint64_t);
-        const SIZE_T offset = m_slot * timingSize;
-        const D3D12_RANGE range{offset, offset + timingSize};
+        const SIZE_T bytes = (4 + 2 * slot.timingViews.size()) * sizeof(uint64_t);
+        const D3D12_RANGE range{0, bytes};
         void* mapped = nullptr;
-        if (SUCCEEDED(m_timingReadback->Map(0, &range, &mapped)))
+        try { m_lastGpuTiming.views.reserve(slot.timingViews.size()); }
+        catch (const std::exception&) { return E_OUTOFMEMORY; }
+        if (SUCCEEDED(slot.timingReadback->Map(0, &range, &mapped)))
         {
-            uint64_t ticks[kTimingQueriesPerSlot];
-            std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, sizeof(ticks));
+            const auto* ticks = static_cast<const uint64_t*>(mapped);
             if (ticks[1] >= ticks[0])
             {
                 m_lastGpuTiming.present = slot.timingPresent;
@@ -359,26 +333,57 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
                 if (slot.timingScene && ticks[3] >= ticks[2])
                     m_lastGpuTiming.sceneMilliseconds = tickMs * static_cast<double>(ticks[3] - ticks[2]);
                 uint64_t firstShadow = UINT64_MAX, lastShadow = 0;
-                for (uint32_t view = 0; view < kShadowListCount; ++view)
+                for (size_t view = 0; view < slot.timingViews.size(); ++view)
                 {
-                    if ((slot.timingShadowMask & (1u << view)) == 0)
-                        continue;
-                    const uint64_t first = ticks[4 + 2 * view];
-                    const uint64_t last = ticks[5 + 2 * view];
+                    const auto first = ticks[4 + 2 * view], last = ticks[5 + 2 * view];
                     if (last < first)
                         continue;
                     firstShadow = (std::min)(firstShadow, first);
                     lastShadow = (std::max)(lastShadow, last);
-                    m_lastGpuTiming.shadowMask |= 1u << view;
-                    m_lastGpuTiming.viewMilliseconds[view] = tickMs * static_cast<double>(last - first);
+                    m_lastGpuTiming.views.push_back({slot.timingViews[view], tickMs * static_cast<double>(last - first)});
                 }
-                if (m_lastGpuTiming.shadowMask != 0)
+                if (!m_lastGpuTiming.views.empty())
                     m_lastGpuTiming.shadowMilliseconds = tickMs * static_cast<double>(lastShadow - firstShadow);
             }
             const D3D12_RANGE noWrite{};
-            m_timingReadback->Unmap(0, &noWrite);
+            slot.timingReadback->Unmap(0, &noWrite);
         }
         slot.timingPresent = 0;
+    }
+    slot.timingViews.clear();
+    if (m_timestampFrequency && (!slot.timingQueries || timingViews > slot.timingCapacity))
+    {
+        if (timingViews > (UINT32_MAX - 4) / 2)
+            return E_INVALIDARG;
+        D3D12_QUERY_HEAP_DESC query{};
+        query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query.Count = 4 + 2 * timingViews;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC readback{};
+        readback.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback.Width = static_cast<uint64_t>(query.Count) * sizeof(uint64_t);
+        readback.Height = 1;
+        readback.DepthOrArraySize = 1;
+        readback.MipLevels = 1;
+        readback.SampleDesc.Count = 1;
+        readback.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Ptr<ID3D12QueryHeap> queries;
+        Ptr<ID3D12Resource> buffer;
+        if (SUCCEEDED(owner.device.CreateQueryHeap(&query, IID_PPV_ARGS(queries.GetAddressOf()))) &&
+            SUCCEEDED(owner.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &readback,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(buffer.GetAddressOf()))))
+        {
+            slot.timingQueries = std::move(queries);
+            slot.timingReadback = std::move(buffer);
+            slot.timingCapacity = timingViews;
+        }
+        else
+        {
+            slot.timingQueries.Reset();
+            slot.timingReadback.Reset();
+            Msg("ph_dx12_native: GPU timestamps unavailable");
+        }
     }
     hr = slot.allocator->Reset();
     if (FAILED(hr))
@@ -390,10 +395,10 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     m_recording = true;
     m_activeList = slot.list.Get();
     m_shadowCount = 0;
-    m_timingShadowMask = 0;
+
     m_timingScene = false;
-    if (m_timingQueries)
-        slot.list->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kTimingQueriesPerSlot * m_slot);
+    if (slot.timingQueries)
+        slot.list->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
     const auto barrier = ColorBarrier(slot.color.Get(), D3D12_RESOURCE_STATE_PRESENT,
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -466,10 +471,20 @@ HRESULT GameDx12NativeFrame12::Recording::OpenShadowList(uint32_t index,
 {
     result = nullptr;
     if (!UsesShadowLists() || !frame->m_recording || slot != frame->m_slot ||
-        index != frame->m_shadowCount || index >= kShadowListCount ||
+        index != frame->m_shadowCount || index >= UINT32_MAX - 2 ||
         frame->m_activeList != frame->m_slots[slot].list.Get())
         return E_UNEXPECTED;
-    auto& pair = frame->m_slots[slot].shadows[index];
+    auto& pool = frame->m_slots[slot].shadows;
+    if (index == pool.size())
+    {
+        AuxiliaryList candidate;
+        const auto create = CreateList(*device, candidate.allocator, candidate.list);
+        if (FAILED(create))
+            return create;
+        try { pool.push_back(std::move(candidate)); }
+        catch (const std::exception&) { return E_OUTOFMEMORY; }
+    }
+    auto& pair = pool[index];
     const HRESULT hr = OpenList(pair);
     if (SUCCEEDED(hr))
     {
@@ -505,25 +520,39 @@ HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
     return hr;
 }
 
-void GameDx12NativeFrame12::Recording::SetShadowTimingMask(uint32_t mask) const noexcept
+HRESULT GameDx12NativeFrame12::Recording::SetShadowTimingViews(std::span<const uint32_t> ids) const noexcept
 {
-    if (frame && frame->m_timingQueries)
-        frame->m_timingShadowMask = mask & ((1u << kShadowListCount) - 1u);
+    if (!frame || !frame->m_recording || frame->m_slot != slot)
+        return E_UNEXPECTED;
+    auto& current = frame->m_slots[slot];
+    if (!current.timingQueries)
+        return S_FALSE;
+    if (ids.size() > current.timingCapacity || !std::is_sorted(ids.begin(), ids.end()) ||
+        std::adjacent_find(ids.begin(), ids.end()) != ids.end())
+        return E_INVALIDARG;
+    try { current.timingViews.assign(ids.begin(), ids.end()); }
+    catch (const std::exception&) { return E_OUTOFMEMORY; }
+    return S_OK;
 }
 
 void GameDx12NativeFrame12::Recording::StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept
 {
-    if (frame && projection < kShadowListCount && (frame->m_timingShadowMask & (1u << projection)) != 0)
-        target.EndQuery(frame->m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-            kTimingQueriesPerSlot * slot + 4 + 2 * projection + (end ? 1 : 0));
+    if (!frame)
+        return;
+    const auto& current = frame->m_slots[slot];
+    const auto& ids = current.timingViews;
+    const auto it = std::lower_bound(ids.begin(), ids.end(), projection);
+    if (it != ids.end() && *it == projection)
+        target.EndQuery(current.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            4 + 2 * static_cast<uint32_t>(it - ids.begin()) + (end ? 1 : 0));
 }
 
 void GameDx12NativeFrame12::Recording::StampSceneStart() const noexcept
 {
-    if (frame && frame->m_timingQueries)
+    if (frame && frame->m_slots[slot].timingQueries)
     {
         frame->m_timingScene = true;
-        list->EndQuery(frame->m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kTimingQueriesPerSlot * slot + 2);
+        list->EndQuery(frame->m_slots[slot].timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
     }
 }
 
@@ -723,21 +752,20 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         return E_UNEXPECTED;
     }
     const bool sceneDrawn = sceneFrame != 0;
-    if (m_timingQueries && sceneDrawn)
+    if (slot.timingQueries && sceneDrawn)
     {
-        const uint32_t query = kTimingQueriesPerSlot * m_slot;
-        m_activeList->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
+        constexpr uint32_t query = 0;
+        m_activeList->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
         const auto resolve = [&](uint32_t first, uint32_t count)
         {
-            m_activeList->ResolveQueryData(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                first, count, m_timingReadback.Get(), first * sizeof(uint64_t));
+            m_activeList->ResolveQueryData(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                first, count, slot.timingReadback.Get(), first * sizeof(uint64_t));
         };
         if (m_timingScene)
-            m_activeList->EndQuery(m_timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 3);
+            m_activeList->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 3);
         resolve(query, m_timingScene ? 4u : 2u);
-        for (uint32_t view = 0; view < kShadowListCount; ++view)
-            if ((m_timingShadowMask & (1u << view)) != 0)
-                resolve(query + 4 + 2 * view, 2);
+        if (!slot.timingViews.empty())
+            resolve(4, 2 * static_cast<uint32_t>(slot.timingViews.size()));
     }
     bool captured = false;
     if (m_capturePath[0] && sceneFrame >= captureSceneStart)
@@ -756,13 +784,22 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
                                       D3D12_RESOURCE_STATE_PRESENT);
     m_activeList->ResourceBarrier(1, &barrier);
     // Один batch гарантирует порядок: начало кадра, карты, цвет и Present.
-    std::array<ID3D12CommandList*, kShadowListCount + 2> lists{};
-    uint32_t count = 0;
-    lists[count++] = slot.list.Get();
-    for (uint32_t index = 0; index < m_shadowCount; ++index)
-        lists[count++] = slot.shadows[index].list.Get();
-    if (m_shadowCount != 0)
-        lists[count++] = slot.colorPass.list.Get();
+    auto& lists = m_submitLists;
+    lists.clear();
+    try
+    {
+        lists.reserve(static_cast<size_t>(m_shadowCount) + 2);
+        lists.push_back(slot.list.Get());
+        for (uint32_t index = 0; index < m_shadowCount; ++index)
+            lists.push_back(slot.shadows[index].list.Get());
+        if (m_shadowCount != 0)
+            lists.push_back(slot.colorPass.list.Get());
+    }
+    catch (const std::exception&)
+    {
+        Cancel();
+        return E_OUTOFMEMORY;
+    }
     const uint64_t value = owner.fenceValue + 1;
     if (m_pendingShadowDescriptors && !m_pendingShadowDescriptors->Expects(owner.fence, value))
     {
@@ -777,7 +814,7 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     }
 
     m_submitted = true;
-    owner.queue.ExecuteCommandLists(count, lists.data());
+    owner.queue.ExecuteCommandLists(static_cast<UINT>(lists.size()), lists.data());
     if (m_presentCount == 79)
     {
         const char* probe = std::getenv("OGSR_DX12_GAME_NATIVE_REMOVE_DEVICE");
@@ -816,10 +853,10 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     if (hr == S_OK)
     {
         ++m_presentCount;
-        if (m_timingQueries && sceneDrawn)
+        if (slot.timingQueries && sceneDrawn)
         {
             slot.timingPresent = m_presentCount;
-            slot.timingShadowMask = m_timingShadowMask;
+
             slot.timingScene = m_timingScene;
         }
         if (captured)
@@ -850,8 +887,6 @@ void GameDx12NativeFrame12::Release() noexcept
     m_dsv.Reset();
     m_rtv.Reset();
     m_swapchain.Reset();
-    m_timingQueries.Reset();
-    m_timingReadback.Reset();
     m_captureReadback.Reset();
 }
 
@@ -878,13 +913,13 @@ void GameDx12NativeFrame12::Quarantine() noexcept
         }
         slot.colorPass.allocator.Detach();
         slot.colorPass.list.Detach();
+        slot.timingQueries.Detach();
+        slot.timingReadback.Detach();
     }
     m_depth.Detach();
     m_dsv.Detach();
     m_rtv.Detach();
     m_swapchain.Detach();
-    m_timingQueries.Detach();
-    m_timingReadback.Detach();
     m_captureReadback.Detach();
 }
 

@@ -84,6 +84,7 @@ class ShadowPageResources
     {
         ShadowPagePlan plan;
         std::vector<Page> pages;
+        std::vector<ShadowPlacement> byPhysicalSlice;
     };
     Ptr<ID3D12Device> device_;
     Ptr<ID3D12Fence> fence_;
@@ -245,6 +246,9 @@ public:
             }
             std::sort(staged->pages.begin(), staged->pages.end(),
                 [](const Page& a, const Page& b) { return a.description.id < b.description.id; });
+            staged->byPhysicalSlice = staged->plan.next.placed;
+            std::sort(staged->byPhysicalSlice.begin(), staged->byPhysicalSlice.end(),
+                [](const auto& a, const auto& b) { return std::pair{a.page, a.first} < std::pair{b.page, b.first}; });
             pending_ = std::move(staged);
             return S_OK;
         }
@@ -313,12 +317,18 @@ public:
     {
         out = {};
         if (!pending_ || unknown_) return false;
-        const auto it = std::find_if(pending_->pages.begin(),pending_->pages.end(),
-            [&](const auto& p){return p.description.id==page;});
-        if (it==pending_->pages.end() || slice>=it->description.spec.slices) return false;
-        const bool placed = std::any_of(pending_->plan.next.placed.begin(),pending_->plan.next.placed.end(),
-            [&](const auto& p){return p.page==page && slice>=p.first && slice-p.first<p.faces;});
-        if (!placed) return false;
+        const auto it = std::lower_bound(pending_->pages.begin(), pending_->pages.end(), page,
+            [](const Page& p, uint64_t id) { return p.description.id < id; });
+        if (it == pending_->pages.end() || it->description.id != page || slice >= it->description.spec.slices)
+            return false;
+        const auto& placements = pending_->byPhysicalSlice;
+        const auto next = std::upper_bound(placements.begin(), placements.end(), std::pair{page, slice},
+            [](const auto& key, const auto& p) { return key < std::pair{p.page, p.first}; });
+        if (next == placements.begin())
+            return false;
+        const auto& placement = *(next - 1);
+        if (placement.page != page || slice - placement.first >= placement.faces)
+            return false;
         out.resource = it->depth.Get();
         out.dsv = it->dsv->GetCPUDescriptorHandleForHeapStart();
         out.dsv.ptr += static_cast<SIZE_T>(slice)*dsvStride_;
