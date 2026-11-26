@@ -12,6 +12,8 @@ param(
     [switch]$NoSunShadows,
     [switch]$NoLocalShadows,
     [switch]$LegacyLocalPriority,
+    [ValidateSet(1,2,3)][uint32]$LocalShadowBanks = 1,
+    [switch]$SuppressUnmappedLocalLights,
     [switch]$LegacySunPCF,
     [ValidateSet('Legacy','Performance','Balanced','Quality')][string]$SunShadowProfile = 'Legacy',
     [ValidateRange(1,4)][uint32]$SunCascades,
@@ -154,6 +156,8 @@ $features = @{
     DYNAMIC_SUN_SHADOWS = [int](-not $NoDynamicSunShadows -and -not $NoShadows -and -not $NoSunShadows)
     LOCAL_SHADOWS = [int](-not $NoShadows -and -not $NoLocalShadows -and -not $NoLocalLights)
     STABLE_LOCAL_PRIORITY = [int](-not $LegacyLocalPriority)
+    LOCAL_SHADOW_BANKS = $LocalShadowBanks
+    SUPPRESS_UNMAPPED_LOCAL_LIGHTS = [int]$SuppressUnmappedLocalLights.IsPresent
     RECEIVER_PLANE_SUN = [int](-not $LegacySunPCF)
     LEGACY_SKY_HEMI = [int]$LegacySkyHemi.IsPresent
     LEGACY_WATER_SSR = [int]$LegacyWaterSSR.IsPresent

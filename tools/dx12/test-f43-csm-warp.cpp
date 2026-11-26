@@ -149,6 +149,7 @@ void VerifyFrameAbi(ID3DBlob& bytecode)
     CHECK_FRAME_FIELD(SunCascadeData, sunCascadeData);
     CHECK_FRAME_FIELD(SunDepthBias, sunDepthBias);
     CHECK_FRAME_FIELD(SunCasterCounts, sunCasterCounts);
+    CHECK_FRAME_FIELD(LocalShadowConfig, localShadowConfig);
 #undef CHECK_FRAME_FIELD
     Check(kFrameConstantsSize >= buffer.Size && kFrameConstantsSize % 256 == 0, "CB allocation alignment");
 }
@@ -177,6 +178,31 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
 {
     uint x = (uint)pixel.x, y = (uint)pixel.y;
     uint count = LightingFlags.w;
+    if (y == 5)
+    {
+        LocalLightData source = (LocalLightData)0;
+        uint layer = LocalShadowConfig.x;
+        float3 position = float3(1,0,0);
+        source.type.x = 1;
+        if (x >= count && x < count + LightingFlags.z)
+        {
+            layer = x - count;
+            const uint offset = layer % 8;
+            if (offset >= 2)
+            {
+                source.type.x = 0;
+                const float3 directions[6] = {float3(1,0,0),float3(-1,0,0),float3(0,1,0),
+                    float3(0,-1,0),float3(0,0,1),float3(0,0,-1)};
+                position = directions[offset-2];
+                layer = layer - offset + 2;
+            }
+        }
+        source.type.y = layer + 1;
+        float3 coords;
+        uint actual;
+        uint status = ProjectLocalShadow(source,position,float3(0,0,0),float3(0,0,0),coords,actual);
+        return float4(status/255.0,(actual+1)/255.0,coords.z,1);
+    }
     if (y == 4)
     {
         const float3 points[8] = {
@@ -193,9 +219,9 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
     {
         uint layer = x - count;
         float stored = LocalShadow.Load(int4(1,1,layer,0));
-        float threshold = .0625 * (layer + 1);
+        float threshold = .03125 * (layer + 1);
         return float4(stored,SampleLocalVisibility(float3(.25,.25,threshold),layer),
-            SampleLocalVisibility(float3(.25,.25,threshold+.03125),layer),1);
+            SampleLocalVisibility(float3(.25,.25,threshold+.015625),layer),1);
     }
     float depth = x + (y == 2 ? .875 : .5);
     float3 position = float3(depth,-.375,.5);
@@ -308,6 +334,14 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         SceneFrameConstants frame{};
         frame.lightingFlags[3] = sunSlices;
         frame.lightingFlags[2] = localSlices;
+        frame.localShadowConfig[0] = localSlices;
+        for (uint32_t layer = 0; layer < localSlices; ++layer)
+        {
+            auto& matrix = frame.localShadowViewProjection[layer];
+            // Fixed interior clip coordinate; independently test bank/face selection.
+            matrix._34 = .5f;
+            matrix._44 = 1;
+        }
         frame.sunCameraForward = {1, 0, 0, 1};
         frame.sunShadowResolution = 8;
         frame.sunFilter = filter;
@@ -337,8 +371,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         gpu.ptr += stride;
         list.SetGraphicsRootDescriptorTable(2, gpu);
         const uint32_t width = (std::max)(sunSlices + localSlices + 1, ref::ProbeCount);
-        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 4, 0, 1};
-        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 5};
+        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 5, 0, 1};
+        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 6};
         list.RSSetViewports(1, &viewport);
         list.RSSetScissorRects(1, &rect);
         list.OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -459,7 +493,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     };
     // Every depth value stays in [0,1], while each slice remains distinguishable.
     const auto sun = createArray(sunCount, ref::SunDepth(0), 0.25f);
-    const auto local = createArray(localCount, ref::LocalDepth(0), 0.0625f);
+    const auto local = createArray(localCount, ref::LocalDepth(0), 0.03125f);
     ShadowSamplingPass sampling(device, sun.resource.Get(), sunCount, local.resource.Get(),
         (std::max)(localCount, 1u), mutation);
     const uint32_t passCount = sunCount + localCount;
@@ -597,7 +631,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         const auto foreground = color.Pixel(0, 8, 8);
         Check(background == 0xff000000 && foreground == 0xff0000ff, "color clear/order mismatch");
         const uint32_t probeWidth = (std::max)(sunCount+localCount+1,ref::ProbeCount);
-        for (uint32_t y = 1; y <= 4; ++y)
+        for (uint32_t y = 1; y <= 5; ++y)
             for (uint32_t x = 0; x < probeWidth; ++x)
             {
                 const uint32_t pixel = sampledColor.Pixel(0,x,y);
@@ -607,7 +641,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
                 {
                     const int actual = (pixel >> (8*channel)) & 255;
                     const int wanted = static_cast<int>(std::lround(expected.rgba[channel]*255));
-                    const int tolerance = channel == expected.exactIndexChannel ? 0 : 1;
+                    const int tolerance = (channel == expected.exactIndexChannel || (y == 5 && channel == 0)) ? 0 : 1;
                     ok = ok && std::abs(actual-wanted) <= tolerance;
                 }
                 if (!ok)
@@ -691,9 +725,12 @@ int main(int argc, char** argv)
         const Frame::Owner owner{*device.Get(), *queue.Get(), *fence.Get(), event, value};
         Check(_putenv_s("OGSR_DX12_CLEAR", "0,0,0") == 0, "set clear color");
         const bool sequentialOnly = argc > 1 && std::strcmp(argv[1], "--sequential") == 0;
-        for (const uint32_t cascades : {1u, 2u, 3u, 4u})
+        const std::array<std::array<uint32_t, 2>, 6> configurations{{
+            {1,8}, {2,0}, {3,8}, {4,8}, {4,16}, {4,24}
+        }};
+        for (const auto& config : configurations)
         {
-            const uint32_t locals = cascades == 2 ? 0 : game_shadow12::LocalLayers;
+            const uint32_t cascades = config[0], locals = config[1];
             const auto legacy = Run(window, *factory.Get(), owner, "legacy", cascades, locals);
             const auto multi = Run(window, *factory.Get(), owner, "multi", cascades, locals);
             Check(legacy == multi, "legacy/multi readback parity");
@@ -708,7 +745,7 @@ int main(int argc, char** argv)
         // is accepted. Compile, PSO, device and fence failures propagate.
         for (const Mutation mutation : {Mutation::ForceSunZero, Mutation::SwapSun,
             Mutation::ReverseCompare, Mutation::WrongNext, Mutation::DisableBlend, Mutation::WrongLocal})
-            Run(window,*factory.Get(),owner,"legacy",4,8,0,mutation);
+            Run(window,*factory.Get(),owner,"legacy",4,24,0,mutation);
         DestroyWindow(window);
         CloseHandle(event);
         uint32_t problems = 0;

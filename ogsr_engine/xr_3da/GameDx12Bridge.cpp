@@ -2295,10 +2295,18 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         Msg("ph_dx12_csm: gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f shadow_mask=0x%x",
             static_cast<unsigned long long>(completedGpu.present), completedGpu.milliseconds,
             completedGpu.shadowMilliseconds, completedGpu.sceneMilliseconds, completedGpu.shadowMask);
-        for (uint32_t slice = 0; slice < game_shadow12::MaxSunCascades; ++slice)
-            if ((completedGpu.shadowMask & (1u << slice)) != 0)
-                Msg("ph_dx12_csm: gpu_present=%llu slice=%u gpu_ms=%.6f",
-                    static_cast<unsigned long long>(completedGpu.present), slice, completedGpu.viewMilliseconds[slice]);
+        for (uint32_t projection = 0; projection < game_shadow12::MaxViews; ++projection)
+            if ((completedGpu.shadowMask & (1u << projection)) != 0)
+            {
+                const game_shadow12::View view{projection};
+                if (view.IsSun())
+                    Msg("ph_dx12_csm: gpu_present=%llu slice=%u gpu_ms=%.6f",
+                        static_cast<unsigned long long>(completedGpu.present), view.Slice(), completedGpu.viewMilliseconds[projection]);
+                else
+                    Msg("ph_dx12_lsa: gpu_present=%llu slice=%u kind=%u gpu_ms=%.6f",
+                        static_cast<unsigned long long>(completedGpu.present), view.Slice(),
+                        static_cast<unsigned>(view.Kind()), completedGpu.viewMilliseconds[projection]);
+            }
     }
     if (hr == S_OK && sceneRecorded && sceneDetail)
     {

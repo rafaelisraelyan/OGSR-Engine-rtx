@@ -1,0 +1,20 @@
+# F4.3-LSA-1 — bounded banked local shadow arrays (experimental)
+
+Parent: 6c4fe804f0c413eb65fca7b69593bfe5e238aa6b. Scope: local shadow capacity/ownership and a separate diagnostic overflow policy. **Windows build, WARP and owner gameplay acceptance pending.** No new scheduler. CSM algorithms unchanged; shared FrameCB, projection IDs and fixtures extended.
+
+## Contract
+
+- 1/2/3 banks (8/16/24 D32_FLOAT 1024² slices; 32/64/96 MiB nominal, actual allocation logged). Each bank is two spots and one complete six-face point light; supports 2/4/6 spots and 1/2/3 points. This is a fixed banked texture array, not a fully general atlas. Lighting admission still max 16. Default 1 bank; the new deterministic allocator also operates in this capacity mode (not a bit-for-bit reversion to FR3).
+- CPU-only allocator chooses winners by type, keeps surviving owners at identical physical slice, 1.25 retention bonus, optional near-volume soft priority, ID tie-break, session/epoch reset, rejects duplicates and invalid scores. Projection generation occurs before selection; invalid projection cannot occupy a slot. No old depth reuse: every active map is cleared and redrawn, including dynamic casters, through existing serial/GR plan. Owner constructs immutable projection and pass arrays before jobs.
+- Actual allocation can fall back 3→2→1 on non-device-removal resource/DSV allocation failure; publish descriptors only after success, report requested/effective and bytes. SRV t6 uses actual size. Null SRV and descriptor intervals preserved. Shared native max 28 projection IDs and uint32 mask; timing/list capacity derived from MaxViews. FrameCB increases to 3328 aligned bytes; adds actual local slice count checked by HLSL. No GPU depth cache, adaptive local resolution or cross-type slot borrowing yet.
+- Optional `-SuppressUnmappedLocalLights` suppresses only direct RGB from eligible, source-shadowed candidates without a map when local shadows are enabled and allocated. This prevents that specific fail-open contribution but can darken an area under pressure. Default retains prior unshadowed behavior; genuine unshadowed lights and explicit NoLocalShadows untouched. Projection-outside fail-open and other leak causes remain open.
+
+## Evidence
+
+Portable C++20 allocator and layout test executed with GCC -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined: PASS 680205 assertions, 10000 deterministic allocation frames. Expanded CPU sampling reference also PASS 79514 numerical checks, including 24 local layers and projected face/base expected channels. Tested input order, bank changes, unique disjoint slots, priority eviction/retention, level/epoch reset, invalid/duplicate inputs. Verified Git blobs: ShadowViews `57532c27e8a210372e2d4fdec7df84be8a31e283`, allocator `6f42eac17ed6cfac5d7eef9150a1d5aa605c14c9`, test `188d1acc380cdad8a4be894cebc2a51b00bfc83d`. Sampling reference blobs: `97bbe7ded66b8b75e9f4362a520625748b45e96c` and `93d73b06d0fba35eecfb9ca192caeefe1225021c`. This is CPU evidence only. Windows runner additionally compiles allocator and reference fixtures. WARP extended to 4+16/24 views, projected face/base validation for all active slices, out-of-range rejection and updated ABI. Not executed here.
+
+## Owner A/B
+
+Same build, save, route, time, local and sun settings. Use launcher `-SunShadowProfile Quality -SunShadowResolution 2048 -GR parallel -CommandLists parallel -GRWorkers 2 -SceneLog -Metrics` with `-LocalShadowBanks 1`, then 2, then 3. Optional repeat 3 with `-SuppressUnmappedLocalLights`. Compare wall leaks/popping, active/released/misses/suppressed counters, ph_dx12_mt_record masks, GPU and frame time. Check NoLocalShadows independently. Verify serial/multi/parallel, Debug Layer/GBV, WARP, normal exit and reload. No issue closure or prypiat merge until accepted.
+
+References: Microsoft D3D12_TEX2D_ARRAY_DSV, GetResourceAllocationInfo, CommandAllocator::Reset; existing native Frame resource-state/allocator ownership. Issues #23/#24/#27/#32/#40. This is a first live capacity step, not completion of F4.3-LSA.

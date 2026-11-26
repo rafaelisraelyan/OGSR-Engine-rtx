@@ -130,7 +130,7 @@ int main()
             mask |= 1u << id;
             Require(view.IsSun() ? view.Slice() < MaxSunCascades : view.Slice() < LocalLayers, "projection identity");
         }
-        Require(mask == 0xfffu, "twelve distinct projection bits");
+        Require(mask == ((1u << MaxViews) - 1u), "distinct projection bits for all shadow views");
         std::puts("PASS 1/2/3/4 projections, 1024/2048/4096, camera bounds, overlap, caster reach, snapping and validation");
         return 0;
     }

@@ -32,11 +32,10 @@ namespace
 using Clock = std::chrono::steady_clock;
 using gameaux12::SurfaceMode;
 
-constexpr uint32_t kSpotShadowLayers = game_shadow12::SpotLayers;
 constexpr uint32_t kPointShadowFaces = game_shadow12::PointFaces;
 constexpr uint32_t kLocalShadowLayers = game_shadow12::LocalLayers;
 constexpr uint32_t kLocalShadowSize = 1024;
-static_assert(kLocalShadowLayers == 8); // LOCAL_SHADOW_LAYERS в FrameCB.
+static_assert(kLocalShadowLayers == 24); // LOCAL_SHADOW_LAYERS в FrameCB.
 
 struct LocalLightGpu
 {
@@ -72,6 +71,7 @@ struct SceneFrameConstants
     std::array<DirectX::XMFLOAT4, game_shadow12::MaxSunCascades> sunCascadeData; // near, far, blend, world texel
     std::array<float, game_shadow12::MaxSunCascades> sunDepthBias; // Нормализованный receiver bias по срезам.
     uint32_t sunCasterCounts[4];
+    uint32_t localShadowConfig[4]; // x: actual allocated local slice count.
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -96,7 +96,8 @@ static_assert(offsetof(SceneFrameConstants, sunDepthBias) == offsetof(SceneFrame
 constexpr uint64_t kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint64_t kFrameConstantsSize = (sizeof(SceneFrameConstants) + kConstantAlignment - 1) &
     ~(kConstantAlignment - 1);
-static_assert(kFrameConstantsSize == 2304);
+static_assert(offsetof(SceneFrameConstants, localShadowConfig) == offsetof(SceneFrameConstants, sunCasterCounts) + 16);
+static_assert(kFrameConstantsSize == 3328);
 constexpr uint64_t kFrameConstantsSlots = GameDx12NativeFrame12::kFrameCount;
 constexpr uint64_t kStagingBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t kStagingAlignment = 512ull;
@@ -481,6 +482,28 @@ const SunSettings& SceneSunSettings()
     return settings;
 }
 
+uint32_t SceneLocalShadowBanksRequested()
+{
+    static const uint32_t banks = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_LOCAL_SHADOW_BANKS");
+        if (value && value[0] >= '1' && value[0] <= '3' && value[1] == '\0')
+            return static_cast<uint32_t>(value[0] - '0');
+        return 1u;
+    }();
+    return banks;
+}
+
+bool SceneSuppressUnmappedLocalLightsRequested()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_SUPPRESS_UNMAPPED_LOCAL_LIGHTS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool SceneStableLocalPriorityRequested()
 {
     static const bool enabled = []
@@ -567,7 +590,8 @@ D3D12_RESOURCE_DESC BufferDesc(uint64_t size)
 }
 
 constexpr const char* kFrameShaderConstants = R"(
-#define LOCAL_SHADOW_LAYERS 8
+#define LOCAL_SHADOW_LAYERS 24
+#define LOCAL_SHADOW_BANK_SIZE 8
 struct LocalLightData
 {
     float4 positionInverseRangeSquared;
@@ -601,6 +625,7 @@ cbuffer FrameCB : register(b0)
     float4 SunCascadeData[4];
     float4 SunDepthBias;
     uint4 SunCasterCounts;
+    uint4 LocalShadowConfig;
 };
 
 // Смещение поверхности использует фазу watermove из R4/IX-Ray.
@@ -617,10 +642,10 @@ cbuffer ShadowLayerCB : register(b6)
 float4 ProjectShadow(float4 world)
 {
     const uint slice = ShadowLayer & 3u;
-    const uint localSlice = (ShadowLayer - 4u) & 7u;
+    const uint localSlice = ShadowLayer - 4u;
     if (ShadowLayer < 4u)
         return mul(world, SunShadowViewProjection[slice]);
-    if (ShadowLayer < 12u)
+    if (localSlice < LOCAL_SHADOW_LAYERS && localSlice < LocalShadowConfig.x)
         return mul(world, LocalShadowViewProjection[localSlice]);
     return float4(0, 0, 2, 1);
 }
@@ -1200,9 +1225,11 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     if (source.type.y == 0)
         return LOCAL_NO_MAP;
     layer = source.type.y - 1;
-    // The fixed layout is two spot layers followed by six point faces.
-    if ((source.type.x == 0 && layer != 2) ||
-        (source.type.x == 1 && layer >= 2) || source.type.x > 1)
+    // Each bank contains two spot slices followed by a contiguous six-face point map.
+    const uint bankOffset = layer % LOCAL_SHADOW_BANK_SIZE;
+    if (layer >= min(LocalShadowConfig.x, (uint)LOCAL_SHADOW_LAYERS) ||
+        (source.type.x == 0 && (bankOffset != 2u || layer + 5u >= LocalShadowConfig.x)) ||
+        (source.type.x == 1 && bankOffset >= 2u) || source.type.x > 1)
         return LOCAL_BAD_LAYER;
     // Смещение задаётся в метрах. Грань point-карты выбирается уже
     // по смещённому приёмнику, который будет спроецирован в эту грань.
@@ -1221,7 +1248,7 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
         else
             layer += delta.z >= 0.0f ? 4 : 5;
     }
-    if (layer >= LOCAL_SHADOW_LAYERS)
+    if (layer >= min(LocalShadowConfig.x, (uint)LOCAL_SHADOW_LAYERS))
         return LOCAL_BAD_LAYER;
     const float4 clipPosition = mul(float4(receiver, 1.0f), LocalShadowViewProjection[layer]);
     if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
@@ -1767,11 +1794,18 @@ struct LocalShadowViews
     std::array<std::array<FrustumPlane, 6>, kLocalShadowLayers> frusta{};
     std::array<bool, kLocalShadowLayers> active{};
     std::array<bool, gamelight12::MaxLocalLights> invalidProjection{};
+    std::array<bool, gamelight12::MaxLocalLights> suppressed{};
     uint32_t count = 0;
 };
 
-bool BuildLocalShadowViews(const gamelight12::LocalLight& light, uint32_t firstLayer,
-    SceneFrameConstants& constants, LocalShadowViews& views)
+struct LocalProjection
+{
+    std::array<DirectX::XMFLOAT4X4, kPointShadowFaces> matrices{};
+    std::array<std::array<FrustumPlane, 6>, kPointShadowFaces> frusta{};
+    uint32_t count = 0;
+};
+
+bool BuildLocalShadowProjection(const gamelight12::LocalLight& light, LocalProjection& result)
 {
     using namespace DirectX;
     constexpr gamelight12::Vec3 cubeDirections[] = {
@@ -1800,77 +1834,80 @@ bool BuildLocalShadowViews(const gamelight12::LocalLight& light, uint32_t firstL
                                                              : gamelight12::Vec3{0, 0, 1}) : cubeUp[face];
         DirectX::XMFLOAT4X4 matrix;
         XMStoreFloat4x4(&matrix, XMMatrixLookToLH(eye, vector(direction), vector(up)) * projection);
-        const uint32_t layer = firstLayer + face;
-        if (!FiniteMatrix(matrix) || !BuildFrustum(matrix, views.frusta[layer].data()))
+        if (!FiniteMatrix(matrix) || !BuildFrustum(matrix, result.frusta[face].data()))
             return false;
-        constants.localShadowViewProjection[layer] = Transpose(matrix);
+        result.matrices[face] = Transpose(matrix);
     }
-    for (uint32_t face = 0; face < faceCount; ++face)
-        views.active[firstLayer + face] = true;
-    views.count += faceCount;
+    result.count = faceCount;
     return true;
 }
 
 void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
-    std::span<uint64_t, kSpotShadowLayers + 1> previous, SceneFrameConstants& constants, LocalShadowViews& views)
+    uint32_t banks, game_shadow12::LocalAllocationState& previous,
+    SceneFrameConstants& constants, LocalShadowViews& views)
 {
-    const auto remembered = std::array{previous[0], previous[1], previous[2]};
+    static_assert(gamelight12::MaxLocalLights == game_shadow12::MaxLocalCandidates);
     const uint32_t lightCount = constants.lightingFlags[2];
-    const bool stablePriority = SceneStableLocalPriorityRequested();
-    std::array<uint32_t, kSpotShadowLayers + 1> winners;
-    winners.fill(UINT32_MAX);
-    for (uint32_t slot = 0; slot < winners.size(); ++slot)
+    if (lightCount > gamelight12::MaxLocalLights || !game_shadow12::ValidBanks(banks))
+        return;
+    std::array<game_shadow12::LocalCandidate, gamelight12::MaxLocalLights> candidates{};
+    std::array<LocalProjection, gamelight12::MaxLocalLights> projections{};
+    for (uint32_t i = 0; i < lightCount; ++i)
     {
-        const bool spot = slot < kSpotShadowLayers;
-        uint32_t best = UINT32_MAX;
-        double bestScore = 0.0;
-        for (uint32_t index = 0; index < lightCount; ++index)
+        const auto& light = lighting.localLights[i];
+        if (!light.castsShadow || !light.id)
+            continue;
+        if (!BuildLocalShadowProjection(light, projections[i]))
         {
-            const auto& light = lighting.localLights[index];
-            if (!light.castsShadow || light.id == 0 ||
-                (light.type == gamelight12::LocalType::Spot) != spot ||
-                std::find(winners.begin(), winners.end(), index) != winners.end())
-                continue;
-            const bool held = std::find(remembered.begin(), remembered.end(), light.id) != remembered.end();
-            // In the experimental policy nearVolume is a soft preference.
-            // It must not bypass retention of an already shadowed receiver.
-            const double score = light.selectionScore * (held ? 1.25 : 1.0) *
-                (stablePriority && light.nearVolume ? 1.25 : 1.0);
-            if (best == UINT32_MAX ||
-                (stablePriority || light.nearVolume == lighting.localLights[best].nearVolume ?
-                    score > bestScore : light.nearVolume))
-            {
-                best = index;
-                bestScore = score;
-            }
+            views.invalidProjection[i] = true;
+            continue;
         }
-        winners[slot] = best;
+        candidates[i] = {light.id, light.selectionScore,
+            light.type == gamelight12::LocalType::Spot, light.nearVolume, true};
     }
-
-    // Перестановка двух победителей spot не меняет привязку к физическим слоям.
-    if (winners[1] != UINT32_MAX && lighting.localLights[winners[1]].id == remembered[0])
-        std::swap(winners[0], winners[1]);
-    else if (winners[0] != UINT32_MAX && lighting.localLights[winners[0]].id == remembered[1])
-        std::swap(winners[0], winners[1]);
-
-    for (uint32_t slot = 0; slot < winners.size(); ++slot)
+    const auto plan = game_shadow12::AllocateLocalShadows(
+        std::span(candidates.data(), lightCount), banks, lighting.levelSession, lighting.levelEpoch,
+        previous, SceneStableLocalPriorityRequested());
+    for (uint32_t slot = 0; slot < banks * game_shadow12::SlotsPerBank; ++slot)
     {
-        previous[slot] = 0;
-        const uint32_t index = winners[slot];
-        if (index == UINT32_MAX)
+        const uint32_t index = plan.candidate[slot];
+        if (index == game_shadow12::NoCandidate)
             continue;
         const auto& light = lighting.localLights[index];
-        if (!BuildLocalShadowViews(light, slot, constants, views))
+        const auto& projection = projections[index];
+        const uint32_t first = game_shadow12::SlotBase(slot);
+        for (uint32_t face = 0; face < projection.count; ++face)
         {
-            views.invalidProjection[index] = true;
-            continue;
+            const uint32_t layer = first + face;
+            constants.localShadowViewProjection[layer] = projection.matrices[face];
+            views.frusta[layer] = projection.frusta[face];
+            views.active[layer] = true;
+            ++views.count;
         }
         auto& type = constants.localLights[index].type;
-        type[1] = slot + 1;
+        type[1] = first + 1;
         type[2] = std::bit_cast<uint32_t>(light.shadowNear);
         type[3] = std::bit_cast<uint32_t>(light.shadowFar);
-        previous[slot] = light.id;
     }
+    previous = plan.next;
+    uint32_t suppressed = 0;
+    // Explicit A/B policy only: suppress direct contribution of eligible
+    // shadow-casting lights that have no map. Never suppress genuine unshadowed
+    // lights or the deliberate NoLocalShadows mode. Default remains legacy.
+    if (SceneSuppressUnmappedLocalLightsRequested())
+        for (uint32_t i = 0; i < lightCount; ++i)
+            if ((plan.eligibleMask & (1u << i)) != 0 && lighting.localLights[i].sourceShadow &&
+                constants.localLights[i].type[1] == 0)
+            {
+                auto& color = constants.localLights[i].colorInnerCos;
+                color.x = color.y = color.z = 0.0f;
+                views.suppressed[i] = true;
+                ++suppressed;
+            }
+    if (lighting.frame % 120 == 0 || lighting.diagnosticBurst)
+        Msg("ph_dx12_lsa: frame=%llu banks=%u eligible=%u assigned=%u retained=%u released=%u misses=%u suppressed=%u views=%u",
+            static_cast<unsigned long long>(lighting.frame), banks, plan.eligible, plan.assigned,
+            plan.retained, plan.released, plan.misses, suppressed, views.count);
 }
 
 uint32_t SceneViewMode()
@@ -2539,7 +2576,6 @@ bool GameDx12StaticScene12::CreateLocalShadow(ID3D12Device* device, std::string&
     image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     image.Width = kLocalShadowSize;
     image.Height = kLocalShadowSize;
-    image.DepthOrArraySize = static_cast<UINT16>(kLocalShadowLayers);
     image.MipLevels = 1;
     image.Format = DXGI_FORMAT_R32_TYPELESS;
     image.SampleDesc.Count = 1;
@@ -2547,29 +2583,51 @@ bool GameDx12StaticScene12::CreateLocalShadow(ID3D12Device* device, std::string&
     D3D12_CLEAR_VALUE clear{};
     clear.Format = DXGI_FORMAT_D32_FLOAT;
     clear.DepthStencil.Depth = 1.0f;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &image,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(m_localShadow.GetAddressOf()))))
-        return Fail(reason, "local shadow depth allocation failed");
-
-    D3D12_DESCRIPTOR_HEAP_DESC desc{};
-    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    desc.NumDescriptors = kLocalShadowLayers;
-    if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(m_localShadowDsv.GetAddressOf()))))
-        return Fail(reason, "local shadow DSV heap allocation failed");
-    m_localShadowDsvStride = device->GetDescriptorHandleIncrementSize(desc.Type);
-
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
-    dsv.Format = DXGI_FORMAT_D32_FLOAT;
-    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-    dsv.Texture2DArray.ArraySize = 1;
-    auto handle = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
-    for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer)
+    const uint32_t requested = SceneLocalShadowBanksRequested();
+    for (uint32_t banks = requested; banks != 0; --banks)
     {
-        dsv.Texture2DArray.FirstArraySlice = layer;
-        device->CreateDepthStencilView(m_localShadow.Get(), &dsv, handle);
-        handle.ptr += m_localShadowDsvStride;
+        const uint32_t slices = banks * game_shadow12::LayersPerBank;
+        image.DepthOrArraySize = static_cast<UINT16>(slices);
+        ComPtr<ID3D12Resource> maps;
+        ComPtr<ID3D12DescriptorHeap> descriptors;
+        HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &image,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(maps.GetAddressOf()));
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        desc.NumDescriptors = slices;
+        if (SUCCEEDED(hr))
+            hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(descriptors.GetAddressOf()));
+        if (FAILED(hr))
+        {
+            Msg("ph_dx12_lsa: allocation_failed requested_banks=%u attempted_banks=%u hr=0x%08X",
+                requested, banks, static_cast<unsigned>(hr));
+            if (FAILED(device->GetDeviceRemovedReason()))
+                break;
+            continue;
+        }
+        const auto stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_D32_FLOAT;
+        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv.Texture2DArray.ArraySize = 1;
+        auto handle = descriptors->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t layer = 0; layer < slices; ++layer, handle.ptr += stride)
+        {
+            dsv.Texture2DArray.FirstArraySlice = layer;
+            device->CreateDepthStencilView(maps.Get(), &dsv, handle);
+        }
+        m_localShadowSlices = slices;
+        m_localShadowBytes = device->GetResourceAllocationInfo(0, 1, &image).SizeInBytes;
+        m_localShadowDsvStride = stride;
+        m_localShadow = std::move(maps);
+        m_localShadowDsv = std::move(descriptors);
+        m_localShadowAllocation = {};
+        Msg("ph_dx12_lsa: allocation_ready requested_banks=%u effective_banks=%u slices=%u bytes=%llu suppress_unmapped=%d",
+            requested, banks, slices, static_cast<unsigned long long>(m_localShadowBytes),
+            SceneSuppressUnmappedLocalLightsRequested() ? 1 : 0);
+        return true;
     }
-    return true;
+    return Fail(reason, "local shadow bank allocation failed");
 }
 
 bool GameDx12StaticScene12::CreateInstanceBuffer(ID3D12Device* device,
@@ -2815,7 +2873,11 @@ bool GameDx12StaticScene12::CreateTextures(
         device->CreateShaderResourceView(m_sunShadow.Get(), &arraySrv, shadow);
 
         auto localSrv = arraySrv;
-        localSrv.Texture2DArray.ArraySize = kLocalShadowLayers;
+        if (m_localShadow && (!game_shadow12::ValidBanks(m_localShadowSlices / game_shadow12::LayersPerBank) ||
+            m_localShadowSlices % game_shadow12::LayersPerBank != 0 ||
+            m_localShadow->GetDesc().DepthOrArraySize != m_localShadowSlices))
+            return Fail(reason, "invalid local shadow bank descriptor layout");
+        localSrv.Texture2DArray.ArraySize = m_localShadow ? m_localShadowSlices : game_shadow12::LayersPerBank;
         auto local = base;
         local.ptr += static_cast<SIZE_T>(kLocalShadowDescriptor) * m_textureDescriptorSize;
         device->CreateShaderResourceView(m_localShadow.Get(), &localSrv, local);
@@ -2835,7 +2897,7 @@ bool GameDx12StaticScene12::CreateTextures(
         }
         Msg("ph_dx12_f43fr2: local_shadow_srv t=6 slot=%u dimension=2d_array format=R32_FLOAT "
             "slices=%u resource=%d water_end=%u terrain_start=%u", kLocalShadowDescriptor,
-            kLocalShadowLayers, m_localShadow ? 1 : 0, kWaterDescriptorEnd, kTerrainDescriptor);
+            localSrv.Texture2DArray.ArraySize, m_localShadow ? 1 : 0, kWaterDescriptorEnd, kTerrainDescriptor);
     }
     if (textures.empty())
         return true;
@@ -3277,7 +3339,7 @@ bool GameDx12StaticScene12::Load(
                 {
                     if (CreateLocalShadow(owner.device, shadowReason))
                         Msg("ph_dx12_f43e: local_shadow state=ready size=%u layers=%u",
-                            kLocalShadowSize, kLocalShadowLayers);
+                            kLocalShadowSize, m_localShadowSlices);
                     else
                     {
                         m_localShadow.Reset();
@@ -3686,6 +3748,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     constants.sunFilter = sunFilter != 0 ? sunFilter : !SceneReceiverPlaneSunRequested() ? 3u : m_sunShadowSlices > 1 ? 2u : 7u;
     constants.sunReceiverBiasMask = sunSettings.biasMask & 3u;
     constants.sunShadowResolution = m_sunShadowResolution;
+    constants.localShadowConfig[0] = m_localShadow ? m_localShadowSlices : 0;
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
@@ -3761,7 +3824,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
             {
                 const auto selectionStart = Clock::now();
-                SelectLocalShadowViews(lighting, m_previousLocalShadowLights, constants, localShadowViews);
+                SelectLocalShadowViews(lighting, m_localShadowSlices / game_shadow12::LayersPerBank,
+                    m_localShadowAllocation, constants, localShadowViews);
                 for (uint32_t slot = 0; slot < lightCount; ++slot)
                 {
                     const auto layerPlusOne = constants.localLights[slot].type[1];
@@ -3814,7 +3878,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         else if (localShadowViews.invalidProjection[trace.gpuSlot])
             shadowReason = "invalid_projection";
         else if (layer == 0)
-            shadowReason = "shadow_budget";
+            shadowReason = localShadowViews.suppressed[trace.gpuSlot] ? "shadow_budget_suppressed" : "shadow_budget";
         const auto* gpu = selected ? &constants.localLights[trace.gpuSlot].positionInverseRangeSquared : nullptr;
         Msg("ph_dx12_f43fr1: light_id=%llu frame=%llu distance=%.2f radius=%.2f active=%d "
             "type=%u frustum_query=%d near_query=%d near_volume=%d camera_inside=%d candidate=%d "
@@ -3886,7 +3950,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     if (localShadowViews.count != 0)
     {
         auto dsv = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
-        for (uint32_t layer = 0; layer < kLocalShadowLayers; ++layer, dsv.ptr += m_localShadowDsvStride)
+        for (uint32_t layer = 0; layer < m_localShadowSlices; ++layer, dsv.ptr += m_localShadowDsvStride)
             if (localShadowViews.active[layer])
                 passes[passCount++] = {dsv, kLocalShadowSize, {layer + game_shadow12::MaxSunCascades},
                     localShadowViews.frusta[layer].data(), true};
@@ -5104,7 +5168,9 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_sunShadowDsv.Reset();
     m_localShadow.Reset();
     m_localShadowDsv.Reset();
-    m_previousLocalShadowLights = {};
+    m_localShadowSlices = 0;
+    m_localShadowBytes = 0;
+    m_localShadowAllocation = {};
     m_sunShadowPipelines = {};
     m_sunShadowAuxPipeline.Reset();
     m_textureHeap.Reset();

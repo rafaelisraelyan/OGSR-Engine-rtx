@@ -45,6 +45,14 @@ try {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & ./csm-math.exe 2>&1 | Tee-Object -FilePath math.log
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & $cl @common "$PSScriptRoot/test-f43-local-shadow.cpp" /Fe:local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow-build.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & ./local-shadow.exe 2>&1 | Tee-Object -FilePath local-shadow.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & $cl @common "$PSScriptRoot/test-f43-csm-sampling-reference.cpp" /Fe:csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference-build.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & ./csm-reference.exe 2>&1 | Tee-Object -FilePath csm-reference.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
         $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','dxguid.lib','user32.lib'

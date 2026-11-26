@@ -5,6 +5,7 @@
 #include "GameDx12AuxGeometry.h"
 #include "GameDx12J2ABatch.h"
 #include "GameDx12Lighting.h"
+#include "GameDx12LocalShadowAllocator.h"
 #include "GameDx12NativeFrame.h"
 #include "GameDx12Surface.h"
 #include "GameDx12Water.h"
@@ -130,8 +131,8 @@ public:
         uint32_t shadowedLights = 0;
         uint32_t sceneCopies = 0;
         uint32_t commandLists = 1;
-        std::array<uint64_t, 3> shadowLightIds{};
-        std::array<uint32_t, 3> shadowLightFirstSlices{};
+        std::array<uint64_t, game_shadow12::MaxLocalSlots> shadowLightIds{};
+        std::array<uint32_t, game_shadow12::MaxLocalSlots> shadowLightFirstSlices{};
         double shadowCpuMs = 0.0;
         double sceneCpuMs = 0.0;
         double waterCpuMs = 0.0;
@@ -402,7 +403,9 @@ private:
     ComPtr<ID3D12Resource> m_localShadow;
     ComPtr<ID3D12DescriptorHeap> m_localShadowDsv;
     UINT m_localShadowDsvStride = 0;
-    std::array<uint64_t, 3> m_previousLocalShadowLights{};
+    uint32_t m_localShadowSlices = 0;
+    uint64_t m_localShadowBytes = 0;
+    game_shadow12::LocalAllocationState m_localShadowAllocation{};
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
     ComPtr<ID3D12Resource> m_frameConstants;
     ComPtr<ID3D12Resource> m_frameTransforms;
