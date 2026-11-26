@@ -92,7 +92,7 @@ inline Expected Pixel(uint32_t x,uint32_t y,uint32_t sun,uint32_t local,uint32_t
     if (y == 4)
     {
         if (x >= ProbeCount) return {{0,0,0,1},Pcf};
-        return {{Filter(filter,Probes[x],false),Filter(filter,Probes[x],true),0,1},Pcf};
+        return {{Filter(filter,Probes[x],false),Filter(filter,Probes[x],true),x == 0 ? .25 : x == 1 ? .75 : 0,1},Pcf};
     }
     if (x >= sun && x < sun+local) return {{LocalDepth(x-sun),1,0,1},Local};
     if (x >= sun) return {{0,0,1,1},Inactive,1};

@@ -3,6 +3,7 @@
 #include <d3d12shader.h>
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
+#include "GameDx12FrameStructuredUpload.h"
 #include "gr/jobs/JobGroup.h"
 #include "gr/jobs/JobSystem.h"
 
@@ -133,12 +134,10 @@ void VerifyFrameAbi(ID3DBlob& bytecode)
     CHECK_FRAME_FIELD(SunDirection, sunDirection);
     CHECK_FRAME_FIELD(SunColor, sunColor);
     CHECK_FRAME_FIELD(LightingFlags, lightingFlags);
-    CHECK_FRAME_FIELD(LocalLights, localLights);
     CHECK_FRAME_FIELD(HemiColor, hemiColor);
     CHECK_FRAME_FIELD(InverseViewProjection, inverseViewProjection);
     CHECK_FRAME_FIELD(WaterWeather, waterWeather);
     CHECK_FRAME_FIELD(WaterSky, waterSky);
-    CHECK_FRAME_FIELD(LocalShadowViewProjection, localShadowViewProjection);
     CHECK_FRAME_FIELD(DiagnosticLight, diagnosticLight);
     CHECK_FRAME_FIELD(DiagnosticOrigin, diagnosticOrigin);
     CHECK_FRAME_FIELD(LegacyWaterSsr, legacyWaterSsr);
@@ -151,6 +150,11 @@ void VerifyFrameAbi(ID3DBlob& bytecode)
     CHECK_FRAME_FIELD(SunCasterCounts, sunCasterCounts);
     CHECK_FRAME_FIELD(LocalShadowConfig, localShadowConfig);
 #undef CHECK_FRAME_FIELD
+    D3D12_SHADER_INPUT_BIND_DESC binding{};
+    Require(reflection->GetResourceBindingDescByName("LocalLights",&binding),"reflect local light SRV");
+    Check(binding.Type==D3D_SIT_STRUCTURED && binding.BindPoint==13 && binding.BindCount==1,"local light SRV ABI");
+    Require(reflection->GetResourceBindingDescByName("LocalShadowMatrices",&binding),"reflect local matrix SRV");
+    Check(binding.Type==D3D_SIT_STRUCTURED && binding.BindPoint==14 && binding.BindCount==1,"local matrix SRV ABI");
     Check(kFrameConstantsSize >= buffer.Size && kFrameConstantsSize % 256 == 0, "CB allocation alignment");
 }
 
@@ -160,6 +164,7 @@ struct ShadowSamplingPass
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12DescriptorHeap> srv;
     ComPtr<ID3D12Resource> constants;
+    game_shadow12::FrameStructuredUpload lights, projections;
     UINT stride = 0;
 
     ShadowSamplingPass(ID3D12Device& device, ID3D12Resource* sun, uint32_t sunSlices,
@@ -212,8 +217,11 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
             float3(.4375,.4375,.5), float3(.5625,.6875,.5)
         };
         if (x >= 8) return float4(0,0,0,1);
+        // Explicit fixture-only probes beyond the legacy CB array limits.
+        const float structured = x == 0 ? LocalLights[32].colorInnerCos.w :
+            x == 1 ? ProjectLocalMatrix(float4(1,2,3,1),31).x : 0.0f;
         return float4(SunFilterVisibility(points[x],float3(0,0,1),0),
-                      SunFilterVisibility(points[x],float3(.25,0,1),0),0,1);
+                      SunFilterVisibility(points[x],float3(.25,0,1),0),structured,1);
     }
     if (x >= count && x < count + LightingFlags.z)
     {
@@ -250,7 +258,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         ranges[0].BaseShaderRegister = 2;
         ranges[1] = ranges[0];
         ranges[1].BaseShaderRegister = 6;
-        D3D12_ROOT_PARAMETER params[3]{};
+        D3D12_ROOT_PARAMETER params[5]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -258,7 +266,11 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[2].DescriptorTable = {1, &ranges[1]};
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-        rootDesc.NumParameters = 3;
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[3].Descriptor.ShaderRegister = 13;
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[4].Descriptor.ShaderRegister = 14;
+        rootDesc.NumParameters = 5;
         rootDesc.pParameters = params;
         D3D12_STATIC_SAMPLER_DESC samplers[2]{};
         for (uint32_t i = 0; i < 2; ++i)
@@ -335,9 +347,17 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         frame.lightingFlags[3] = sunSlices;
         frame.lightingFlags[2] = localSlices;
         frame.localShadowConfig[0] = localSlices;
+        // Caller waits for GPU completion between fixture frames. Exercise
+        // resource growth and accesses beyond 16 lights / 24 local matrices.
+        const size_t recordCount = size_t(33) << (filter > 2 ? 2 : filter-1);
+        std::vector<LocalLightGpu> localLights(recordCount);
+        std::vector<DirectX::XMFLOAT4X4> localProjections(recordCount);
+        localLights[32].colorInnerCos.w = .25f;
+        localProjections[31]._11 = .25f;
+        localProjections[31]._12 = .25f;
         for (uint32_t layer = 0; layer < localSlices; ++layer)
         {
-            auto& matrix = frame.localShadowViewProjection[layer];
+            auto& matrix = localProjections[layer];
             // Fixed interior clip coordinate; independently test bank/face selection.
             matrix._34 = .5f;
             matrix._44 = 1;
@@ -360,6 +380,10 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         Require(constants->Map(0, &noRead, &memory), "map frame constants");
         std::memcpy(memory, &frame, sizeof(frame));
         constants->Unmap(0, nullptr);
+        ComPtr<ID3D12Device> device;
+        Require(constants->GetDevice(IID_PPV_ARGS(device.GetAddressOf())),"fixture buffer device");
+        Require(lights.Write(*device.Get(),std::span<const LocalLightGpu>(localLights)),"fixture lights upload");
+        Require(projections.Write(*device.Get(),std::span<const DirectX::XMFLOAT4X4>(localProjections)),"fixture matrix upload");
         ID3D12DescriptorHeap* heaps[] = {srv.Get()};
         list.SetDescriptorHeaps(1, heaps);
         list.SetPipelineState(pipeline.Get());
@@ -367,6 +391,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         auto gpu = srv->GetGPUDescriptorHandleForHeapStart();
         list.SetGraphicsRootConstantBufferView(0, constants->GetGPUVirtualAddress());
+        list.SetGraphicsRootShaderResourceView(3, lights.Address());
+        list.SetGraphicsRootShaderResourceView(4, projections.Address());
         list.SetGraphicsRootDescriptorTable(1, gpu);
         gpu.ptr += stride;
         list.SetGraphicsRootDescriptorTable(2, gpu);

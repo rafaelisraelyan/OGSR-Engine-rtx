@@ -7,6 +7,7 @@
 #include "GameDx12Lighting.h"
 #include "GameDx12LocalShadowAllocator.h"
 #include "GameDx12NativeFrame.h"
+#include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12Surface.h"
 #include "GameDx12Water.h"
 #include "dx12xrayasset.h"
@@ -408,6 +409,8 @@ private:
     game_shadow12::LocalAllocationState m_localShadowAllocation{};
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
     ComPtr<ID3D12Resource> m_frameConstants;
+    std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localLightUploads;
+    std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localProjectionUploads;
     ComPtr<ID3D12Resource> m_frameTransforms;
     // Держим staging даже при раннем выходе из загрузки с неизвестным fence.
     ComPtr<ID3D12Resource> m_copyStaging;

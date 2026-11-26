@@ -2519,3 +2519,6 @@ CoP/модовых материалах, **не подтверждены в на
 
 
 **F4.3-P0-B2b:** real D3D12 shadow page resource owner source implemented: adapter-specific allocation sizes, DXGI budget observation, committed depth arrays, per-slice DSV/page SRV, transactional staging, completed-fence protection and terminal quarantine. [Implementation contract and WARP fixture](dx12-f43-hybrid-shadow-evolution.md#p0-b2b-physical-d3d12-shadow-page-owner-source-implemented-gpu-validation-pending). Windows/WARP NOT RUN; not yet wired to the native scene; next global budget/descriptor and variable GPU metadata/view scheduling integration. Existing banked fallback and R4 unchanged.
+
+
+**F4.3-P0-B3a:** native local light/projection arrays migrated out of FrameCB into growable per-slot structured upload SRVs t13/t14. CBV stride 3328 -> 768 bytes; unchanged CSM and legacy banked shadow mapping. [ABI and validation](dx12-f43-hybrid-shadow-evolution.md#p0-b3a-native-structured-light-and-projection-buffers-source-integrated). CPU reference PASS 84834; MSVC/FXC/WARP/runtime NOT RUN. CPU capture cap 16 and shadow recording cap 28 remain; next dynamic capture/admission, page-aware GPU metadata, scalable GR views and clustered lighting research. Do not label this full removal of runtime limits.
