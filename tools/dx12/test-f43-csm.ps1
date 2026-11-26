@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [switch]$Sequential
+    [switch]$Sequential,
+    [string]$JobLibrary
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,21 @@ $fixtureIncludes = "#include <windows.h>" + [Environment]::NewLine + "void Msg(c
 $native = (Get-Content -LiteralPath "$engine/GameDx12NativeFrame.cpp" -Raw).Replace('#include "stdafx.h"', $fixtureIncludes)
 $nativePath = Join-Path $output.FullName 'GameDx12NativeFrame.cpp'
 $native | Set-Content -LiteralPath $nativePath -Encoding utf8
+# Компилируем те же объявления C++ и HLSL, которые использует игровой проход.
+$scene = Get-Content -LiteralPath "$engine/GameDx12StaticScene.cpp" -Raw
+$patterns = @(
+    '(?s)constexpr uint32_t kLocalShadowLayers = .*?static_assert\(kFrameConstantsSize == \d+\);',
+    '(?s)constexpr const char\* kFrameShaderConstants = R"\(.*?\)";',
+    '(?s)constexpr const char\* kScenePixelShader = R"\(.*?\)";'
+)
+$declarations = foreach ($pattern in $patterns) {
+    $match = [regex]::Match($scene, $pattern)
+    if (!$match.Success) { throw "Не найдено объявление для проверки GPU: $pattern" }
+    $match.Value
+}
+$declarations | Set-Content -LiteralPath "$($output.FullName)/production-shadow.inc" -Encoding utf8
+if (!$JobLibrary) { $JobLibrary = "$gr/x64/ReleaseDX12/gr_job_system.lib" }
+$common += "/I$($output.FullName)"
 $warpArgs = @()
 if ($Sequential) { $warpArgs = @('--sequential') }
 Push-Location -LiteralPath $output.FullName
@@ -31,7 +47,7 @@ try {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
-        "$gr/x64/ReleaseDX12/gr_job_system.lib",'d3d12.lib','dxgi.lib','user32.lib'
+        $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','user32.lib'
     & $cl @common @argsForWarp 2>&1 | Tee-Object -FilePath warp-build.log
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & ./csm-warp.exe @warpArgs 2>&1 | Tee-Object -FilePath warp.log
