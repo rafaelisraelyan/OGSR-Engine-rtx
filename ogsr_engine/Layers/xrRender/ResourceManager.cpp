@@ -13,6 +13,7 @@
 #include "dxRenderDeviceRender.h"
 #include "../xrRenderPC_R4/blender_deffer_aref.h"
 #include "Blender_BmmD.h"
+#include "Blender_Particle.h"
 #include <cmath>
 #endif
 
@@ -34,6 +35,29 @@ namespace
 } // namespace
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+bool CResourceManager::ReadClassicParticleSource(LPCSTR name, u32& blendId,
+    u32& priority, bool& clampTexture, bool& strictSorting)
+{
+    if (!name || !*name)
+        return false;
+    const auto found = m_blenders.find(name);
+    if (found == m_blenders.end())
+        return false;
+    const auto* blender = dynamic_cast<const CBlender_Particle*>(found->second);
+    // Lua overrides take precedence in Create(). Do not guess their pass state.
+    return blender && !_lua_HasShader(name) &&
+        blender->ReadNativeParticleSource(blendId, priority, clampTexture, strictSorting);
+}
+
+bool GameDx12ReadR4ClassicParticleSource(LPCSTR name, u32& blendId,
+    u32& priority, bool& clampTexture, bool& strictSorting)
+{
+    if (!Device.m_pRender)
+        return false;
+    auto* resources = dxRenderDeviceRender::Instance().Resources;
+    return resources && resources->ReadClassicParticleSource(name, blendId, priority, clampTexture, strictSorting);
+}
+
 bool CResourceManager::ReadDeferredLevelAlphaSource(LPCSTR name, bool& blended)
 {
     const auto found = m_blenders.find(name);

@@ -15,6 +15,7 @@
 #include "GameDx12Water.h"
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 #include "GameDx12ParticleCapture.h"
+#include "GameDx12ParticleMaterials.h"
 #include "PS_instance.h"
 #endif
 
@@ -2227,12 +2228,54 @@ void CaptureNativeParticleDiagnostics(uint64_t session, uint64_t epoch)
             static_cast<unsigned>(prepared.packets.size()), static_cast<unsigned>(prepared.vertices.size()),
             static_cast<unsigned>(prepared.indices.size()), verify ? "verify" : parallel && count ? "parallel" : "serial",
             static_cast<unsigned long long>(gr.submitted), static_cast<unsigned long long>(gr.completed));
-        // Bounded material inventory; not a claim that the shader is supported.
+        // Diagnostic only: source states plus real DDS bytes, not GPU residency.
+        MaterialInventory inventory;
+        const auto resolve = [](const std::string& shader, ClassicMaterialSource& source)
+        {
+            return GameDx12ReadR4ClassicParticleSource(shader.c_str(), source.blendId,
+                source.priority, source.clamp, source.strictSorting);
+        };
+        if (!BuildMaterialInventory(snapshot, resolve, inventory))
+        {
+            Msg("ph_dx12_particles: state=rejected reason=material_inventory");
+            return;
+        }
+        std::vector<GameDx12SceneTexture12> textures;
+        GameDx12TextureReadStats12 textureStats{};
+        GameDx12J2ABatch_ReadTextureNames(inventory.names, textures, textureStats, MaxParticleTextureBytes);
+        std::vector<uint8_t> decoded(inventory.names.size(), 0);
+        if (textures.size() == inventory.names.size())
+            for (size_t i = 0; i < textures.size(); ++i)
+                if (textures[i].name == inventory.names[i] && !textures[i].dds.data.empty())
+                    decoded[i] = 1;
+        DrawPlan drawPlan;
+        if (!BuildDecodedDrawPlan(prepared, inventory, decoded, drawPlan))
+        {
+            Msg("ph_dx12_particles: state=rejected reason=decoded_draw_plan");
+            return;
+        }
+        uint32_t eligibleQuads = 0;
+        for (const auto& batch : drawPlan.batches)
+            eligibleQuads += batch.indexCount / 6;
+        Msg("ph_dx12_particles: state=material_cpu_only session=%llu epoch=%llu frame=%llu "
+            "texture_names=%u decoded=%u missing=%u unsupported=%u bytes=%llu "
+            "eligible_quads=%u unresolved_quads=%u batches=%u gpu_draws=0",
+            static_cast<unsigned long long>(session), static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(snapshot.frame), static_cast<unsigned>(inventory.names.size()),
+            static_cast<unsigned>(std::count(decoded.begin(), decoded.end(), uint8_t{1})),
+            textureStats.missing, textureStats.unsupported, static_cast<unsigned long long>(textureStats.bytes),
+            eligibleQuads, drawPlan.unresolvedQuads, static_cast<unsigned>(drawPlan.batches.size()));
+        // Bounded diagnostic of original metadata; no promise of visual parity.
         for (size_t i = 0; i < (std::min)(snapshot.emitters.size(), size_t{12}); ++i)
         {
             const auto& e = snapshot.emitters[i];
-            Msg("ph_dx12_particles: material_pending effect='%s' shader='%s' texture='%s' flags=0x%x cull=%u quads=%u",
-                e.effect.c_str(), e.shader.c_str(), e.texture.c_str(), e.flags, static_cast<unsigned>(e.cull), e.count);
+            const auto& binding = inventory.bindings[i];
+            const bool ddsReady = binding.texture < decoded.size() && decoded[binding.texture];
+            Msg("ph_dx12_particles: material_source effect='%s' shader='%s' texture='%s' flags=0x%x cull=%u quads=%u "
+                "blend_id=%u priority=%u clamp=%u strict=%u dds_ready=%u",
+                e.effect.c_str(), e.shader.c_str(), e.texture.c_str(), e.flags, static_cast<unsigned>(e.cull), e.count,
+                binding.source.blendId, binding.source.priority, binding.source.clamp ? 1u : 0u,
+                binding.source.strictSorting ? 1u : 0u, ddsReady ? 1u : 0u);
         }
     }
     catch (const std::exception& e)
