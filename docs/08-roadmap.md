@@ -2501,3 +2501,8 @@ CoP/модовых материалах, **не подтверждены в на
 **Инварианты:** звук и AI должны получать согласованные игровые события, но визуальная/акустическая детализация не должна скрытно менять поведение NPC; DX11 и Classic fallback обязательны; исходные аудиоресурсы и узнаваемая атмосфера Зоны сохраняются. Использовать feature flags и сравнение Classic/Enhanced. Нельзя считать `psSoundTargets = 256` доказательством 256 одновременно слышимых звуков, а номинальные три блока по 400 мс — задержкой старта 1,2 с без runtime измерений.
 
 **Статус:** PLANNED / NOT IMPLEMENTED. Первый следующий шаг — AUDIO0, без преждевременной замены OpenAL backend.
+
+
+### F4.5 — Native DX12 HUD / UI (production design)
+
+[Architecture and source investigation](dx12-f45-hud-ui-architecture.md), pinned to 36fd6a4670fc79d8daa837860db56631d390be3b. **DESIGN / implementation pending.** A: native menu/loading/game UI frame modes, actual UI and font backend; B: animated first-person HUD with correct transforms/depth/skin; C: scopes, 3D item UI, dynamic textures/video and composition; D: runtime parity/lifecycle/performance. No new prototype scene quotas, no second swapchain, no R4 UI framebuffer copy. Retain XML/LTX/Lua and input behavior. Native frame must support no-level menu/loading, preserve single owner and fence/descriptor lifetimes, and stop relying on forced startup menu close once native UI exists. Existing R4 and prypiat remain unchanged. Windows/GPU NOT RUN.

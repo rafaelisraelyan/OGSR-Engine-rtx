@@ -1,0 +1,65 @@
+# F4.5 — Native DX12 HUD and UI production architecture
+
+Status: source investigation / proposed implementation contract. No native HUD/UI rendering or Windows test is claimed. Baseline: 36fd6a4670fc79d8daa837860db56631d390be3b, experiment/f43-csm-r2-c. Keep R4 behavior and prypiat unchanged.
+
+## 1. Verified source seams
+
+| Path (under ogsr_engine/) | Evidence at baseline |
+|---|---|
+| xr_3da/device.cpp:258–273, 324–343 | Loading events call LoadDraw and return; bridge runs before secondary thread work; native viewport skips seqRender.Process. ImGui DX11 draw occurs in End (103–108). |
+| xr_3da/GameDx12Bridge.cpp:1540–1569, 3714–3752 | Native owns HWND/swapchain; OnFrame requires ready active level and no load events; first native gameplay explicitly closes active startup menu. These are preview limitations, not production UI policy. |
+| xr_3da/GameDx12NativeFrame.cpp:474–493, 655–721 | BeginColorList can replace the active list; Present resolves timing, optional readback and transitions to PRESENT before one submission. Use actual active color list, not stale Recording copy after shadow-list handoff. |
+| xr_3da/GameDx12NativeFrame.cpp:16 | Current output R8G8B8A8_UNORM. No assumption of full HDR pipeline today. |
+| Include/xrRender/UIRender.h; Layers/xrRender/dxUIRender.cpp | IUIRender already has shader, alpha ref, scissor, texture dimensions, Start/Push/Flush, TL and LIT, triangle/line lists/strips, world and cull. DX11 locks dynamic vertex buffer and writes RCache. |
+| Layers/xrRender/dxUIShader.cpp | Shader and texture pair, cached or no_cache; retain identity and lifetime, not DX11 objects. UpdateShaderName in dxUIRender selects hud\\movie for OGM. |
+| Layers/xrRender/dxFontRender.cpp:17–177; xr_3da/GameFont.cpp:245–248 | Font own vertex path, atlas dimensions, glyph quads, original alignment/multibyte/gradient/shadow and half-pixel adjustment; CGameFont clears strings after OnRender. Must produce once, not capture and redraw twice. |
+| xrGame/Level.cpp:490–507; xrGame/HUDManager.cpp:208–313 | Level renders world then UI; Render_MAIN emits HUD geometry through OnHUDDraw; RenderUI draws HitMarker, game UI, fonts, target and pause message. Visibility/online/renderable gates belong to game. |
+| xrGame/player_hud.cpp:836–912 | Two attached items, two hand models, script animation/override and additional item model; LIT item UI is world-transformed, not screen overlay. |
+| Layers/xrRenderPC_R4/HUDInitializer.cpp | Two HUD camera variants, current and previous transforms, saves/restores world camera. Native must use immutable copies instead of mutating Device matrices. |
+| Layers/xrRenderPC_R4/r4_R_render.cpp:397–430; r4_rendertarget_phase_combine.cpp:130–150 | HUD geometry after scene depth copy, scope depth after HUD depth copy; active item UI follows forward pass before later combine effects. Distinct depth/scope and item UI domains. |
+| xrGame/MainMenu.cpp:330–350; xrGame/UIDialogHolder.cpp:150–159 | Menu combines world and dialogs; only shown/enabled windows are drawn in original order. Split producer from world render without invoking both twice. |
+| docs/08-roadmap.md F4 and G5.0 UI lifecycle | HUD/weapon in F4; previous dialog UAF/reentrant tutorial teardown are known risks; verify same-process reload and input receiver lifetime. |
+
+## 2. ADR: one backend, three domains
+
+Keep game UI tree, XML/LTX/Lua, input, fonts' layout, weapon/HUD animation and sound untouched. Do not replace with ImGui, copy the R4 framebuffer, or create a second swapchain. New DX12 UI implementation at existing rendering interfaces (IUIRender, IUIShader, IFontRender via factory; inspect exact factory ABI before edits). During migration R4 asset/animation producers may remain, but native draws never borrow DX11 COM objects. No unconditional change to R4 factory routing.
+
+A. Screen-space output UI: original TL pixel positions, UV, packed ARGB, alpha ref, blend/sampler, scissors, cull, line/triangle topology, stable submission order. Menus, cursor, PDA, inventory, console and loading. Preserve base layout and actual output pixel mapping; verify legacy half-pixel conventions by A/B before compensation. Handle empty/small strips without unsigned underflow. Clip signed rectangles to target; empty clip skips safely. Batch only adjacent compatible commands, never reorder alpha UI. Keep per-command texture dimensions available before draw. Material state comes from actual UI shader/pass, not filename guesses. Explicit unsupported path with diagnostics; preserve movie, render-target and dynamically updated sources via providers (do not treat them as DDS).
+B. Font backend: share pure glyph generation with R4 where parity permits; consume original atlas and metrics, alignment, scaling, Cyrillic/multibyte, gradients, shadows, spaces and legacy offsets. Capture actual quads at font OnRender with original winding; no second traversal or second strings.clear(). Font and normal UI use common ordered command stream and registry.
+C. First-person 3D: snapshot real submissions at player_hud/OnHUDDraw boundary, both hands, attached items, transforms, poses, visibility, current and previous HUD matrices, shader passes. Reuse shared world geometry/material/skin registry; explicitly audit weighted skinning and hidden bones (rigid world support alone not enough). Preserve animation state and gameplay. HUD projection is independent of world FOV. Own HUD depth domain or compatible depth remap, verify original occlusion, world depth and scope depth before choosing implementation. No forced near-plane hack. LIT item displays are depth-aware with the same HUD transforms; never flatten to screen quads. World actor shadows and muzzle lights remain separate from cosmetic first-person geometry. Preserve scope masks, lens/zoom and render-target dependencies, including alternate scope/PiP where present, after asset audit.
+
+## 3. Native frame orchestration
+
+Replace gameplay-only frame assumption with explicit frame mode: Startup/Menu, Loading/Precache, Gameplay, Paused/MenuOverlay, Teardown/Inactive. Native present can occur without level or scene geometry; do not fake level readiness. Loading entry point and normal owner frame need coordinated dispatch and no reentrant rendering. Preserve input and game update cadence; no forced main_menu off in production. Extract render-only producers for game HUD/menu/loading/console; do not blindly re-enable seqRender (also invokes R4 world). Avoid duplicate font/UI calls, updates and ImGui. UI producers execute on owner at a defined stable point, after relevant update and before DX12 submission. Current bridge timing before secondary thread work is a seam to redesign, not authorization to traverse live UI concurrently. GPU recording consumes immutable packets only.
+
+Target graph (logical, future HDR/post stages not implemented by this ADR):
+world shadows -> world opaque/deferred -> world transparency/water/particles (actual material order) -> HUD 3D at appropriate scene-linear/depth phase -> depth-aware item UI/scope -> post/temporal/upscale/tone-map according to effect contracts -> display-space screen UI -> optional developer overlay -> capture/PRESENT. Validate against original R4 order; scope and effects can require earlier subpasses. Maintain pre-HUD world depth and HUD depth where consumers need both. Keep screen UI outside world DOF/motion blur/TAA/upscale; separate HUDless output and UI color/alpha contract for future DLSS FG, not an assertion that current DLSS integration is ready. Future HDR output requires explicit transfer/color-space and UI luminance, not an implicit change to current UNORM target.
+
+One native frame owner and monotonic fence. Add explicit RecordOverlay/active color recording context before readback/PRESENT; with separate shadow lists, do not record overlay into the closed initial list. A UI-only frame clears/backgrounds according to game mode and can be captured even when sceneDraws == 0. Preserve resize, minimize, device removal, teardown; no independent Present.
+
+## 4. Resource ownership and performance
+
+Use one renderer-wide texture/material/geometry registry (including particle work) with stable generation handles, immutable per-frame binding and a device epoch. Atlas/DDS static uploads and dynamic video/RT producers differentiated; actual dimensions, format, mips, alpha and color space retained. No per-frame VFS reload. Shared descriptor allocator, GPU-visible descriptor pages/ranges; no overwrite or release until last-use fence completed. Per-frame upload pages grow on demand with checked byte/index arithmetic, recycle via fence, align CBVs per API, explicit backpressure/OOM and telemetry. Never silently discard valid UI at arbitrary counts or byte limits. Hardware and OS budget, API representability and asset validity are legitimate limits. Reuse GR for pure geometry preparation/packing if profiling supports it, not live widgets, font mutable queues or VFS calls. Preserve order across worker chunks. No extra wait per draw, texture or frame just for UI. PSO cache keys include shader/pass, vertex domain, primitive type, blend, depth, cull, RTV/DSV format and sample count; viewport/scissor/IA topology set explicitly. State barriers tracked by native owner; unknown completion uses existing quarantine semantics. No screen UI in DXR world TLAS; HUD 3D participation in RT requires an explicit visibility/reflection policy.
+
+## 5. Implementation work packages (production functionality, not separate demos)
+
+F4.5-A — Native frame modes, render-only producers, UI backend, static atlas materials, primitives, font path. Deliver actual interactive main menu, game HUD, inventory, PDA, dialogs, console and loading screen on DX12, including input; preserve original ordering and resize behavior. No dependency on level readiness for menu. DX11 unchanged.
+F4.5-B — HUD 3D: actual animated hands/weapon, both attached slots, script animation, skeleton/skin, attachments, correct matrices and depth, flashlight and muzzle effects with world lights. Connect existing geometry/PSO/material registry; not static test gun.
+F4.5-C — Scope/detector/3D item UI, OGM video, live textures, dynamic UI materials, integration with post/temporal and future upscale/FG boundary. Preserve all supported legacy behavior; enumerate asset-specific unsupported features with owner review, not silent fallback.
+F4.5-D — Production acceptance across A–C: source review, real Windows x64 feature-on/off, actual DX12 frame evidence with draw counts and screenshots, R4 A/B, D3D12 Debug Layer/GBV, PIX timing, leak/descriptor lifetime and recovery. Acceptance tests accompany implementation, never constrain capacities.
+
+## 6. Acceptance matrix
+
+Cold startup without -start or preview menu-close; keyboard/mouse focus, keyboard navigation where legacy supports it, new game/load/save/disconnect/quit, inventory transfer, trade, PDA maps/tasks, dialog, pause, console and loading screens. Same-process Zaton/Jupiter reload and return to menu, active dialogs on teardown, no stale receivers or callbacks. Cyrillic/Latin, atlas clipping, gradients/shadow, overlapping translucent widgets, line/strip cases, nested clipping, 4:3/16:9/16:10/21:9, window/fullscreen resize and DPI. Weapon holster/switch/reload/aim/fire, detector in other hand, script animations, optics, scope depth, world near-wall contact, HUD FOV vs world FOV, HUD motion, muzzle flash/light, screenshot mode. Compare same assets/camera/settings against R4, check actual pixels and interaction, not draw count alone. Verify current normal output first; with later temporal/HDR features validate UI sharpness, ghosting, color and FG boundaries separately. Measure CPU p50/p95/p99, GPU UI and HUD ms, draw/PSO changes, upload bytes, descriptor pressure, memory and repeated lifecycle; no invented target performance numbers.
+
+## 7. API references
+
+- Microsoft: https://learn.microsoft.com/en-us/windows/win32/direct3d12/managing-graphics-pipeline-state-in-direct3d-12
+- Microsoft: https://learn.microsoft.com/en-us/windows/win32/direct3d12/resource-binding-flow-of-control
+- Microsoft: https://learn.microsoft.com/en-us/windows/win32/direct3d12/fence-based-resource-management
+- Microsoft: https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12
+- NVIDIA Streamline DLSS integration: https://developer.nvidia.com/blog/how-to-integrate-nvidia-dlss-4-into-your-game-with-nvidia-streamline/
+
+## 8. Remaining investigation and blockers
+
+Exact factory ABI, current UI shader catalog and Lua overrides, loading/console/video producers, scope variants, dynamic texture implementations and original color/depth behavior require targeted source/asset audits during implementation. No prior dedicated F4.5 ADR found in the branch docs listing. Current branch has no native HUD/UI acceptance; no native Windows build, WARP or GPU execution in this investigation. Do not claim production parity. This ADR is a proposed design, not a completed renderer.
