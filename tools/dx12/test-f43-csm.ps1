@@ -4,6 +4,7 @@ param(
     [switch]$Sequential,
     [switch]$DescriptorTestsOnly,
     [switch]$CsmWarpOnly,
+    [ValidateSet('banked-parity','scalable')][string]$WarpCase,
     [string]$JobLibrary
 )
 
@@ -42,6 +43,7 @@ if (!$JobLibrary) { $JobLibrary = "$gr/x64/ReleaseDX12/gr_job_system.lib" }
 $common += "/I$($output.FullName)"
 $warpArgs = @()
 if ($Sequential) { $warpArgs = @('--sequential') }
+if ($WarpCase) { $warpArgs = @("--$WarpCase") }
 Push-Location -LiteralPath $output.FullName
 try {
     if ($DescriptorTestsOnly) {
@@ -52,7 +54,7 @@ try {
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         $warpArgs = @('--page-table')
     }
-    elseif (!$CsmWarpOnly) {
+    elseif (!$CsmWarpOnly -and !$WarpCase) {
         & $cl @common "$PSScriptRoot/test-f43-csm-math.cpp" /Fe:csm-math.exe 2>&1 | Tee-Object -FilePath math-build.log
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         & ./csm-math.exe 2>&1 | Tee-Object -FilePath math.log
@@ -104,6 +106,13 @@ try {
         & $cl @common "$PSScriptRoot/test-f43-shadow-address.cpp" /Fe:shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address-build.log
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         & ./shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    }
+    if ($WarpCase -eq 'scalable') {
+        & $cl @common "$PSScriptRoot/test-f43-shadow-schedule.cpp" /Fe:shadow-schedule.exe 2>&1 |
+            Tee-Object -FilePath shadow-schedule-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./shadow-schedule.exe 2>&1 | Tee-Object -FilePath shadow-schedule.log
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
     }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",

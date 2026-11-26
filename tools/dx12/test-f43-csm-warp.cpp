@@ -3,6 +3,7 @@
 #include <d3d12shader.h>
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
+#include "GameDx12ShadowRecording.h"
 #include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12ShadowAddress.h"
 #include "gr/jobs/JobGroup.h"
@@ -167,10 +168,13 @@ struct ShadowSamplingPass
     ComPtr<ID3D12Resource> constants;
     game_shadow12::FrameStructuredUpload lights, projections;
     UINT stride = 0;
+    bool banked51 = false;
 
     ShadowSamplingPass(ID3D12Device& device, ID3D12Resource* sun, uint32_t sunSlices,
-        ID3D12Resource* local, uint32_t localSlices, Mutation mutation, bool pageTable = false)
+        ID3D12Resource* local, uint32_t localSlices, Mutation mutation, bool pageTable = false, bool banked = false, ID3D12DescriptorHeap* sharedHeap = nullptr)
+        : srv(sharedHeap), banked51(banked)
     {
+        const bool sm51 = pageTable || banked;
         constexpr char vertex[] = R"(
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
@@ -229,7 +233,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         uint layer = x - count;
         // Independent expected physical mapping, not a read from metadata.
         const uint physical = layer % 8 < 2 ? layer ^ 1u : layer;
-        float stored = LocalShadow.Load(int4(1,1,physical,0));
+        float stored = LOCAL_SHADOW_PAGE(0).Load(int4(1,1,physical,0));
         float threshold = .03125 * (physical + 1);
         return float4(stored,SampleLocalVisibility(float3(.25,.25,threshold),layer),
             SampleLocalVisibility(float3(.25,.25,threshold+.015625),layer),1);
@@ -266,9 +270,11 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         }
         else
             Mutate(pixel,mutation);
+        if (banked)
+            pixel.insert(0, "#define OGSR_DX12_SHADOW_PAGE_TABLE 1\n");
         const auto vs = Compile(vertex, "vs", "vs_5_0");
-        const auto ps = Compile(pixel.c_str(), "probe", pageTable ? "ps_5_1" : "ps_5_0",
-            pageTable ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0);
+        const auto ps = Compile(pixel.c_str(), "probe", sm51 ? "ps_5_1" : "ps_5_0",
+            sm51 ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0);
         if (!pageTable && mutation == Mutation::None) VerifyFrameAbi(*ps.Get());
 
         D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -276,9 +282,9 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         ranges[0].NumDescriptors = 1;
         ranges[0].BaseShaderRegister = 2;
         ranges[1] = ranges[0];
-        ranges[1].BaseShaderRegister = pageTable ? 0 : 6;
-        ranges[1].RegisterSpace = pageTable ? 1 : 0;
-        ranges[1].NumDescriptors = pageTable ? UINT32_MAX : 1;
+        ranges[1].BaseShaderRegister = sm51 ? 0 : 6;
+        ranges[1].RegisterSpace = sm51 ? 1 : 0;
+        ranges[1].NumDescriptors = sm51 ? UINT32_MAX : 1;
         D3D12_ROOT_PARAMETER params[6]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 
@@ -293,7 +299,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         params[4].Descriptor.ShaderRegister = 14;
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[5].Descriptor.ShaderRegister = 15;
-        rootDesc.NumParameters = pageTable ? 6 : 5;
+        rootDesc.NumParameters = sm51 ? 6 : 5;
         rootDesc.pParameters = params;
         D3D12_STATIC_SAMPLER_DESC samplers[2]{};
         for (uint32_t i = 0; i < 2; ++i)
@@ -337,8 +343,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.NumDescriptors = pageTable ? 6 : 2;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srv)),
-            "create shadow sampling SRV heap");
+        if (!srv)
+            Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srv)), "create shadow sampling SRV heap");
         stride = device.GetDescriptorHandleIncrementSize(heapDesc.Type);
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = DXGI_FORMAT_R32_FLOAT;
@@ -405,6 +411,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         frame.localShadowConfig[0] = localSlices;
         frame.localShadowConfig[1] = localSlices ? 1u : 0u;
         frame.localShadowConfig[2] = localSlices;
+        frame.localShadowConfig[3] = banked51 && localSlices ? ref::Size : 0;
         // Caller waits for GPU completion between fixture frames. Exercise
         // resource growth and accesses beyond 16 lights / 24 local matrices.
         const size_t recordCount = size_t(33) << (filter > 2 ? 2 : filter-1);
@@ -456,6 +463,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         list.SetGraphicsRootDescriptorTable(1, gpu);
         gpu.ptr += stride;
         list.SetGraphicsRootDescriptorTable(2, gpu);
+        if (banked51)
+            list.SetGraphicsRootShaderResourceView(5, projections.Address());
         const uint32_t width = (std::max)(sunSlices + localSlices + 1, ref::ProbeCount);
         D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 5, 0, 1};
         D3D12_RECT rect{0, 1, static_cast<LONG>(width), 6};
@@ -528,10 +537,11 @@ using Frame = GameDx12NativeFrame12;
 
 std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
     const char* mode, uint32_t sunCount, uint32_t localCount, uint32_t workers = 0,
-    Mutation mutation = Mutation::None)
+    Mutation mutation = Mutation::None, bool banked51 = false)
 {
     const bool multi = std::strcmp(mode, "legacy") != 0;
     const bool parallel = std::strcmp(mode, "parallel") == 0;
+    Check(_putenv_s("OGSR_DX12_GAME_METRICS", banked51 ? "1" : "0") == 0, "banked timestamp mode");
     Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", mode) == 0, "set command list mode");
     gr::jobs::JobSystem jobs;
     if (parallel)
@@ -580,8 +590,8 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     // Every depth value stays in [0,1], while each slice remains distinguishable.
     const auto sun = createArray(sunCount, ref::SunDepth(0), 0.25f);
     const auto local = createArray(localCount, ref::LocalDepth(0), 0.03125f);
-    ShadowSamplingPass sampling(device, sun.resource.Get(), sunCount, local.resource.Get(),
-        (std::max)(localCount, 1u), mutation);
+    ShadowSamplingPass sampling(device, sun.resource.Get(), sunCount, localCount ? local.resource.Get() : nullptr,
+        (std::max)(localCount, 1u), mutation, false, banked51);
     const uint32_t passCount = sunCount + localCount;
     const auto passView = [sunCount](uint32_t index)
     {
@@ -628,6 +638,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
 
     std::vector<uint32_t> result;
     uint32_t mismatches = 0;
+    bool observedTiming = false;
     const uint32_t frameCount = mutation == Mutation::None ? 8u : 1u;
     for (uint32_t index = 0; index < frameCount; ++index)
     {
@@ -639,6 +650,23 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         Check(recording.list && recording.width == static_cast<uint32_t>(windowSize), "resize reached native frame");
         Check(recording.UsesShadowLists() == multi && recording.UsesParallelShadowLists() == parallel,
             "effective command list mode");
+        if (banked51)
+        {
+            const auto& timing = frame.LastGpuTiming();
+            if (timing.present)
+            {
+                Check(timing.views.size() == passCount && timing.milliseconds >= timing.shadowMilliseconds,
+                    "banked CSM/local/frame timestamps");
+                for (uint32_t i = 0; i < passCount; ++i)
+                    Check(timing.views[i].projection == passView(i).projection, "banked timestamp projection ID");
+                observedTiming = true;
+            }
+            std::array<uint32_t, game_shadow12::MaxViews> ids{};
+            for (uint32_t i = 0; i < passCount; ++i)
+                ids[i] = passView(i).projection;
+            Check(recording.SetShadowTimingViews(std::span(ids.data(), passCount)) == S_OK,
+                "enable banked CSM/local timestamps");
+        }
         std::array<ID3D12GraphicsCommandList*, game_shadow12::MaxViews> shadowLists{};
         for (uint32_t pass = 0; pass < passCount; ++pass)
         {
@@ -653,6 +681,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
             for (uint32_t pass = first; pass < last; ++pass)
             {
                 const auto view = passView(pass);
+                recording.StampShadow(*shadowLists[pass], view.projection, false);
                 shadowLists[pass]->ClearDepthStencilView({handle.ptr + stride * pass}, D3D12_CLEAR_FLAG_DEPTH,
                     mapsFor(view).clear + mapsFor(view).step * static_cast<float>(view.Slice()), 0, 0, nullptr);
                 if (view.IsSun() && view.Slice() == 0)
@@ -665,6 +694,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
                                 D3D12_CLEAR_FLAG_DEPTH, ref::Texel(0,x,y), 0, 1, &texel);
                         }
                 }
+                recording.StampShadow(*shadowLists[pass], view.projection, true);
                 if (multi)
                     Require(recording.CloseShadowList(pass), "close exclusive shadow list");
             }
@@ -695,6 +725,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         // Sample every production array slice through t2/t6 before the color pass
         // overwrites the control pixels. The readback proves SRV array indexing.
         const uint32_t filter = mutation == Mutation::None ? index + 1 : 4;
+        recording.StampSceneStart();
         sampling.Draw(*recording.list, recording.rtv, sunCount, localCount, filter);
         Readback sampledColor(device, recording.color->GetDesc(), 1);
         Transition(*recording.list, *recording.color, renderState, copyState);
@@ -709,7 +740,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         color.Copy(*recording.list, *recording.color, 0);
         Transition(*recording.list, *recording.color, copyState, renderState);
 
-        Require(frame.Present(owner, 0), "present ordered batch");
+        Require(frame.Present(owner, banked51 ? 1 : 0), "present ordered batch");
         Require(owner.fence.SetEventOnCompletion(owner.fenceValue, owner.event), "set fence event");
         Check(WaitForSingleObject(owner.event, 10000) == WAIT_OBJECT_0, "wait GPU fence");
         Require(device.GetDeviceRemovedReason(), "D3D12 device after ordered submission");
@@ -758,6 +789,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         }
     }
     Require(frame.Drain(owner), "drain native slot work");
+    Check(!banked51 || observedTiming, "banked CSM/frame timing observed after slot reuse");
     if (parallel)
     {
         const auto stats = jobs.GetStats();
@@ -916,6 +948,371 @@ void RunPages(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner)
     std::puts("PASS: physical 128x128x6 / 256x256x9, divergent sampling, bounds, two slots, cancel/commit, gated lifetime");
 }
 
+void RunGatedDescriptorDraws(const Frame::Owner& owner)
+{
+    using namespace game_shadow12;
+    auto& device = owner.device;
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NumDescriptors = 7;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "gated shared material heap");
+    std::array<ShadowPageResources, 2> pages;
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "gated descriptor transaction");
+    ShadowSamplingPass first(device, nullptr, 1, nullptr, 1, Mutation::None, true, false, heap.Get());
+    ShadowSamplingPass second(device, nullptr, 1, nullptr, 1, Mutation::None, true, false, heap.Get());
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
+    rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtvDesc.NumDescriptors = 2;
+    ComPtr<ID3D12DescriptorHeap> rtvs;
+    Require(device.CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&rtvs)), "gated outputs heap");
+    const auto stride = device.GetDescriptorHandleIncrementSize(rtvDesc.Type);
+    D3D12_RESOURCE_DESC color{};
+    color.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    color.Width = 8;
+    color.Height = color.DepthOrArraySize = color.MipLevels = 1;
+    color.SampleDesc.Count = 1;
+    color.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_HEAP_PROPERTIES defaults{};
+    defaults.Type = D3D12_HEAP_TYPE_DEFAULT;
+    defaults.CreationNodeMask = defaults.VisibleNodeMask = 1;
+    struct Output
+    {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ComPtr<ID3D12Resource> texture;
+        std::unique_ptr<Readback> pixels;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+    };
+    std::array<Output, 2> outputs;
+    for (uint32_t slot = 0; slot < outputs.size(); ++slot)
+    {
+        auto& output = outputs[slot];
+        Require(pages[slot].Initialize(device, owner.fence, slot), "gated slot initialize");
+        Require(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&output.allocator)),
+            "gated command allocator");
+        Require(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, output.allocator.Get(), nullptr,
+            IID_PPV_ARGS(&output.list)), "gated command list");
+        Require(device.CreateCommittedResource(&defaults, D3D12_HEAP_FLAG_NONE, &color,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&output.texture)), "gated output");
+        output.rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+        output.rtv.ptr += slot * stride;
+        device.CreateRenderTargetView(output.texture.Get(), nullptr, output.rtv);
+        output.pixels = std::make_unique<Readback>(device, color, 1);
+    }
+
+    ComPtr<ID3D12Fence> gate;
+    Require(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "gated draw fence");
+    // Слот 1 уже публиковал диапазон из двух страниц до начала задержанного кадра.
+    const std::array<ShadowPageShape, 4> shapes{{{64,6},{128,6},{256,6},{512,6}}};
+    AdaptivePlan logical{1,1,1,1,UINT64_MAX,0,{{1,1,64,64,1},{2,1,128,128,1}}};
+    const auto previousFence = owner.fenceValue + 1;
+    ShadowAddressPlan previousAddresses;
+    ShadowDescriptors::Binding previousBinding;
+    Require(pages[1].Prepare(logical, shapes, UINT64_MAX, UINT64_MAX, previousFence), "prepare prior two-page range");
+    Require(descriptors.Stage(owner.fence, 1, pages[1], previousAddresses, previousBinding), "stage prior two-page range");
+    Check(previousBinding.pageCount == 2, "previous second-slot descriptor count");
+    Require(owner.queue.Signal(&owner.fence, previousFence), "signal prior two-page range");
+    owner.fenceValue = previousFence;
+    Require(descriptors.CommitSubmitted(owner.fence, previousFence), "commit prior two-page range");
+    Require(owner.fence.SetEventOnCompletion(previousFence, owner.event), "wait prior two-page range");
+    Check(WaitForSingleObject(owner.event, 10000) == WAIT_OBJECT_0, "prior range completed");
+    ++logical.frame;
+
+    const auto oldFence = owner.fenceValue + 1;
+    const auto newFence = oldFence + 1;
+    Require(owner.queue.Wait(gate.Get(), 1), "gate GPU before either draw");
+    struct FinishGated
+    {
+        const Frame::Owner& owner;
+        ID3D12Fence& gate;
+        ~FinishGated()
+        {
+            gate.Signal(1);
+            if (owner.fence.GetCompletedValue() < owner.fenceValue &&
+                SUCCEEDED(owner.fence.SetEventOnCompletion(owner.fenceValue, owner.event)))
+                WaitForSingleObject(owner.event, 10000);
+        }
+    } cleanup{owner, *gate.Get()};
+    std::array<ShadowDescriptors::Binding, 2> bindings{};
+    const auto submit = [&](uint32_t slot, ShadowSamplingPass& pass, uint64_t value)
+    {
+        auto& arena = pages[slot];
+        auto& output = outputs[slot];
+        ShadowAddressPlan addresses;
+        Require(arena.Prepare(logical, shapes, UINT64_MAX, UINT64_MAX, value), "prepare gated pages");
+        Require(descriptors.Stage(owner.fence, slot, arena, addresses, bindings[slot]), "stage gated descriptors");
+        Check(addresses.views.size() == 2 + slot, "gated page count");
+        std::array<LocalShadowGpuProjection, 8> projections{};
+        for (uint32_t i = 0; i < addresses.views.size(); ++i)
+        {
+            const auto& address = addresses.views[i];
+            ShadowPageResources::View page;
+            Check(arena.GetView(addresses.pageIds[address.page], address.slice, page), "gated physical page");
+            auto& list = *output.list.Get();
+            Transition(list, *page.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, page.slice);
+            list.ClearDepthStencilView(page.dsv, D3D12_CLEAR_FLAG_DEPTH, (i + slot) % 2 ? .75f : .25f, 0, 0, nullptr);
+            Transition(list, *page.resource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, page.slice);
+        }
+        for (uint32_t i = 0; i < projections.size(); ++i)
+            projections[i].address = addresses.views[i % addresses.views.size()];
+        pass.DrawPages(device, *output.list.Get(), output.rtv, bindings[slot], projections);
+        Transition(*output.list.Get(), *output.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        output.pixels->Copy(*output.list.Get(), *output.texture.Get(), 0);
+        Require(output.list->Close(), "close gated draw");
+        ID3D12CommandList* lists[]{output.list.Get()};
+        owner.queue.ExecuteCommandLists(1, lists);
+        const auto signal = owner.queue.Signal(&owner.fence, value);
+        if (FAILED(signal))
+            descriptors.Quarantine();
+        Require(signal, "signal gated draw");
+        owner.fenceValue = value;
+        Require(descriptors.CommitSubmitted(owner.fence, value), "commit gated draw range");
+    };
+    submit(0, first, oldFence);
+    Check(owner.fence.GetCompletedValue() < oldFence, "first real draw remains queued");
+    logical.lights.push_back({3,1,256,256,1});
+    logical.lights.push_back({4,1,512,512,1});
+    Require(pages[1].Prepare(logical, shapes, UINT64_MAX, UINT64_MAX, newFence), "prepare overflowing second range");
+    ShadowAddressPlan rejected;
+    Check(descriptors.Stage(owner.fence, 1, pages[1], rejected, bindings[1]) == E_OUTOFMEMORY &&
+        !bindings[1].table.ptr && owner.fenceValue == oldFence, "capacity rejection leaves queue unchanged");
+    Require(pages[1].CancelUnsubmitted(), "rollback oversized second range");
+    logical.lights.pop_back();
+    submit(1, second, newFence);
+    Check(bindings[0].pageCount == 2 && bindings[1].pageCount == 3 &&
+        bindings[0].table.ptr != bindings[1].table.ptr && bindings[1].table.ptr < previousBinding.table.ptr &&
+        owner.fence.GetCompletedValue() < oldFence,
+        "second range grows while first real draw is still pending");
+    Require(gate->Signal(1), "release both real draws");
+    Require(owner.fence.SetEventOnCompletion(newFence, owner.event), "wait both range reads");
+    Check(WaitForSingleObject(owner.event, 10000) == WAIT_OBJECT_0, "gated range completion");
+    Require(device.GetDeviceRemovedReason(), "device survives gated ranges");
+    for (uint32_t slot = 0; slot < outputs.size(); ++slot)
+        for (uint32_t pixel = 0; pixel < 8; ++pixel)
+        {
+            const auto page = pixel % (2 + slot);
+            const auto expected = (page + slot) % 2 ? 0xff00ffff : 0xff00ff00;
+            Check(outputs[slot].pixels->Pixel(0, pixel, 0) == expected, "old/new gated range readback");
+        }
+    std::puts("PASS: real draws behind fence, live two-page range and successful three-page range, rollback and 16 readbacks");
+}
+
+struct DepthPacketPipeline
+{
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+
+    explicit DepthPacketPipeline(ID3D12Device& device)
+    {
+        auto vertex = Compile(R"(
+cbuffer Packet : register(b0) { float Depth; }
+float4 main(uint id : SV_VertexID) : SV_Position {
+    float2 vertices[3] = {float2(-1,-1), float2(-1,3), float2(3,-1)};
+    return float4(vertices[id], Depth, 1);
+})", "main", "vs_5_0");
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameter.Constants.Num32BitValues = 1;
+        D3D12_ROOT_SIGNATURE_DESC signature{};
+        signature.NumParameters = 1;
+        signature.pParameters = &parameter;
+        ComPtr<ID3DBlob> blob;
+        Require(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+            "serialize depth packet signature");
+        Require(device.CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+            "create depth packet signature");
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = root.Get();
+        desc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.DepthStencilState.DepthEnable = TRUE;
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        desc.SampleDesc.Count = 1;
+        desc.SampleMask = UINT_MAX;
+        Require(device.CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "create depth packet PSO");
+    }
+};
+
+std::vector<uint32_t> RunScalable(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
+    const DepthPacketPipeline& pass, const char* mode, uint32_t lights)
+{
+    using namespace game_shadow12;
+    Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", mode) == 0, "set scalable mode");
+    Check(_putenv_s("OGSR_DX12_GAME_METRICS", "1") == 0, "enable scalable timestamps");
+    auto& device = owner.device;
+    std::array<ShadowPageResources, Frame::kFrameCount> pages;
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NumDescriptors = 24;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "scalable material heap");
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "scalable descriptors");
+    for (uint32_t slot = 0; slot < pages.size(); ++slot)
+        Require(pages[slot].Initialize(device, owner.fence, slot), "scalable slot arena");
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "initialize scalable frame");
+    gr::jobs::JobSystem jobs;
+    if (std::strcmp(mode, "parallel") == 0)
+    {
+        gr::jobs::JobConfig config;
+        config.backgroundWorkers = 2;
+        config.automaticWorkers = false;
+        Check(jobs.Initialize(config), "initialize scalable GR");
+    }
+
+    const std::array<ShadowPageShape, 2> shapes{{{128, 12}, {256, 12}}};
+    AdaptivePlan logical{1, 1, 0, 1, UINT64_MAX, 0, {}};
+    for (uint32_t i = 0; i < lights; ++i)
+    {
+        const uint32_t size = i % 2 ? 256 : 128;
+        logical.lights.push_back({i + 1u, 6, size, size, 1});
+    }
+    const uint32_t count = lights * 6;
+    std::vector<float> depths(count);
+    std::vector<ShadowPacketRange> packets(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        depths[i] = static_cast<float>(i + 1) / 64.0f;
+        packets[i] = {i, 1};
+    }
+
+    std::vector<uint32_t> outcome;
+    std::array<std::vector<ID3D12Resource*>, Frame::kFrameCount> previous;
+    std::array<std::vector<ID3D12GraphicsCommandList*>, Frame::kFrameCount> previousLists;
+    bool timingRead = false, physicalReused = false;
+    for (uint32_t iteration = 0; iteration < 4; ++iteration)
+    {
+        Frame::Recording recording;
+        Check(frame.Begin(window, owner, recording, count) == S_OK, "begin scalable frame");
+        auto& arena = pages[recording.slot];
+        if (iteration && frame.LastGpuTiming().present)
+        {
+            const auto& timing = frame.LastGpuTiming();
+            Check(timing.views.size() == count && timing.milliseconds >= timing.shadowMilliseconds,
+                "dynamic shadow timestamps");
+            for (uint32_t i = 0; i < count; ++i)
+                Check(timing.views[i].projection == ReservedCsmProjections + i, "timestamp projection identity");
+            timingRead = true;
+        }
+
+        logical.frame = iteration + 1;
+        const auto fenceBefore = owner.fenceValue;
+        Require(arena.Prepare(logical, shapes, UINT64_MAX, UINT64_MAX, fenceBefore + 1), "prepare scalable pages");
+        ShadowAddressPlan addresses;
+        ShadowDescriptors::Binding binding;
+        Require(recording.StageShadowPages(descriptors, arena, addresses, binding), "stage scalable pages");
+        Check(binding.pageCount > 1 && addresses.views.size() == count, "scalable full page placement");
+        std::vector<ScheduledShadowView> schedule;
+        Check(PlanShadowViews(addresses, packets, depths.size(), schedule), "plan scalable shadow schedule");
+
+        const auto dispatch = [&](uint32_t size, const auto& work) -> HRESULT
+        {
+            auto group = jobs.CreateGroup();
+            try
+            {
+                group.ParallelFor(size, 1, work);
+                group.Wait();
+            }
+            catch (...)
+            {
+                group.DrainNoThrow();
+                return E_FAIL;
+            }
+            return S_OK;
+        };
+        std::vector<ID3D12GraphicsCommandList*> lists(count);
+        const auto draw = [&](ID3D12GraphicsCommandList& list, const ScheduledShadowView& view,
+                              const ShadowPageResources::View&) -> HRESULT
+        {
+            if (iteration == 0 && view.projection == ReservedCsmProjections)
+                return E_ABORT;
+            lists[view.projection - ReservedCsmProjections] = &list;
+            list.SetPipelineState(pass.pipeline.Get());
+            list.SetGraphicsRootSignature(pass.root.Get());
+            list.SetGraphicsRoot32BitConstant(0, std::bit_cast<uint32_t>(depths[view.packets.first]), 0);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3, 1, 0, 0);
+            return S_OK;
+        };
+        const auto recorded = RecordShadowSchedule(recording, arena, schedule, draw, dispatch);
+        if (iteration == 0)
+        {
+            Check(recorded == E_ABORT && !arena.PreparedPlan() && owner.fenceValue == fenceBefore &&
+                frame.Present(owner, 1) == E_FAIL, "partial shadow recording rollback without submission");
+            continue;
+        }
+        Require(recorded, "record scalable shadow schedule");
+
+        std::vector<std::unique_ptr<Readback>> readbacks(binding.pageCount);
+        std::vector<ID3D12Resource*> resources(binding.pageCount);
+        for (uint32_t i = 0; i < schedule.size(); ++i)
+        {
+            const auto& view = schedule[i];
+            const auto ordinal = addresses.views[i].page;
+            ShadowPageResources::View target;
+            Check(arena.GetView(view.page, view.slice, target), "read scalable shadow view");
+            if (!readbacks[ordinal])
+            {
+                const auto desc = target.resource->GetDesc();
+                readbacks[ordinal] = std::make_unique<Readback>(device, desc, desc.DepthOrArraySize);
+                resources[ordinal] = target.resource;
+            }
+            Transition(*recording.list, *target.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, view.slice);
+            readbacks[ordinal]->Copy(*recording.list, *target.resource, view.slice);
+            Transition(*recording.list, *target.resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, view.slice);
+        }
+        auto& prior = previous[recording.slot];
+        if (!prior.empty())
+        {
+            Check(prior == resources && arena.PreparedPlan()->create.empty(), "fenced reuse of physical pages");
+            physicalReused = true;
+        }
+        prior = resources;
+        if (recording.UsesShadowLists())
+        {
+            const std::unordered_set<ID3D12GraphicsCommandList*> distinct(lists.begin(), lists.end());
+            Check(distinct.size() == count, "exclusive command list for each recorded range");
+        }
+        auto& priorLists = previousLists[recording.slot];
+        if (!priorLists.empty())
+            Check(priorLists == lists, "fenced reuse of command list pool");
+        priorLists = lists;
+        recording.StampSceneStart();
+        Require(frame.Present(owner, 1), "submit scalable draw packets");
+        Require(frame.Drain(owner), "drain scalable shadow frame");
+        outcome.clear();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const auto& view = addresses.views[i];
+            const auto actual = readbacks[view.page]->Pixel(view.slice, view.resolution / 2, view.resolution / 2);
+            Check(actual == std::bit_cast<uint32_t>(depths[i]), "distinct depth for every shadow projection");
+            outcome.push_back(actual);
+        }
+    }
+    Check(timingRead && physicalReused, "timing and reuse observed at recycled slot");
+    if (jobs.IsInitialized())
+        jobs.Shutdown();
+    std::printf("PASS: %s %u depth draws, dynamic timestamps, fence reuse and partial cancellation\n", mode, count);
+    return outcome;
+}
+
 int main(int argc, char** argv)
 {
     ComPtr<ID3D12InfoQueue> messages;
@@ -954,7 +1351,29 @@ int main(int argc, char** argv)
         Check(_putenv_s("OGSR_DX12_CLEAR", "0,0,0") == 0, "set clear color");
         const bool sequentialOnly = argc > 1 && std::strcmp(argv[1], "--sequential") == 0;
         const bool pageTableOnly = argc > 1 && std::strcmp(argv[1], "--page-table") == 0;
-        if (pageTableOnly)
+        const bool bankedOnly = argc > 1 && std::strcmp(argv[1], "--banked-parity") == 0;
+        const bool scalableOnly = argc > 1 && std::strcmp(argv[1], "--scalable") == 0;
+        if (scalableOnly)
+        {
+            RunGatedDescriptorDraws(owner);
+            DepthPacketPipeline pass(owner.device);
+            const auto legacy = RunScalable(window, *factory.Get(), owner, pass, "legacy", 2);
+            Check(legacy == RunScalable(window, *factory.Get(), owner, pass, "multi", 2), "legacy/multi depth parity");
+            Check(legacy == RunScalable(window, *factory.Get(), owner, pass, "parallel", 2), "legacy/parallel depth parity");
+            const auto serial = RunScalable(window, *factory.Get(), owner, pass, "multi", 7);
+            Check(serial == RunScalable(window, *factory.Get(), owner, pass, "parallel", 7), "expanded serial/parallel depth parity");
+        }
+        else if (bankedOnly)
+        {
+            for (const uint32_t local : {0u, 8u})
+            {
+                const auto legacy = Run(window, *factory.Get(), owner, "legacy", 2, local);
+                Check(legacy == Run(window, *factory.Get(), owner, "legacy", 2, local, 0, Mutation::None, true),
+                    "banked SM5.0 / SM5.1 readback parity");
+            }
+            std::puts("PASS: banked PS 5.0 / 5.1, CSM, local maps and empty local maps");
+        }
+        else if (pageTableOnly)
             RunPages(window, *factory.Get(), owner);
         else
         {
@@ -1010,7 +1429,9 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts(pageTableOnly ? "PASS: WARP Debug Layer + GBV, physical page descriptor table" :
+        std::puts(scalableOnly ? "PASS: WARP Debug Layer + GBV, scalable shadow recording" :
+            bankedOnly ? "PASS: WARP Debug Layer + GBV, banked sampling parity" :
+            pageTableOnly ? "PASS: WARP Debug Layer + GBV, physical page descriptor table" :
             "PASS: WARP Debug Layer + GBV, sun/local sampling, PCF 1-8, GPU mutations, ABI, readback parity, resize, cancel, GR fault drain");
         return 0;
     }
