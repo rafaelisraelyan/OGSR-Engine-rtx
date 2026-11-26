@@ -2516,3 +2516,6 @@ CoP/модовых материалах, **не подтверждены в на
 
 
 **F4.3-P0-B2a:** CPU frame-slot placement implemented: resolution-tiered array pages, complete spot/point groups, stable ranges, whole-page budget and explicit create/retire/denied results, completed-fence gate. [Details and limitations](dx12-f43-hybrid-shadow-evolution.md#p0-b2a-frame-slot-shadow-page-placement-cpu-implemented). Native D3D12 resource manager/descriptor binding, global budget reconciliation and scalable GPU light/view metadata still pending; existing banked runtime unchanged. No new Windows/GPU validation.
+
+
+**F4.3-P0-B2b:** real D3D12 shadow page resource owner source implemented: adapter-specific allocation sizes, DXGI budget observation, committed depth arrays, per-slice DSV/page SRV, transactional staging, completed-fence protection and terminal quarantine. [Implementation contract and WARP fixture](dx12-f43-hybrid-shadow-evolution.md#p0-b2b-physical-d3d12-shadow-page-owner-source-implemented-gpu-validation-pending). Windows/WARP NOT RUN; not yet wired to the native scene; next global budget/descriptor and variable GPU metadata/view scheduling integration. Existing banked fallback and R4 unchanged.
