@@ -4,7 +4,7 @@ param(
     [switch]$Sequential,
     [switch]$DescriptorTestsOnly,
     [switch]$CsmWarpOnly,
-    [ValidateSet('banked-parity','scalable')][string]$WarpCase,
+    [ValidateSet('banked-parity','scalable','adaptive-runtime')][string]$WarpCase,
     [string]$JobLibrary
 )
 
@@ -113,6 +113,13 @@ try {
             Tee-Object -FilePath shadow-schedule-build.log
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         & ./shadow-schedule.exe 2>&1 | Tee-Object -FilePath shadow-schedule.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    }
+    if ($WarpCase -eq 'adaptive-runtime') {
+        & $cl @common "$PSScriptRoot/test-f43-adaptive-runtime.cpp" /Fe:adaptive-runtime.exe 2>&1 |
+            Tee-Object -FilePath adaptive-runtime-build.log
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & ./adaptive-runtime.exe 2>&1 | Tee-Object -FilePath adaptive-runtime.log
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
     }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",

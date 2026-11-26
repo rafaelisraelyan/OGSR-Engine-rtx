@@ -4,6 +4,7 @@
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
 #include "GameDx12ShadowRecording.h"
+#include "GameDx12AdaptiveShadowRuntime.h"
 #include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12ShadowAddress.h"
 #include "gr/jobs/JobGroup.h"
@@ -262,6 +263,11 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
 float4 probe(float4 pixel : SV_Position) : SV_Target
 {
     uint layer = uint(pixel.x);
+    if (layer < LightingFlags.w)
+        return float4(SunFilterVisibility(float3(.5,.5,.5), float3(0,0,1), layer),1,0,1);
+    layer -= LightingFlags.w;
+    if (layer >= LocalShadowConfig.x)
+        return float4(1,0,0,1);
     uint4 address = LocalShadowMatrices[layer].address;
     float visibility = SampleLocalVisibility(float3(.5, .5, LocalLights[0].colorInnerCos.w), layer);
     return float4(visibility, ValidLocalAddress(address) ? 1 : 0, 0, 1);
@@ -370,9 +376,13 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
     }
 
     void DrawPages(ID3D12Device& device, ID3D12GraphicsCommandList& list, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-        game_shadow12::ShadowDescriptors::Binding binding, std::span<const LocalShadowGpuProjection> data)
+        game_shadow12::ShadowDescriptors::Binding binding, std::span<const LocalShadowGpuProjection> data,
+        uint32_t sunSlices = 0)
     {
         SceneFrameConstants frame{};
+        frame.lightingFlags[3] = sunSlices;
+        frame.sunFilter = 1;
+        frame.sunShadowResolution = 8;
         frame.localShadowConfig[0] = static_cast<uint32_t>(data.size());
         frame.localShadowConfig[1] = binding.pageCount;
         void* mapped = nullptr;
@@ -383,16 +393,20 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         LocalLightGpu light{};
         light.colorInnerCos.w = .5f;
         Require(lights.Write(device, std::span<const LocalLightGpu>(&light, 1)), "page probe light");
-        Require(projections.Write(device, data), "page probe addresses");
+        if (!data.empty())
+            Require(projections.Write(device, data), "page probe addresses");
         ID3D12DescriptorHeap* heaps[] = {srv.Get()};
         list.SetDescriptorHeaps(1, heaps);
         list.SetPipelineState(pipeline.Get());
         list.SetGraphicsRootSignature(root.Get());
         list.SetGraphicsRootConstantBufferView(0, constants->GetGPUVirtualAddress());
-        list.SetGraphicsRootDescriptorTable(2, binding.table);
-        list.SetGraphicsRootShaderResourceView(5, binding.shapes);
+        const auto heapStart = srv->GetGPUDescriptorHandleForHeapStart();
+        list.SetGraphicsRootDescriptorTable(1, heapStart);
+        list.SetGraphicsRootDescriptorTable(2, binding.table.ptr ? binding.table :
+            D3D12_GPU_DESCRIPTOR_HANDLE{heapStart.ptr + stride});
+        list.SetGraphicsRootShaderResourceView(5, binding.shapes ? binding.shapes : constants->GetGPUVirtualAddress());
         list.SetGraphicsRootShaderResourceView(3, lights.Address());
-        list.SetGraphicsRootShaderResourceView(4, projections.Address());
+        list.SetGraphicsRootShaderResourceView(4, data.empty() ? constants->GetGPUVirtualAddress() : projections.Address());
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VIEWPORT viewport{0, 0, 8, 1, 0, 1};
         const D3D12_RECT rect{0, 0, 8, 1};
@@ -1313,6 +1327,220 @@ std::vector<uint32_t> RunScalable(HWND window, IDXGIFactory2& factory, const Fra
     return outcome;
 }
 
+std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
+    IDXGIAdapter3& adapter, const char* mode, const DepthPacketPipeline& depth)
+{
+    using namespace game_shadow12;
+    constexpr uint32_t sunCount = 2, fullCount = 42;
+    auto& device = owner.device;
+    Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", mode) == 0, "mixed recording mode");
+    Check(_putenv_s("OGSR_DX12_GAME_METRICS", "1") == 0, "mixed timestamps");
+    gr::jobs::JobSystem jobs;
+    if (std::strcmp(mode, "parallel") == 0)
+    {
+        gr::jobs::JobConfig config;
+        config.automaticWorkers = false;
+        config.backgroundWorkers = 2;
+        Check(jobs.Initialize(config), "mixed GR");
+    }
+    const auto dispatch = [&](uint32_t count, const auto& work) -> HRESULT
+    {
+        auto group = jobs.CreateGroup();
+        try { group.ParallelFor(count, 1, work); group.Wait(); }
+        catch (...) { group.DrainNoThrow(); return E_FAIL; }
+        return S_OK;
+    };
+
+    D3D12_RESOURCE_DESC sunDesc{};
+    Require(DescribeShadowPage({8, 6}, sunDesc), "mixed CSM resource description");
+    sunDesc.DepthOrArraySize = sunCount;
+    D3D12_HEAP_PROPERTIES defaults{};
+    defaults.Type = D3D12_HEAP_TYPE_DEFAULT;
+    defaults.CreationNodeMask = defaults.VisibleNodeMask = 1;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1;
+    ComPtr<ID3D12Resource> sun;
+    Require(device.CreateCommittedResource(&defaults, D3D12_HEAP_FLAG_NONE, &sunDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&sun)), "mixed CSM texture");
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    heapDesc.NumDescriptors = sunCount;
+    ComPtr<ID3D12DescriptorHeap> sunDsv;
+    Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&sunDsv)), "mixed CSM DSVs");
+    const auto stride = device.GetDescriptorHandleIncrementSize(heapDesc.Type);
+    std::array<ShadowRecordingPass, sunCount> csm{};
+    for (uint32_t i = 0; i < sunCount; ++i)
+    {
+        auto dsv = sunDsv->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += i * stride;
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_D32_FLOAT;
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {0, i, 1};
+        device.CreateDepthStencilView(sun.Get(), &view, dsv);
+        csm[i] = {i, {sun.Get(), dsv, {}, i, 8}};
+    }
+
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NumDescriptors = 24;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "mixed material heap");
+    ShadowSamplingPass sampling(device, sun.Get(), sunCount, nullptr, 1, Mutation::None, true, false, heap.Get());
+    AdaptiveShadowRuntime runtime;
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "mixed descriptors");
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "mixed frame");
+
+    ShadowPageSpec low{};
+    Require(QueryShadowPageSpec(device, {128,6}, low), "cost of lower tier");
+    std::vector<AdaptiveCandidate> candidates;
+    std::vector<uint64_t> lightIds;
+    for (uint32_t i = 0; i < fullCount / 6; ++i)
+    {
+        const double res = i % 2 ? 256 : 128;
+        candidates.push_back({i + 1, static_cast<double>(fullCount - i), res, 6});
+        lightIds.push_back(i + 1);
+    }
+
+    std::array<bool, Frame::kFrameCount> used{};
+    std::vector<uint32_t> readbacks;
+    for (uint32_t iteration = 0; iteration < 5; ++iteration)
+    {
+        Frame::Recording recording;
+        Check(frame.Begin(window, owner, recording) == S_OK, "mixed begin without prior timing hint");
+        const auto& arena = runtime.Pages(recording.slot);
+        const auto planned = iteration < 3 ? UINT64_MAX : iteration == 3 ? low.bytes + 5 : 0;
+        const uint32_t expectedCount = iteration < 3 ? fullCount : iteration == 3 ? 6 : 0;
+        const auto previous = owner.fenceValue;
+        const auto oldBytes = arena.CurrentBytes();
+        ShadowAddressPlan addresses;
+        ShadowDescriptors::Binding binding;
+        const auto prepare = runtime.Prepare(owner, adapter, recording, descriptors, candidates, 1, 1,
+            iteration + 1, sunCount, addresses, binding, planned);
+        Require(prepare, "coordinate mixed frame budget and stage");
+        Check(prepare == S_OK, "WARP reports a local DXGI budget");
+        Check(addresses.views.size() == expectedCount &&
+            (expectedCount != 0 || (!binding.table.ptr && !binding.shapes && !binding.pageCount)),
+            "budget shrink and empty descriptor binding");
+        std::vector<uint32_t> mapping;
+        Check(ReconcileAdaptiveAddresses(lightIds, addresses, mapping), "reconcile mixed light addresses");
+        const auto admitted = std::count_if(mapping.begin(), mapping.end(), [](auto first) { return first != 0; });
+        Check(admitted * 6 == expectedCount, "physical denial omits complete groups");
+
+        std::vector<ShadowPacketRange> ranges(expectedCount);
+        for (uint32_t i = 0; i < expectedCount; ++i)
+            ranges[i] = {i, 1};
+        std::vector<ScheduledShadowView> schedule;
+        Check(PlanShadowViews(addresses, ranges, expectedCount, schedule), "mixed local schedule");
+        std::vector<ShadowRecordingPass> passes(csm.begin(), csm.end());
+        std::vector<float> depths{.25f,.75f};
+        for (const auto& view : schedule)
+        {
+            ShadowPageResources::View target;
+            Check(arena.GetView(view.page, view.slice, target), "mixed local page slice");
+            passes.push_back({view.projection, target});
+            depths.push_back(static_cast<float>((view.light - 1) * 6 + view.face + 1) / 64);
+        }
+
+        const auto result = RecordShadowPasses(recording, passes, [&](ID3D12GraphicsCommandList& list, uint32_t index)
+        {
+            if (!iteration && index == sunCount)
+                return E_ABORT;
+            list.SetPipelineState(depth.pipeline.Get());
+            list.SetGraphicsRootSignature(depth.root.Get());
+            list.SetGraphicsRoot32BitConstant(0, std::bit_cast<uint32_t>(depths[index]), 0);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3, 1, 0, 0);
+            return S_OK;
+        }, dispatch);
+        if (!iteration)
+        {
+            Check(result == E_ABORT && !arena.PreparedPlan() && arena.CurrentBytes() == oldBytes &&
+                owner.fenceValue == previous && frame.Present(owner, 1) == E_FAIL, "mixed cancellation has no partial publication");
+            continue;
+        }
+        Require(result, "record one mixed CSM/local batch");
+        used[recording.slot] = true;
+        if (iteration >= 3)
+            Check(frame.LastGpuTiming().views.size() == fullCount + sunCount, "combined timestamp ID count after slot reuse");
+
+        Readback sunRead(device, sunDesc, sunCount);
+        std::vector<std::unique_ptr<Readback>> localRead(binding.pageCount);
+        for (uint32_t i = 0; i < passes.size(); ++i)
+        {
+            const auto& view = passes[i].target;
+            Readback* destination = &sunRead;
+            if (i >= sunCount)
+            {
+                auto& target = localRead[addresses.views[i - sunCount].page];
+                if (!target)
+                {
+                    const auto desc = view.resource->GetDesc();
+                    target = std::make_unique<Readback>(device, desc, desc.DepthOrArraySize);
+                }
+                destination = target.get();
+            }
+            Transition(*recording.list, *view.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, view.slice);
+            destination->Copy(*recording.list, *view.resource, view.slice);
+            Transition(*recording.list, *view.resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, view.slice);
+        }
+
+        std::vector<LocalShadowGpuProjection> probes;
+        std::vector<float> probeDepths;
+        if (!schedule.empty())
+        {
+            // Шесть соседних пикселей читают разные страницы в одном draw.
+            for (uint32_t i = 0; i < 6; ++i)
+            {
+                const auto local = static_cast<uint32_t>(i * (schedule.size() - 1) / 5);
+                LocalShadowGpuProjection probe{};
+                probe.address = addresses.views[local];
+                probes.push_back(probe);
+                probeDepths.push_back(depths[sunCount + local]);
+            }
+        }
+        recording.StampSceneStart();
+        sampling.DrawPages(device, *recording.list, recording.rtv, binding, probes, sunCount);
+        Readback colorRead(device, recording.color->GetDesc(), 1);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        colorRead.Copy(*recording.list, *recording.color, 0);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Require(frame.Present(owner, 1), "present mixed schedule");
+        Require(frame.Drain(owner), "wait mixed readback");
+        Check((arena.CurrentBytes() == 0) == (expectedCount == 0) && !arena.PreparedPlan(), "mixed budget committed on Signal");
+
+        for (uint32_t i = 0; i < passes.size(); ++i)
+        {
+            const auto& view = passes[i].target;
+            auto& source = i < sunCount ? sunRead : *localRead[addresses.views[i - sunCount].page];
+            const auto actual = source.Pixel(view.slice, view.resolution / 2, view.resolution / 2);
+            Check(actual == std::bit_cast<uint32_t>(depths[i]), "mixed physical depth");
+            readbacks.push_back(actual);
+        }
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            const uint32_t wanted = i < sunCount ? (i ? 0xff00ffff : 0xff00ff00) :
+                probes.empty() ? 0xff0000ff : probeDepths[i - sunCount] >= .5f ? 0xff00ffff : 0xff00ff00;
+            const auto actual = colorRead.Pixel(0, i, 0);
+            if (actual != wanted)
+                std::fprintf(stderr, "mixed stage=%u x=%u actual=%08x expected=%08x\n", iteration, i, actual, wanted);
+            Check(actual == wanted, "production CSM and multi-page sampling");
+            readbacks.push_back(actual);
+        }
+        std::printf("PASS: %s slot=%u CSM=%u locals=%u pages=%u budget=%llu\n", mode, recording.slot,
+            sunCount, expectedCount, binding.pageCount, static_cast<unsigned long long>(planned));
+    }
+    Check(used[0] && used[1], "mixed frame exercises two slots");
+    if (jobs.IsInitialized())
+        jobs.Shutdown();
+    return readbacks;
+}
+
 int main(int argc, char** argv)
 {
     ComPtr<ID3D12InfoQueue> messages;
@@ -1353,7 +1581,18 @@ int main(int argc, char** argv)
         const bool pageTableOnly = argc > 1 && std::strcmp(argv[1], "--page-table") == 0;
         const bool bankedOnly = argc > 1 && std::strcmp(argv[1], "--banked-parity") == 0;
         const bool scalableOnly = argc > 1 && std::strcmp(argv[1], "--scalable") == 0;
-        if (scalableOnly)
+        const bool mixedOnly = argc > 1 && std::strcmp(argv[1], "--adaptive-runtime") == 0;
+        if (mixedOnly)
+        {
+            DepthPacketPipeline depth(owner.device);
+            ComPtr<IDXGIAdapter3> memoryAdapter;
+            Require(adapter.As(&memoryAdapter), "WARP DXGI memory budget interface");
+            const auto serial = RunMixedRuntime(window, *factory.Get(), owner, *memoryAdapter.Get(), "multi", depth);
+            Check(serial == RunMixedRuntime(window, *factory.Get(), owner, *memoryAdapter.Get(), "parallel", depth),
+                "mixed serial/parallel parity");
+            std::printf("PASS: mixed serial/parallel parity, %zu depth and sampling records per mode\n", serial.size());
+        }
+        else if (scalableOnly)
         {
             RunGatedDescriptorDraws(owner);
             DepthPacketPipeline pass(owner.device);
@@ -1429,7 +1668,8 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts(scalableOnly ? "PASS: WARP Debug Layer + GBV, scalable shadow recording" :
+        std::puts(mixedOnly ? "PASS: WARP Debug Layer + GBV, adaptive native shadow runtime" :
+            scalableOnly ? "PASS: WARP Debug Layer + GBV, scalable shadow recording" :
             bankedOnly ? "PASS: WARP Debug Layer + GBV, banked sampling parity" :
             pageTableOnly ? "PASS: WARP Debug Layer + GBV, physical page descriptor table" :
             "PASS: WARP Debug Layer + GBV, sun/local sampling, PCF 1-8, GPU mutations, ABI, readback parity, resize, cancel, GR fault drain");
