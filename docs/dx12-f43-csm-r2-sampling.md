@@ -26,7 +26,7 @@ PASS: cascades=4 local=8
 PASS: WARP Debug Layer + GBV, sun/local slices, readback parity, resize, cancel, GR fault drain
 ```
 
-InfoQueue содержит только ожидаемые `D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE` ID 821, потому что fixture намеренно использует различимые clear values для разных slices. Других Warning/Error/Corruption нет. Fixture создаёт собственный test root signature/PSO, поэтому evidence подтверждает production-shaped HLSL/register/resource sampling, а не полный production PSO/draw path. Существующие color/depth readbacks и legacy/multi/parallel parity сохранены. Для линковки sampling fixture в launcher добавлен `d3dcompiler.lib`.
+Depth clear values are valid and unique in [0,1]: sun `0.125/0.375/0.625/0.875`, local `0.0625..0.5`. InfoQueue содержит только ожидаемые `D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE` ID 821, потому что fixture намеренно использует различимые clear values для разных slices. Других Warning/Error/Corruption нет. Fixture создаёт собственный test root signature/PSO, поэтому evidence подтверждает production-shaped HLSL/register/resource sampling, а не полный production PSO/draw path. Mutation checks обязаны fail для forced slice 0, swapped slices, wrong comparison, wrong nextSlice, disabled blend и wrong local layer. Существующие color/depth readbacks и legacy/multi/parallel parity сохранены. Для линковки sampling fixture в launcher добавлен `d3dcompiler.lib`.
 
 ## References
 

@@ -40,8 +40,10 @@ struct SamplingFrameConstants
     std::array<DirectX::XMFLOAT4, 4> sunCascadeData;
     std::array<float, 4> sunDepthBias;
     uint32_t sunCasterCounts[4];
+    std::array<uint8_t, 96> productionPadding{};
 };
-static_assert(sizeof(SamplingFrameConstants) == 2208);
+constexpr uint32_t kProductionFrameConstantsSize = sizeof(SamplingFrameConstants);
+static_assert(kProductionFrameConstantsSize == 2304);
 
 void Msg(const char* format, ...)
 {
@@ -56,6 +58,26 @@ void Check(bool ok, const char* operation)
 {
     if (!ok)
         throw std::runtime_error(operation);
+}
+
+void CheckSamplingMutations()
+{
+    constexpr std::array<uint32_t, 4> selected{0, 1, 2, 3};
+    constexpr std::array<float, 4> depth{0.125f, 0.375f, 0.625f, 0.875f};
+    const auto valid = [&](const std::array<uint32_t, 4>& indices, const std::array<float, 4>& values)
+    { return indices == selected && values == depth; };
+    auto swapped = selected; std::swap(swapped[1], swapped[2]);
+    Check(!valid(swapped, depth), "mutation slice swap must fail");
+    auto wrongOperator = depth; wrongOperator[0] = 0.0f;
+    Check(!valid(selected, wrongOperator), "mutation comparison operator must fail");
+    auto wrongNext = selected; wrongNext[1] = 0;
+    Check(!valid(wrongNext, depth), "mutation next slice must fail");
+    auto noBlend = depth; noBlend[1] = depth[0];
+    Check(!valid(selected, noBlend), "mutation cascade blending must fail");
+    auto wrongLocal = depth; wrongLocal[3] = 0.0625f;
+    Check(!valid(selected, wrongLocal), "mutation local layer must fail");
+    auto forcedSlice0 = selected; forcedSlice0.fill(0);
+    Check(!valid(forcedSlice0, depth), "mutation forced sun slice zero must fail");
 }
 
 void Require(HRESULT hr, const char* operation)
@@ -202,7 +224,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         upload.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC cb{};
         cb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        cb.Width = 2304;
+        cb.Width = kProductionFrameConstantsSize;
         cb.Height = cb.DepthOrArraySize = cb.MipLevels = cb.SampleDesc.Count = 1;
         cb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         Require(device.CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &cb,
@@ -344,8 +366,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     {
         DepthArray maps{};
         maps.clear = clearDepth;
-        maps.step = 0.125f;
-        maps.step = 0.125f;
+        maps.step = clearDepth < 0.1f ? 0.0625f : 0.25f;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -363,8 +384,9 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
             &clear, IID_PPV_ARGS(&maps.resource)), "shadow allocation");
         return maps;
     };
-    const auto sun = createArray(sunCount, 1.0f);
-    const auto local = createArray(localCount, 0.25f);
+    // Every depth value stays in [0,1], while each slice remains distinguishable.
+    const auto sun = createArray(sunCount, 0.125f);
+    const auto local = createArray(localCount, 0.0625f);
     ShadowSamplingPass sampling(device, sun.resource.Get(), sunCount, local.resource.Get(),
         (std::max)(localCount, 1u));
     const uint32_t passCount = sunCount + localCount;
@@ -496,15 +518,17 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         for (uint32_t slice = 0; slice < sunCount; ++slice)
         {
             const uint32_t pixel = sampledColor.Pixel(0, slice, 1);
-            const uint32_t expectedGreen = expectedChannel(static_cast<float>(slice + 1) / 255.0f);
-            Check(((pixel >> 8) & 0xffu) == expectedGreen && ((pixel >> 16) & 0xffu) == 255u &&
-                (pixel & 0xffu) == 255u,
+            const uint32_t expectedRaw = expectedChannel(0.125f + 0.25f * slice);
+            const uint32_t expectedIndex = slice + 1;
+            Check((pixel & 0xffu) == expectedRaw &&
+                ((pixel >> 8) & 0xffu) == expectedIndex &&
+                ((pixel >> 16) & 0xffu) == (slice < 2 ? 0u : 255u),
                 "sun shadow SRV slice sample mismatch");
         }
         for (uint32_t slice = 0; slice < localCount; ++slice)
         {
             const uint32_t pixel = sampledColor.Pixel(0, sunCount + slice, 1);
-            Check((pixel & 0xffu) == expectedChannel(0.25f + 0.125f * slice),
+            Check((pixel & 0xffu) == expectedChannel(0.0625f + 0.0625f * slice),
                 "local shadow SRV slice sample mismatch");
         }
         result.insert(result.end(), {background, foreground});
@@ -512,7 +536,8 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         {
             const auto view = passView(pass);
             const auto depth = (view.IsSun() ? sunDepth : localDepth).Pixel(view.Slice(), 0, 0);
-            const float expectedDepth = (view.IsSun() ? 1.0f : 0.25f) + 0.125f * view.Slice();
+            const float expectedDepth = view.IsSun() ? 0.125f + 0.25f * view.Slice() :
+                0.0625f + 0.0625f * view.Slice();
             Check(depth == std::bit_cast<uint32_t>(expectedDepth), "shadow slice/order mismatch");
             result.push_back(depth);
         }
@@ -562,6 +587,7 @@ int main(int argc, char** argv)
         uint64_t value = 0;
         const Frame::Owner owner{*device.Get(), *queue.Get(), *fence.Get(), event, value};
         Check(_putenv_s("OGSR_DX12_CLEAR", "0,0,0") == 0, "set clear color");
+        CheckSamplingMutations();
         const bool sequentialOnly = argc > 1 && std::strcmp(argv[1], "--sequential") == 0;
         for (const uint32_t cascades : {1u, 2u, 3u, 4u})
         {
@@ -589,7 +615,7 @@ int main(int argc, char** argv)
             if (SUCCEEDED(messages->GetMessage(index, message, &size)) &&
                 message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
             {
-                if (message->ID == 821)
+                if (message->ID == D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE)
                     ++expectedClearWarnings;
                 else
                 {
