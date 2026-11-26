@@ -7,6 +7,7 @@
 #include "GameDx12Lighting.h"
 #include "GameDx12LocalShadowAllocator.h"
 #include "GameDx12NativeFrame.h"
+#include "GameDx12AdaptiveShadowRuntime.h"
 #include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12Surface.h"
 #include "GameDx12Water.h"
@@ -187,6 +188,7 @@ public:
               std::string& reason);
 
     bool RecordNativeFrame(GameDx12NativeFrame12::Recording recording,
+                           const GameDx12NativeFrame12::Owner& owner, IDXGIAdapter3* adapter,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
                            const float cameraPosition[3], const gameaux12::Frame& extras,
                            const gamelight12::FrameSnapshot& lighting,
@@ -296,7 +298,7 @@ private:
         std::vector<uint8_t> statics;
         std::vector<uint8_t> objects;
         // Sun, две карты spot и шесть граней point light.
-        std::array<ShadowPreparation, game_shadow12::MaxViews> shadows;
+        std::vector<ShadowPreparation> shadows;
         bool operator==(const FramePreparation&) const = default;
         void Clear();
     };
@@ -414,6 +416,7 @@ private:
     uint64_t m_localShadowBytes = 0;
     game_shadow12::LocalAllocationState m_localShadowAllocation{};
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
+    std::unique_ptr<game_shadow12::AdaptiveShadowRuntime> m_adaptiveShadows;
     std::unique_ptr<game_shadow12::ShadowDescriptors> m_shadowDescriptors;
     bool m_shadowPageSampling = false;
     ComPtr<ID3D12Resource> m_frameConstants;

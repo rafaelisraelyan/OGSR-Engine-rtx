@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "GameDx12StaticScene.h"
+#include "GameDx12ShadowRecording.h"
 #include "GameDx12ShadowAddress.h"
 #include "GameDx12J2APreparation.h"
 #include "GameDx12SunCascades.h"
@@ -125,8 +126,9 @@ constexpr uint32_t kLocalPageShapesRoot = 15;
 constexpr uint32_t kTerrainDescriptor = kLocalShadowDescriptor + 1;
 constexpr uint32_t kTerrainTextureCount = 5;
 constexpr uint32_t kMaxTerrainSets = 128;
-constexpr uint32_t kSceneDescriptorCount = kTerrainDescriptor +
+constexpr uint32_t kNullLocalShadowDescriptor = kTerrainDescriptor +
     kTerrainTextureCount * (1 + kMaxTerrainSets);
+constexpr uint32_t kSceneDescriptorCount = kNullLocalShadowDescriptor + 1;
 static_assert(kSunShadowDescriptor == kMaxTextures + 1);
 static_assert(kNullWaterDescriptor == kSunShadowDescriptor + 1);
 static_assert(kLocalShadowDescriptor == kNullWaterDescriptor +
@@ -3002,12 +3004,17 @@ bool GameDx12StaticScene12::CreateTextures(
             device->CreateShaderResourceView(nullptr,
                 (index - kNullWaterDescriptor) % kWaterSrvCount == 2 ? &shadowSrv : &nullSrv, descriptor);
         }
-        for (uint32_t index = kTerrainDescriptor; index < kSceneDescriptorCount; ++index)
+        for (uint32_t index = kTerrainDescriptor; index < kNullLocalShadowDescriptor; ++index)
         {
             auto descriptor = base;
             descriptor.ptr += static_cast<SIZE_T>(index) * m_textureDescriptorSize;
             device->CreateShaderResourceView(nullptr, &nullSrv, descriptor);
         }
+        auto nullLocal = base;
+        nullLocal.ptr += static_cast<SIZE_T>(kNullLocalShadowDescriptor) * m_textureDescriptorSize;
+        localSrv.Texture2DArray.ArraySize = 1;
+        device->CreateShaderResourceView(nullptr, &localSrv, nullLocal);
+        localSrv.Texture2DArray.ArraySize = m_localShadow ? m_localShadowSlices : game_shadow12::LayersPerBank;
         Msg("ph_dx12_f43fr2: local_shadow_srv t=6 slot=%u dimension=2d_array format=R32_FLOAT "
             "slices=%u resource=%d water_end=%u terrain_start=%u", kLocalShadowDescriptor,
             localSrv.Texture2DArray.ArraySize, m_localShadow ? 1 : 0, kWaterDescriptorEnd, kTerrainDescriptor);
@@ -3827,6 +3834,7 @@ void GameDx12StaticScene12::FramePreparation::Clear()
 
 bool GameDx12StaticScene12::RecordNativeFrame(
     GameDx12NativeFrame12::Recording recording,
+    const GameDx12NativeFrame12::Owner& owner, IDXGIAdapter3* adapter,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const float cameraPosition[3], const gameaux12::Frame& extras,
     const gamelight12::FrameSnapshot& lighting,
@@ -3863,6 +3871,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     game_shadow12::SunPlan sunPlan;
     std::array<std::array<FrustumPlane, 6>, game_shadow12::MaxSunCascades> sunPlanes{};
     LocalShadowViews localShadowViews;
+    game_shadow12::ShadowAddressPlan adaptiveAddresses;
+    game_shadow12::ShadowDescriptors::Binding adaptiveBinding;
+    std::vector<std::array<FrustumPlane, 6>> adaptiveFrusta;
+    bool adaptive = false;
     const uint32_t viewMode = SceneViewMode();
     static const bool legacyWaterSsr = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_WATER_SSR");
     constants.legacyWaterSsr = legacyWaterSsr ? 1u : 0u;
@@ -3952,7 +3964,85 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 if (light.id == lighting.tracedLightId)
                     constants.diagnosticLight[0] = index + 1;
             }
-            if (m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
+        }
+        if (m_shadowDescriptors && adapter && SceneLocalShadowsRequested() && game_shadow12::AdaptiveShadowRuntime::Enabled())
+        {
+            const auto selectionStart = Clock::now();
+            if (!m_adaptiveShadows)
+                m_adaptiveShadows = std::make_unique<game_shadow12::AdaptiveShadowRuntime>();
+            std::vector<game_shadow12::AdaptiveCandidate> candidates;
+            std::vector<uint64_t> lightIds;
+            lightIds.reserve(localLights.size());
+            const bool renderLocal = lighting.shadowsEnabled && (viewMode == 0 || viewMode >= 4);
+            const double pixelsPerRadian = (std::max)(
+                std::hypot(double(logicalViewProjection._11), double(logicalViewProjection._21),
+                    double(logicalViewProjection._31)) * recording.width,
+                std::hypot(double(logicalViewProjection._12), double(logicalViewProjection._22),
+                    double(logicalViewProjection._32)) * recording.height);
+            for (size_t i = 0; i < localLights.size(); ++i)
+            {
+                const auto& light = lighting.localLights[i];
+                lightIds.push_back(light.id);
+                if (!renderLocal || !light.castsShadow)
+                    continue;
+                LocalProjection projection;
+                if (!BuildLocalShadowProjection(light, projection))
+                {
+                    localShadowViews.invalidProjection[i] = true;
+                    continue;
+                }
+                candidates.push_back(game_shadow12::AdaptiveShadowRuntime::Candidate(light, cameraPosition, pixelsPerRadian));
+            }
+            const auto hr = m_adaptiveShadows->Prepare(owner, *adapter, recording, *m_shadowDescriptors,
+                candidates, LevelSession(), LevelEpoch(), lighting.frame, sunPlan.count, adaptiveAddresses, adaptiveBinding);
+            if (FAILED(hr))
+                return Fail(reason, "adaptive local shadow preparation failed");
+            adaptive = hr == S_OK;
+            if (adaptive)
+            {
+                std::vector<uint32_t> mapping;
+                if (!game_shadow12::ReconcileAdaptiveAddresses(lightIds, adaptiveAddresses, mapping))
+                    return Fail(reason, "adaptive light and projection mapping differ");
+                localProjections.assign(adaptiveAddresses.views.size(), {});
+                adaptiveFrusta.resize(adaptiveAddresses.views.size());
+                for (size_t i = 0; i < localLights.size(); ++i)
+                {
+                    const auto& light = lighting.localLights[i];
+                    auto& gpu = localLights[i];
+                    if (!mapping[i])
+                    {
+                        if (renderLocal && light.castsShadow)
+                        {
+                            gpu.colorInnerCos.x = gpu.colorInnerCos.y = gpu.colorInnerCos.z = 0.0f;
+                            localShadowViews.suppressed[i] = true;
+                        }
+                        continue;
+                    }
+                    LocalProjection projection;
+                    if (!BuildLocalShadowProjection(light, projection))
+                        return Fail(reason, "published adaptive projection is invalid");
+                    const auto first = mapping[i] - 1;
+                    for (uint32_t face = 0; face < projection.count; ++face)
+                    {
+                        const auto index = first + face;
+                        localProjections[index] = {projection.matrices[face], adaptiveAddresses.views[index]};
+                        adaptiveFrusta[index] = projection.frusta[face];
+                    }
+                    gpu.type[1] = mapping[i];
+                    gpu.type[2] = std::bit_cast<uint32_t>(light.shadowNear);
+                    gpu.type[3] = std::bit_cast<uint32_t>(light.shadowFar);
+                    ++stats.shadowedLights;
+                }
+                constants.localShadowConfig[0] = static_cast<uint32_t>(localProjections.size());
+                constants.localShadowConfig[1] = adaptiveBinding.pageCount;
+                constants.localShadowConfig[2] = constants.localShadowConfig[3] = 0;
+            }
+            stats.shadowCpuMs += Ms(selectionStart);
+        }
+        if (lighting.localEnabled)
+        {
+            const uint32_t lightCount = lighting.localCount;
+            if (!adaptive && m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
             {
                 const auto selectionStart = Clock::now();
                 if (!SelectLocalShadowViews(lighting, m_localShadowSlices / game_shadow12::LayersPerBank,
@@ -4064,10 +4154,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         return Fail(reason, "invalid structured lighting buffer counts");
     auto& lightUpload = m_localLightUploads[frameSlot];
     auto& projectionUpload = m_localProjectionUploads[frameSlot];
-    const HRESULT lightHr = lightUpload.Write(*recording.device,std::span<const LocalLightGpu>(localLights));
+    const HRESULT lightHr = adaptive && localLights.empty() ? S_OK :
+        lightUpload.Write(*recording.device, std::span<const LocalLightGpu>(localLights));
     if (FAILED(lightHr))
         return Fail(reason, "local light structured upload failed");
-    const HRESULT projectionHr = projectionUpload.Write(*recording.device,
+    const HRESULT projectionHr = adaptive && localProjections.empty() ? S_OK : projectionUpload.Write(*recording.device,
         std::span<const LocalShadowGpuProjection>(localProjections));
     if (FAILED(projectionHr))
         return Fail(reason, "local projection structured upload failed");
@@ -4080,26 +4171,50 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         game_shadow12::View view;
         const FrustumPlane* planes;
         bool dynamic;
+        bool spot;
+        ID3D12Resource* resource;
+        uint32_t slice;
     };
-    static_assert(GameDx12NativeFrame12::kShadowListCount == game_shadow12::MaxViews);
-    std::array<ShadowPass, GameDx12NativeFrame12::kShadowListCount> passes{};
-    uint32_t passCount = 0;
+    std::vector<ShadowPass> passes;
+    passes.reserve(sunPlan.count + (adaptive ? adaptiveAddresses.views.size() : localShadowViews.count));
     const bool dynamicSun = SceneDynamicSunShadowsRequested();
     if (sunPlan.count != 0)
     {
         auto dsv = m_sunShadowDsv->GetCPUDescriptorHandleForHeapStart();
         for (uint32_t slice = 0; slice < sunPlan.count; ++slice, dsv.ptr += m_sunShadowDsvStride)
-            passes[passCount++] = {dsv, m_sunShadowResolution, {slice}, sunPlanes[slice].data(), dynamicSun};
+            passes.push_back({dsv, m_sunShadowResolution, {slice}, sunPlanes[slice].data(), dynamicSun, false, m_sunShadow.Get(), slice});
     }
     if (localShadowViews.count != 0)
     {
         auto dsv = m_localShadowDsv->GetCPUDescriptorHandleForHeapStart();
         for (uint32_t layer = 0; layer < m_localShadowSlices; ++layer, dsv.ptr += m_localShadowDsvStride)
             if (localShadowViews.active[layer])
-                passes[passCount++] = {dsv, kLocalShadowSize, {layer + game_shadow12::MaxSunCascades},
-                    localShadowViews.frusta[layer].data(), true};
+                passes.push_back({dsv, kLocalShadowSize, {layer + game_shadow12::MaxSunCascades},
+                    localShadowViews.frusta[layer].data(), true, layer % game_shadow12::LayersPerBank < 2,
+                    m_localShadow.Get(), layer});
     }
 
+    std::vector<game_shadow12::ScheduledShadowView> adaptiveSchedule;
+    if (adaptive)
+    {
+        std::vector<game_shadow12::ShadowPacketRange> packets(adaptiveAddresses.views.size());
+        for (uint32_t i = 0; i < packets.size(); ++i)
+            packets[i] = {game_shadow12::ReservedCsmProjections + i, 1};
+        if (!game_shadow12::PlanShadowViews(adaptiveAddresses, packets,
+                game_shadow12::ReservedCsmProjections + packets.size(), adaptiveSchedule))
+            return Fail(reason, "invalid adaptive shadow schedule");
+        for (const auto& view : adaptiveSchedule)
+        {
+            game_shadow12::ShadowPageResources::View target;
+            if (!m_adaptiveShadows->Pages(frameSlot).GetView(view.page, view.slice, target) ||
+                target.resolution != view.resolution)
+                return Fail(reason, "adaptive shadow view unavailable");
+            const auto local = view.packets.first - game_shadow12::ReservedCsmProjections;
+            passes.push_back({target.dsv, target.resolution, {view.projection}, adaptiveFrusta[local].data(),
+                true, (adaptiveAddresses.views[local].group & 255) == 1, target.resource, target.slice});
+        }
+    }
+    const uint32_t passCount = static_cast<uint32_t>(passes.size());
     FrustumPlane planes[6] = {};
     const bool cull = !SceneCullDisabled() && BuildFrustum(logicalViewProjection, planes);
     stats.total = static_cast<uint32_t>(m_draws.size());
@@ -4140,7 +4255,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         const auto& mesh = snapshot.meshes[handle];
         return mesh.skinned == object.skinned && mesh.requiredBones <= object.boneCount ? &mesh : nullptr;
     };
-    static_assert(std::tuple_size_v<decltype(FramePreparation::shadows)> == game_shadow12::MaxViews);
+    const size_t projectionCount = passes.empty() ? 0 : size_t(passes.back().view.projection) + 1;
     static_assert(std::tuple_size_v<decltype(ShadowPreparation::statics)> == std::tuple_size_v<decltype(m_sunShadowPipelines)>);
     // Эталон Verify использует тот же обход, что и исходная serial запись.
     const auto visitLegacyCasters = [&](const ShadowCasterTree& tree, const FrustumPlane* frustum, const auto& emit)
@@ -4202,10 +4317,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 throw std::runtime_error("GR native preparation exceeds source cap");
             const uint32_t staticBlocks = (static_cast<uint32_t>(snapshot.draws.size()) + grain - 1) / grain;
             const uint32_t objectBlocks = (static_cast<uint32_t>(objectCount) + grain - 1) / grain;
+            if (passCount > UINT32_MAX - staticBlocks - objectBlocks)
+                throw std::runtime_error("shadow preparation work count overflow");
             workCount = staticBlocks + objectBlocks + passCount;
 
             const auto prepStart = Clock::now();
             prepared.Clear();
+            prepared.shadows.resize(projectionCount);
             prepared.statics.resize(snapshot.draws.size());
             prepared.objects.resize(objectCount);
             auto& workers = m_preparationParticipants;
@@ -4318,6 +4436,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 const auto serialStart = Clock::now();
                 auto& reference = m_referenceFrame;
                 reference.Clear();
+                reference.shadows.resize(projectionCount);
                 for (const auto& draw : m_draws)
                     reference.statics.push_back(!cull || SphereInside(planes, draw.center, draw.radius));
                 if (validExtras)
@@ -4399,10 +4518,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         ID3D12DescriptorHeap* heaps[] = {textureHeap};
         target->SetDescriptorHeaps(1, heaps);
         target->SetGraphicsRootConstantBufferView(0, frameCb);
-        target->SetGraphicsRootShaderResourceView(kLocalLightBufferRoot, lightUpload.Address());
-        target->SetGraphicsRootShaderResourceView(kLocalProjectionBufferRoot, projectionUpload.Address());
+        target->SetGraphicsRootShaderResourceView(kLocalLightBufferRoot, localLights.empty() ? frameCb : lightUpload.Address());
+        target->SetGraphicsRootShaderResourceView(kLocalProjectionBufferRoot,
+            localProjections.empty() ? frameCb : projectionUpload.Address());
         if (m_shadowPageSampling)
-            target->SetGraphicsRootShaderResourceView(kLocalPageShapesRoot, projectionUpload.Address()); // Legacy использует размеры из FrameCB.
+            target->SetGraphicsRootShaderResourceView(kLocalPageShapesRoot,
+                adaptiveBinding.shapes ? adaptiveBinding.shapes : frameCb);
         if (validExtras)
             target->SetGraphicsRootShaderResourceView(4, transformSrv);
     };
@@ -4659,17 +4780,22 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         uint64_t hash = 14695981039346656037ull;
     };
     const bool sampleCsm = lighting.frame % 120 == 0;
-    std::array<uint32_t, game_shadow12::MaxViews> timingIds{};
-    for (uint32_t index = 0; index < passCount; ++index)
-        timingIds[index] = passes[index].view.projection;
-    std::sort(timingIds.begin(), timingIds.begin() + passCount);
-    recording.SetShadowTimingViews(std::span(timingIds.data(), passCount));
+    if (!adaptive)
+    {
+        std::vector<uint32_t> timingIds;
+        timingIds.reserve(passCount);
+        for (const auto& pass : passes)
+            timingIds.push_back(pass.view.projection);
+        if (FAILED(recording.SetShadowTimingViews(timingIds)))
+            return Fail(reason, "shadow timing registration failed");
+    }
     const FramePreparation& preparedPackets = prepared;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
         const FrustumPlane* shadowPlanes, bool dynamic)
     {
-        recording.StampShadow(*shadowList, projection, false);
+        if (!adaptive)
+            recording.StampShadow(*shadowList, projection, false);
         ShadowDraws draws;
         const auto mix = [&](uint32_t value)
         {
@@ -4729,12 +4855,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             shadowList->IASetIndexBuffer(&mesh.ib);
             shadowList->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
         };
-        const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size), 0.0f, 1.0f};
-        const D3D12_RECT rect{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
-        shadowList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
-        shadowList->RSSetViewports(1, &viewport);
-        shadowList->RSSetScissorRects(1, &rect);
-        shadowList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        if (!adaptive)
+        {
+            const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size), 0.0f, 1.0f};
+            const D3D12_RECT rect{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
+            shadowList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+            shadowList->RSSetViewports(1, &viewport);
+            shadowList->RSSetScissorRects(1, &rect);
+            shadowList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        }
         shadowList->SetGraphicsRoot32BitConstant(kShadowLayerRoot, projection, 0);
         for (uint32_t layout = 0; layout < static_cast<uint32_t>(m_sunShadowPipelines.size()); ++layout)
         {
@@ -4798,7 +4927,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 ++draws.detailDraws;
             }
         }
-        recording.StampShadow(*shadowList, projection, true);
+        if (!adaptive)
+            recording.StampShadow(*shadowList, projection, true);
         return draws;
     };
     const auto shadowRecordStart = Clock::now();
@@ -4836,11 +4966,44 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         else
         {
             ++stats.localShadowMaps;
-            ++(pass.view.Kind() == game_shadow12::ViewKind::SpotLight ? stats.spotShadowMaps : stats.pointShadowFaces);
+            ++(pass.spot ? stats.spotShadowMaps : stats.pointShadowFaces);
             stats.localShadowDraws += draws.statics + draws.rigid + draws.skinned;
         }
     };
-    if (passCount != 0 && recording.UsesShadowLists())
+    if (adaptive)
+    {
+        std::vector<game_shadow12::ShadowRecordingPass> batch;
+        batch.reserve(passCount);
+        for (const auto& pass : passes)
+            batch.push_back({pass.view.projection, {pass.resource, pass.dsv, {}, pass.slice, pass.size}});
+        std::vector<ShadowDraws> results(passCount);
+        const auto dispatch = [&](uint32_t count, const auto& work) -> HRESULT
+        {
+            if (!usePrepared)
+            {
+                work(0, count, 0);
+                return S_OK;
+            }
+            GameDx12GRRangeStats12 stats;
+            std::string taskReason;
+            return GameDx12GR_RunRanges(count, 1, work, stats, taskReason) ? S_OK : E_FAIL;
+        };
+        const auto hr = game_shadow12::RecordShadowPasses(recording, batch,
+            [&](ID3D12GraphicsCommandList& target, uint32_t index)
+        {
+            const auto& pass = passes[index];
+            results[index] = recordShadowMap(&target, pass.dsv, pass.size, pass.view.projection, pass.planes, pass.dynamic);
+            return S_OK;
+        }, dispatch);
+        if (FAILED(hr))
+            return Fail(reason, "unified adaptive shadow recording failed");
+        list = recording.list;
+        if (passCount && recording.UsesShadowLists())
+            stats.commandLists = passCount + 2;
+        for (uint32_t i = 0; i < passCount; ++i)
+            accumulateShadows(passes[i], results[i]);
+    }
+    else if (passCount != 0 && recording.UsesShadowLists())
     {
         // Состояния карт задаёт владелец. Списки карт только пишут глубину.
         transitionShadows(activePasses, sampleState, depthState);
@@ -4964,7 +5127,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     }
     recording.StampSceneStart();
     bindColorFrame(list);
-    if (constants.lightingFlags[3] != 0 || localShadowViews.count != 0)
+    if (passCount != 0)
     {
         list->OMSetRenderTargets(1, &recording.rtv, FALSE, &recording.dsv);
         const D3D12_VIEWPORT mainViewport{0.0f, 0.0f, static_cast<float>(recording.width),
@@ -4979,8 +5142,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     shadowSrv.ptr += static_cast<UINT64>(kSunShadowDescriptor) * m_textureDescriptorSize;
     list->SetGraphicsRootDescriptorTable(6, shadowSrv);
     auto localShadowSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-    localShadowSrv.ptr += static_cast<UINT64>(kLocalShadowDescriptor) * m_textureDescriptorSize;
-    list->SetGraphicsRootDescriptorTable(kLocalShadowSrvRoot, localShadowSrv);
+    localShadowSrv.ptr += static_cast<UINT64>(adaptive ? kNullLocalShadowDescriptor : kLocalShadowDescriptor) * m_textureDescriptorSize;
+    list->SetGraphicsRootDescriptorTable(kLocalShadowSrvRoot, adaptiveBinding.pageCount ? adaptiveBinding.table : localShadowSrv);
 
     const auto drawStatic = [&](const DrawSource12& draw)
     {
@@ -5325,6 +5488,7 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_sunShadowPipelines = {};
     m_sunShadowAuxPipeline.Reset();
     m_shadowDescriptors.reset();
+    m_adaptiveShadows.reset();
     m_textureHeap.Reset();
     m_pipelineUv24.Reset();
     m_pipelineSkeletal.Reset();
@@ -5407,6 +5571,11 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
     {
         m_shadowDescriptors->Quarantine();
         m_shadowDescriptors.reset();
+    }
+    if (m_adaptiveShadows)
+    {
+        m_adaptiveShadows->Quarantine();
+        m_adaptiveShadows.reset();
     }
     park(g_staticQuarantine.heap, m_textureHeap.Detach());
     park(g_staticQuarantine.pipelineState, m_pipelineState.Detach());

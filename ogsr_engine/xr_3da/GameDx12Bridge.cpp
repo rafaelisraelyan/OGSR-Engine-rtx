@@ -2391,7 +2391,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 prepareMs = elapsed(begin, FrameClock::now());
             if (!prepared ||
                 !state.staticScene.RecordNativeFrame(
-                    recording, viewProjection, position, state.gameVisuals.Snapshot(),
+                    recording, owner, state.nativeMemoryAdapter.Get(), viewProjection, position, state.gameVisuals.Snapshot(),
                     lighting, CaptureWater(), sceneStats, auxDraws, reason))
                 hr = E_FAIL;
             else
@@ -2473,9 +2473,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                     Msg("ph_dx12_csm: gpu_present=%llu slice=%u gpu_ms=%.6f",
                         static_cast<unsigned long long>(completedGpu.present), view.Slice(), timing.milliseconds);
                 else
-                    Msg("ph_dx12_lsa: gpu_present=%llu slice=%u kind=%u gpu_ms=%.6f",
-                        static_cast<unsigned long long>(completedGpu.present), view.Slice(),
-                        static_cast<unsigned>(view.Kind()), timing.milliseconds);
+                    Msg("ph_dx12_lsa: gpu_present=%llu projection=%u gpu_ms=%.6f",
+                        static_cast<unsigned long long>(completedGpu.present), timing.projection, timing.milliseconds);
             }
     }
     if (hr == S_OK && sceneRecorded && sceneDetail)
