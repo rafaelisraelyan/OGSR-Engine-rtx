@@ -40,6 +40,10 @@ int main()
     Require(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(device.GetAddressOf())),"WARP device");
     ComPtr<ID3D12InfoQueue> messages;
     Require(device.As(&messages),"InfoQueue");
+    messages->ClearStorageFilter();
+    messages->ClearRetrievalFilter();
+    // Сообщения создания устройства уже прошли через исходный фильтр.
+    const auto deniedAtDeviceCreation = messages->GetNumMessagesDeniedByStorageFilter();
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     ComPtr<ID3D12CommandQueue> queue;
@@ -56,16 +60,16 @@ int main()
         Require(device->GetDeviceRemovedReason(),"device status");
     };
     const std::array<ShadowPageShape,2> shapes{{{128,8},{256,8}}};
-    ShadowPageSpec small{},large{},invalid{};
-    Require(QueryShadowPageSpec(*device.Get(),shapes[0],small),"small allocation info");
+    ShadowPageSpec smallPage{},large{},invalid{};
+    Require(QueryShadowPageSpec(*device.Get(),shapes[0],smallPage),"small allocation info");
     Require(QueryShadowPageSpec(*device.Get(),shapes[1],large),"large allocation info");
     Check(FAILED(QueryShadowPageSpec(*device.Get(),{127,8},invalid)) && !invalid.bytes,"invalid shape rejected");
-    Check(small.bytes>0 && large.bytes>0,"allocation sizes");
+    Check(smallPage.bytes>0 && large.bytes>0,"allocation sizes");
     DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
     uint64_t headroom=0;
     const auto budgetResult=QueryShadowMemoryBudget(*device.Get(),*adapter.Get(),0,memory,headroom);
     std::printf("WARP allocation bytes=%llu/%llu DXGI budget hr=0x%08X budget=%llu usage=%llu headroom=%llu\n",
-        static_cast<unsigned long long>(small.bytes),static_cast<unsigned long long>(large.bytes),
+        static_cast<unsigned long long>(smallPage.bytes),static_cast<unsigned long long>(large.bytes),
         static_cast<unsigned>(budgetResult),static_cast<unsigned long long>(memory.Budget),
         static_cast<unsigned long long>(memory.CurrentUsage),static_cast<unsigned long long>(headroom));
     if (SUCCEEDED(budgetResult))
@@ -74,11 +78,11 @@ int main()
     AdaptivePlan logical{1,1,1,1,UINT64_MAX,0,{{1,6,128,128,1},{2,1,128,128,1}}};
     ShadowPageResources owner;
     Require(owner.Initialize(*device.Get(),*fence.Get(),0),"initialize");
-    Check(owner.Prepare(logical,shapes,small.bytes,0,1)==E_OUTOFMEMORY && !owner.PreparedPlan(),
+    Check(owner.Prepare(logical,shapes,smallPage.bytes,0,1)==E_OUTOFMEMORY && !owner.PreparedPlan(),
         "transient budget rejects new allocation without publication");
-    Require(owner.Prepare(logical,shapes,small.bytes,small.bytes,1),"prepare physical page");
+    Require(owner.Prepare(logical,shapes,smallPage.bytes,smallPage.bytes,1),"prepare physical page");
     const auto* plan=owner.PreparedPlan();
-    Check(plan && plan->next.pages.size()==1 && plan->next.placed.size()==2 && plan->bytes==small.bytes,
+    Check(plan && plan->next.pages.size()==1 && plan->next.placed.size()==2 && plan->bytes==smallPage.bytes,
         "physical plan and allocation accounting");
     const auto point=plan->next.placed[0];
     Check(point.faces==6,"point group atomic");
@@ -148,8 +152,8 @@ int main()
     Require(queue->Signal(fence.Get(),1),"signal submission");
     Require(owner.CommitSubmitted(1),"publish after signal");
     logical.frame=2;
-    Check(owner.CurrentBytes()==small.bytes &&
-        owner.Prepare(logical,shapes,small.bytes,0,2)==DXGI_ERROR_WAS_STILL_DRAWING &&
+    Check(owner.CurrentBytes()==smallPage.bytes &&
+        owner.Prepare(logical,shapes,smallPage.bytes,0,2)==DXGI_ERROR_WAS_STILL_DRAWING &&
         owner.Release()==DXGI_ERROR_WAS_STILL_DRAWING,"in-flight slot protected");
     Require(gate->Signal(1),"release GPU work");
     wait(1);
@@ -169,7 +173,7 @@ int main()
     }
     const D3D12_RANGE noWrite{};
     readback->Unmap(0,&noWrite);
-    Require(owner.Prepare(logical,shapes,small.bytes,0,2),"reuse with no new bytes");
+    Require(owner.Prepare(logical,shapes,smallPage.bytes,0,2),"reuse with no new bytes");
     ShadowPageResources::View reused;
     Check(owner.GetView(point.page,point.first,reused) && reused.resource==a.resource &&
         owner.PreparedPlan()->create.empty(),"physical resource reuse");
@@ -178,14 +182,14 @@ int main()
     {
         DXGI_QUERY_VIDEO_MEMORY_INFO latest{};
         uint64_t available=0;
-        Require(owner.PrepareBudgeted(logical,shapes,small.bytes,*adapter.Get(),UINT64_MAX,2,latest,available),
+        Require(owner.PrepareBudgeted(logical,shapes,smallPage.bytes,*adapter.Get(),UINT64_MAX,2,latest,available),
             "live DXGI budget with zero additional headroom and retained resources");
         Check(available==0 && owner.PreparedPlan()->create.empty(),"real budget reuse");
         Require(owner.CancelUnsubmitted(),"cancel live budget plan");
     }
     logical.epoch=2;
     logical.lights[0].resolution=256; logical.lights[1].resolution=256;
-    Check(owner.Prepare(logical,shapes,large.bytes,0,2)==E_OUTOFMEMORY && owner.CurrentBytes()==small.bytes,
+    Check(owner.Prepare(logical,shapes,large.bytes,0,2)==E_OUTOFMEMORY && owner.CurrentBytes()==smallPage.bytes,
         "epoch replacement peak denied transactionally");
     Require(owner.Prepare(logical,shapes,large.bytes,large.bytes,2),"stage epoch replacement");
     Check(owner.PreparedPlan()->retire.size()==1 && owner.PreparedPlan()->create.size()==1,"replacement delta");
@@ -193,7 +197,7 @@ int main()
     Require(owner.Release(),"release completed slot");
     // A differing optimized-clear value is intentional in the layer test.
     const auto count=messages->GetNumStoredMessages();
-    Check(messages->GetNumMessagesDeniedByStorageFilter()==0 &&
+    Check(messages->GetNumMessagesDeniedByStorageFilter()==deniedAtDeviceCreation &&
         messages->GetNumMessagesDiscardedByMessageCountLimit()==0 &&
         messages->GetNumStoredMessagesAllowedByRetrievalFilter()==count,"complete debug messages");
     for (uint64_t i=0;i<count;++i)

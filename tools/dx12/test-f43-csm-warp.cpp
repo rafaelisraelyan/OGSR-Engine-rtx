@@ -743,6 +743,10 @@ int main(int argc, char** argv)
         Require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "WARP device");
         ComPtr<ID3D12InfoQueue> messages;
         Require(device.As(&messages), "D3D12 info queue");
+        messages->ClearStorageFilter();
+        messages->ClearRetrievalFilter();
+        // Сообщения создания устройства уже прошли через исходный фильтр.
+        const auto deniedAtDeviceCreation = messages->GetNumMessagesDeniedByStorageFilter();
         Require(messages->SetMessageCountLimit(100000), "InfoQueue message limit");
         ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC desc{};
@@ -784,7 +788,7 @@ int main(int argc, char** argv)
         uint32_t problems = 0;
         uint32_t expectedClearWarnings = 0;
         Check(messages->GetNumMessagesDiscardedByMessageCountLimit() == 0, "InfoQueue discarded messages");
-        Check(messages->GetNumMessagesDeniedByStorageFilter() == 0, "InfoQueue storage-filtered messages");
+        Check(messages->GetNumMessagesDeniedByStorageFilter() == deniedAtDeviceCreation, "InfoQueue storage-filtered messages");
         Check(messages->GetNumStoredMessagesAllowedByRetrievalFilter() == messages->GetNumStoredMessages(),
             "InfoQueue retrieval-filtered messages");
         for (uint64_t index = 0; index < messages->GetNumStoredMessages(); ++index)
