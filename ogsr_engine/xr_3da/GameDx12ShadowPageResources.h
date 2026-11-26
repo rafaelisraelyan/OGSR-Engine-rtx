@@ -243,6 +243,8 @@ public:
                     staged->pages.push_back(std::move(created));
                 }
             }
+            std::sort(staged->pages.begin(), staged->pages.end(),
+                [](const Page& a, const Page& b) { return a.description.id < b.description.id; });
             pending_ = std::move(staged);
             return S_OK;
         }
@@ -268,6 +270,11 @@ public:
         return Prepare(logical,shapes,pageBudget,headroom,submitFence);
     }
 
+    bool MatchesOwner(const ID3D12Fence& fence, uint32_t slot) const noexcept
+    {
+        return fence_.Get() == &fence && slot_ == slot;
+    }
+
     const ShadowPagePlan* PreparedPlan() const noexcept { return pending_ ? &pending_->plan : nullptr; }
     uint64_t CurrentBytes() const noexcept { return bytes_; }
 
@@ -282,14 +289,16 @@ public:
             std::span<const ShadowPlacement>(arena.placed),out);
     }
 
-    bool GetPreparedPageSrv(uint64_t page,D3D12_CPU_DESCRIPTOR_HANDLE& out) const noexcept
+    bool GetPreparedPageSrv(uint64_t page,D3D12_CPU_DESCRIPTOR_HANDLE& out,
+        D3D12_RESOURCE_DESC* resource = nullptr) const noexcept
     {
         out={};
         if (!pending_ || unknown_) return false;
-        const auto it=std::find_if(pending_->pages.begin(),pending_->pages.end(),
-            [&](const auto& p){return p.description.id==page;});
-        if (it==pending_->pages.end()) return false;
+        const auto it = std::lower_bound(pending_->pages.begin(), pending_->pages.end(), page,
+            [](const Page& entry, uint64_t id) { return entry.description.id < id; });
+        if (it == pending_->pages.end() || it->description.id != page) return false;
         out=it->srv->GetCPUDescriptorHandleForHeapStart();
+        if (resource) *resource=it->depth->GetDesc();
         return true;
     }
 

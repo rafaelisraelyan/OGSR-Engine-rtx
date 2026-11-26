@@ -79,6 +79,19 @@ Next P0-B3c2: implement a fenced shader-visible page descriptor table, keep lega
 
 Microsoft references: https://learn.microsoft.com/en-us/windows/win32/direct3d12/dynamic-indexing-using-hlsl-5-1 ; https://learn.microsoft.com/en-us/windows/win32/direct3d12/hardware-support ; https://learn.microsoft.com/en-us/windows/win32/direct3d12/advanced-use-of-descriptor-tables .
 
+### P0-B3c2: дескрипторы физических страниц и многокартовая выборка
+
+`GameDx12ShadowDescriptors` управляет хвостом существующей shader-visible material heap. Материалы, CSM, legacy-страница, вода и terrain сохраняют свои индексы. Диапазоны двух слотов растут с разных концов свободной области, без фиксированной квоты на слот. Размер берётся из фактически созданной heap. При нехватке непрерывного места поверх живого диапазона Stage возвращает ошибку, сохраняя ранее активные данные. Для доступности таблицы проверяются ResourceBindingTier 2+ и SM 5.1. Если расширенная heap недоступна, кадр по-прежнему может привязать банковую страницу. Tier 1 использует исходную привязку PS 5.0.
+
+`ShadowPageResources` сохраняет владение физическими страницами, их CPU SRV и идентичностью session/epoch/page ID. Компонент получает один подготовленный план того же fence и слота, копирует SRV в порядке GPU-ординалов и загружает фактические ширину, высоту и число слоёв из описаний ресурсов в t15. Хвост heap и буфер метаданных нельзя переписывать до завершения соответствующего fence. Запись выполняется на потоке владельца. GR получает только готовый GPU handle. Время жизни компонента и арены покрывает запись и завершение транзакции native frame.
+
+`Recording::StageShadowPages` привязывает транзакцию к текущей записи NativeFrame. До Execute проверяется точное следующее значение fence. Физический план и диапазон становятся активными после успешного Signal. Cancel отбрасывает незапущенный план после закрытия списков. При неопределённом завершении ссылки на heap, страницы и буферы сохраняются в карантине. Код, который готовит план и получает ошибку Stage, по-прежнему владеет этим планом и может его отменить.
+
+Пиксельный шейдер использует `Texture2DArray[]` в space1 и `NonUniformResourceIndex`. Проверки используют фактические размеры и число слоёв выбранной страницы. Метаданные берутся из того же ресурса, что CPU SRV. WARP с расходящимися индексами показал неверные результаты `GetDimensions` на динамической таблице, поэтому validation размеров вынесена в t15. FrameCB сохраняет stride 768 байт, записи t14 — 80 байт. Диагностический просмотр глубины использует физический слой.
+
+Игровой кадр пока поставляет одну банковую страницу. Подключение адаптивного плана к полному игровому кадру требует записи проходов, переходов ресурсов и масштабируемого расписания B3d. Проверки B3c2 используют две физические страницы в одном draw и штатную транзакцию NativeFrame. Игровая и аппаратная приёмка остаются отдельным этапом.
+
+
 ## P1 and RTX
 
 Study IX-Ray incremental caster visibility and local detail shadows; use conservative invalidation for moving geometry, wind, animation and light movement. Investigate depth caching only after correctness, and GPU-driven/LOD for costly far cascades. HUD screen-space contact shadows already required in F4.5-B; future DXR contact/soft shadows share visibility contracts without double shadowing. Current CSM fitting, overlap, texel snapping, receiver-plane mode, GR job system and R4 path retained. No new GPU timings or visual claims.

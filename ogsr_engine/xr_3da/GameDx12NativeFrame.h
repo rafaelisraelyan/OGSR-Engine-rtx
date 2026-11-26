@@ -2,6 +2,7 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12ShadowDescriptors.h"
 #include "GameDx12ShadowViews.h"
 
 #include <array>
@@ -16,6 +17,7 @@ class GameDx12NativeFrame12
 {
 public:
     static constexpr uint32_t kFrameCount = 2;
+    static_assert(kFrameCount == game_shadow12::ShadowDescriptors::kSlotCount);
     static constexpr uint32_t kShadowListCount = game_shadow12::MaxViews;
 
     struct Recording
@@ -34,6 +36,9 @@ public:
         double slotFenceWaitMs = 0.0;
         GameDx12NativeFrame12* frame = nullptr;
 
+        HRESULT StageShadowPages(game_shadow12::ShadowDescriptors& descriptors,
+            game_shadow12::ShadowPageResources& pages, game_shadow12::ShadowAddressPlan& addresses,
+            game_shadow12::ShadowDescriptors::Binding& binding) const;
         bool UsesShadowLists() const noexcept;
         bool UsesParallelShadowLists() const noexcept;
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
@@ -88,6 +93,10 @@ public:
     void Quarantine() noexcept;
 
 private:
+    HRESULT CloseRecording() noexcept;
+    game_shadow12::ShadowDescriptors* m_pendingShadowDescriptors = nullptr;
+    ID3D12Fence* m_recordingFence = nullptr;
+
     template <typename T> using Ptr = Microsoft::WRL::ComPtr<T>;
     // Пары для кадра, основного прохода и каждого projection ID.
     static constexpr uint32_t kTimingQueriesPerSlot = 4 + 2 * kShadowListCount;

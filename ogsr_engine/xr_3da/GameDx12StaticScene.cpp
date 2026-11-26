@@ -78,7 +78,7 @@ struct SceneFrameConstants
     std::array<DirectX::XMFLOAT4, game_shadow12::MaxSunCascades> sunCascadeData; // near, far, blend, world texel
     std::array<float, game_shadow12::MaxSunCascades> sunDepthBias; // Нормализованный receiver bias по срезам.
     uint32_t sunCasterCounts[4];
-    uint32_t localShadowConfig[4]; // x: projection count; y: bound page count; z: legacy page slice count.
+    uint32_t localShadowConfig[4]; // x: проекции, y: страницы, z/w: слои и разрешение legacy-страницы.
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -121,6 +121,7 @@ constexpr uint32_t kTerrainSrvRoot = 11;
 constexpr uint32_t kTerrainScaleRoot = 12;
 constexpr uint32_t kLocalLightBufferRoot = 13;
 constexpr uint32_t kLocalProjectionBufferRoot = 14;
+constexpr uint32_t kLocalPageShapesRoot = 15;
 constexpr uint32_t kTerrainDescriptor = kLocalShadowDescriptor + 1;
 constexpr uint32_t kTerrainTextureCount = 5;
 constexpr uint32_t kMaxTerrainSets = 128;
@@ -683,14 +684,15 @@ struct ShadowInterpolants
 
 bool CompileShader(const char* source, const char* entryPoint,
                    const char* target, ID3D10Blob** outBlob,
-                   std::string& reason)
+                   std::string& reason, bool pageTable = false)
 {
     ComPtr<ID3D10Blob> error;
     const auto maxLocalLights = std::to_string(gamelight12::LegacyDiagnosticLightScale);
-    const D3D_SHADER_MACRO definitions[] = {{"LEGACY_DIAGNOSTIC_LIGHT_SCALE", maxLocalLights.c_str()}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO definitions[] = {{"LEGACY_DIAGNOSTIC_LIGHT_SCALE", maxLocalLights.c_str()},
+        {pageTable ? "OGSR_DX12_SHADOW_PAGE_TABLE" : nullptr, pageTable ? "1" : nullptr}, {nullptr, nullptr}};
     const std::string shader = std::string(kFrameShaderConstants) + source;
     const HRESULT hr = D3DCompile(shader.data(), shader.size(), nullptr, definitions,
-                                  nullptr, entryPoint, target, 0, 0, outBlob,
+                                  nullptr, entryPoint, target, pageTable ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0, 0, outBlob,
                                   &error);
     if (FAILED(hr))
     {
@@ -960,7 +962,16 @@ ShadowInterpolants shadowMain(float3 position : POSITION, float3 normal : NORMAL
 constexpr const char* kScenePixelShader = R"(
 Texture2D BaseColor : register(t0);
 Texture2DArray<float> SunShadow : register(t2);
+#if defined(OGSR_DX12_SHADOW_PAGE_TABLE)
+Texture2DArray<float> LocalShadowPages[] : register(t0, space1);
+StructuredBuffer<uint4> LocalShadowPageShapes : register(t15);
+// Даже если компилятор переместит чтение через ветку, индекс остаётся
+// в пределах таблицы. При нулевом count владелец привязывает null SRV.
+#define LOCAL_SHADOW_PAGE(ordinal) LocalShadowPages[NonUniformResourceIndex(min(ordinal, max(LocalShadowConfig.y, 1u) - 1u))]
+#else
 Texture2DArray<float> LocalShadow : register(t6);
+#define LOCAL_SHADOW_PAGE(ordinal) LocalShadow
+#endif
 Texture2D HemiLightmap : register(t7);
 Texture2D TerrainMask : register(t8);
 Texture2D TerrainRed : register(t9);
@@ -1250,13 +1261,20 @@ static const uint LOCAL_OUTSIDE = 2;
 static const uint LOCAL_BAD_LAYER = 3;
 static const uint LOCAL_BAD_PROJECTION = 4;
 
-// The current binding exposes only legacy page zero. Reject an unbound
-// ordinal instead of silently sampling another page. Multi-page
-// descriptor indexing is introduced with the physical page runtime.
 bool ValidLocalAddress(uint4 address)
 {
-    return address.x == 0u && address.x < LocalShadowConfig.y &&
-        address.y < LocalShadowConfig.z && address.z > 0u;
+    [branch]
+    if (address.x >= LocalShadowConfig.y || address.z == 0u)
+        return false;
+#if defined(OGSR_DX12_SHADOW_PAGE_TABLE)
+    [branch]
+    if (LocalShadowConfig.w != 0u)
+        return address.x == 0u && address.z == LocalShadowConfig.w && address.y < LocalShadowConfig.z;
+    const uint4 shape = LocalShadowPageShapes[min(address.x, max(LocalShadowConfig.y, 1u) - 1u)];
+    return address.z == shape.x && address.z == shape.y && address.y < shape.z;
+#else
+    return address.x == 0u && address.y < LocalShadowConfig.z;
+#endif
 }
 
 uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
@@ -1321,7 +1339,7 @@ float SampleLocalVisibility(float3 coords, uint layer)
     const uint physicalSlice = address.y;
     const float2 halfTexel = 0.5f / (float)address.z;
     const float2 center = clamp(coords.xy, halfTexel, 1.0f - halfTexel);
-    float visibility = LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(center, physicalSlice), coords.z);
+    float visibility = LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(center, physicalSlice), coords.z);
     [branch]
     if (visibility > 0.0f && visibility < 1.0f)
     {
@@ -1330,8 +1348,8 @@ float SampleLocalVisibility(float3 coords, uint layer)
         const float2 low = clamp(coords.xy - offset, halfTexel, 1.0f - halfTexel);
         const float2 high = clamp(coords.xy + offset, halfTexel, 1.0f - halfTexel);
         visibility = (visibility +
-            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(low, physicalSlice), coords.z) +
-            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(high, physicalSlice), coords.z)) / 3.0f;
+            LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(low, physicalSlice), coords.z) +
+            LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(high, physicalSlice), coords.z)) / 3.0f;
     }
     return visibility;
 }
@@ -1366,10 +1384,11 @@ float3 DebugLocalShadow(float3 position, float3 normal)
         uint layer;
         if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
             continue;
-        const float3 sampleCoords = float3(coords.xy, layer);
         if (ViewMode == 4)
         {
-            const float depth = LocalShadow.SampleLevel(WallmarkSampler, sampleCoords, 0);
+            const uint4 address = LocalShadowMatrices[layer].address;
+            const float3 sampleCoords = float3(coords.xy, address.y);
+            const float depth = LOCAL_SHADOW_PAGE(address.x).SampleLevel(WallmarkSampler, sampleCoords, 0);
             const float nearDepth = asfloat(source.type.z);
             const float farDepth = asfloat(source.type.w);
             const float linearDepth = nearDepth * farDepth / lerp(farDepth, nearDepth, depth);
@@ -2173,7 +2192,7 @@ uint32_t GameDx12StaticScene12::BuildShadowCasterNode(ShadowCasterTree& tree, ui
 bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                            std::string& reason)
 {
-    D3D12_ROOT_PARAMETER params[15] = {};
+    D3D12_ROOT_PARAMETER params[16] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -2228,7 +2247,10 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[kShadowLayerRoot].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
     auto localShadowRange = range;
-    localShadowRange.BaseShaderRegister = 6;
+    m_shadowPageSampling = game_shadow12::ShadowDescriptors::Supported(*device);
+    localShadowRange.BaseShaderRegister = m_shadowPageSampling ? 0 : 6;
+    localShadowRange.RegisterSpace = m_shadowPageSampling ? 1 : 0;
+    localShadowRange.NumDescriptors = m_shadowPageSampling ? UINT32_MAX : 1;
     params[kLocalShadowSrvRoot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[kLocalShadowSrvRoot].DescriptorTable.NumDescriptorRanges = 1;
     params[kLocalShadowSrvRoot].DescriptorTable.pDescriptorRanges = &localShadowRange;
@@ -2260,6 +2282,10 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[kLocalProjectionBufferRoot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[kLocalProjectionBufferRoot].Descriptor.ShaderRegister = 14;
     params[kLocalProjectionBufferRoot].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[kLocalPageShapesRoot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[kLocalPageShapesRoot].Descriptor.ShaderRegister = 15;
+    params[kLocalPageShapesRoot].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
@@ -2324,8 +2350,8 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     ComPtr<ID3D10Blob> pixelShader;
     if (!CompileShader(kSceneVertexShader, "main", "vs_5_0",
                        vertexShader.GetAddressOf(), reason) ||
-        !CompileShader(kScenePixelShader, "main", "ps_5_0",
-                       pixelShader.GetAddressOf(), reason))
+        !CompileShader(kScenePixelShader, "main", m_shadowPageSampling ? "ps_5_1" : "ps_5_0",
+                       pixelShader.GetAddressOf(), reason, m_shadowPageSampling))
         return false;
 
     D3D12_RASTERIZER_DESC rasterizer = {};
@@ -2923,9 +2949,24 @@ bool GameDx12StaticScene12::CreateTextures(
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.NumDescriptors = kSceneDescriptorCount;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(device->CreateDescriptorHeap(&heap,
-                IID_PPV_ARGS(m_textureHeap.GetAddressOf()))))
+        if (m_shadowPageSampling)
+            heap.NumDescriptors = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+        HRESULT heapResult = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(m_textureHeap.GetAddressOf()));
+        if (FAILED(heapResult) && m_shadowPageSampling)
+        {
+            // Таблица из одной legacy-страницы помещается и в исходную heap.
+            heap.NumDescriptors = kSceneDescriptorCount;
+            heapResult = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(m_textureHeap.GetAddressOf()));
+        }
+        if (FAILED(heapResult))
             return Fail(reason, "scene descriptor heap creation failed");
+        if (heap.NumDescriptors > kSceneDescriptorCount)
+        {
+            auto descriptors = std::make_unique<game_shadow12::ShadowDescriptors>();
+            if (FAILED(descriptors->Initialize(*device, *owner.fence, *m_textureHeap.Get(), kSceneDescriptorCount)))
+                return Fail(reason, "shadow descriptor tail initialization failed");
+            m_shadowDescriptors = std::move(descriptors);
+        }
         m_textureDescriptorSize = device->GetDescriptorHandleIncrementSize(heap.Type);
         if (m_textureDescriptorSize == 0 || (m_sunShadow &&
             (m_sunShadowSlices == 0 || m_sunShadowSlices > game_shadow12::MaxSunCascades ||
@@ -3833,6 +3874,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     constants.localShadowConfig[0] = m_localShadow ? m_localShadowSlices : 0;
     constants.localShadowConfig[1] = m_localShadow ? 1u : 0u;
     constants.localShadowConfig[2] = constants.localShadowConfig[0];
+    constants.localShadowConfig[3] = m_localShadow ? static_cast<uint32_t>(m_localShadow->GetDesc().Width) : 0;
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
@@ -4359,6 +4401,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         target->SetGraphicsRootConstantBufferView(0, frameCb);
         target->SetGraphicsRootShaderResourceView(kLocalLightBufferRoot, lightUpload.Address());
         target->SetGraphicsRootShaderResourceView(kLocalProjectionBufferRoot, projectionUpload.Address());
+        if (m_shadowPageSampling)
+            target->SetGraphicsRootShaderResourceView(kLocalPageShapesRoot, projectionUpload.Address()); // Legacy использует размеры из FrameCB.
         if (validExtras)
             target->SetGraphicsRootShaderResourceView(4, transformSrv);
     };
@@ -5279,6 +5323,7 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_localShadowAllocation = {};
     m_sunShadowPipelines = {};
     m_sunShadowAuxPipeline.Reset();
+    m_shadowDescriptors.reset();
     m_textureHeap.Reset();
     m_pipelineUv24.Reset();
     m_pipelineSkeletal.Reset();
@@ -5357,6 +5402,11 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
     park(g_staticQuarantine.constants, m_frameConstants.Detach());
     for (auto& upload : m_localLightUploads) upload.Quarantine();
     for (auto& upload : m_localProjectionUploads) upload.Quarantine();
+    if (m_shadowDescriptors)
+    {
+        m_shadowDescriptors->Quarantine();
+        m_shadowDescriptors.reset();
+    }
     park(g_staticQuarantine.heap, m_textureHeap.Detach());
     park(g_staticQuarantine.pipelineState, m_pipelineState.Detach());
     if (g_staticQuarantine.pipelineState != nullptr)

@@ -16,6 +16,7 @@
 #include <DirectXMath.h>
 
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -192,6 +193,11 @@ public:
                            const gamewater12::Frame& water,
                            FrameStats12& stats, AuxStats& auxStats,
                            std::string& reason);
+
+    game_shadow12::ShadowDescriptors* ShadowPageDescriptors() const noexcept
+    {
+        return m_shadowDescriptors.get();
+    }
 
     bool RegisterMeshes(const GameDx12StaticSceneOwner12& owner,
                         std::span<const gameaux12::Mesh* const> sources,
@@ -408,6 +414,8 @@ private:
     uint64_t m_localShadowBytes = 0;
     game_shadow12::LocalAllocationState m_localShadowAllocation{};
     ComPtr<ID3D12DescriptorHeap> m_textureHeap;
+    std::unique_ptr<game_shadow12::ShadowDescriptors> m_shadowDescriptors;
+    bool m_shadowPageSampling = false;
     ComPtr<ID3D12Resource> m_frameConstants;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localLightUploads;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localProjectionUploads;

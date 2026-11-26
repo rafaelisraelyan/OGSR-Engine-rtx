@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -297,6 +298,19 @@ HRESULT GameDx12NativeFrame12::Resize(const Owner& owner, uint32_t width, uint32
     return CreateTargets(owner.device, width, height);
 }
 
+HRESULT GameDx12NativeFrame12::Recording::StageShadowPages(game_shadow12::ShadowDescriptors& descriptors,
+    game_shadow12::ShadowPageResources& pages, game_shadow12::ShadowAddressPlan& addresses,
+    game_shadow12::ShadowDescriptors::Binding& binding) const
+{
+    if (!frame || !frame->m_recording || !frame->m_recordingFence ||
+        slot != frame->m_slot || frame->m_pendingShadowDescriptors)
+        return E_UNEXPECTED;
+    const auto hr = descriptors.Stage(*frame->m_recordingFence, slot, pages, addresses, binding);
+    if (SUCCEEDED(hr))
+        frame->m_pendingShadowDescriptors = &descriptors;
+    return hr;
+}
+
 HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording& recording)
 {
     recording = {};
@@ -372,6 +386,7 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     hr = slot.list->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(hr))
         return hr;
+    m_recordingFence = &owner.fence;
     m_recording = true;
     m_activeList = slot.list.Get();
     m_shadowCount = 0;
@@ -544,6 +559,18 @@ void GameDx12NativeFrame12::Recording::EndWater() const noexcept
 
 HRESULT GameDx12NativeFrame12::Cancel() noexcept
 {
+    const auto close = CloseRecording();
+    if (auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr))
+    {
+        const auto cancel = descriptors->CancelUnsubmitted();
+        if (FAILED(cancel) && SUCCEEDED(close))
+            return cancel;
+    }
+    return close;
+}
+
+HRESULT GameDx12NativeFrame12::CloseRecording() noexcept
+{
     if (!m_recording)
         return S_FALSE;
     auto& slot = m_slots[m_slot];
@@ -566,6 +593,7 @@ HRESULT GameDx12NativeFrame12::Cancel() noexcept
     }
     m_activeList = nullptr;
     m_shadowCount = 0;
+    m_recordingFence = nullptr;
     m_recording = false;
     return hr;
 }
@@ -735,9 +763,18 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         lists[count++] = slot.shadows[index].list.Get();
     if (m_shadowCount != 0)
         lists[count++] = slot.colorPass.list.Get();
-    const HRESULT close = Cancel();
+    const uint64_t value = owner.fenceValue + 1;
+    if (m_pendingShadowDescriptors && !m_pendingShadowDescriptors->Expects(owner.fence, value))
+    {
+        Cancel();
+        return E_UNEXPECTED;
+    }
+    const HRESULT close = CloseRecording();
     if (FAILED(close))
+    {
+        Cancel();
         return close;
+    }
 
     m_submitted = true;
     owner.queue.ExecuteCommandLists(count, lists.data());
@@ -756,14 +793,25 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
                 Msg("ph_dx12_f42: fault device removal unavailable (ID3D12Device5)");
         }
     }
-    const uint64_t value = owner.fenceValue + 1;
     const HRESULT signal = owner.queue.Signal(&owner.fence, value);
+    auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr);
     if (FAILED(signal))
     {
+        if (descriptors)
+            descriptors->Quarantine();
         m_unknown = true;
         return signal;
     }
     owner.fenceValue = slot.fence = value;
+    if (descriptors)
+    {
+        const auto commit = descriptors->CommitSubmitted(owner.fence, value);
+        if (FAILED(commit))
+        {
+            m_unknown = true;
+            return commit;
+        }
+    }
     const HRESULT hr = m_swapchain->Present(1, 0);
     if (hr == S_OK)
     {
@@ -809,6 +857,9 @@ void GameDx12NativeFrame12::Release() noexcept
 
 void GameDx12NativeFrame12::Quarantine() noexcept
 {
+    if (auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr))
+        descriptors->Quarantine();
+    m_recordingFence = nullptr;
     // Fence без подтверждения: ссылки живут до завершения процесса.
     m_unknown = true;
     m_recording = false;
