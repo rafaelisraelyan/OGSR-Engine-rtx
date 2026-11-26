@@ -4,6 +4,7 @@
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
 #include "GameDx12FrameStructuredUpload.h"
+#include "GameDx12ShadowAddress.h"
 #include "gr/jobs/JobGroup.h"
 #include "gr/jobs/JobSystem.h"
 
@@ -226,8 +227,10 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
     if (x >= count && x < count + LightingFlags.z)
     {
         uint layer = x - count;
-        float stored = LocalShadow.Load(int4(1,1,layer,0));
-        float threshold = .03125 * (layer + 1);
+        // Independent expected physical mapping, not a read from metadata.
+        const uint physical = layer % 8 < 2 ? layer ^ 1u : layer;
+        float stored = LocalShadow.Load(int4(1,1,physical,0));
+        float threshold = .03125 * (physical + 1);
         return float4(stored,SampleLocalVisibility(float3(.25,.25,threshold),layer),
             SampleLocalVisibility(float3(.25,.25,threshold+.015625),layer),1);
     }
@@ -347,17 +350,21 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         frame.lightingFlags[3] = sunSlices;
         frame.lightingFlags[2] = localSlices;
         frame.localShadowConfig[0] = localSlices;
+        frame.localShadowConfig[1] = localSlices ? 1u : 0u;
+        frame.localShadowConfig[2] = localSlices;
         // Caller waits for GPU completion between fixture frames. Exercise
         // resource growth and accesses beyond 16 lights / 24 local matrices.
         const size_t recordCount = size_t(33) << (filter > 2 ? 2 : filter-1);
         std::vector<LocalLightGpu> localLights(recordCount);
-        std::vector<DirectX::XMFLOAT4X4> localProjections(recordCount);
+        std::vector<LocalShadowGpuProjection> localProjections(recordCount);
         localLights[32].colorInnerCos.w = .25f;
-        localProjections[31]._11 = .25f;
-        localProjections[31]._12 = .25f;
+        localProjections[31].matrix._11 = .25f;
+        localProjections[31].matrix._12 = .25f;
         for (uint32_t layer = 0; layer < localSlices; ++layer)
         {
-            auto& matrix = localProjections[layer];
+            auto& matrix = localProjections[layer].matrix;
+            localProjections[layer].address = game_shadow12::LegacyShadowAddress(layer,8);
+            if (layer%8<2) localProjections[layer].address.slice ^= 1u;
             // Fixed interior clip coordinate; independently test bank/face selection.
             matrix._34 = .5f;
             matrix._44 = 1;
@@ -383,7 +390,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         ComPtr<ID3D12Device> device;
         Require(constants->GetDevice(IID_PPV_ARGS(device.GetAddressOf())),"fixture buffer device");
         Require(lights.Write(*device.Get(),std::span<const LocalLightGpu>(localLights)),"fixture lights upload");
-        Require(projections.Write(*device.Get(),std::span<const DirectX::XMFLOAT4X4>(localProjections)),"fixture matrix upload");
+        Require(projections.Write(*device.Get(),std::span<const LocalShadowGpuProjection>(localProjections)),"fixture matrix upload");
         ID3D12DescriptorHeap* heaps[] = {srv.Get()};
         list.SetDescriptorHeaps(1, heaps);
         list.SetPipelineState(pipeline.Get());

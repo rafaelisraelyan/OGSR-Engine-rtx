@@ -65,7 +65,7 @@ int main()
     {
         const auto local = ref::Pixel(4 + layer, 1, 4, 24, 4);
         const auto projection = ref::Pixel(4 + layer, 5, 4, 24, 4);
-        Require(local.rgba[0] == ref::LocalDepth(layer) && local.rgba[1] == 1 && local.rgba[2] == 0);
+        Require(local.rgba[0] == ref::LocalDepth(ref::PhysicalLocalLayer(layer)) && local.rgba[1] == 1 && local.rgba[2] == 0);
         Require(projection.rgba[0] == 1.0/255 && projection.rgba[1] == (layer+1)/255.0);
         ++checks;
     }

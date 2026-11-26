@@ -12,6 +12,7 @@ constexpr float Bias = 0.03125f;
 constexpr uint32_t ProbeCount = 8;
 constexpr float SunDepth(uint32_t slice) { return 0.125f + 0.25f * slice; }
 constexpr float LocalDepth(uint32_t layer) { return 0.03125f * (layer + 1); }
+constexpr uint32_t PhysicalLocalLayer(uint32_t logical) { return logical%8<2 ? logical^1u : logical; }
 
 // Lower five rows are uniform; the upper three rows of slice zero
 // contain a vertical step and a checkerboard.
@@ -94,7 +95,7 @@ inline Expected Pixel(uint32_t x,uint32_t y,uint32_t sun,uint32_t local,uint32_t
         if (x >= ProbeCount) return {{0,0,0,1},Pcf};
         return {{Filter(filter,Probes[x],false),Filter(filter,Probes[x],true),x == 0 ? .25 : x == 1 ? .75 : 0,1},Pcf};
     }
-    if (x >= sun && x < sun+local) return {{LocalDepth(x-sun),1,0,1},Local};
+    if (x >= sun && x < sun+local) return {{LocalDepth(PhysicalLocalLayer(x-sun)),1,0,1},Local};
     if (x >= sun) return {{0,0,1,1},Inactive,1};
     // Wide 7x7 reaches patterned rows and white border even in the
     // primary/overlap probes. Compute the original fixture projection.

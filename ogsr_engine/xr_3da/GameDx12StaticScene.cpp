@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "GameDx12StaticScene.h"
+#include "GameDx12ShadowAddress.h"
 #include "GameDx12J2APreparation.h"
 #include "GameDx12SunCascades.h"
 
@@ -35,7 +36,7 @@ using gameaux12::SurfaceMode;
 constexpr uint32_t kPointShadowFaces = game_shadow12::PointFaces;
 constexpr uint32_t kLocalShadowLayers = game_shadow12::LocalLayers;
 constexpr uint32_t kLocalShadowSize = 1024;
-static_assert(kLocalShadowLayers == 24); // Legacy banked texture/view layout, not a CBV capacity.
+static_assert(kLocalShadowLayers == 24); // Legacy physical bank layout, not a projection ABI capacity.
 
 struct LocalLightGpu
 {
@@ -44,6 +45,14 @@ struct LocalLightGpu
     DirectX::XMFLOAT4 colorInnerCos;
     uint32_t type[4];
 };
+
+struct LocalShadowGpuProjection
+{
+    DirectX::XMFLOAT4X4 matrix;
+    game_shadow12::ShadowViewAddress address;
+};
+static_assert(sizeof(LocalShadowGpuProjection)==80);
+static_assert(offsetof(LocalShadowGpuProjection,address)==64);
 
 // Per-frame scalar ABI; variable local records live in root SRVs.
 struct SceneFrameConstants
@@ -69,7 +78,7 @@ struct SceneFrameConstants
     std::array<DirectX::XMFLOAT4, game_shadow12::MaxSunCascades> sunCascadeData; // near, far, blend, world texel
     std::array<float, game_shadow12::MaxSunCascades> sunDepthBias; // Нормализованный receiver bias по срезам.
     uint32_t sunCasterCounts[4];
-    uint32_t localShadowConfig[4]; // x: actual allocated legacy slices and uploaded matrices.
+    uint32_t localShadowConfig[4]; // x: projection count; y: bound page count; z: legacy page slice count.
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -588,8 +597,6 @@ D3D12_RESOURCE_DESC BufferDesc(uint64_t size)
 }
 
 constexpr const char* kFrameShaderConstants = R"(
-#define LOCAL_SHADOW_LAYERS 24
-#define LOCAL_SHADOW_BANK_SIZE 8
 struct LocalLightData
 {
     float4 positionInverseRangeSquared;
@@ -633,6 +640,7 @@ struct LocalShadowMatrix
     float4 column1;
     float4 column2;
     float4 column3;
+    uint4 address; // page ordinal, physical slice, resolution, group/face
 };
 StructuredBuffer<LocalLightData> LocalLights : register(t13);
 StructuredBuffer<LocalShadowMatrix> LocalShadowMatrices : register(t14);
@@ -659,7 +667,7 @@ float4 ProjectShadow(float4 world)
     const uint localSlice = ShadowLayer - 4u;
     if (ShadowLayer < 4u)
         return mul(world, SunShadowViewProjection[slice]);
-    if (localSlice < LOCAL_SHADOW_LAYERS && localSlice < LocalShadowConfig.x)
+    if (localSlice < LocalShadowConfig.x)
         return ProjectLocalMatrix(world, localSlice);
     return float4(0, 0, 2, 1);
 }
@@ -1242,6 +1250,15 @@ static const uint LOCAL_OUTSIDE = 2;
 static const uint LOCAL_BAD_LAYER = 3;
 static const uint LOCAL_BAD_PROJECTION = 4;
 
+// The current binding exposes only legacy page zero. Reject an unbound
+// ordinal instead of silently sampling another page. Multi-page
+// descriptor indexing is introduced with the physical page runtime.
+bool ValidLocalAddress(uint4 address)
+{
+    return address.x == 0u && address.x < LocalShadowConfig.y &&
+        address.y < LocalShadowConfig.z && address.z > 0u;
+}
+
 uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
                         out float3 coords, out uint layer)
 {
@@ -1250,16 +1267,19 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     if (source.type.y == 0)
         return LOCAL_NO_MAP;
     layer = source.type.y - 1;
-    // Each bank contains two spot slices followed by a contiguous six-face point map.
-    const uint bankOffset = layer % LOCAL_SHADOW_BANK_SIZE;
-    if (layer >= min(LocalShadowConfig.x, (uint)LOCAL_SHADOW_LAYERS) ||
-        (source.type.x == 0 && (bankOffset != 2u || layer + 5u >= LocalShadowConfig.x)) ||
-        (source.type.x == 1 && bankOffset >= 2u) || source.type.x > 1)
+    if (layer >= LocalShadowConfig.x || source.type.x > 1u)
+        return LOCAL_BAD_LAYER;
+    const uint faces = source.type.x == 0u ? 6u : 1u;
+    const uint first = layer;
+    if (faces > LocalShadowConfig.x - first)
+        return LOCAL_BAD_LAYER;
+    const uint4 baseAddress = LocalShadowMatrices[first].address;
+    if (!ValidLocalAddress(baseAddress) || baseAddress.w != faces)
         return LOCAL_BAD_LAYER;
     // Смещение задаётся в метрах. Грань point-карты выбирается уже
     // по смещённому приёмнику, который будет спроецирован в эту грань.
     const float3 lightPosition = source.positionInverseRangeSquared.xyz;
-    const float footprint = clamp(length(position - lightPosition) * (1.0f / 1024.0f), 0.004f, 0.05f);
+    const float footprint = clamp(length(position - lightPosition) / (float)baseAddress.z, 0.004f, 0.05f);
     const float3 receiver = position + lightDirection * 0.003f +
         normal * (footprint * (1.0f - saturate(dot(normal, lightDirection))));
     if (source.type.x == 0)
@@ -1273,7 +1293,13 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
         else
             layer += delta.z >= 0.0f ? 4 : 5;
     }
-    if (layer >= min(LocalShadowConfig.x, (uint)LOCAL_SHADOW_LAYERS))
+    if (layer >= LocalShadowConfig.x)
+        return LOCAL_BAD_LAYER;
+    const uint4 address = LocalShadowMatrices[layer].address;
+    const uint face = layer - first;
+    if (!ValidLocalAddress(address) || address.x != baseAddress.x ||
+        address.z != baseAddress.z || address.y < baseAddress.y ||
+        address.y - baseAddress.y != face || address.w != (faces | (face << 8)))
         return LOCAL_BAD_LAYER;
     const float4 clipPosition = ProjectLocalMatrix(float4(receiver, 1.0f), layer);
     if (!all(isfinite(clipPosition)) || clipPosition.w <= 0.0f)
@@ -1287,19 +1313,25 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
 
 float SampleLocalVisibility(float3 coords, uint layer)
 {
-    const float2 halfTexel = 0.5f / 1024.0f;
+    if (layer >= LocalShadowConfig.x)
+        return 1.0f;
+    const uint4 address = LocalShadowMatrices[layer].address;
+    if (!ValidLocalAddress(address))
+        return 1.0f;
+    const uint physicalSlice = address.y;
+    const float2 halfTexel = 0.5f / (float)address.z;
     const float2 center = clamp(coords.xy, halfTexel, 1.0f - halfTexel);
-    float visibility = LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(center, layer), coords.z);
+    float visibility = LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(center, physicalSlice), coords.z);
     [branch]
     if (visibility > 0.0f && visibility < 1.0f)
     {
         // Узкий PCF на границе. Не читаем белый border за последним текселем.
-        const float2 offset = float2(0.55f, 0.55f) / 1024.0f;
+        const float2 offset = float2(0.55f, 0.55f) / (float)address.z;
         const float2 low = clamp(coords.xy - offset, halfTexel, 1.0f - halfTexel);
         const float2 high = clamp(coords.xy + offset, halfTexel, 1.0f - halfTexel);
         visibility = (visibility +
-            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(low, layer), coords.z) +
-            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(high, layer), coords.z)) / 3.0f;
+            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(low, physicalSlice), coords.z) +
+            LocalShadow.SampleCmpLevelZero(SunShadowSampler, float3(high, physicalSlice), coords.z)) / 3.0f;
     }
     return visibility;
 }
@@ -1870,7 +1902,7 @@ bool BuildLocalShadowProjection(const gamelight12::LocalLight& light, LocalProje
 bool SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
     uint32_t banks, game_shadow12::LocalAllocationState& previous,
     const SceneFrameConstants& constants, std::span<LocalLightGpu> localLights,
-    std::span<DirectX::XMFLOAT4X4> localProjections, LocalShadowViews& views)
+    std::span<LocalShadowGpuProjection> localProjections, LocalShadowViews& views)
 {
     const uint32_t lightCount = constants.lightingFlags[2];
     if (lightCount != localLights.size() || lightCount != lighting.localLights.size() ||
@@ -1911,7 +1943,7 @@ bool SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
         for (uint32_t face = 0; face < projection.count; ++face)
         {
             const uint32_t layer = first + face;
-            localProjections[layer] = projection.matrices[face];
+            localProjections[layer].matrix = projection.matrices[face];
             views.frusta[layer] = projection.frusta[face];
             views.active[layer] = true;
             ++views.count;
@@ -3778,11 +3810,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const auto cullStart = Clock::now();
     SceneFrameConstants constants{};
     std::vector<LocalLightGpu> localLights;
-    std::vector<DirectX::XMFLOAT4X4> localProjections;
+    std::vector<LocalShadowGpuProjection> localProjections;
     if (m_localShadow && m_localShadowSlices > kLocalShadowLayers)
         return Fail(reason, "invalid legacy shadow slice count");
     if (m_localShadow)
+    {
         localProjections.resize(m_localShadowSlices);
+        for (uint32_t slice=0;slice<m_localShadowSlices;++slice)
+            localProjections[slice].address = game_shadow12::LegacyShadowAddress(slice,kLocalShadowSize);
+    }
     game_shadow12::SunPlan sunPlan;
     std::array<std::array<FrustumPlane, 6>, game_shadow12::MaxSunCascades> sunPlanes{};
     LocalShadowViews localShadowViews;
@@ -3795,6 +3831,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     constants.sunReceiverBiasMask = sunSettings.biasMask & 3u;
     constants.sunShadowResolution = m_sunShadowResolution;
     constants.localShadowConfig[0] = m_localShadow ? m_localShadowSlices : 0;
+    constants.localShadowConfig[1] = m_localShadow ? 1u : 0u;
+    constants.localShadowConfig[2] = constants.localShadowConfig[0];
     constants.diagnosticLight[1] = lighting.tracedLightId != 0 ? 1u : 0u;
     constants.diagnosticLight[2] = frameSlot;
     constants.diagnosticLight[3] = static_cast<uint32_t>(lighting.frame);
@@ -3988,7 +4026,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     if (FAILED(lightHr))
         return Fail(reason, "local light structured upload failed");
     const HRESULT projectionHr = projectionUpload.Write(*recording.device,
-        std::span<const DirectX::XMFLOAT4X4>(localProjections));
+        std::span<const LocalShadowGpuProjection>(localProjections));
     if (FAILED(projectionHr))
         return Fail(reason, "local projection structured upload failed");
     std::memcpy(frameDestination, &constants, sizeof(constants));

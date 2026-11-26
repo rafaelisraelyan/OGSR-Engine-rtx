@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GameDx12ShadowPagePlan.h"
+#include "GameDx12ShadowAddress.h"
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -269,6 +270,28 @@ public:
 
     const ShadowPagePlan* PreparedPlan() const noexcept { return pending_ ? &pending_->plan : nullptr; }
     uint64_t CurrentBytes() const noexcept { return bytes_; }
+
+    // Build the descriptor ordinal / logical projection mapping from actual
+    // staged resources, not the nominal adaptive assignment. Only usable
+    // before Commit/Cancel on the owner thread.
+    bool BuildPreparedAddresses(ShadowAddressPlan& out) const
+    {
+        if (!pending_ || unknown_) return false;
+        const auto& arena=pending_->plan.next;
+        return BuildShadowAddresses(std::span<const ShadowPage>(arena.pages),
+            std::span<const ShadowPlacement>(arena.placed),out);
+    }
+
+    bool GetPreparedPageSrv(uint64_t page,D3D12_CPU_DESCRIPTOR_HANDLE& out) const noexcept
+    {
+        out={};
+        if (!pending_ || unknown_) return false;
+        const auto it=std::find_if(pending_->pages.begin(),pending_->pages.end(),
+            [&](const auto& p){return p.description.id==page;});
+        if (it==pending_->pages.end()) return false;
+        out=it->srv->GetCPUDescriptorHandleForHeapStart();
+        return true;
+    }
 
     struct View
     {

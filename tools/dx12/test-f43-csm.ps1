@@ -89,6 +89,10 @@ try {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & ./local-light-capture.exe 2>&1 | Tee-Object -FilePath local-light-capture.log
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & $cl @common "$PSScriptRoot/test-f43-shadow-address.cpp" /Fe:shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address-build.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & ./shadow-address.exe 2>&1 | Tee-Object -FilePath shadow-address.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
         $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','dxguid.lib','user32.lib'

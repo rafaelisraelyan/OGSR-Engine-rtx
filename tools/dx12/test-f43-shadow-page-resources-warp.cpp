@@ -82,6 +82,19 @@ int main()
         "physical plan and allocation accounting");
     const auto point=plan->next.placed[0];
     Check(point.faces==6,"point group atomic");
+    ShadowAddressPlan addresses;
+    Check(owner.BuildPreparedAddresses(addresses) && addresses.pageIds.size()==1 &&
+        addresses.groups.size()==2 && addresses.views.size()==7,"physical page addresses");
+    Check(addresses.groups[0].light==1 && addresses.groups[0].faces==6,"stable point group identity");
+    for (uint32_t face=0;face<6;++face)
+    {
+        const auto& v=addresses.views[addresses.groups[0].firstProjection+face];
+        Check(addresses.pageIds[v.page]==point.page && v.slice==point.first+face &&
+            v.resolution==128 && v.group==(6u|(face<<8)),"physical point face mapping");
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE pageSrv{};
+    Check(owner.GetPreparedPageSrv(point.page,pageSrv) && pageSrv.ptr!=0,"page descriptor lookup");
+    Check(!owner.GetPreparedPageSrv(0,pageSrv) && pageSrv.ptr==0,"invalid page descriptor rejected");
     ShadowPageResources::View a,b,bad;
     Require(owner.GetView(point.page,point.first,a)?S_OK:E_FAIL,"point face 0 view");
     Require(owner.GetView(point.page,point.first+5,b)?S_OK:E_FAIL,"point face 5 view");
