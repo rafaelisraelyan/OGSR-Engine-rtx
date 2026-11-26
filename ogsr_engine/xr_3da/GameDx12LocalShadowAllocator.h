@@ -5,12 +5,13 @@
 #include <cmath>
 #include <limits>
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 namespace game_shadow12
 {
-// CPU-only, owner-thread allocation of complete spot/cubemap slots.
+// Dynamic candidate admission; the physical bank layout is still legacy.
 // This remembers ownership, never claims the old GPU depth contents are valid.
-constexpr uint32_t MaxLocalCandidates = 16;
 constexpr uint32_t NoCandidate = UINT32_MAX;
 struct LocalCandidate
 {
@@ -31,16 +32,16 @@ struct LocalAllocation
     LocalAllocationState next{};
     std::array<uint32_t, MaxLocalSlots> candidate{};
     uint32_t eligible = 0, retained = 0, assigned = 0, released = 0, misses = 0;
-    uint32_t eligibleMask = 0;
+    std::vector<uint8_t> eligibleCandidates;
 };
 
 inline LocalAllocation AllocateLocalShadows(std::span<const LocalCandidate> input,
     uint32_t banks, uint64_t session, uint64_t epoch, const LocalAllocationState& previous,
-    bool stablePriority = true) noexcept
+    bool stablePriority = true)
 {
     LocalAllocation out;
     out.candidate.fill(NoCandidate);
-    if (!ValidBanks(banks) || input.size() > MaxLocalCandidates)
+    if (!ValidBanks(banks) || input.size() > UINT32_MAX)
         return out;
     out.next.session = session;
     out.next.epoch = epoch;
@@ -48,21 +49,25 @@ inline LocalAllocation AllocateLocalShadows(std::span<const LocalCandidate> inpu
     const bool sameLevel = previous.session == session && previous.epoch == epoch && ValidBanks(previous.banks);
     const uint32_t oldSlots = sameLevel ? previous.banks * SlotsPerBank : 0;
     const uint32_t slots = banks * SlotsPerBank;
-    std::array<bool, MaxLocalCandidates> eligible{}, selected{};
-    std::array<double, MaxLocalCandidates> scores{};
+    out.eligibleCandidates.resize(input.size());
+    std::vector<uint8_t> selected(input.size());
+    std::vector<double> scores(input.size());
+    // Count duplicate eligible identities once in O(n), including invalid
+    // scores, preserving the previous rejection semantics.
+    std::unordered_map<uint64_t, uint8_t> identities;
+    identities.reserve(input.size());
+    for (const auto& c : input)
+        if (c.eligible && c.id)
+        {
+            const auto [it, inserted] = identities.try_emplace(c.id, 1);
+            if (!inserted) it->second = 2;
+        }
     for (uint32_t i = 0; i < input.size(); ++i)
     {
         const auto& c = input[i];
-        if (!c.eligible || !c.id || !std::isfinite(c.score) || c.score < 0)
+        if (!c.eligible || !c.id || !std::isfinite(c.score) || c.score < 0 || identities.at(c.id) != 1)
             continue;
-        // Reject ambiguous identities rather than bind a map to the wrong light.
-        uint32_t copies = 0;
-        for (const auto& other : input)
-            copies += other.eligible && other.id == c.id;
-        if (copies != 1)
-            continue;
-        eligible[i] = true;
-        out.eligibleMask |= 1u << i;
+        out.eligibleCandidates[i] = 1;
         ++out.eligible;
         bool held = false;
         for (uint32_t s = 0; s < oldSlots; ++s)
@@ -78,7 +83,7 @@ inline LocalAllocation AllocateLocalShadows(std::span<const LocalCandidate> inpu
         uint32_t best = NoCandidate;
         for (uint32_t i = 0; i < input.size(); ++i)
         {
-            if (!eligible[i] || selected[i] || input[i].spot != SpotSlot(s))
+            if (!out.eligibleCandidates[i] || selected[i] || input[i].spot != SpotSlot(s))
                 continue;
             const bool better = best == NoCandidate ||
                 (!stablePriority && input[i].near != input[best].near ? input[i].near :

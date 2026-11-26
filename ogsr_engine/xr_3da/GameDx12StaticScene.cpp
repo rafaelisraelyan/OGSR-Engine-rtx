@@ -678,8 +678,8 @@ bool CompileShader(const char* source, const char* entryPoint,
                    std::string& reason)
 {
     ComPtr<ID3D10Blob> error;
-    const auto maxLocalLights = std::to_string(gamelight12::MaxLocalLights);
-    const D3D_SHADER_MACRO definitions[] = {{"MAX_LOCAL_LIGHTS", maxLocalLights.c_str()}, {nullptr, nullptr}};
+    const auto maxLocalLights = std::to_string(gamelight12::LegacyDiagnosticLightScale);
+    const D3D_SHADER_MACRO definitions[] = {{"LEGACY_DIAGNOSTIC_LIGHT_SCALE", maxLocalLights.c_str()}, {nullptr, nullptr}};
     const std::string shader = std::string(kFrameShaderConstants) + source;
     const HRESULT hr = D3DCompile(shader.data(), shader.size(), nullptr, definitions,
                                   nullptr, entryPoint, target, 0, 0, outBlob,
@@ -1624,7 +1624,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         if (DiagnosticLight.x == 0 || DiagnosticLight.x > count)
             return float4(1.0f, 0.0f, 1.0f, 1.0f);
         if (ViewMode == 16)
-            return float4(DiagnosticLight.x / (float)MAX_LOCAL_LIGHTS,
+            return float4(DiagnosticLight.x / (float)max((uint)LEGACY_DIAGNOSTIC_LIGHT_SCALE,count),
                           (DiagnosticLight.w & 255u) / 255.0f, DiagnosticLight.z / 2.0f, 1.0f);
         const LocalLightData source = LocalLights[DiagnosticLight.x - 1];
         const float3 toLight = source.positionInverseRangeSquared.xyz - input.world;
@@ -1818,8 +1818,8 @@ struct LocalShadowViews
 {
     std::array<std::array<FrustumPlane, 6>, kLocalShadowLayers> frusta{};
     std::array<bool, kLocalShadowLayers> active{};
-    std::array<bool, gamelight12::MaxLocalLights> invalidProjection{};
-    std::array<bool, gamelight12::MaxLocalLights> suppressed{};
+    std::vector<uint8_t> invalidProjection;
+    std::vector<uint8_t> suppressed;
     uint32_t count = 0;
 };
 
@@ -1867,24 +1867,27 @@ bool BuildLocalShadowProjection(const gamelight12::LocalLight& light, LocalProje
     return true;
 }
 
-void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
+bool SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
     uint32_t banks, game_shadow12::LocalAllocationState& previous,
     const SceneFrameConstants& constants, std::span<LocalLightGpu> localLights,
     std::span<DirectX::XMFLOAT4X4> localProjections, LocalShadowViews& views)
 {
-    static_assert(gamelight12::MaxLocalLights == game_shadow12::MaxLocalCandidates);
     const uint32_t lightCount = constants.lightingFlags[2];
-    if (lightCount > gamelight12::MaxLocalLights || lightCount != localLights.size() ||
+    if (lightCount != localLights.size() || lightCount != lighting.localLights.size() ||
+        lightCount != views.invalidProjection.size() || lightCount != views.suppressed.size() ||
         !game_shadow12::ValidBanks(banks) || localProjections.size() != banks * game_shadow12::LayersPerBank)
-        return;
-    std::array<game_shadow12::LocalCandidate, gamelight12::MaxLocalLights> candidates{};
-    std::array<LocalProjection, gamelight12::MaxLocalLights> projections{};
+        return false;
+    std::vector<game_shadow12::LocalCandidate> candidates(lightCount);
+    // Validate all eligible projections, but retain only selected matrices.
+    // Rebuild the small set of winners instead of storing six matrices and
+    // six frusta for every visible light in a potentially large frame.
     for (uint32_t i = 0; i < lightCount; ++i)
     {
         const auto& light = lighting.localLights[i];
         if (!light.castsShadow || !light.id)
             continue;
-        if (!BuildLocalShadowProjection(light, projections[i]))
+        LocalProjection validation;
+        if (!BuildLocalShadowProjection(light, validation))
         {
             views.invalidProjection[i] = true;
             continue;
@@ -1895,13 +1898,15 @@ void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
     const auto plan = game_shadow12::AllocateLocalShadows(
         std::span(candidates.data(), lightCount), banks, lighting.levelSession, lighting.levelEpoch,
         previous, SceneStableLocalPriorityRequested());
+    if (plan.eligibleCandidates.size() != lightCount) return false;
     for (uint32_t slot = 0; slot < banks * game_shadow12::SlotsPerBank; ++slot)
     {
         const uint32_t index = plan.candidate[slot];
         if (index == game_shadow12::NoCandidate)
             continue;
         const auto& light = lighting.localLights[index];
-        const auto& projection = projections[index];
+        LocalProjection projection;
+        if (!BuildLocalShadowProjection(light, projection)) return false;
         const uint32_t first = game_shadow12::SlotBase(slot);
         for (uint32_t face = 0; face < projection.count; ++face)
         {
@@ -1923,7 +1928,7 @@ void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
     // lights or the deliberate NoLocalShadows mode. Default remains legacy.
     if (SceneSuppressUnmappedLocalLightsRequested())
         for (uint32_t i = 0; i < lightCount; ++i)
-            if ((plan.eligibleMask & (1u << i)) != 0 && lighting.localLights[i].sourceShadow &&
+            if (plan.eligibleCandidates[i] != 0 && lighting.localLights[i].sourceShadow &&
                 localLights[i].type[1] == 0)
             {
                 auto& color = localLights[i].colorInnerCos;
@@ -1935,6 +1940,7 @@ void SelectLocalShadowViews(const gamelight12::FrameSnapshot& lighting,
         Msg("ph_dx12_lsa: frame=%llu banks=%u eligible=%u assigned=%u retained=%u released=%u misses=%u suppressed=%u views=%u",
             static_cast<unsigned long long>(lighting.frame), banks, plan.eligible, plan.assigned,
             plan.retained, plan.released, plan.misses, suppressed, views.count);
+    return true;
 }
 
 uint32_t SceneViewMode()
@@ -3846,8 +3852,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         if (lighting.localEnabled)
         {
-            const uint32_t lightCount = (std::min)(lighting.localCount, static_cast<uint32_t>(lighting.localLights.size()));
+            if (lighting.localCount != lighting.localLights.size())
+                return Fail(reason, "local light snapshot count mismatch");
+            const uint32_t lightCount = lighting.localCount;
             localLights.resize(lightCount);
+            localShadowViews.invalidProjection.resize(lightCount);
+            localShadowViews.suppressed.resize(lightCount);
             constants.lightingFlags[2] = lightCount;
             for (uint32_t index = 0; index < lightCount; ++index)
             {
@@ -3865,8 +3875,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
             {
                 const auto selectionStart = Clock::now();
-                SelectLocalShadowViews(lighting, m_localShadowSlices / game_shadow12::LayersPerBank,
-                    m_localShadowAllocation, constants, localLights, localProjections, localShadowViews);
+                if (!SelectLocalShadowViews(lighting, m_localShadowSlices / game_shadow12::LayersPerBank,
+                    m_localShadowAllocation, constants, localLights, localProjections, localShadowViews))
+                    return Fail(reason, "invalid local shadow selection");
                 for (uint32_t slot = 0; slot < lightCount; ++slot)
                 {
                     const auto layerPlusOne = localLights[slot].type[1];

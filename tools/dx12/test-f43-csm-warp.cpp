@@ -177,7 +177,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position
     return float4(p[id], 0, 1);
 }
 )";
-        std::string pixel = "#define MAX_LOCAL_LIGHTS " + std::to_string(gamelight12::MaxLocalLights) +
+        std::string pixel = "#define LEGACY_DIAGNOSTIC_LIGHT_SCALE " + std::to_string(gamelight12::LegacyDiagnosticLightScale) +
             "\n" + kFrameShaderConstants + kScenePixelShader + R"(
 float4 probe(float4 pixel : SV_Position) : SV_Target
 {

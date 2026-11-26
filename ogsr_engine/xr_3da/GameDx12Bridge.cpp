@@ -60,6 +60,8 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <stdexcept>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -1744,6 +1746,15 @@ const LightingDiagnostics& LightingDiagnosticOptions()
     return options;
 }
 
+void RequireLocalLightOrder(gamelight12::FrameSnapshot& snapshot)
+{
+    if (!gamelight12::FinalizeLocalLightOrder(snapshot))
+    {
+        Msg("ph_dx12_local: rejected frame: invalid identity or unrepresentable light count");
+        throw std::runtime_error("invalid local light snapshot");
+    }
+}
+
 void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics& options,
                               const float position[3], gamelight12::FrameSnapshot& snapshot)
 {
@@ -1751,12 +1762,14 @@ void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics&
     auto& probe = state.localLightProbe;
     auto& lights = snapshot.localLights;
     auto& count = snapshot.localCount;
+    lights.clear();
     count = 0;
     snapshot.probeMode = options.freezeRecord ? FrameSnapshot::ProbeMode::FrozenRecord :
         FrameSnapshot::ProbeMode::FixedSelection;
     if (options.freezeRecord && probe.frozen.id != 0)
     {
-        lights[count++] = probe.frozen;
+        lights.push_back(probe.frozen);
+        RequireLocalLightOrder(snapshot);
         return;
     }
 
@@ -1767,6 +1780,7 @@ void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics&
     const bool limitShadows = ps_r2_ls_flags.test(R2FLAG_LIGHT_NO_DIST_SHADOWS);
     for (ISpatial* entry : state.nearLightQuery)
     {
+        if (!entry) continue;
         const IRender_Light* source = entry->dcast_Light();
         gamelight12::LocalLight candidate;
         if (!source || gamelight12::ReadWorldLight(*source, candidate) != gamelight12::LocalRejection::None ||
@@ -1780,7 +1794,7 @@ void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics&
             // от данных GPU и выбранного пикселя.
             candidate.castsShadow = false;
             probe.frozen = candidate;
-            lights[count++] = candidate;
+            lights.push_back(candidate);
             break;
         }
         if (std::find(options.fixedIds.begin(), options.fixedIds.begin() + options.fixedCount, candidate.id) ==
@@ -1794,12 +1808,13 @@ void OverrideDiagnosticLights(BridgeStateData& state, const LightingDiagnostics&
         const double luminance = 0.2126 * candidate.color.x + 0.7152 * candidate.color.y + 0.0722 * candidate.color.z;
         candidate.selectionScore = luminance * rangeSquared / (rangeSquared + distanceSquared);
         candidate.castsShadow = candidate.castsShadow && (!limitShadows || distanceSquared <= 10000.0);
-        lights[count++] = candidate;
-        if (count == options.fixedCount)
+        if (std::any_of(lights.begin(),lights.end(),[&](const auto& light){return light.id == candidate.id;}))
+            continue;
+        lights.push_back(candidate);
+        if (lights.size() == options.fixedCount)
             break;
     }
-    std::sort(lights.begin(), lights.begin() + count,
-        [](const auto& left, const auto& right) { return left.id < right.id; });
+    RequireLocalLightOrder(snapshot);
 }
 
 void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewProjection,
@@ -1906,30 +1921,10 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
                  (axial >= 0.0 && axial * axial >= distanceSquared * candidate.outerCos * candidate.outerCos));
             candidate.nearVolume = nearVolume;
             candidate.selectionScore = luminance * rangeSquared / (rangeSquared + distanceSquared);
-            ++snapshot.localCandidateCount;
-
-            uint32_t insert = 0;
-            for (; insert < snapshot.localCount; ++insert)
-            {
-                const auto& current = snapshot.localLights[insert];
-                if (candidate.nearVolume != current.nearVolume)
-                {
-                    if (candidate.nearVolume)
-                        break;
-                    continue;
-                }
-                if (candidate.selectionScore > current.selectionScore ||
-                    (candidate.selectionScore == current.selectionScore && candidate.id < current.id))
-                    break;
-            }
-            if (insert < snapshot.localLights.size())
-            {
-                if (snapshot.localCount < snapshot.localLights.size())
-                    ++snapshot.localCount;
-                for (uint32_t index = snapshot.localCount - 1; index > insert; --index)
-                    snapshot.localLights[index] = snapshot.localLights[index - 1];
-                snapshot.localLights[insert] = candidate;
-            }
+            // Admission is geometric/semantic, not a top-N lighting budget.
+            // Keep the score for shadow allocation; no light is discarded
+            // merely because another source has a higher score.
+            snapshot.localLights.push_back(candidate);
         }
 
         const bool fixedTrace = traceLightId == 0 && options.fixedCount != 0;
@@ -1973,24 +1968,26 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
         snapshot.localTrace[insert] = record;
     };
 
+    // Spatial queries may overlap or repeat entries. Visit each spatial
+    // object once; pointer keys are owner-thread transient, not GPU IDs.
+    std::unordered_set<ISpatial*> seen;
+    std::unordered_set<ISpatial*> nearEntries;
+    if (trace)
+        nearEntries.insert(state.nearLightQuery.begin(),state.nearLightQuery.end());
+    seen.reserve(state.lightQuery.size());
+    snapshot.localLights.reserve(state.lightQuery.size());
     for (ISpatial* entry : state.lightQuery)
-        consider(entry, true, trace &&
-            std::find(state.nearLightQuery.begin(), state.nearLightQuery.end(), entry) != state.nearLightQuery.end());
+        if (entry && seen.insert(entry).second)
+            consider(entry,true,trace && nearEntries.count(entry)!=0);
     for (ISpatial* entry : state.nearLightQuery)
-    {
-        if (std::find(state.lightQuery.begin(), state.lightQuery.end(), entry) == state.lightQuery.end())
-            consider(entry, false, true);
-    }
+        if (entry && seen.insert(entry).second)
+            consider(entry,false,true);
 
-    // При изменении ранга тот же набор света получает те же GPU-индексы.
-    std::sort(snapshot.localLights.begin(), snapshot.localLights.begin() + snapshot.localCount,
-        [](const auto& left, const auto& right) { return left.id < right.id; });
+    RequireLocalLightOrder(snapshot);
+    snapshot.localCandidateCount = snapshot.localCount;
     const auto slotOf = [&](uint64_t id)
     {
-        for (uint32_t i = 0; i < snapshot.localCount; ++i)
-            if (snapshot.localLights[i].id == id)
-                return static_cast<int32_t>(i);
-        return int32_t{-1};
+        return gamelight12::FindLocalLightSlot(snapshot,id);
     };
     const auto addMissing = [&](uint64_t id)
     {
@@ -2060,8 +2057,8 @@ void CaptureLocalLights(BridgeStateData& state, const DirectX::XMFLOAT4X4& viewP
         OverrideDiagnosticLights(state, options, position, snapshot);
     for (uint32_t i = 0; i < snapshot.localTraceCount; ++i)
         snapshot.localTrace[i].gpuSlot = slotOf(snapshot.localTrace[i].id);
-    for (uint32_t i = 0; i < snapshot.localCount; ++i)
-        snapshot.localShadowCandidateCount += snapshot.localLights[i].castsShadow ? 1u : 0u;
+    for (const auto& light : snapshot.localLights)
+        snapshot.localShadowCandidateCount += light.castsShadow ? 1u : 0u;
 }
 
 gamelight12::FrameSnapshot CaptureLighting(BridgeStateData& state,

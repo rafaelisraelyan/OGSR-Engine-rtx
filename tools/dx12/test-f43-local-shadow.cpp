@@ -13,17 +13,19 @@ static void Require(bool ok)
 }
 static void Validate(std::span<const LocalCandidate> in, uint32_t banks, const LocalAllocation& plan)
 {
-    uint32_t mask = 0, lights = 0, assigned = 0;
-    Require(std::popcount(plan.eligibleMask) == static_cast<int>(plan.eligible));
+    uint32_t mask = 0, assigned = 0;
+    std::vector<uint8_t> lights(in.size());
+    Require(plan.eligibleCandidates.size() == in.size());
+    Require(std::count(plan.eligibleCandidates.begin(), plan.eligibleCandidates.end(), 1) == plan.eligible);
     for (uint32_t s = 0; s < MaxLocalSlots; ++s)
     {
         const uint32_t i = plan.candidate[s];
         if (i == NoCandidate) { Require(plan.next.owners[s] == 0); continue; }
         Require(s < banks * SlotsPerBank && i < in.size());
         Require(in[i].eligible && in[i].id && in[i].spot == SpotSlot(s));
-        Require((plan.eligibleMask & (1u << i)) != 0);
-        Require(plan.next.owners[s] == in[i].id && !(lights & (1u << i)));
-        lights |= 1u << i;
+        Require(plan.eligibleCandidates[i] != 0);
+        Require(plan.next.owners[s] == in[i].id && !lights[i]);
+        lights[i] = 1;
         const uint32_t base = SlotBase(s), n = SpotSlot(s) ? 1 : PointFaces;
         Require(ValidBase(base, in[i].spot, banks) && base + n <= banks * LayersPerBank);
         for (uint32_t f = 0; f < n; ++f)
@@ -67,8 +69,24 @@ int main()
     Require(AllocateLocalShadows(points,1,1,1,previous).assigned == 0);
     Require(AllocateLocalShadows(in,0,1,1,{}).assigned == 0);
     Require(AllocateLocalShadows(in,4,1,1,{}).assigned == 0);
-    std::array<LocalCandidate,17> tooMany{};
-    Require(AllocateLocalShadows(tooMany,1,1,1,{}).assigned == 0);
+    std::vector<LocalCandidate> many(4096);
+    for (uint32_t i = 0; i < many.size(); ++i)
+        many[i] = {i+1, double(i+1), i%3 != 0, false, true};
+    for (uint32_t banks = 1; banks <= 3; ++banks)
+    {
+        const auto plan = AllocateLocalShadows(many,banks,1,1,{});
+        Validate(many,banks,plan);
+        Require(plan.eligible == many.size() && plan.assigned == banks*3);
+        for (uint32_t s=0; s<banks*SlotsPerBank; ++s) Require(plan.candidate[s] > 31);
+        auto reversed=many; std::reverse(reversed.begin(),reversed.end());
+        const auto again=AllocateLocalShadows(reversed,banks,1,1,plan.next);
+        Validate(reversed,banks,again);
+        Require(plan.next.owners==again.next.owners && again.retained==plan.assigned);
+    }
+    many.back().id=many.front().id;
+    const auto ambiguous=AllocateLocalShadows(many,3,1,1,{});
+    Validate(many,3,ambiguous);
+    Require(ambiguous.eligible==many.size()-2 && !ambiguous.eligibleCandidates.front() && !ambiguous.eligibleCandidates.back());
     std::mt19937 rng(4711);
     LocalAllocationState state{};
     for (uint32_t frame = 0; frame < 10000; ++frame)
@@ -94,5 +112,5 @@ int main()
                             Require(s == t);
         state = plan.next;
     }
-    std::printf("PASS: %u assertions, 10000 deterministic allocation frames\n",checks);
+    std::printf("PASS: %u assertions, 10000 deterministic allocation frames, 4096 candidates\n",checks);
 }

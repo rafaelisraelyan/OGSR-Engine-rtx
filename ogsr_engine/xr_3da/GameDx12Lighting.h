@@ -4,12 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <vector>
+#include <algorithm>
+#include <limits>
 
 class IRender_Light;
 
 namespace gamelight12
 {
-inline constexpr std::size_t MaxLocalLights = 16;
+// Legacy diagnostic color scale only; never an admission limit.
+inline constexpr std::size_t LegacyDiagnosticLightScale = 16;
 inline constexpr std::size_t MaxLocalLightTrace = 3;
 
 enum class LocalType : uint32_t
@@ -143,7 +147,7 @@ struct FrameSnapshot
     Vec3 ambient;
     Vec3 hemi; // Оттенок среды из R4 phase_combine, до декодирования.
     bool hemiEnabled = false;
-    std::array<LocalLight, MaxLocalLights> localLights{};
+    std::vector<LocalLight> localLights;
     uint32_t localCount = 0;
     uint32_t localCandidateCount = 0;
     uint32_t localShadowCandidateCount = 0;
@@ -155,4 +159,29 @@ struct FrameSnapshot
     std::array<LocalLightTrace, MaxLocalLightTrace> localTrace{};
     uint32_t localTraceCount = 0;
 };
+
+// Called on owner thread after capture, before publishing the immutable frame.
+// Invalid identity/count rejects the frame, not an arbitrary subset of lights.
+inline bool FinalizeLocalLightOrder(FrameSnapshot& snapshot)
+{
+    auto& lights = snapshot.localLights;
+    if (lights.size() > static_cast<std::size_t>((std::numeric_limits<int32_t>::max)())) return false;
+    std::sort(lights.begin(),lights.end(),
+        [](const auto& a,const auto& b){return a.id < b.id;});
+    if ((!lights.empty() && !lights.front().id) ||
+        std::adjacent_find(lights.begin(),lights.end(),
+            [](const auto& a,const auto& b){return a.id == b.id;}) != lights.end()) return false;
+    snapshot.localCount = static_cast<uint32_t>(lights.size());
+    return true;
+}
+
+// Only on a successfully finalized snapshot. IDs, not indices, identify
+// sources across frames; indices can shift as visibility changes.
+inline int32_t FindLocalLightSlot(const FrameSnapshot& snapshot, uint64_t id) noexcept
+{
+    const auto& lights = snapshot.localLights;
+    const auto it = std::lower_bound(lights.begin(),lights.end(),id,
+        [](const auto& light,uint64_t key){return light.id < key;});
+    return it != lights.end() && it->id == id ? static_cast<int32_t>(it-lights.begin()) : int32_t{-1};
+}
 }
