@@ -652,6 +652,33 @@ HRESULT GameDx12NativeFrame12::FinishCapture(const Owner& owner, uint64_t fence)
     return S_OK;
 }
 
+HRESULT GameDx12NativeFrame12::BeginScreenOverlay(ID3D12GraphicsCommandList*& list) noexcept
+{
+    list = nullptr;
+    if (!m_recording || m_unknown || m_submitted || !m_activeList ||
+        !m_width || !m_height || m_slot >= kFrameCount)
+        return E_UNEXPECTED;
+    auto& slot = m_slots[m_slot];
+    if (m_shadowCount != 0)
+    {
+        if (m_activeList != slot.colorPass.list.Get() || !slot.colorPass.open)
+            return E_UNEXPECTED;
+    }
+    else if (m_activeList != slot.list.Get())
+        return E_UNEXPECTED;
+    // The caller must have restored the swapchain color to RENDER_TARGET
+    // (e.g. EndWater). Screen overlays never bind the scene DSV.
+    const auto rtv = Rtv(m_slot);
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(m_width),
+        static_cast<float>(m_height), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height)};
+    m_activeList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    m_activeList->RSSetViewports(1, &viewport);
+    m_activeList->RSSetScissorRects(1, &scissor);
+    list = m_activeList;
+    return S_OK;
+}
+
 HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
 {
     if (!m_recording || m_unknown)

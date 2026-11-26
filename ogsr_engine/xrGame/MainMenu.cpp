@@ -336,6 +336,13 @@ void CMainMenu::OnRender()
         Render->Calculate();
     Render->Render();
 
+    RenderMenuUiOnly();
+}
+
+void CMainMenu::RenderMenuUiOnly()
+{
+    if (m_Flags.test(flGameSaveScreenshot))
+        return;
     ::Render->ui_is_rendering = true;
 
  //   if (!OnRenderPPUI_query())

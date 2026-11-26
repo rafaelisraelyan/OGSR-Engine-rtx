@@ -65,6 +65,10 @@ try {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & ./particle-materials.exe 2>&1 | Tee-Object -FilePath particle-materials.log
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & $cl @common "$PSScriptRoot/test-f45-ui-commands.cpp" /Fe:ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands-build.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & ./ui-commands.exe 2>&1 | Tee-Object -FilePath ui-commands.log
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
         $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','dxguid.lib','user32.lib'

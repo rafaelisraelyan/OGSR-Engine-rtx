@@ -72,6 +72,8 @@ public:
     void OnRenderPPUI_main();
     void OnRenderPPUI_PP();
 
+    // Draw original dialogs/fonts only; no world renderer or Present.
+    void RenderMenuUiOnly();
     virtual void OnRender();
     virtual void OnFrame(void);
     //virtual void StartStopMenu(CUIDialogWnd* pDialog, bool bDoHideIndicators);

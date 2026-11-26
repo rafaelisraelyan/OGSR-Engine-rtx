@@ -73,6 +73,10 @@ public:
 
     HRESULT Initialize(HWND window, IDXGIFactory2& factory, const Owner& owner);
     HRESULT Begin(HWND window, const Owner& owner, Recording& recording);
+    // Owner only, after all scene/color work, before Present. Borrowed list
+    // is valid only until Cancel/Present. Never use the initial Recording
+    // after BeginColorList has switched the active command list.
+    HRESULT BeginScreenOverlay(ID3D12GraphicsCommandList*& list) noexcept;
     HRESULT Present(const Owner& owner, uint64_t sceneFrame);
     HRESULT Cancel() noexcept;
     HRESULT Drain(const Owner& owner) noexcept;
