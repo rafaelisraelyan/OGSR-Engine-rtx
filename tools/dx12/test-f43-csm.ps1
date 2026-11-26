@@ -47,7 +47,7 @@ try {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $argsForWarp = '/DOGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE',"/I$gr/include",
         "$PSScriptRoot/test-f43-csm-warp.cpp",$nativePath,'/Fe:csm-warp.exe','/link',
-        $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','user32.lib'
+        $JobLibrary,'d3d12.lib','dxgi.lib','d3dcompiler.lib','dxguid.lib','user32.lib'
     & $cl @common @argsForWarp 2>&1 | Tee-Object -FilePath warp-build.log
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & ./csm-warp.exe @warpArgs 2>&1 | Tee-Object -FilePath warp.log

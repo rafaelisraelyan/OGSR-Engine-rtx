@@ -1,5 +1,7 @@
 # F4.3-CSM-R2 — GPU resource and shadow sampling audit
 
+> Historical report for the earlier fixture. The corrected test and its pending Windows validation are described in [sampling fixture hardening](dx12-f43-csm-r2-sampling-hardening.md). Earlier PASS results and CPU-only mutation checks do not establish GPU mutation coverage.
+
 26.11.2026 MSK. Проверен baseline `55023575828fb74cd174a20c6a05338777717b1e`.
 
 ## Findings

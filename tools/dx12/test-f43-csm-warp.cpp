@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <d3dcompiler.h>
+#include <d3d12shader.h>
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
 #include "gr/jobs/JobGroup.h"
@@ -11,7 +12,9 @@
 #include <string>
 #include <DirectXMath.h>
 #include "GameDx12Lighting.h"
+#include <cstddef>
 #include "production-shadow.inc"
+#include "test-f43-csm-sampling-reference.h"
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -21,29 +24,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-struct SamplingFrameConstants
-{
-    DirectX::XMFLOAT4X4 viewProjection;
-    DirectX::XMFLOAT4 cameraPosition;
-    std::array<DirectX::XMFLOAT4X4, 4> sunShadowViewProjection;
-    DirectX::XMFLOAT4 ambient, sunDirection, sunColor;
-    uint32_t lightingFlags[4];
-    std::array<uint8_t, 16 * 64> localLights{};
-    DirectX::XMFLOAT4 hemiColor;
-    DirectX::XMFLOAT4X4 inverseViewProjection;
-    DirectX::XMFLOAT4 waterWeather, waterSky;
-    std::array<DirectX::XMFLOAT4X4, 8> localShadowViewProjection;
-    uint32_t diagnosticLight[4];
-    DirectX::XMFLOAT4 diagnosticOrigin;
-    uint32_t legacyWaterSsr, sunFilter, sunReceiverBiasMask, sunShadowResolution;
-    DirectX::XMFLOAT4 sunCameraForward;
-    std::array<DirectX::XMFLOAT4, 4> sunCascadeData;
-    std::array<float, 4> sunDepthBias;
-    uint32_t sunCasterCounts[4];
-    std::array<uint8_t, 96> productionPadding{};
-};
-constexpr uint32_t kProductionFrameConstantsSize = sizeof(SamplingFrameConstants);
-static_assert(kProductionFrameConstantsSize == 2304);
+namespace ref = csm_reference;
 
 void Msg(const char* format, ...)
 {
@@ -60,24 +41,52 @@ void Check(bool ok, const char* operation)
         throw std::runtime_error(operation);
 }
 
-void CheckSamplingMutations()
+enum class Mutation { None, ForceSunZero, SwapSun, ReverseCompare, WrongNext, DisableBlend, WrongLocal };
+const char* MutationName(Mutation m)
 {
-    constexpr std::array<uint32_t, 4> selected{0, 1, 2, 3};
-    constexpr std::array<float, 4> depth{0.125f, 0.375f, 0.625f, 0.875f};
-    const auto valid = [&](const std::array<uint32_t, 4>& indices, const std::array<float, 4>& values)
-    { return indices == selected && values == depth; };
-    auto swapped = selected; std::swap(swapped[1], swapped[2]);
-    Check(!valid(swapped, depth), "mutation slice swap must fail");
-    auto wrongOperator = depth; wrongOperator[0] = 0.0f;
-    Check(!valid(selected, wrongOperator), "mutation comparison operator must fail");
-    auto wrongNext = selected; wrongNext[1] = 0;
-    Check(!valid(wrongNext, depth), "mutation next slice must fail");
-    auto noBlend = depth; noBlend[1] = depth[0];
-    Check(!valid(selected, noBlend), "mutation cascade blending must fail");
-    auto wrongLocal = depth; wrongLocal[3] = 0.0625f;
-    Check(!valid(selected, wrongLocal), "mutation local layer must fail");
-    auto forcedSlice0 = selected; forcedSlice0.fill(0);
-    Check(!valid(forcedSlice0, depth), "mutation forced sun slice zero must fail");
+    switch (m)
+    {
+    case Mutation::ForceSunZero: return "force-sun-slice-zero";
+    case Mutation::SwapSun: return "swap-sun-slices";
+    case Mutation::ReverseCompare: return "reverse-manual-comparison";
+    case Mutation::WrongNext: return "wrong-next-slice";
+    case Mutation::DisableBlend: return "disable-blending";
+    case Mutation::WrongLocal: return "wrong-local-layer";
+    default: return "control";
+    }
+}
+uint32_t RequiredFailure(Mutation m)
+{
+    switch (m)
+    {
+    case Mutation::WrongNext:
+    case Mutation::DisableBlend: return ref::Overlap;
+    case Mutation::WrongLocal: return ref::Local;
+    case Mutation::None: return 0;
+    default: return ref::Primary;
+    }
+}
+void ReplaceOnce(std::string& source, const std::string& from, const std::string& to)
+{
+    const auto at = source.find(from);
+    Check(at != std::string::npos && source.find(from,at+from.size()) == std::string::npos,
+        "mutation anchor missing or ambiguous; update fixture after production changes");
+    source.replace(at,from.size(),to);
+}
+void Mutate(std::string& source, Mutation m)
+{
+    const std::string sun = "float SunFilterVisibility(float3 coords, float3 planeNormal, uint slice)\n{";
+    const std::string local = "float SampleLocalVisibility(float3 coords, uint layer)\n{";
+    switch (m)
+    {
+    case Mutation::ForceSunZero: ReplaceOnce(source,sun,sun+"\n    slice = 0u;"); break;
+    case Mutation::SwapSun: ReplaceOnce(source,sun,sun+"\n    slice = slice == 1u ? 2u : slice == 2u ? 1u : slice;"); break;
+    case Mutation::ReverseCompare: ReplaceOnce(source,"<= SunStoredDepth(texel, slice)",">= SunStoredDepth(texel, slice)"); break;
+    case Mutation::WrongNext: ReplaceOnce(source,"selected.nextSlice = next;","selected.nextSlice = 0u;"); break;
+    case Mutation::DisableBlend: ReplaceOnce(source,"if (selected.nextSlice < 4)","if (false)"); break;
+    case Mutation::WrongLocal: ReplaceOnce(source,local,local+"\n    layer = 0u;"); break;
+    default: break;
+    }
 }
 
 void Require(HRESULT hr, const char* operation)
@@ -101,6 +110,49 @@ ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* targ
     return bytecode;
 }
 
+void VerifyFrameAbi(ID3DBlob& bytecode)
+{
+    ComPtr<ID3D12ShaderReflection> reflection;
+    Require(D3DReflect(bytecode.GetBufferPointer(), bytecode.GetBufferSize(),
+        IID_ID3D12ShaderReflection, reinterpret_cast<void**>(reflection.GetAddressOf())), "reflect FrameCB");
+    auto* cb = reflection->GetConstantBufferByName("FrameCB");
+    D3D12_SHADER_BUFFER_DESC buffer{};
+    Require(cb->GetDesc(&buffer), "reflect FrameCB description");
+    Check(buffer.Size == sizeof(SceneFrameConstants), "FrameCB size mismatch");
+    const auto field = [&](const char* name, size_t offset, size_t bytes)
+    {
+        D3D12_SHADER_VARIABLE_DESC variable{};
+        Require(cb->GetVariableByName(name)->GetDesc(&variable), name);
+        Check(variable.StartOffset == offset && variable.Size == bytes, name);
+    };
+#define CHECK_FRAME_FIELD(hlsl, cpp) field(#hlsl, offsetof(SceneFrameConstants, cpp), sizeof(SceneFrameConstants::cpp))
+    CHECK_FRAME_FIELD(ViewProjection, viewProjection);
+    CHECK_FRAME_FIELD(CameraPosition, cameraPosition);
+    CHECK_FRAME_FIELD(SunShadowViewProjection, sunShadowViewProjection);
+    CHECK_FRAME_FIELD(Ambient, ambient);
+    CHECK_FRAME_FIELD(SunDirection, sunDirection);
+    CHECK_FRAME_FIELD(SunColor, sunColor);
+    CHECK_FRAME_FIELD(LightingFlags, lightingFlags);
+    CHECK_FRAME_FIELD(LocalLights, localLights);
+    CHECK_FRAME_FIELD(HemiColor, hemiColor);
+    CHECK_FRAME_FIELD(InverseViewProjection, inverseViewProjection);
+    CHECK_FRAME_FIELD(WaterWeather, waterWeather);
+    CHECK_FRAME_FIELD(WaterSky, waterSky);
+    CHECK_FRAME_FIELD(LocalShadowViewProjection, localShadowViewProjection);
+    CHECK_FRAME_FIELD(DiagnosticLight, diagnosticLight);
+    CHECK_FRAME_FIELD(DiagnosticOrigin, diagnosticOrigin);
+    CHECK_FRAME_FIELD(LegacyWaterSsr, legacyWaterSsr);
+    CHECK_FRAME_FIELD(SunFilter, sunFilter);
+    CHECK_FRAME_FIELD(SunReceiverBiasMask, sunReceiverBiasMask);
+    CHECK_FRAME_FIELD(SunShadowResolution, sunShadowResolution);
+    CHECK_FRAME_FIELD(SunCameraForward, sunCameraForward);
+    CHECK_FRAME_FIELD(SunCascadeData, sunCascadeData);
+    CHECK_FRAME_FIELD(SunDepthBias, sunDepthBias);
+    CHECK_FRAME_FIELD(SunCasterCounts, sunCasterCounts);
+#undef CHECK_FRAME_FIELD
+    Check(kFrameConstantsSize >= buffer.Size && kFrameConstantsSize % 256 == 0, "CB allocation alignment");
+}
+
 struct ShadowSamplingPass
 {
     ComPtr<ID3D12RootSignature> root;
@@ -110,7 +162,7 @@ struct ShadowSamplingPass
     UINT stride = 0;
 
     ShadowSamplingPass(ID3D12Device& device, ID3D12Resource* sun, uint32_t sunSlices,
-        ID3D12Resource* local, uint32_t localSlices)
+        ID3D12Resource* local, uint32_t localSlices, Mutation mutation)
     {
         constexpr char vertex[] = R"(
 float4 vs(uint id : SV_VertexID) : SV_Position
@@ -119,33 +171,52 @@ float4 vs(uint id : SV_VertexID) : SV_Position
     return float4(p[id], 0, 1);
 }
 )";
-        const std::string pixel = "#define MAX_LOCAL_LIGHTS " + std::to_string(gamelight12::MaxLocalLights) +
+        std::string pixel = "#define MAX_LOCAL_LIGHTS " + std::to_string(gamelight12::MaxLocalLights) +
             "\n" + kFrameShaderConstants + kScenePixelShader + R"(
 float4 probe(float4 pixel : SV_Position) : SV_Target
 {
     uint x = (uint)pixel.x, y = (uint)pixel.y;
     uint count = LightingFlags.w;
+    if (y == 4)
+    {
+        const float3 points[8] = {
+            float3(.46875,.0625,.5), float3(.53125,.0625,.640625),
+            float3(.46875,.265625,.5), float3(.53125,.3125,.5),
+            float3(.03125,.1875,.5), float3(.96875,.1875,.5),
+            float3(.4375,.4375,.5), float3(.5625,.6875,.5)
+        };
+        if (x >= 8) return float4(0,0,0,1);
+        return float4(SunFilterVisibility(points[x],float3(0,0,1),0),
+                      SunFilterVisibility(points[x],float3(.25,0,1),0),0,1);
+    }
     if (x >= count && x < count + LightingFlags.z)
     {
         uint layer = x - count;
-        float stored = LocalShadow.Load(int4(1, 1, layer, 0));
-        return float4(stored, SampleLocalVisibility(float3(.25, .25, .5), layer),
-            SampleLocalVisibility(float3(.25, .25, .99), layer), 1);
+        float stored = LocalShadow.Load(int4(1,1,layer,0));
+        float threshold = .0625 * (layer + 1);
+        return float4(stored,SampleLocalVisibility(float3(.25,.25,threshold),layer),
+            SampleLocalVisibility(float3(.25,.25,threshold+.03125),layer),1);
     }
-    // Каждая строка выбирает середину интервала, середину overlap или границу двух текселей.
     float depth = x + (y == 2 ? .875 : .5);
-    float3 position = float3(depth, 0, .5);
-    SunSelection selected = SelectSun(position, float3(0, 0, 1), 1);
+    float3 position = float3(depth,-.375,.5);
+    SunSelection selected = SelectSun(position,float3(0,0,1),1);
     if (selected.slice >= 4)
-        return float4(0, 0, SunSelectedVisibility(selected, float3(0, 0, 1)), 1);
-    float raw = SunStoredDepth(int2(1, 1), selected.slice);
-    float visibility = y == 3 ? SunFilterVisibility(float3(.5, .5, .5), float3(0, 0, 1), selected.slice) :
-        SunSelectedVisibility(selected, float3(0, 0, 1));
-    return float4(raw, (selected.slice + 1) / 255.0, visibility, 1);
+        return float4(0,0,SunSelectedVisibility(selected,float3(0,0,1)),1);
+    float visibility = SunSelectedVisibility(selected,float3(0,0,1));
+    if (y == 2)
+        return float4(visibility,selected.nextSlice < 4 ? (selected.nextSlice+1)/255.0 : 0,
+            selected.blend,selected.fade);
+    if (y == 3)
+        return float4(SunFilterVisibility(selected.coords,float3(0,0,1),selected.slice),
+            selected.coords.z,selected.fade,1);
+    return float4(SunStoredDepth(int2(1,5),selected.slice),(selected.slice+1)/255.0,visibility,1);
 }
 )";
+        pixel.erase(std::remove(pixel.begin(),pixel.end(),'\r'),pixel.end());
+        Mutate(pixel,mutation);
         const auto vs = Compile(vertex, "vs", "vs_5_0");
         const auto ps = Compile(pixel.c_str(), "probe", "ps_5_0");
+        if (mutation == Mutation::None) VerifyFrameAbi(*ps.Get());
 
         D3D12_DESCRIPTOR_RANGE ranges[2]{};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -224,7 +295,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         upload.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC cb{};
         cb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        cb.Width = kProductionFrameConstantsSize;
+        cb.Width = kFrameConstantsSize;
         cb.Height = cb.DepthOrArraySize = cb.MipLevels = cb.SampleDesc.Count = 1;
         cb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         Require(device.CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &cb,
@@ -234,7 +305,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
     void Draw(ID3D12GraphicsCommandList& list, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
         uint32_t sunSlices, uint32_t localSlices, uint32_t filter)
     {
-        SamplingFrameConstants frame{};
+        SceneFrameConstants frame{};
         frame.lightingFlags[3] = sunSlices;
         frame.lightingFlags[2] = localSlices;
         frame.sunCameraForward = {1, 0, 0, 1};
@@ -244,10 +315,11 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         {
             auto& matrix = frame.sunShadowViewProjection[i];
             // Транспонированная ортопроекция помещает приёмник в левую половину карты.
-            matrix._11 = .01f;
+            matrix._11 = .125f;
             matrix._14 = -.5f;
             matrix._22 = matrix._33 = matrix._44 = 1;
             frame.sunCascadeData[i] = {float(i), float(i+1), float(i)+.75f, .125f};
+            frame.sunDepthBias[i] = ref::Bias;
         }
         void* memory;
         const D3D12_RANGE noRead{};
@@ -264,9 +336,9 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         list.SetGraphicsRootDescriptorTable(1, gpu);
         gpu.ptr += stride;
         list.SetGraphicsRootDescriptorTable(2, gpu);
-        const uint32_t width = sunSlices + localSlices + 1;
-        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 3, 0, 1};
-        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 4};
+        const uint32_t width = (std::max)(sunSlices + localSlices + 1, ref::ProbeCount);
+        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 4, 0, 1};
+        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 5};
         list.RSSetViewports(1, &viewport);
         list.RSSetScissorRects(1, &rect);
         list.OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -335,7 +407,8 @@ struct Readback
 using Frame = GameDx12NativeFrame12;
 
 std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
-    const char* mode, uint32_t sunCount, uint32_t localCount, uint32_t workers = 0)
+    const char* mode, uint32_t sunCount, uint32_t localCount, uint32_t workers = 0,
+    Mutation mutation = Mutation::None)
 {
     const bool multi = std::strcmp(mode, "legacy") != 0;
     const bool parallel = std::strcmp(mode, "parallel") == 0;
@@ -362,11 +435,11 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         float clear;
         float step;
     };
-    const auto createArray = [&](uint32_t slices, float clearDepth)
+    const auto createArray = [&](uint32_t slices, float clearDepth, float step)
     {
         DepthArray maps{};
         maps.clear = clearDepth;
-        maps.step = clearDepth < 0.1f ? 0.0625f : 0.25f;
+        maps.step = step;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -385,10 +458,10 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         return maps;
     };
     // Every depth value stays in [0,1], while each slice remains distinguishable.
-    const auto sun = createArray(sunCount, 0.125f);
-    const auto local = createArray(localCount, 0.0625f);
+    const auto sun = createArray(sunCount, ref::SunDepth(0), 0.25f);
+    const auto local = createArray(localCount, ref::LocalDepth(0), 0.0625f);
     ShadowSamplingPass sampling(device, sun.resource.Get(), sunCount, local.resource.Get(),
-        (std::max)(localCount, 1u));
+        (std::max)(localCount, 1u), mutation);
     const uint32_t passCount = sunCount + localCount;
     const auto passView = [sunCount](uint32_t index)
     {
@@ -434,7 +507,9 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     }
 
     std::vector<uint32_t> result;
-    for (uint32_t index = 0; index < 6; ++index)
+    uint32_t mismatches = 0;
+    const uint32_t frameCount = mutation == Mutation::None ? 7u : 1u;
+    for (uint32_t index = 0; index < frameCount; ++index)
     {
         const int windowSize = index < 3 ? 48 : 64;
         Check(SetWindowPos(window, nullptr, 0, 0, windowSize, windowSize,
@@ -460,6 +535,16 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
                 const auto view = passView(pass);
                 shadowLists[pass]->ClearDepthStencilView({handle.ptr + stride * pass}, D3D12_CLEAR_FLAG_DEPTH,
                     mapsFor(view).clear + mapsFor(view).step * static_cast<float>(view.Slice()), 0, 0, nullptr);
+                if (view.IsSun() && view.Slice() == 0)
+                {
+                    for (int y = 0; y < 3; ++y)
+                        for (int x = 0; x < ref::Size; ++x)
+                        {
+                            const D3D12_RECT texel{x,y,x+1,y+1};
+                            shadowLists[pass]->ClearDepthStencilView({handle.ptr + stride * pass},
+                                D3D12_CLEAR_FLAG_DEPTH, ref::Texel(0,x,y), 0, 1, &texel);
+                        }
+                }
                 if (multi)
                     Require(recording.CloseShadowList(pass), "close exclusive shadow list");
             }
@@ -489,7 +574,8 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         constexpr auto renderState = D3D12_RESOURCE_STATE_RENDER_TARGET;
         // Sample every production array slice through t2/t6 before the color pass
         // overwrites the control pixels. The readback proves SRV array indexing.
-        sampling.Draw(*recording.list, recording.rtv, sunCount, localCount, 4);
+        const uint32_t filter = mutation == Mutation::None ? index + 1 : 4;
+        sampling.Draw(*recording.list, recording.rtv, sunCount, localCount, filter);
         Readback sampledColor(device, recording.color->GetDesc(), 1);
         Transition(*recording.list, *recording.color, renderState, copyState);
         sampledColor.Copy(*recording.list, *recording.color, 0);
@@ -510,48 +596,64 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         const auto background = color.Pixel(0, 0, 0);
         const auto foreground = color.Pixel(0, 8, 8);
         Check(background == 0xff000000 && foreground == 0xff0000ff, "color clear/order mismatch");
-        const auto expectedChannel = [](float value)
-        {
-            const uint32_t channel = static_cast<uint32_t>(value * 255.0f + 0.5f);
-            return channel > 255 ? 255u : channel;
-        };
-        for (uint32_t slice = 0; slice < sunCount; ++slice)
-        {
-            const uint32_t pixel = sampledColor.Pixel(0, slice, 1);
-            const uint32_t expectedRaw = expectedChannel(0.125f + 0.25f * slice);
-            const uint32_t expectedIndex = slice + 1;
-            Check((pixel & 0xffu) == expectedRaw &&
-                ((pixel >> 8) & 0xffu) == expectedIndex &&
-                ((pixel >> 16) & 0xffu) == (slice < 2 ? 0u : 255u),
-                "sun shadow SRV slice sample mismatch");
-        }
-        for (uint32_t slice = 0; slice < localCount; ++slice)
-        {
-            const uint32_t pixel = sampledColor.Pixel(0, sunCount + slice, 1);
-            Check((pixel & 0xffu) == expectedChannel(0.0625f + 0.0625f * slice),
-                "local shadow SRV slice sample mismatch");
-        }
-        result.insert(result.end(), {background, foreground});
+        const uint32_t probeWidth = (std::max)(sunCount+localCount+1,ref::ProbeCount);
+        for (uint32_t y = 1; y <= 4; ++y)
+            for (uint32_t x = 0; x < probeWidth; ++x)
+            {
+                const uint32_t pixel = sampledColor.Pixel(0,x,y);
+                const auto expected = ref::Pixel(x,y,sunCount,localCount,filter);
+                bool ok = true;
+                for (int channel = 0; channel < 4; ++channel)
+                {
+                    const int actual = (pixel >> (8*channel)) & 255;
+                    const int wanted = static_cast<int>(std::lround(expected.rgba[channel]*255));
+                    const int tolerance = channel == expected.exactIndexChannel ? 0 : 1;
+                    ok = ok && std::abs(actual-wanted) <= tolerance;
+                }
+                if (!ok)
+                {
+                    if ((mismatches & expected.category) == 0)
+                        std::printf("sampling mismatch mutation=%s mode=%s filter=%u x=%u y=%u category=%u actual=%08x expected=(%.4f,%.4f,%.4f,%.4f)\n",
+                            MutationName(mutation),mode,filter,x,y,expected.category,pixel,
+                            expected.rgba[0],expected.rgba[1],expected.rgba[2],expected.rgba[3]);
+                    mismatches |= expected.category;
+                }
+                if (mutation == Mutation::None && (index == 0 || y == 4))
+                    std::printf("sampling readback mode=%s sun=%u local=%u filter=%u x=%u y=%u rgba=%08x\n",
+                        mode,sunCount,localCount,filter,x,y,pixel);
+                result.push_back(pixel);
+            }
+        result.insert(result.end(), {background,foreground});
         for (uint32_t pass = 0; pass < passCount; ++pass)
         {
             const auto view = passView(pass);
-            const auto depth = (view.IsSun() ? sunDepth : localDepth).Pixel(view.Slice(), 0, 0);
-            const float expectedDepth = view.IsSun() ? 0.125f + 0.25f * view.Slice() :
-                0.0625f + 0.0625f * view.Slice();
-            Check(depth == std::bit_cast<uint32_t>(expectedDepth), "shadow slice/order mismatch");
-            result.push_back(depth);
+            for (int y = 0; y < ref::Size; ++y)
+                for (int x = 0; x < ref::Size; ++x)
+                {
+                    const auto depth = (view.IsSun() ? sunDepth : localDepth).Pixel(view.Slice(),x,y);
+                    const float expectedDepth = view.IsSun() ? ref::Texel(view.Slice(),x,y) : ref::LocalDepth(view.Slice());
+                    Check(depth == std::bit_cast<uint32_t>(expectedDepth), "shadow depth pattern/order mismatch");
+                    result.push_back(depth);
+                }
         }
     }
     Require(frame.Drain(owner), "drain native slot work");
     if (parallel)
     {
         const auto stats = jobs.GetStats();
-        Check(stats.tasksSubmitted == 7 && stats.tasksCompleted == 7 && stats.jobFailures == 1 &&
+        Check(stats.tasksSubmitted == frameCount + 1 && stats.tasksCompleted == frameCount + 1 && stats.jobFailures == 1 &&
             stats.unobservedFailures == 0, "GR close/drain counters");
         std::printf("GR workers=%u submit=%llu complete=%llu observed_faults=%llu\n", workers,
             static_cast<unsigned long long>(stats.tasksSubmitted), static_cast<unsigned long long>(stats.tasksCompleted),
             static_cast<unsigned long long>(stats.jobFailures));
         jobs.Shutdown();
+    }
+    if (mutation == Mutation::None)
+        Check(mismatches == 0,"control GPU sampling mismatch");
+    else
+    {
+        Check((mismatches & RequiredFailure(mutation)) != 0,"GPU mutation survived targeted validation");
+        std::printf("MUTATION KILLED: %s mismatch_mask=%u\n",MutationName(mutation),mismatches);
     }
     return result;
 }
@@ -574,6 +676,7 @@ int main(int argc, char** argv)
         Require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "WARP device");
         ComPtr<ID3D12InfoQueue> messages;
         Require(device.As(&messages), "D3D12 info queue");
+        Require(messages->SetMessageCountLimit(100000), "InfoQueue message limit");
         ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC desc{};
         Require(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "direct queue");
@@ -587,7 +690,6 @@ int main(int argc, char** argv)
         uint64_t value = 0;
         const Frame::Owner owner{*device.Get(), *queue.Get(), *fence.Get(), event, value};
         Check(_putenv_s("OGSR_DX12_CLEAR", "0,0,0") == 0, "set clear color");
-        CheckSamplingMutations();
         const bool sequentialOnly = argc > 1 && std::strcmp(argv[1], "--sequential") == 0;
         for (const uint32_t cascades : {1u, 2u, 3u, 4u})
         {
@@ -602,20 +704,31 @@ int main(int argc, char** argv)
             }
             std::printf("PASS: cascades=%u local=%u\n", cascades, locals);
         }
+        // Compile and execute each mutated copy; only the targeted GPU mismatch
+        // is accepted. Compile, PSO, device and fence failures propagate.
+        for (const Mutation mutation : {Mutation::ForceSunZero, Mutation::SwapSun,
+            Mutation::ReverseCompare, Mutation::WrongNext, Mutation::DisableBlend, Mutation::WrongLocal})
+            Run(window,*factory.Get(),owner,"legacy",4,8,0,mutation);
         DestroyWindow(window);
         CloseHandle(event);
         uint32_t problems = 0;
         uint32_t expectedClearWarnings = 0;
+        Check(messages->GetNumMessagesDiscardedByMessageCountLimit() == 0, "InfoQueue discarded messages");
+        Check(messages->GetNumMessagesDeniedByStorageFilter() == 0, "InfoQueue storage-filtered messages");
+        Check(messages->GetNumStoredMessagesAllowedByRetrievalFilter() == messages->GetNumStoredMessages(),
+            "InfoQueue retrieval-filtered messages");
         for (uint64_t index = 0; index < messages->GetNumStoredMessages(); ++index)
         {
             SIZE_T size = 0;
-            messages->GetMessage(index, nullptr, &size);
+            Require(messages->GetMessage(index, nullptr, &size), "InfoQueue message size");
+            Check(size >= sizeof(D3D12_MESSAGE), "InfoQueue invalid message size");
             std::vector<unsigned char> storage(size);
             auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-            if (SUCCEEDED(messages->GetMessage(index, message, &size)) &&
-                message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
+            Require(messages->GetMessage(index, message, &size), "InfoQueue read message");
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
             {
-                if (message->ID == D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE)
+                if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING &&
+                    message->ID == D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE)
                     ++expectedClearWarnings;
                 else
                 {
@@ -626,7 +739,7 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts("PASS: WARP Debug Layer + GBV, sun/local slices, readback parity, resize, cancel, GR fault drain");
+        std::puts("PASS: WARP Debug Layer + GBV, sun/local sampling, PCF 1-7, GPU mutations, ABI, readback parity, resize, cancel, GR fault drain");
         return 0;
     }
     catch (const std::exception& error)
