@@ -1,8 +1,8 @@
 # 08 — План работ
 
 > **Актуальная рабочая ветка DX12:** `experiment/f43-csm-r2-c`.
-> **Дата сверки:** 2026-11-27. Проверенный HEAD перед docs-only обновлением: `ab701796d7917d5842db98a8fcaa8a8dc4a27ec6` (B3c2). Windows baseline и B3c2 technical evidence — PASS WITH NOTES; native adaptive runtime/hardware/game NOT RUN.
-> **Область сверки:** экспериментальная ветка DX12, не текущий production `prypiat`. На момент сверки ветки имеют 111/72 уникальных коммита соответственно (merge-base `01bcc0b7ad4ec858b5f72987248e747309c9beda`). Не выполнять автоматический merge/rebase. Это не разрешение на интеграцию в prypiat.
+> **Дата сверки:** 2026-11-27. Проверенный HEAD перед docs-only обновлением: `ac987a8bcc94c577e35cb275efe1235ce9cb5616` (B3d). Windows baseline, B3c2 и B3d technical evidence — PASS WITH NOTES; targeted B3c2 closure PASS. Native adaptive runtime/hardware/game NOT RUN.
+> **Область сверки:** экспериментальная ветка DX12, не текущий production `prypiat`. На момент сверки ветки имеют 114/72 уникальных коммита соответственно (merge-base `01bcc0b7ad4ec858b5f72987248e747309c9beda`). Не выполнять автоматический merge/rebase. Это не разрешение на интеграцию в prypiat.
 > **Приоритет источника:** текущая сводка ниже и актуальная матрица F имеют приоритет над датированными историческими статусами и гейтами в этом файле. История сохраняется, но не используется как задание на повторную реализацию. Source-only, CPU PASS, WARP, hardware runtime и независимая приёмка — разные статусы.
 > **Параллельные треки:** V (clouds), P (PhysX), DX11 и другие направления сохранены с их последними документированными статусами; их отдельные рабочие ветки в этой сверке не проверялись. Не считать их состояния актуальными на 2026-11-27 без отдельной сверки.
 
@@ -10,14 +10,14 @@
 
 **Цель:** полноценный игровой native DX12 renderer с сохранением оригинальной логики, ресурсов и модификаций, затем hybrid raster + DXR. Не отдельная техническая демонстрация.
 
-**Точка продолжения:** B3c2 — PASS WITH NOTES в пределах descriptor table / WARP multi-page sampling. В игре по-прежнему используется banked page. **Следующий этап — B3d**, с коротким targeted closure гейтом для SM5.1 banked regression и настоящего in-flight descriptor readback (см. [B3c2 review](dx12-f43-b3c2-review.md)). Полный adaptive runtime/hardware/game acceptance отдельно.
+**Точка продолжения:** B3d — PASS WITH NOTES в пределах scalable recording/CPU/WARP. Два targeted B3c2 closure tests PASS. В игре по-прежнему используется banked page. **Следующий этап — Adaptive Native Runtime**, с единым бюджетом двух slot arenas и opt-in native integration, без включения по умолчанию до hardware/game acceptance. См. [B3d review](dx12-f43-b3d-review.md).
 
 | Приоритет | Следующий результат | Зависимость |
 |---|---|---|
 | 1 | Windows baseline — PASS WITH NOTES | [Evidence review](dx12-f43-windows-baseline-review.md); повторять только затронутые проверки |
-| 2 | F4.3-P0-B3c2 — PASS WITH NOTES | [Evidence review](dx12-f43-b3c2-review.md); multi-page WARP, descriptor range/slot lifetime, actual queue Signal transaction; native banked path remains |
-| 3 | F4.3-P0-B3d — NEXT: dynamic shadow views, GR, command-list pool, timestamp queries and page-local transitions | Close targeted B3c2 notes first/in first incremental commit; preserve CSM and legacy banked path; no full baseline repeat |
-| 4 | F4.3: включение adaptive multi-page runtime, global budget, physical-denial policy и game/hardware A/B | B3c2/B3d; корректные ownership/Signal/Cancel/Quarantine |
+| 2 | F4.3-P0-B3c2 — PASS WITH NOTES; targeted closure PASS | [B3c2 review](dx12-f43-b3c2-review.md), [B3d review](dx12-f43-b3d-review.md): SM5.0/5.1 banked parity and gated real draws verified |
+| 3 | F4.3-P0-B3d — PASS WITH NOTES | [Evidence review](dx12-f43-b3d-review.md): CPU 48 local views, WARP 12/42, dynamic lists/timestamps, page-local depth, rollback and reuse |
+| 4 | F4.3 Adaptive Native Runtime — NEXT: общий бюджет, opt-in интеграция реальных light/caster packets, combined CSM/local schedule, pressure/fallback policy | B3c2/B3d technical evidence; compact combined-frame WARP and Release build; hardware/game A/B separately before defaults |
 | 5 | Clustered Lighting: conservative overlap, variable-length lists, no silent truncation | Корректный light/shadow ABI и adaptive runtime; исследование можно начать раньше |
 | Параллельно | F4.4-A2b.2 particles; F4.5-A IUIRender/fonts/menu/frame modes | Согласованные общие контракты ресурсов; без конкурирующих heap/queue/registry |
 | Далее | F4.5-B/C/D, остальные raster/material/HDR/temporal/DLSS, F6, hybrid DXR | Гейты готовности соответствующих подсистем; G0–G2 research может идти отдельно |
@@ -705,7 +705,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 ### Актуальная матрица DX12 — экспериментальная ветка 2026-11-27
 
-Основание: reviewed B3c2 HEAD `ab701796d7917d5842db98a8fcaa8a8dc4a27ec6`, implementation `2d7ad0e13dcc3cf359f8e089f32f1acc9c2979bd`, earlier [Windows baseline](dx12-f43-windows-baseline-review.md) and [B3c2 independent evidence review](dx12-f43-b3c2-review.md). PASS WITH NOTES within technical scope; no independent Windows replay, no game/hardware execution.
+Основание: reviewed B3d HEAD `ac987a8bcc94c577e35cb275efe1235ce9cb5616`, implementation `4f1cb13013f4d89efc95acbb19b830da7cf833d3`, [B3d review](dx12-f43-b3d-review.md), earlier [Windows baseline](dx12-f43-windows-baseline-review.md) and [B3c2 review](dx12-f43-b3c2-review.md). PASS WITH NOTES within technical scope; no independent Windows replay, no game/hardware execution.
 
 | Этап | Состояние | Доказательства и оставшиеся гейты |
 |---|---|---|
@@ -736,9 +736,9 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | P0-B3a | `71f14be5`: t13/t14 growable structured uploads, FrameCB stride 768; MSVC/FXC/WARP baseline PASS | Production game/hardware validation pending. |
 | P0-B3b | `33b4a994`: remove top-16 / candidate mask for supported world point/spot lights; 8192 synthetic capture records CPU PASS | Native spatial capture/high-density scene pending; legacy shadow bank limits remain. |
 | P0-B3c1 | `2b04d361`: 80-byte projection records; CPU address test and updated WARP baseline PASS | Current single bound physical page 0; multi-page descriptor sampling/runtime pending. |
-| P0-B3c2 | `ab701796`: source integrated + targeted Windows/WARP PASS WITH NOTES | Two physical pages sampled in one draw, t15 shape metadata, SM5.1 nonuniform index, 3/3 mutations, two-slot range policy and native Signal/cancel. SM5.0 legacy regression PASS; short SM5.1 banked and true in-flight readback closure before B3d acceptance. |
-| P0-B3d | NEXT | Dedicated schedule/recording component, variable logical projection IDs and physical page/slice mapping, per-subresource DSV/barriers, reusable exclusive allocator/list pool, variable timestamp queries/readback and deterministic GR parity beyond 32 views. Full adaptive game enablement separate. |
-| Adaptive native runtime | PLANNED | Actual Prepare/Commit/Cancel/Quarantine with native queue Signal, cross-slot budget, explicit physical denial policy, real multi-page sampling and render evidence. |
+| P0-B3c2 | `ab701796`: source integrated + targeted Windows/WARP PASS WITH NOTES; two closure checks PASS at `ac987a8b` | t15, SM5.1 nonuniform index, 3/3 prior mutations, native Signal/cancel. Banked SM5.0/5.1 parity and real gated draws across disjoint ranges verified; production hardware acceptance and descriptor capacity/budget policy remain open. |
+| P0-B3d | `ac987a8b`: source integrated + CPU/WARP PASS WITH NOTES | 48 local views CPU; 12 legacy/multi/parallel and 42 serial multi/parallel WARP; dynamic per-slot list pool/timing IDs, actual depth, rollback/reuse. No mixed CSM+adaptive local frame or real game caster draw verified. |
+| Adaptive native runtime | NEXT | Global cross-slot budget incl. retained/staged pages, physical denial/descriptor pressure reconciliation, actual world light/caster capture and immutable GR packets, unified CSM+local scheduling and timing, t13/t14/t15 binding, native Signal/Cancel/Quarantine. Opt-in only; compact combined-frame technical test, then separate game/hardware A/B. |
 | Clustered Lighting | PLANNED | Conservative overlap, variable-length lists, no silent per-cluster truncation; compare against brute-force reference and measure dense scenes. |
 | P1 / DXR shadows | PLANNED | Caster visibility/LOD/invalidation and safe caching; optional DXR visibility without double shadowing. |
 
@@ -775,7 +775,7 @@ MSVC UI command core CPU regression PASS in Windows baseline; native UI renderin
 |---|---|---|
 | Bridge / StaticScene | 4444 / 5653 lines at source baseline; mixed responsibilities | Incremental feature-oriented extraction under [Modular ADR](dx12-modular-production-adr.md), start B3c2. No file-length quota or blanket rewrite. |
 | Descriptor heap / texture registry | B3c2 shared material heap tail ranges grow within actual capacity; scene still attempts Tier-2 maximum heap and retains `kMaxTextures=16384` / 16 MiB DDS cap | Budget-aware capacity sizing/versioning, telemetry and shared CPU descriptor sources in future registry work; no competing heap. Do not confuse range growth with heap reallocation or full global budgeting. |
-| Shadow views and timings | Fixed array and 32-bit mask | B3d variable storage/recording and query pool with checked ranges and fences. |
+| Shadow views and timings | B3d removes fixed pool/mask in NativeFrame; banked StaticScene retains MaxViews arrays and default Begin capacity | Integrate variable runtime scheduling before single color handoff, account CSM + local IDs, handle SetShadowTimingViews failure, bounded actual memory for retained pool/query storage; no scene quotas. |
 | Particle snapshots | Fixed diagnostic total counts | Dynamic checked allocation/backpressure; maintain original batch semantics. |
 | HUD and no-level frames | Bridge requires loaded level, native path skips R4 render callbacks and forces startup menu closed | F4.5-A native frame modes and render-only producers; preserve game logic and DX11. |
 | Geometry/materials | Partial skinning, vegetation, transparency and legacy material coverage | Feature-specific modules and evidence; retain legacy compatibility, optional PBR. |
@@ -790,7 +790,7 @@ MSVC UI command core CPU regression PASS in Windows baseline; native UI renderin
 5. If tests fail, fix minimal root cause, preserve assertions and independent oracle, rerun affected and regression tests. Publish logs and evidence; no new feature work on an unexplained build/GPU correctness failure. No game launch until separately agreed; hardware/game runtime remains a distinct gate.
 6. After baseline: B3c2 → B3d → adaptive runtime → hardware and game A/B (Jupiter, dense lights, resize/reload/shutdown, Debug/GBV separately from profiling). Capture actual GPU timings, CPU frametimes, memory budget/usage and visual parity; no claim of performance from CPU fixture or theoretical sample count.
 
-**Current verdict:** PASS WITH NOTES for technical baseline and scoped B3c2, [baseline review](dx12-f43-windows-baseline-review.md), [B3c2 review](dx12-f43-b3c2-review.md). No full game/runtime acceptance; no independent Windows replay. Next B3d with targeted closure; retain checklist for affected regressions only.
+**Current verdict:** PASS WITH NOTES for technical baseline, scoped B3c2 and B3d; B3c2 targeted closure PASS. [B3d review](dx12-f43-b3d-review.md). No full game/runtime acceptance or independent Windows replay. Next Adaptive Native Runtime; retain checklist for affected regressions only.
 
 ### Исторические статусы F — снимок 2026-11-06 (prypiat)
 
