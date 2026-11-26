@@ -11,8 +11,6 @@ struct ClassicMaterialSource
     bool clamp = false;
     bool strictSorting = false;
 };
-inline constexpr uint32_t MaxParticleTextures = 128;
-inline constexpr uint64_t MaxParticleTextureBytes = 32ull * 1024 * 1024;
 struct MaterialBinding
 {
     ClassicMaterialSource source;
@@ -63,7 +61,6 @@ inline bool BuildMaterialInventory(const Snapshot& s, Resolve&& resolve, Materia
         uint32_t index = static_cast<uint32_t>(found - inv.names.begin());
         if (found == inv.names.end())
         {
-            if (inv.names.size() >= MaxParticleTextures) continue;
             inv.names.push_back(std::move(name));
         }
         inv.bindings[i] = {source, index};
@@ -77,7 +74,7 @@ inline bool BuildDecodedDrawPlan(const Prepared& p, const MaterialInventory& inv
     std::span<const uint8_t> decoded, DrawPlan& out)
 {
     out = {};
-    if (inv.names.size() > MaxParticleTextures || inv.bindings.size() > MaxEmitters ||
+    if (inv.names.size() > inv.bindings.size() || inv.bindings.size() > MaxEmitters ||
         decoded.size() != inv.names.size()) return false;
     for (auto d : decoded) if (d > 1) return false;
     std::vector<DrawMaterial> materials(inv.bindings.size());

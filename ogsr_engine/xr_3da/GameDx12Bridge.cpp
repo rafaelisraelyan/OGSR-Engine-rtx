@@ -2240,14 +2240,30 @@ void CaptureNativeParticleDiagnostics(uint64_t session, uint64_t epoch)
             Msg("ph_dx12_particles: state=rejected reason=material_inventory");
             return;
         }
-        std::vector<GameDx12SceneTexture12> textures;
+        // Probe each unique DDS independently: no arbitrary aggregate texture
+        // count/byte cutoff, and no accumulation of all decoded CPU payloads.
+        // The shared VFS reader still enforces its per-file safety limit.
+        // This is a sampled diagnostic, NOT the production texture cache.
         GameDx12TextureReadStats12 textureStats{};
-        GameDx12J2ABatch_ReadTextureNames(inventory.names, textures, textureStats, MaxParticleTextureBytes);
         std::vector<uint8_t> decoded(inventory.names.size(), 0);
-        if (textures.size() == inventory.names.size())
-            for (size_t i = 0; i < textures.size(); ++i)
-                if (textures[i].name == inventory.names[i] && !textures[i].dds.data.empty())
-                    decoded[i] = 1;
+        for (size_t i = 0; i < inventory.names.size(); ++i)
+        {
+            std::vector<GameDx12SceneTexture12> textures;
+            GameDx12TextureReadStats12 single{};
+            GameDx12J2ABatch_ReadTextureNames({inventory.names[i]}, textures, single,
+                (std::numeric_limits<uint64_t>::max)());
+            textureStats.missing += single.missing;
+            textureStats.unsupported += single.unsupported;
+            if (single.bytes > (std::numeric_limits<uint64_t>::max)() - textureStats.bytes)
+            {
+                Msg("ph_dx12_particles: state=rejected reason=texture_byte_overflow");
+                return;
+            }
+            textureStats.bytes += single.bytes;
+            if (textures.size() == 1 && textures[0].name == inventory.names[i] &&
+                !textures[0].dds.data.empty())
+                decoded[i] = 1;
+        }
         DrawPlan drawPlan;
         if (!BuildDecodedDrawPlan(prepared, inventory, decoded, drawPlan))
         {

@@ -36,9 +36,21 @@ int main()
     ++p.frame; assert(!BuildDecodedDrawPlan(p, inv, decoded, plan) && plan.batches.empty()); --p.frame;
     assert(!BuildDecodedDrawPlan(p, inv, std::array<uint8_t, 2>{1, 2}, plan));
     inv.bindings[0].texture = 99; assert(!BuildDecodedDrawPlan(p, inv, decoded, plan));
-    for (uint32_t i = 0; i < MaxParticleTextures + 1; ++i) add("alpha", "fx\\t" + std::to_string(i));
-    assert(BuildMaterialInventory(s, resolve, inv) && inv.names.size() == MaxParticleTextures);
-    assert(inv.bindings.back().texture == UINT32_MAX);
+    // Exercise the entire existing snapshot emitter capacity with unique textures.
+    Snapshot large;
+    large.session = 1; large.epoch = 2; large.frame = 3;
+    for (uint32_t i = 0; i < MaxEmitters; ++i)
+    {
+        large.emitters.push_back({"effect", "alpha", "fx\\t" + std::to_string(i), 0, Cull::None, i, 1});
+        large.quads.emplace_back();
+    }
+    assert(BuildMaterialInventory(large, resolve, inv) && inv.names.size() == MaxEmitters);
+    assert(inv.bindings.back().texture == MaxEmitters - 1);
+    assert(BuildPackets(large, 1, 2, std::vector<uint8_t>(MaxEmitters, 1), p));
+    assert(BuildDecodedDrawPlan(p, inv, std::vector<uint8_t>(MaxEmitters, 1), plan));
+    assert(plan.batches.size() == MaxEmitters && plan.unresolvedQuads == 0);
+    inv.names.push_back("extra");
+    assert(!BuildDecodedDrawPlan(p, inv, std::vector<uint8_t>(MaxEmitters + 1, 1), plan));
     ++s.emitters[0].first; assert(!BuildMaterialInventory(s, resolve, inv) && inv.names.empty());
-    std::cout << "PASS: particle material inventory, DDS eligibility, identity and bounded names\n";
+    std::cout << "PASS: particle material inventory, DDS eligibility, identity and full snapshot texture coverage\n";
 }
