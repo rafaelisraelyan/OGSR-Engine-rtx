@@ -9,6 +9,7 @@
 #include "GameDx12NativeFrame.h"
 #include "GameDx12AdaptiveShadowRuntime.h"
 #include "GameDx12FrameStructuredUpload.h"
+#include "GameDx12LevelDetails.h"
 #include "GameDx12Surface.h"
 #include "GameDx12Water.h"
 #include "dx12xrayasset.h"
@@ -147,6 +148,8 @@ public:
         double grParallelMs = 0.0;
         game_shadow12::AdaptiveShadowTelemetry adaptive;
         const char* shadowMode = "disabled";
+        uint32_t sunFilter = 0, localFilterRadius = 0;
+        bool detailSunShadows = false;
         uint64_t grPrepJobs = 0, grPrepCompleted = 0, grRecordJobs = 0, grRecordCompleted = 0;
         double grRecordWaitMs = 0;
         bool adaptiveRequested = false;
@@ -211,6 +214,7 @@ public:
                            const GameDx12NativeFrame12::Owner& owner, IDXGIAdapter3* adapter,
                            const DirectX::XMFLOAT4X4& logicalViewProjection,
                            const float cameraPosition[3], const gameaux12::Frame& extras,
+                           gameaux12::LevelDetails* detailSource,
                            const gamelight12::FrameSnapshot& lighting,
                            const gamewater12::Frame& water,
                            FrameStats12& stats, AuxStats& auxStats,
@@ -268,6 +272,8 @@ private:
         uint8_t layout = 1;
         uint8_t traceSlot = UINT8_MAX;
         bool vertexHemi = false;
+        float treeHemiScale = 0.0f;
+        float treeHemiBias = 0.0f;
         uint32_t hemiDescriptor = kNullDescriptor;
         uint32_t terrainSet = 0;
         float terrainScale = 0.0f;
@@ -447,6 +453,8 @@ private:
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localProjectionUploads;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_clusterGridUploads, m_clusterIndexUploads;
     ComPtr<ID3D12Resource> m_frameTransforms;
+    std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_detailShadowUploads;
+    gameaux12::DetailShadowSnapshot m_detailShadowSnapshot;
     // Держим staging даже при раннем выходе из загрузки с неизвестным fence.
     ComPtr<ID3D12Resource> m_copyStaging;
     void* m_frameConstantsMapped = nullptr;

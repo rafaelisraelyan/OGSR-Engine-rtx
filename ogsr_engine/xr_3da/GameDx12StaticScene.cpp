@@ -5,6 +5,9 @@
 #include "GameDx12StaticShadowCache.h"
 #include "GameDx12ShadowAddress.h"
 #include "GameDx12ShadowCullMask.h"
+#include "GameDx12ShadowFilter.h"
+#include "GameDx12ShadowFilterHlsl.h"
+#include "GameDx12DetailShadowDraws.h"
 #include "GameDx12J2APreparation.h"
 #include "GameDx12SunCascades.h"
 
@@ -30,6 +33,7 @@
 #include <utility>
 
 bool GameDx12ReadR4DeferredAlphaSource(LPCSTR name, bool& blended);
+bool GameDx12ReadR4TreeAlphaSource(LPCSTR name, bool& cutout);
 bool GameDx12ReadR4TerrainSource(LPCSTR shader, LPCSTR baseTexture,
                                std::array<std::string, 4>& layerNames, float& detailScale);
 
@@ -87,6 +91,9 @@ struct SceneFrameConstants
     uint32_t clusterTiles[4]; // viewport width/height и размер XY тайла.
     uint32_t clusterGrid[4]; // количество тайлов X/Y, Z срезов, индексов.
     float clusterDepth[4]; // near, far, масштаб log2, резерв.
+    uint32_t localFilterRadius;
+    float pointFaceBlendStart;
+    uint32_t shadowFilterPadding[2];
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -99,7 +106,9 @@ static_assert(sizeof(DirectX::XMFLOAT4X4) == 64);
 static_assert(offsetof(SceneFrameConstants, hemiColor) == 400);
 static_assert(offsetof(SceneFrameConstants, diagnosticLight) == 512);
 static_assert(offsetof(SceneFrameConstants, clusterTiles) == 688);
-static_assert(sizeof(SceneFrameConstants) == 736);
+static_assert(offsetof(SceneFrameConstants, localFilterRadius) == 736);
+static_assert(offsetof(SceneFrameConstants, pointFaceBlendStart) == 740);
+static_assert(sizeof(SceneFrameConstants) == 752);
 static_assert(offsetof(SceneFrameConstants, diagnosticOrigin) ==
     offsetof(SceneFrameConstants, diagnosticLight) + 16);
 static_assert(offsetof(SceneFrameConstants, legacyWaterSsr) ==
@@ -149,15 +158,21 @@ constexpr uint32_t kLightmapHemi = 1024u;
 constexpr uint32_t kTerrainDetail = 2048u;
 constexpr uint32_t kTerrainBaseHemi = 4096u;
 constexpr uint32_t kObjectSkyHemi = 8192u;
+constexpr uint32_t kDetailMaterial = 16384u;
+constexpr uint32_t kTreeMaterial = 32768u;
 constexpr float kSunShadowRadius = 48.0f;
 // Центр ближней области приёмников в 20 м перед камерой. Глубина сохраняет
 // запас для удалённых от камеры, но расположенных выше по свету caster'ов.
 constexpr float kSunShadowForward = 20.0f;
 constexpr uint64_t kMaxAuxGeometryBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kMaxAuxTextureBytes = 256ull * 1024 * 1024;
-constexpr uint32_t kDetailShadowInstances = 512;
 constexpr uint64_t kTransformSlotBytes =
-    (gameaux12::kMaxFrameTransforms + kDetailShadowInstances) * sizeof(DirectX::XMFLOAT4X4);
+    gameaux12::kMaxFrameTransforms * sizeof(DirectX::XMFLOAT4X4);
+// Оценка рабочей памяти, а не лимит количества размещений. Декодирование
+// продолжает работу в следующих кадрах, выдавая только полный новый снимок.
+constexpr size_t kDetailShadowUploadBytes = 32u * 1024 * 1024;
+constexpr gameaux12::DetailShadowBudget kDetailShadowBudget{
+    64u * 1024 * 1024, 32u * 1024 * 1024, 16u * 1024 * 1024, 256};
 static_assert(sizeof(DirectX::XMFLOAT4X4) == 4 * 4 * sizeof(float));
 constexpr uint64_t kMaxTextureBytes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxSceneTextureBytes = 4ull * 1024ull * 1024ull * 1024ull;
@@ -444,16 +459,19 @@ uint32_t SceneSunFilter()
     static const uint32_t mode = []
     {
         const char* value = std::getenv("OGSR_DX12_GAME_SUN_FILTER");
-        if (!value)
-            return 0u;
-        constexpr const char* names[] = {"auto", "point", "bilinear", "legacy",
-            "receiverplane", "pcf3", "pcf5", "fr3", "pcf7"};
-        for (uint32_t i = 0; i < std::size(names); ++i)
-            if (std::strcmp(value, names[i]) == 0)
-                return i;
-        return 0u;
+        return game_shadow12::SunFilterMode(value ? value : "");
     }();
     return mode;
+}
+
+uint32_t SceneLocalFilterRadius()
+{
+    static const uint32_t radius = []
+    {
+        const char* value = std::getenv("OGSR_DX12_GAME_LOCAL_FILTER");
+        return game_shadow12::LocalFilterRadius(value ? value : "");
+    }();
+    return radius;
 }
 
 struct SunSettings
@@ -645,6 +663,8 @@ cbuffer FrameCB : register(b0)
     uint4 ClusterTiles;
     uint4 ClusterGrid;
     float4 ClusterDepth;
+    uint LocalFilterRadius;
+    float PointFaceBlendStart;
 };
 
 // CPU uploads transposed matrices: each consecutive float4 is one
@@ -697,15 +717,21 @@ struct ShadowInterpolants
 };
 )";
 
-bool CompileShader(const char* source, const char* entryPoint,
+bool CompileShader(std::string_view source, const char* entryPoint,
                    const char* target, ID3D10Blob** outBlob,
                    std::string& reason, bool pageTable = false)
 {
     ComPtr<ID3D10Blob> error;
     const auto maxLocalLights = std::to_string(gamelight12::LegacyDiagnosticLightScale);
+    const auto sunMode = SceneSunFilter();
+    const auto sunRadius = std::to_string(sunMode < game_shadow12::FirstContinuousSunMode ? 0u :
+        sunMode - game_shadow12::FirstContinuousSunMode + 1u);
+    const auto localRadius = std::to_string(SceneLocalFilterRadius());
     const D3D_SHADER_MACRO definitions[] = {{"LEGACY_DIAGNOSTIC_LIGHT_SCALE", maxLocalLights.c_str()},
+        {"OGSR_DX12_CONTINUOUS_SUN", sunRadius.c_str()}, {"OGSR_DX12_CONTINUOUS_LOCAL", localRadius.c_str()},
         {pageTable ? "OGSR_DX12_SHADOW_PAGE_TABLE" : nullptr, pageTable ? "1" : nullptr}, {nullptr, nullptr}};
-    const std::string shader = std::string(kFrameShaderConstants) + source;
+    std::string shader(kFrameShaderConstants);
+    shader += source;
     const HRESULT hr = D3DCompile(shader.data(), shader.size(), nullptr, definitions,
                                   nullptr, entryPoint, target, pageTable ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0, 0, outBlob,
                                   &error);
@@ -828,7 +854,7 @@ VSOutput main(VSInput input)
 {
     VSOutput output;
     float4 worldPosition = mul(float4(input.position, 1.0f), World);
-    if (AdvancedWaterGeometry != 0)
+    if (TreeGeometry == 0 && AdvancedWaterGeometry != 0)
         worldPosition.y += WaterDisplacement(worldPosition.xyz);
     output.position = mul(worldPosition, ViewProjection);
     if (output.position.z > 0.0f)
@@ -851,7 +877,8 @@ VSOutput main(VSInput input)
     }
     output.uv = MaterialUv(input);
     output.world = worldPosition.xyz;
-    output.hemi = input.nh.w;
+    // Для дерева последние два DWORD b4 содержат коэффициенты TREEDEF2.
+    output.hemi = TreeGeometry != 0 ? input.nh.w * asfloat(AdvancedWaterGeometry) + PuddleHeight : input.nh.w;
     output.lmapUv = float2(input.tc.zw) * (1.0f / 32768.0f);
     return output;
 }
@@ -954,9 +981,14 @@ VSOutput main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TE
         output.position.z = max(0.0f, output.position.z - WallmarkClipShift);
     const float normalSquared = dot(worldNormal, worldNormal);
     output.normal = normalSquared > 0.0f ? normalize(worldNormal) : float3(0, 1, 0);
+    if (ReservedGeometry != 0)
+    {
+        const Transform detail = Transforms[MatrixBase + instance];
+        output.normal = normalize(float3(detail.row0.w, detail.row1.w, detail.row2.w));
+    }
     output.uv = uv;
     output.world = worldPosition;
-    output.hemi = ObjectSkyHemi;
+    output.hemi = ReservedGeometry != 0 ? Transforms[MatrixBase + instance].row3.w : ObjectSkyHemi;
     output.lmapUv = 0.0f;
     return output;
 }
@@ -974,7 +1006,7 @@ ShadowInterpolants shadowMain(float3 position : POSITION, float3 normal : NORMAL
 }
 )";
 
-constexpr const char* kScenePixelShader = R"(
+const std::string kScenePixelShader = std::string(R"(
 Texture2D BaseColor : register(t0);
 Texture2DArray<float> SunShadow : register(t2);
 #if defined(OGSR_DX12_SHADOW_PAGE_TABLE)
@@ -1103,11 +1135,26 @@ float SunPlaneVisibility(float2 uv, float compareDepth, float2 gradient, uint sl
     return lerp(lerp(a, b, weight.x), lerp(c, d, weight.x), weight.y);
 }
 
+)")
+    + game_shadow12::ContinuousSunFilterHlsl + R"(
 float SunFilterVisibility(float3 coords, float3 planeNormal, uint slice)
 {
     const float2 uv = coords.xy;
     const float compareDepth = coords.z - SunDepthBias[slice];
     float2 gradient = 0.0f;
+#if defined(OGSR_DX12_CONTINUOUS_SUN) && OGSR_DX12_CONTINUOUS_SUN > 0
+    if (!SunReceiverGradient(planeNormal, slice, gradient))
+        gradient = 0.0f;
+    return ContinuousSunFilter(uv, compareDepth, gradient, slice, OGSR_DX12_CONTINUOUS_SUN);
+#else
+#if !defined(OGSR_DX12_CONTINUOUS_SUN)
+    if (SunFilter >= 9u && SunFilter <= 11u)
+    {
+        if (!SunReceiverGradient(planeNormal, slice, gradient))
+            gradient = 0.0f;
+        return ContinuousSunFilter(uv, compareDepth, gradient, slice, (int)SunFilter - 8);
+    }
+#endif
     if ((SunFilter == 4 || SunFilter == 7) && SunReceiverGradient(planeNormal, slice, gradient))
         return SunPlaneVisibility(uv, compareDepth, gradient, slice);
     if (SunFilter == 1)
@@ -1151,6 +1198,7 @@ float SunFilterVisibility(float3 coords, float3 planeNormal, uint slice)
             SunShadow.SampleCmpLevelZero(SunShadowSampler, float3(uv - offset, slice), compareDepth)) / 3.0f;
     }
     return visibility;
+#endif
 }
 )"
 R"(
@@ -1292,40 +1340,9 @@ bool ValidLocalAddress(uint4 address)
 #endif
 }
 
-uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
-                        out float3 coords, out uint layer)
+uint ProjectLocalFace(uint first, uint layer, uint faces, uint4 baseAddress, float3 receiver, out float3 coords)
 {
     coords = 0.0f;
-    layer = 0;
-    if (source.type.y == 0)
-        return LOCAL_NO_MAP;
-    layer = source.type.y - 1;
-    if (layer >= LocalShadowConfig.x || source.type.x > 1u)
-        return LOCAL_BAD_LAYER;
-    const uint faces = source.type.x == 0u ? 6u : 1u;
-    const uint first = layer;
-    if (faces > LocalShadowConfig.x - first)
-        return LOCAL_BAD_LAYER;
-    const uint4 baseAddress = LocalShadowMatrices[first].address;
-    if (!ValidLocalAddress(baseAddress) || baseAddress.w != faces)
-        return LOCAL_BAD_LAYER;
-    // Смещение задаётся в метрах. Грань point-карты выбирается уже
-    // по смещённому приёмнику, который будет спроецирован в эту грань.
-    const float3 lightPosition = source.positionInverseRangeSquared.xyz;
-    const float footprint = clamp(length(position - lightPosition) / (float)baseAddress.z, 0.004f, 0.05f);
-    const float3 receiver = position + lightDirection * 0.003f +
-        normal * (footprint * (1.0f - saturate(dot(normal, lightDirection))));
-    if (source.type.x == 0)
-    {
-        const float3 delta = receiver - lightPosition;
-        const float3 axis = abs(delta);
-        if (axis.x >= max(axis.y, axis.z))
-            layer += delta.x >= 0.0f ? 0 : 1;
-        else if (axis.y >= axis.z)
-            layer += delta.y >= 0.0f ? 2 : 3;
-        else
-            layer += delta.z >= 0.0f ? 4 : 5;
-    }
     if (layer >= LocalShadowConfig.x)
         return LOCAL_BAD_LAYER;
     const uint4 address = LocalShadowMatrices[layer].address;
@@ -1342,6 +1359,51 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     if (!all(isfinite(coords)))
         return LOCAL_BAD_PROJECTION;
     return all(coords > 0.0f) && all(coords < 1.0f) ? LOCAL_VALID : LOCAL_OUTSIDE;
+}
+
+uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
+                        out float3 coords, out uint layer, out float3 receiver)
+{
+    coords = 0.0f;
+    layer = 0;
+    receiver = position;
+    if (source.type.y == 0)
+        return LOCAL_NO_MAP;
+    layer = source.type.y - 1;
+    if (layer >= LocalShadowConfig.x || source.type.x > 1u)
+        return LOCAL_BAD_LAYER;
+    const uint faces = source.type.x == 0u ? 6u : 1u;
+    const uint first = layer;
+    if (faces > LocalShadowConfig.x - first)
+        return LOCAL_BAD_LAYER;
+    const uint4 baseAddress = LocalShadowMatrices[first].address;
+    if (!ValidLocalAddress(baseAddress) || baseAddress.w != faces)
+        return LOCAL_BAD_LAYER;
+    // Смещение задаётся в метрах. Грань point-карты выбирается уже
+    // по смещённому приёмнику, который будет спроецирован в эту грань.
+    const float3 lightPosition = source.positionInverseRangeSquared.xyz;
+    const float footprint = clamp(length(position - lightPosition) / (float)baseAddress.z, 0.004f, 0.05f);
+    receiver = position + lightDirection * 0.003f +
+        normal * (footprint * (1.0f - saturate(dot(normal, lightDirection))));
+    if (source.type.x == 0)
+    {
+        const float3 delta = receiver - lightPosition;
+        const float3 axis = abs(delta);
+        if (axis.x >= max(axis.y, axis.z))
+            layer += delta.x >= 0.0f ? 0 : 1;
+        else if (axis.y >= axis.z)
+            layer += delta.y >= 0.0f ? 2 : 3;
+        else
+            layer += delta.z >= 0.0f ? 4 : 5;
+    }
+    return ProjectLocalFace(first, layer, faces, baseAddress, receiver, coords);
+}
+
+uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, float3 lightDirection,
+                        out float3 coords, out uint layer)
+{
+    float3 receiver;
+    return ProjectLocalShadow(source, position, normal, lightDirection, coords, layer, receiver);
 }
 
 // Differentiate clip.xyz / clip.w along the geometric receiver plane.
@@ -1384,6 +1446,8 @@ float CompareLocalShadow(float2 uv, float3 coords, float2 gradient, uint4 addres
     return lerp(lerp(visible.w, visible.z, weight.x), lerp(visible.x, visible.y, weight.x), weight.y);
 }
 
+)"
+    + game_shadow12::ContinuousLocalFilterHlsl + R"(
 float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
 {
     if (layer >= LocalShadowConfig.x)
@@ -1391,6 +1455,13 @@ float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
     const uint4 address = LocalShadowMatrices[layer].address;
     if (!ValidLocalAddress(address))
         return 1.0f;
+#if defined(OGSR_DX12_CONTINUOUS_LOCAL) && OGSR_DX12_CONTINUOUS_LOCAL > 0
+    return ContinuousLocalFilter(coords, gradient, address, OGSR_DX12_CONTINUOUS_LOCAL);
+#else
+#if !defined(OGSR_DX12_CONTINUOUS_LOCAL)
+    if (LocalFilterRadius >= 1u && LocalFilterRadius <= 3u)
+        return ContinuousLocalFilter(coords, gradient, address, (int)LocalFilterRadius);
+#endif
     const float2 halfTexel = 0.5f / (float)address.z;
     const float2 center = clamp(coords.xy, halfTexel, 1.0f - halfTexel);
     float visibility = CompareLocalShadow(center, coords, gradient, address);
@@ -1406,15 +1477,48 @@ float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
             CompareLocalShadow(high, coords, gradient, address)) / 3.0f;
     }
     return visibility;
+#endif
 }
 
 float LocalVisibility(LocalLightData source, float3 position, float3 normal, float3 lightDirection, float3 planeNormal)
 {
-    float3 coords;
+    float3 coords, receiver;
     uint layer;
-    if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
+    if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer, receiver) != LOCAL_VALID)
         return 1.0f;
-    return SampleLocalVisibility(coords, layer, LocalReceiverGradient(coords, planeNormal, layer));
+    const float primary = SampleLocalVisibility(coords, layer, LocalReceiverGradient(coords, planeNormal, layer));
+#if !defined(OGSR_DX12_CONTINUOUS_LOCAL) || OGSR_DX12_CONTINUOUS_LOCAL > 0
+    if (source.type.x == 0 && LocalFilterRadius != 0u &&
+        PointFaceBlendStart > 0.0f && PointFaceBlendStart < 1.0f)
+    {
+        const float3 delta = receiver - source.positionInverseRangeSquared.xyz;
+        const float3 axis = abs(delta);
+        const float largest = max(axis.x, max(axis.y, axis.z));
+        if (largest > 0.0f)
+        {
+            const uint first = source.type.y - 1u;
+            const uint4 baseAddress = LocalShadowMatrices[first].address;
+            float visibility = primary, total = 1.0f;
+            [loop]
+            for (uint i = 0; i < 3; ++i)
+            {
+                const uint other = first + 2 * i + (delta[i] < 0.0f ? 1u : 0u);
+                const float weight = smoothstep(PointFaceBlendStart, 1.0f, axis[i] / largest);
+                if (other == layer || weight <= 0.0f)
+                    continue;
+                float3 otherCoords;
+                if (ProjectLocalFace(first, other, 6u, baseAddress, receiver, otherCoords) == LOCAL_VALID)
+                {
+                    visibility += weight * SampleLocalVisibility(otherCoords, other,
+                        LocalReceiverGradient(otherCoords, planeNormal, other));
+                    total += weight;
+                }
+            }
+            return visibility / total;
+        }
+    }
+#endif
+    return primary;
 }
 
 bool DebugLightMatches(uint index)
@@ -1438,6 +1542,14 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
         uint layer;
         if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
             continue;
+        if (ViewMode == 40 || ViewMode == 41)
+        {
+            const uint4 address = LocalShadowMatrices[layer].address;
+            if (ViewMode == 40)
+                return 0.15f + 0.85f * frac(float3(address.x + 1u, address.y + 1u, (address.w >> 8) + 1u) *
+                    float3(0.618f, 0.381f, 0.173f));
+            return (address.z / 1024.0f).xxx;
+        }
         if (ViewMode == 4)
         {
             const uint4 address = LocalShadowMatrices[layer].address;
@@ -1525,9 +1637,12 @@ float3 LocalLighting(float3 normal, float3 position, float2 screen, float3 plane
             const uint last = max(ClusterGrid.w, 1u) - 1u;
             index = ClusterLightIndices[min(range.x + item, last)];
         }
-        if (diagnostic && !DebugLightMatches(index))
+        if (index >= LightingFlags.z || (diagnostic && !DebugLightMatches(index)))
             continue;
-        const LocalLightData source = LocalLights[index];
+        // Root SRV не несёт размера. Защищаем загрузку и в случае,
+        // когда FXC выносит её из условной ветви при трансформации цикла.
+        const uint lastLight = max(LightingFlags.z, 1u) - 1u;
+        const LocalLightData source = LocalLights[min(index, lastLight)];
         const float3 toLight = source.positionInverseRangeSquared.xyz - position;
         const float falloff = LocalFalloff(source, toLight);
         if (falloff <= 0.0f)
@@ -1727,7 +1842,8 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
 R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
     // Считаем производные плоскости до clip и ветвления на режимы материалов.
-    const float3 correctedPlaneNormal = LocalShadowConfig.x != 0u || SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ?
+    const bool continuousSun = SunFilter >= 9u && SunFilter <= 11u;
+    const float3 correctedPlaneNormal = LocalShadowConfig.x != 0u || SunFilter == 4 || continuousSun || ViewMode == 24 || ViewMode == 30 ?
         SunPlaneNormal(ddx_fine(input.world), ddy_fine(input.world)) : 0.0f;
     const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
     const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
@@ -1745,8 +1861,20 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     if (ViewMode == 3)
         return textured ? float4(0.1f, 0.1f, 0.1f, 1.0f)
                         : float4(0.9f, 0.1f, 0.1f, 1.0f);
-    if (ViewMode >= 4 && ViewMode <= 6)
+    if ((ViewMode >= 4 && ViewMode <= 6) || ViewMode == 40)
         return float4(DebugLocalShadow(input.world, n, correctedPlaneNormal), 1.0f);
+    if (ViewMode == 41)
+        return DiagnosticLight.y != 0 ? float4(DebugLocalShadow(input.world, n, correctedPlaneNormal), 1.0f) :
+            float4((LightingFlags.w != 0u ? SunShadowResolution / 4096.0f : 0.0f).xxx, 1.0f);
+    if (ViewMode == 42)
+    {
+        if ((TextureMode & 16384u) != 0) return float4(0.15f, 0.8f, 0.15f, 1);
+        if ((TextureMode & 32768u) != 0) return float4(0.7f, 0.4f, 0.15f, 1);
+        if ((TextureMode & 4096u) != 0) return float4(0.5f, 0.55f, 0.3f, 1);
+        if ((TextureMode & 2u) != 0) return float4(0.7f, 0.25f, 0.65f, 1);
+        if ((TextureMode & 8u) != 0) return float4(0.2f, 0.55f, 0.85f, 1);
+        return float4(0.35f, 0.35f, 0.35f, 1);
+    }
     if ((TextureMode & 2048u) != 0)
         baseColor.rgb = TerrainAlbedo(baseColor.rgb, input.uv, input.world);
     if (ViewMode == 7)
@@ -1758,6 +1886,8 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         bakedHemi = HemiLightmap.Sample(WallmarkSampler, input.lmapUv).a; // CoP: s_hemi alpha.
     if ((TextureMode & 4096u) != 0)
         bakedHemi = baseColor.a; // BmmD terrain: alpha базового слоя перед detail.
+    if (ViewMode == 39)
+        return float4(saturate(bakedHemi).xxx, 1.0f);
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
     if (ViewMode == 14)
@@ -1805,7 +1935,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
     // Geometric receiver plane, computed before the light-dependent branch.
     const float3 planeNormal = SunFilter == 7 ? SafeDirection(cross(ddx(input.world), ddy(input.world))) :
-        (SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ? correctedPlaneNormal : 0.0f);
+        (SunFilter == 4 || continuousSun || ViewMode == 24 || ViewMode == 30 ? correctedPlaneNormal : 0.0f);
     if (ViewMode == 19 || ViewMode == 20 || (ViewMode >= 26 && ViewMode <= 38))
         return float4(DebugSun(ViewMode, SelectSun(input.world, n, sunCosine), planeNormal, sunCosine), 1);
     if (ViewMode == 21)
@@ -1813,6 +1943,8 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     if (ViewMode == 22)
         return float4(ToDisplay(SunColor.rgb * sunCosine *
             SunVisibility(input.world, n, sunCosine, planeNormal)), 1);
+    if (ViewMode == 43)
+        return float4(ToDisplay(SunColor.rgb * sunCosine), 1);
     if (ViewMode == 23)
         return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, false, true)), 1);
     if (ViewMode == 24)
@@ -1982,7 +2114,11 @@ bool BuildLocalShadowProjection(const gamelight12::LocalLight& light, LocalProje
     const bool spot = light.type == gamelight12::LocalType::Spot;
     const uint32_t faceCount = spot ? 1u : kPointShadowFaces;
     // Поля фильтрации по краям карты и на стыках шести граней.
-    const float fov = spot ? 2.0f * std::acos(light.outerCos) + 0.04f : XM_PIDIV2 + 0.04f;
+    const float nominalFov = spot ? 2.0f * std::acos(light.outerCos) : XM_PIDIV2;
+    float fov = nominalFov + 0.04f;
+    if (SceneLocalFilterRadius() != 0 &&
+        !game_shadow12::GuardedLocalFov(nominalFov, game_shadow12::MinShadowMapResolution, fov, !spot))
+        return false;
     if (!std::isfinite(fov) || fov <= 0.0f || fov >= XM_PI)
         return false;
     const auto vector = [](const gamelight12::Vec3& v) { return XMVectorSet(v.x, v.y, v.z, 0.0f); };
@@ -2090,7 +2226,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 38ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 43ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -3472,8 +3608,11 @@ bool GameDx12StaticScene12::Load(
             }
             draw.surface = ResolveSurface(material.surface, binaryAlpha);
             draw.wallmarkClamp = material.wallmarkClamp;
-            draw.vertexHemi = !visual.has_world && !material.usesHemiLightmap &&
-                visual.layout == xraylevel12::VertexLayout12::Classic;
+            const bool tree = visual.type == xraylevel12::kMtTreeSt || visual.type == xraylevel12::kMtTreePm;
+            draw.vertexHemi = (tree && visual.has_world) || (!visual.has_world && !material.usesHemiLightmap &&
+                visual.layout == xraylevel12::VertexLayout12::Classic);
+            draw.treeHemiScale = visual.tree_hemi_scale;
+            draw.treeHemiBias = visual.tree_hemi_bias;
             if (!visual.has_world && material.hemiTextureIndex < textures.size() &&
                 HasPackedLightmapUv(visual, pools))
                 draw.hemiDescriptor = material.hemiTextureIndex + 1;
@@ -3940,6 +4079,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const GameDx12NativeFrame12::Owner& owner, IDXGIAdapter3* adapter,
     const DirectX::XMFLOAT4X4& logicalViewProjection,
     const float cameraPosition[3], const gameaux12::Frame& extras,
+    gameaux12::LevelDetails* detailSource,
     const gamelight12::FrameSnapshot& lighting,
     const gamewater12::Frame& water,
     FrameStats12& stats, AuxStats& auxStats, std::string& reason)
@@ -3992,6 +4132,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     const uint32_t sunFilter = SceneSunFilter();
     const auto& sunSettings = SceneSunSettings();
     constants.sunFilter = sunFilter != 0 ? sunFilter : !SceneReceiverPlaneSunRequested() ? 3u : m_sunShadowSlices > 1 ? 2u : 7u;
+    constants.localFilterRadius = SceneLocalFilterRadius();
+    constants.pointFaceBlendStart = game_shadow12::PointFaceBlendStart(game_shadow12::MinShadowMapResolution);
+    stats.sunFilter = constants.sunFilter;
+    stats.localFilterRadius = constants.localFilterRadius;
+    stats.detailSunShadows = SceneDetailSunShadowsRequested();
     constants.sunReceiverBiasMask = sunSettings.biasMask & 3u;
     constants.sunShadowResolution = m_sunShadowResolution;
     constants.localShadowConfig[0] = m_localShadow ? m_localShadowSlices : 0;
@@ -4022,7 +4167,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             const bool fitRequested = sunSettings.distance != 0 && m_sunShadowSlices == sunSettings.count;
             bool fitted = fitRequested && game_shadow12::MakeSunPlan(logicalViewProjection, cameraPosition,
                 {lighting.sunDirection.x, lighting.sunDirection.y, lighting.sunDirection.z},
-                m_sunShadowSlices, m_sunShadowResolution, static_cast<float>(sunSettings.distance), sunPlan);
+                m_sunShadowSlices, m_sunShadowResolution, static_cast<float>(sunSettings.distance), sunPlan,
+                sunFilter >= game_shadow12::FirstContinuousSunMode);
             for (uint32_t slice = 0; slice < sunPlan.count; ++slice)
                 fitted &= BuildFrustum(sunPlan.cascades[slice].viewProjection, sunPlanes[slice].data());
             if (!fitted)
@@ -4105,9 +4251,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 candidates.push_back(game_shadow12::AdaptiveShadowRuntime::Candidate(light, cameraPosition, pixelsPerRadian));
             }
             stats.adaptive.fallback = "none";
+            if (lighting.localTraceCount != 0)
+                stats.adaptive.tracedLight = lighting.tracedLightId;
             const auto hr = m_adaptiveShadows->Prepare(owner, *adapter, recording, *m_shadowDescriptors,
                 candidates, LevelSession(), LevelEpoch(), lighting.frame, sunPlan.count, adaptiveAddresses, adaptiveBinding,
-                UINT64_MAX, (recording.frame->Measuring() || (recording.frame->PresentCount() + 1) % 120 == 0 || recording.frame->PresentCount() == 0)
+                UINT64_MAX, (stats.adaptive.tracedLight || recording.frame->Measuring() ||
+                    (recording.frame->PresentCount() + 1) % 120 == 0 || recording.frame->PresentCount() == 0)
                     ? &stats.adaptive : nullptr, stats.batchingRequested ? 0u : UINT32_MAX);
             if (FAILED(hr))
                 return Fail(reason, "adaptive local shadow preparation failed");
@@ -4234,6 +4383,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             gamelight12::LocalTraceReasonName(trace.rejection), shadowReason);
         const auto record = selected ? localLights[trace.gpuSlot] : LocalLightGpu{};
         const bool packedIdMatches = selected && lighting.localLights[trace.gpuSlot].id == trace.id;
+        if (layer == 0)
+            Msg("ph_dx12_shadow_assignment: frame=%llu slot=%u light=%llu admitted=0 requested_resolution=%u "
+                "actual_resolution=0 reason=%s",
+                static_cast<unsigned long long>(lighting.frame), frameSlot, static_cast<unsigned long long>(trace.id),
+                trace.id == stats.adaptive.tracedLight ? stats.adaptive.tracedRequestedResolution : 0u, shadowReason);
         Msg("ph_dx12_f43fr2: light_record frame=%llu id=%llu production_slot=%d gpu_slot=%d packed_id_match=%d "
             "source_dir=(%.6g,%.6g,%.6g,%.6g) source_rgb=(%.6g,%.6g,%.6g,%.6g) "
             "gpu_pos_rsq=(%.6g,%.6g,%.6g,%.6g) gpu_dir=(%.6g,%.6g,%.6g,%.6g) "
@@ -4882,8 +5036,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         const bool waves = waterPass && gamewater12::WaterEnabled() &&
             draw.surface == SurfaceMode::Translucent && draw.transparency == gameaux12::TransparentMaterial::Water;
         const uint32_t geometry[] = {draw.layout == 3 ? 1u : 0u, std::bit_cast<uint32_t>(clipShift),
-                                     waves ? 1u : 0u};
-        list->SetGraphicsRoot32BitConstants(5, 3, geometry, 0);
+                                     draw.layout == 3 ? std::bit_cast<uint32_t>(draw.treeHemiScale) : (waves ? 1u : 0u),
+                                     std::bit_cast<uint32_t>(draw.treeHemiBias)};
+        list->SetGraphicsRoot32BitConstants(5, 4, geometry, 0);
         if (draw.hemiDescriptor != kNullDescriptor && boundHemi != draw.hemiDescriptor)
         {
             auto hemiSrv = heapGpu;
@@ -4905,7 +5060,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         const uint32_t materialFlags = (draw.hemiDescriptor == kNullDescriptor ? 0u : kLightmapHemi) |
             (draw.terrainSet == 0 ? 0u : kTerrainDetail) |
-            (draw.terrainBaseHemi ? kTerrainBaseHemi : 0u);
+            (draw.terrainBaseHemi ? kTerrainBaseHemi : 0u) |
+            (draw.layout == 3 ? kTreeMaterial : 0u);
         bindMaterial(draw.descriptor, draw.visualId, draw.surface, draw.wallmarkClamp, draw.transparency,
             false, draw.vertexHemi, materialFlags, draw.traceSlot != UINT8_MAX);
         list->IASetVertexBuffers(0, 1, &draw.vertexView);
@@ -4918,11 +5074,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                                        float skyHemi = 0.0f)
     {
         list->SetGraphicsRoot32BitConstant(3, offset, 0);
-        bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, twoSided,
-            false, skyHemi > 0.0f ? kObjectSkyHemi : 0u);
+        bindMaterial(mesh.descriptor, id, surface, mesh.wallmarkClamp, mesh.transparency, false,
+            twoSided, twoSided ? kVertexHemi | kDetailMaterial : (skyHemi > 0.0f ? kObjectSkyHemi : 0u));
         const bool waves = waterPass && gamewater12::WaterEnabled() &&
             surface == SurfaceMode::Translucent && mesh.transparency == gameaux12::TransparentMaterial::Water;
-        const uint32_t geometry[] = {0u,
+        const uint32_t geometry[] = {twoSided ? 1u : 0u,
             std::bit_cast<uint32_t>(IsOverlay(surface) ? kWallmarkClipShift : 0.0f),
             waves ? 1u : 0u, std::bit_cast<uint32_t>(skyHemi)};
         list->SetGraphicsRoot32BitConstants(5, static_cast<UINT>(std::size(geometry)), geometry, 0);
@@ -4932,51 +5088,85 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         list->DrawIndexedInstanced(mesh.indices, count, 0, 0, 0);
     };
 
-    // Копируем матрицы травы на потоке-владельце в отдельный диапазон
-    // защищённого fence слота. Задача sun map читает готовые пакеты.
-    struct DetailShadowPacket
+    // Слоты декодируются на потоке владельца. Работники записи получают
+    // неизменяемые пакеты и адрес загрузки уже защищённого fence слота.
+    std::array<std::vector<gameaux12::DetailShadowDraw>, game_shadow12::MaxSunCascades> sunDetails;
+    D3D12_GPU_VIRTUAL_ADDRESS detailShadowSrv = 0;
+    if (sunPlan.count != 0 && validExtras && detailSource && stats.detailSunShadows && m_sunShadowAuxPipeline)
     {
-        uint32_t mesh, first, count;
-    };
-    std::array<DetailShadowPacket, kDetailShadowInstances> detailPackets;
-    uint32_t detailPacketCount = 0;
-    if (constants.lightingFlags[3] != 0 && validExtras && SceneDetailSunShadowsRequested() && m_sunShadowAuxPipeline)
-    {
-        uint32_t next = gameaux12::kMaxFrameTransforms;
-        constexpr uint32_t end = gameaux12::kMaxFrameTransforms + kDetailShadowInstances;
-        for (const auto& group : extras.details)
+        const char* detailStatus = "invalid_region";
+        gameaux12::DetailShadowSnapshot candidate;
+        std::vector<DirectX::XMFLOAT4X4> transforms;
+        auto& upload = m_detailShadowUploads[frameSlot];
+        try
         {
-            if (next == end)
-                break;
-            if (group.mesh >= snapshot.meshes.size())
-                continue;
-            const auto& mesh = snapshot.meshes[group.mesh];
-            if (mesh.skinned || mesh.requiredBones != 1)
-                continue;
-            const uint32_t first = next;
-            for (const auto& transform : group.transforms)
+            std::array<gameaux12::DetailShadowRegion, game_shadow12::MaxSunCascades> regions{};
+            bool valid = true;
+            for (uint32_t i = 0; i < sunPlan.count; ++i)
+                valid &= gameaux12::DetailCasterRegion(sunPlan.cascades[i].viewProjection, regions[i]);
+            if (valid)
             {
-                if (next == end)
-                    break;
-                if (!FiniteMatrix(transform))
-                    continue;
-                const float center[] = {transform._41, transform._42, transform._43};
-                const float scale = std::hypot(transform._11, transform._12, transform._13);
-                const float distance = std::hypot(center[0] - cameraPosition[0],
-                    center[1] - cameraPosition[1], center[2] - cameraPosition[2]);
-                if (distance > 12.0f || !std::isfinite(scale) || !SphereInside(sunPlanes[0].data(), center, mesh.radius * scale))
-                    continue;
-                std::memcpy(transformDestination + uint64_t{next} * sizeof(transform), &transform, sizeof(transform));
-                ++next;
+                detailSource->CollectShadow(std::span(regions).first(sunPlan.count), kDetailShadowBudget, candidate);
+                if (candidate.complete)
+                {
+                    m_detailShadowSnapshot = std::move(candidate);
+                    detailStatus = "complete";
+                }
+                else if (candidate.generation != m_detailShadowSnapshot.generation)
+                {
+                    m_detailShadowSnapshot = {};
+                    detailStatus = "pending";
+                }
+                else
+                    detailStatus = m_detailShadowSnapshot.complete ? "retained" : "pending";
+
+                std::vector<uint32_t> meshes;
+                meshes.reserve(extras.details.size());
+                for (const auto& group : extras.details)
+                {
+                    const auto* mesh = group.mesh < snapshot.meshes.size() ? &snapshot.meshes[group.mesh] : nullptr;
+                    meshes.push_back(mesh && !mesh->skinned && mesh->requiredBones == 1 ?
+                        group.mesh : gameaux12::kInvalidMesh);
+                }
+                const auto& placements = m_detailShadowSnapshot.placements;
+                const auto bounds = gameaux12::DetailShadowBounds(placements);
+                for (uint32_t i = 0; i < sunPlan.count && valid; ++i)
+                {
+                    std::array<gameaux12::DetailShadowPlane, 6> frustum;
+                    for (uint32_t plane = 0; plane < frustum.size(); ++plane)
+                    {
+                        const auto& p = sunPlanes[i][plane];
+                        frustum[plane] = {{p.nx, p.ny, p.nz}, p.d};
+                    }
+                    valid = gameaux12::AppendDetailShadowDraws(placements, bounds, frustum, meshes,
+                        kDetailShadowUploadBytes, transforms, sunDetails[i]);
+                }
+                if (!valid)
+                    detailStatus = "upload_budget";
+                else if (!transforms.empty())
+                {
+                    if (SUCCEEDED(upload.Write(*recording.device,
+                        std::span<const DirectX::XMFLOAT4X4>(transforms), kDetailShadowUploadBytes)))
+                        detailShadowSrv = upload.Address();
+                    else
+                        detailStatus = "upload_failed";
+                }
             }
-            if (next != first)
-                detailPackets[detailPacketCount++] = {group.mesh, first, next - first};
         }
-        if (lighting.diagnosticBurst)
-            Msg("ph_dx12_fr3: detail_sun_shadow instances=%u cap=%u",
-                next - gameaux12::kMaxFrameTransforms, kDetailShadowInstances);
+        catch (const std::bad_alloc&)
+        {
+            detailStatus = "host_memory";
+        }
+        if (!detailShadowSrv)
+            sunDetails = {};
+        if (lighting.diagnosticBurst || lighting.frame % 120 == 0)
+            Msg("ph_dx12_shadow_details: frame=%llu slot=%u state=%s placements=%zu instances=%zu pending_slots=%zu "
+                "snapshot_generation=%llu upload_capacity_bytes=%llu",
+                static_cast<unsigned long long>(lighting.frame), frameSlot, detailStatus,
+                m_detailShadowSnapshot.placements.size(), detailShadowSrv ? transforms.size() : 0,
+                candidate.pendingSlots, static_cast<unsigned long long>(m_detailShadowSnapshot.generation),
+                static_cast<unsigned long long>(upload.Capacity()));
     }
-    const std::span<const DetailShadowPacket> sunDetails(detailPackets.data(), detailPacketCount);
 
     struct ShadowDraws
     {
@@ -4999,6 +5189,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     }
     const FramePreparation& preparedPackets = prepared;
     enum class ShadowDrawPart { All, Static, Dynamic };
+    using ShadowPhase = GameDx12NativeFrame12::ShadowPhase;
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
         const FrustumPlane* shadowPlanes, bool dynamic, ShadowDrawPart part = ShadowDrawPart::All)
@@ -5075,6 +5266,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         shadowList->SetGraphicsRoot32BitConstant(kShadowLayerRoot, projection, 0);
         if (part != ShadowDrawPart::Dynamic)
+        {
+        recording.StampShadowPhase(*shadowList, projection, ShadowPhase::Static, false);
         for (uint32_t layout = 0; layout < static_cast<uint32_t>(m_sunShadowPipelines.size()); ++layout)
         {
             const auto& tree = m_shadowCasters[layout];
@@ -5096,8 +5289,11 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 ++draws.statics;
             });
         }
+        recording.StampShadowPhase(*shadowList, projection, ShadowPhase::Static, true);
+        }
         if (part != ShadowDrawPart::Static && dynamic && validExtras && m_sunShadowAuxPipeline != nullptr)
         {
+            recording.StampShadowPhase(*shadowList, projection, ShadowPhase::Dynamic, false);
             shadowList->SetPipelineState(m_sunShadowAuxPipeline.Get());
             if (usePrepared)
             {
@@ -5125,11 +5321,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     }
                 }
             }
+            recording.StampShadowPhase(*shadowList, projection, ShadowPhase::Dynamic, true);
         }
-        if (projection == 0 && !sunDetails.empty())
+        if (projection < sunDetails.size() && !sunDetails[projection].empty())
         {
             shadowList->SetPipelineState(m_sunShadowAuxPipeline.Get());
-            for (const auto& packet : sunDetails)
+            shadowList->SetGraphicsRootShaderResourceView(4, detailShadowSrv);
+            for (const auto& packet : sunDetails[projection])
             {
                 submitAuxShadow(snapshot.meshes[packet.mesh], SurfaceMode::Cutout, packet.first, packet.count);
                 ++draws.rigid;
@@ -5190,8 +5388,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             size_t draws = prepared.objects.size();
             for (const auto& layout : prepared.statics)
                 draws += layout.size();
-            if (pass.view.projection == 0)
-                draws += sunDetails.size();
+            if (pass.view.IsSun())
+                draws += sunDetails[pass.view.Slice()].size();
             return static_cast<uint32_t>((std::min)(draws, size_t(UINT32_MAX)));
         };
         std::vector<size_t> dirtyPasses;
@@ -5297,7 +5495,43 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         for (size_t i = 0; i < passes.size(); ++i)
         {
             const auto& pass = passes[i];
-            if (!pass.view.IsSun() && cacheReasons && (*cacheReasons)[local++] == game_shadow12::ShadowContentHit)
+            const bool isLocal = !pass.view.IsSun();
+            const uint32_t dirtyReason = isLocal && cacheReasons ? (*cacheReasons)[local++] : UINT32_MAX;
+            if (isLocal && stats.adaptive.tracedLight != 0 && pass.light == stats.adaptive.tracedLight)
+            {
+                Msg("ph_dx12_shadow_assignment: frame=%llu slot=%u light=%llu admitted=1 requested_resolution=%u "
+                    "actual_resolution=%u page=%llu slice=%u generation=%llu face=%u dirty_reason_mask=%u cache_active=%d",
+                    static_cast<unsigned long long>(lighting.frame), frameSlot, static_cast<unsigned long long>(pass.light),
+                    stats.adaptive.tracedRequestedResolution, pass.size, static_cast<unsigned long long>(pass.page),
+                    pass.slice, static_cast<unsigned long long>(pass.page), pass.face, dirtyReason, cacheReasons != nullptr);
+                if (usePrepared)
+                {
+                    const auto& casters = preparedPackets.shadows[pass.view.projection];
+                    size_t staticCount = 0;
+                    bool containsVisual = false;
+                    const auto selectedVisual = R1VisualSelection()[0];
+                    for (const auto& layout : casters.statics)
+                    {
+                        staticCount += layout.size();
+                        if (selectedVisual != UINT32_MAX)
+                            containsVisual |= std::any_of(layout.begin(), layout.end(), [&](uint32_t index)
+                            {
+                                return snapshot.draws[index].visualId == selectedVisual;
+                            });
+                    }
+                    const bool containsObject = extras.traceId != UINT32_MAX &&
+                        std::any_of(casters.objects.begin(), casters.objects.end(), [&](const auto& packet)
+                        {
+                            return snapshot.objects[packet.objectIndex].id == extras.traceId;
+                        });
+                    Msg("ph_dx12_shadow_membership: frame=%llu slot=%u light=%llu face=%u static=%zu dynamic=%zu "
+                        "visual=%u visual_member=%d object=%u object_member=%d",
+                        static_cast<unsigned long long>(lighting.frame), frameSlot,
+                        static_cast<unsigned long long>(pass.light), pass.face, staticCount, casters.objects.size(),
+                        selectedVisual, containsVisual, extras.traceId, containsObject);
+                }
+            }
+            if (dirtyReason == game_shadow12::ShadowContentHit)
             {
                 stats.cacheSkippedDraws += drawCount(pass);
                 ++stats.localShadowMaps;
@@ -5390,13 +5624,19 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (staticReasons && staticUpdates[index].scratch.page)
             {
                 const auto& update = staticUpdates[index];
+                const auto projection = pass.view.projection;
+                const bool refresh = (*staticReasons)[update.keyIndex] != game_shadow12::ShadowContentHit;
                 ShadowDraws statics;
+                if (!refresh)
+                    recording.StampShadowPhase(target, projection, ShadowPhase::Copy, false);
                 game_shadow12::CopyStaticShadow(target, update.scratch.view, batch[index].target,
-                    (*staticReasons)[update.keyIndex] != game_shadow12::ShadowContentHit, [&]
+                    refresh, [&]
                 {
                     statics = recordShadowMap(&target, update.scratch.view.dsv, pass.size,
-                        pass.view.projection, pass.planes, false, ShadowDrawPart::Static);
+                        projection, pass.planes, false, ShadowDrawPart::Static);
+                    recording.StampShadowPhase(target, projection, ShadowPhase::Copy, false);
                 });
+                recording.StampShadowPhase(target, projection, ShadowPhase::Copy, true);
                 results[index] = recordShadowMap(&target, pass.dsv, pass.size,
                     pass.view.projection, pass.planes, pass.dynamic, ShadowDrawPart::Dynamic);
                 results[index].statics = statics.statics;
@@ -5672,8 +5912,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             }
             const auto& mesh = m_auxMeshes[group.mesh];
             const uint32_t first = next;
-            for (const auto& transform : group.transforms)
+            for (const auto& detail : group.transforms)
             {
+                const auto& transform = detail.world;
                 const float scale = std::hypot(transform._11, transform._12, transform._13);
                 const float center[] = {transform._41, transform._42, transform._43};
                 if (cull && !SphereInside(planes, center, mesh.radius * scale))
@@ -5687,7 +5928,14 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     ++auxStats.detailBudget;
                     continue;
                 }
-                std::memcpy(transformDestination + next * sizeof(transform), &transform, sizeof(transform));
+                // Последний столбец матрицы не влияет на xyz affine-преобразования;
+                // он используется только в отдельном detail-потоке t1.
+                auto gpuInstance = transform;
+                gpuInstance._14 = detail.terrainNormal.x;
+                gpuInstance._24 = detail.terrainNormal.y;
+                gpuInstance._34 = detail.terrainNormal.z;
+                gpuInstance._44 = detail.hemi;
+                std::memcpy(transformDestination + next * sizeof(gpuInstance), &gpuInstance, sizeof(gpuInstance));
                 ++next;
             }
             if (next > first)
@@ -5893,6 +6141,8 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_frameConstantsMapped = nullptr;
     m_frameConstants.Reset();
     for (auto& upload : m_localLightUploads) upload.Reset();
+    for (auto& upload : m_detailShadowUploads) upload.Reset();
+    m_detailShadowSnapshot = {};
     for (auto& upload : m_localProjectionUploads) upload.Reset();
     for (auto& upload : m_clusterGridUploads) upload.Reset();
     for (auto& upload : m_clusterIndexUploads) upload.Reset();
@@ -5961,6 +6211,8 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
         geometry.Detach();
     m_copyStaging.Detach();
     m_frameTransforms.Detach();
+    for (auto& upload : m_detailShadowUploads) upload.Quarantine();
+    m_detailShadowSnapshot = {};
     m_frameTransformsMapped = nullptr;
     m_pipelineSkeletal.Detach();
     m_pipelineDetail.Detach();
@@ -6056,12 +6308,13 @@ void GameDx12StaticScene12_ResolveMaterials(
             const char* disabled = std::getenv("OGSR_DX12_GAME_SOURCE_ALPHA_TEST");
             return !disabled || std::strcmp(disabled, "0") != 0;
         }();
-        if (sourceAlphaTest && material.surface == SurfaceMode::Auto &&
-            !shader.empty() && shader.size() < 256)
+        if (sourceAlphaTest && !shader.empty() && shader.size() < 256)
         {
             const std::string sourceShader(shader);
             bool blended = false;
-            if (GameDx12ReadR4DeferredAlphaSource(sourceShader.c_str(), blended))
+            if (GameDx12ReadR4TreeAlphaSource(sourceShader.c_str(), blended))
+                material.surface = blended ? SurfaceMode::Cutout : SurfaceMode::Opaque;
+            else if (material.surface == SurfaceMode::Auto && GameDx12ReadR4DeferredAlphaSource(sourceShader.c_str(), blended))
             {
                 if (blended)
                     material.checkAlphaCoverage = true;

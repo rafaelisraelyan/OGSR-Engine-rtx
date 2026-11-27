@@ -2424,6 +2424,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             if (!prepared ||
                 !state.staticScene.RecordNativeFrame(
                     recording, owner, state.nativeMemoryAdapter.Get(), viewProjection, position, state.gameVisuals.Snapshot(),
+                    state.gameVisuals.ShadowDetailSource(),
                     lighting, CaptureWater(), sceneStats, auxDraws, reason))
                 hr = E_FAIL;
             else
@@ -2593,18 +2594,27 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     if (hr == S_OK && sceneRecorded && (count == 1 || count % 120 == 0))
         Msg("ph_dx12_perf_modes: present=%llu shadow=%s cache_requested=%d cache_actual=%d "
-            "cache_hits=%u cache_dirty=%u skipped_draws=%llu cache_unknown=%u "
+            "cache_hits=%u cache_dirty=%u skipped_draws=%llu cache_unknown=%u cache_new=%u "
+            "cache_resource=%u cache_light=%u cache_matrix=%u cache_raster=%u cache_casters=%u "
             "static_cache_requested=%d static_cache_actual=%d static_cache_hits=%u copies=%u copy_bytes=%llu "
             "batching_requested=%d batching_actual=%d batches=%u lists=%u caster_requested=%d caster_actual=%d "
-            "cluster_requested=%d cluster_actual=%d clusters=%u indices=%u cluster_buffer_bytes=%llu",
+            "cluster_requested=%d cluster_actual=%d clusters=%u indices=%u cluster_buffer_bytes=%llu "
+            "sun_filter=%u sun_continuous_support=%u sun_receiver_plane=%d "
+            "local_filter_radius=%u local_continuous_support=%u local_receiver_plane=1 detail_sun_shadows=%d",
             static_cast<unsigned long long>(count), sceneStats.shadowMode, sceneStats.cacheRequested, sceneStats.cacheActive,
             sceneStats.cache.hits, sceneStats.cache.dirty, static_cast<unsigned long long>(sceneStats.cacheSkippedDraws),
-            sceneStats.cache.reasons[0], sceneStats.staticCacheRequested, sceneStats.staticCacheCopies != 0,
+            sceneStats.cache.reasons[0], sceneStats.cache.reasons[1], sceneStats.cache.reasons[2],
+            sceneStats.cache.reasons[3], sceneStats.cache.reasons[4], sceneStats.cache.reasons[5],
+            sceneStats.cache.reasons[6], sceneStats.staticCacheRequested, sceneStats.staticCacheCopies != 0,
             sceneStats.staticCacheHits, sceneStats.staticCacheCopies, static_cast<unsigned long long>(sceneStats.staticCacheCopyBytes),
             sceneStats.batchingRequested, sceneStats.batchingActive, sceneStats.shadowBatches, sceneStats.commandLists,
             sceneStats.casterPreparationRequested, sceneStats.casterPreparationActive,
             sceneStats.clusteredRequested, sceneStats.clusteredActive, sceneStats.clusterCount, sceneStats.clusterIndices,
-            static_cast<unsigned long long>(sceneStats.clusterBufferBytes));
+            static_cast<unsigned long long>(sceneStats.clusterBufferBytes),
+            sceneStats.sunFilter, sceneStats.sunFilter >= 9 ? 2u * (sceneStats.sunFilter - 7u) : 0u,
+            sceneStats.sunFilter == 4 || sceneStats.sunFilter == 7 || sceneStats.sunFilter >= 9,
+            sceneStats.localFilterRadius, sceneStats.localFilterRadius ? 2u * (sceneStats.localFilterRadius + 1u) : 0u,
+            sceneStats.detailSunShadows);
     if (hr == S_OK && sceneRecorded)
         state.gameVisuals.LogPresent(count, state.fenceValue, auxDraws, state.staticScene.AuxResources());
     if (hr == S_OK && draws != 0)
@@ -2643,7 +2653,12 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 "page_prepare_ms=%.6f descriptor_stage_ms=%.6f cache_ms=%.6f reset_ms=%.6f close_work_ms=%.6f "
                 "shadow_record_ms=%.6f gr_wait_ms=%.6f execute_ms=%.6f signal_ms=%.6f swapchain_present_ms=%.6f "
                 "slot_wait_ms=%.6f cluster_build_ms=%.6f csm_gpu_ms=%.6f local_gpu_ms=%.6f opaque_gpu_ms=%.6f "
-                "water_gpu_ms=%.6f water_gpu_valid=%d",
+                "water_gpu_ms=%.6f water_gpu_valid=%d caster_prep_ms=%.6f "
+                "local_static_gpu_ms=%.6f local_copy_gpu_ms=%.6f local_dynamic_gpu_ms=%.6f local_phases_valid=%d "
+                "sun_filter=%u local_filter_radius=%u detail_sun_shadows=%d "
+                "camera=(%.5f,%.5f,%.5f) forward=(%.6f,%.6f,%.6f) sun_dir=(%.6f,%.6f,%.6f) "
+                "sun_rgb=(%.6f,%.6f,%.6f) ambient=(%.6f,%.6f,%.6f) hemi=(%.6f,%.6f,%.6f) "
+                "sun_active=%d hemi_active=%d local_count=%u",
                 static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
                 static_cast<unsigned long long>(gpu.present), sceneStats.shadowMode,
                 frameMs, gpu.milliseconds, sceneStats.cache.hits, sceneStats.cache.dirty,
@@ -2653,7 +2668,16 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 sceneStats.cacheValidationMs, cpu.resetMs, cpu.closeMs, sceneStats.shadowCpuMs, sceneStats.grRecordWaitMs,
                 cpu.executeMs, cpu.signalMs, cpu.presentMs, recording.slotFenceWaitMs,
                 sceneStats.clusterBuildMs, gpu.csmMilliseconds, gpu.localMilliseconds, gpu.opaqueMilliseconds,
-                gpu.waterMilliseconds, gpu.waterMeasured);
+                gpu.waterMilliseconds, gpu.waterMeasured, sceneStats.grParallelMs,
+                gpu.localPhaseMilliseconds[0], gpu.localPhaseMilliseconds[1], gpu.localPhaseMilliseconds[2],
+                gpu.localPhasesMeasured, sceneStats.sunFilter, sceneStats.localFilterRadius, sceneStats.detailSunShadows,
+                Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
+                Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z,
+                lighting.sunDirection.x, lighting.sunDirection.y, lighting.sunDirection.z,
+                lighting.sunColor.x, lighting.sunColor.y, lighting.sunColor.z,
+                lighting.ambient.x, lighting.ambient.y, lighting.ambient.z,
+                lighting.hemi.x, lighting.hemi.y, lighting.hemi.z,
+                lighting.sunEnabled, lighting.hemiEnabled, lighting.localCount);
         }
         if (frames == 1 || frames == 30 || frames % 120 == 0)
         {

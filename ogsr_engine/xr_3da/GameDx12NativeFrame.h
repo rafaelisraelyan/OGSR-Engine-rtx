@@ -22,6 +22,8 @@ public:
     static_assert(kFrameCount == game_shadow12::ShadowDescriptors::kSlotCount);
     static constexpr uint32_t kShadowListCount = game_shadow12::MaxViews;
 
+    enum class ShadowPhase : uint32_t { Static, Copy, Dynamic, Count };
+
     struct Recording
     {
         ID3D12GraphicsCommandList* list = nullptr;
@@ -50,6 +52,8 @@ public:
         HRESULT ReserveShadowStorage(uint32_t views, uint32_t listLimit = UINT32_MAX) const noexcept;
         HRESULT SetShadowTimingViews(std::span<const uint32_t> projections) const noexcept;
         void StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept;
+        void StampShadowPhase(ID3D12GraphicsCommandList& target, uint32_t projection,
+            ShadowPhase phase, bool end) const noexcept;
         void StampSceneStart() const noexcept;
         void StampOpaqueEnd() const noexcept;
 
@@ -78,7 +82,9 @@ public:
         double sceneMilliseconds = 0;
         double shadowMilliseconds = 0;
         double csmMilliseconds = 0, localMilliseconds = 0, opaqueMilliseconds = 0, waterMilliseconds = 0;
+        std::array<double, static_cast<size_t>(ShadowPhase::Count)> localPhaseMilliseconds{};
         bool waterMeasured = false;
+        bool localPhasesMeasured = false;
         struct View { uint32_t projection; double milliseconds; };
         std::vector<View> views;
     };
@@ -137,6 +143,7 @@ private:
         Ptr<ID3D12QueryHeap> timingQueries, shadowQueries;
         Ptr<ID3D12Resource> timingReadback;
         std::vector<uint32_t> timingViews;
+        std::vector<uint8_t> shadowPhaseMask;
         uint32_t timingCapacity = 0;
         AuxiliaryList colorPass;
         uint64_t fence = 0;
@@ -144,7 +151,7 @@ private:
         bool timingScene = false, timingOpaque = false, timingWater = false;
     };
 
-    static HRESULT PrepareShadowTiming(ID3D12Device& device, Slot& slot, uint32_t views) noexcept;
+    HRESULT PrepareShadowTiming(ID3D12Device& device, Slot& slot, uint32_t views) const noexcept;
     HRESULT Wait(const Owner& owner, uint64_t value) noexcept;
     HRESULT Resize(const Owner& owner, uint32_t width, uint32_t height);
     HRESULT CreateTargets(ID3D12Device& device, uint32_t width, uint32_t height);
@@ -184,6 +191,7 @@ private:
     bool m_submitted = false;
     bool m_unknown = false;
     bool m_measureFrame = false;
+    bool m_measureShadowPhases = false;
 };
 
 #endif

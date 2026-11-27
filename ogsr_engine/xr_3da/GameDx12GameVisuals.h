@@ -18,6 +18,7 @@ public:
     void Reset();
     void InvalidateFrame(uint64_t epoch);
     const Frame& Snapshot() const { return m_frame; }
+    LevelDetails* ShadowDetailSource() { return m_detailsLoaded ? &m_details : nullptr; }
     void LogPresent(uint64_t present, uint64_t fence, const GameDx12StaticScene12::AuxStats& draws,
                     const GameDx12StaticScene12::AuxStats& resources) const;
 
@@ -51,7 +52,7 @@ private:
     uint32_t m_unsupported = 0;
     LevelDetails m_details;
     DetailStats m_detailStats;
-    std::vector<std::vector<DirectX::XMFLOAT4X4>> m_detailInstances;
+    std::vector<std::vector<DetailInstance>> m_detailInstances;
     std::unordered_map<std::string, Model> m_models;
     bool m_detailsAttempted = false;
     bool m_detailsLoaded = false;

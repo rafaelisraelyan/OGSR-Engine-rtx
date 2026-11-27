@@ -12,11 +12,15 @@
 
 namespace game_shadow12
 {
+inline constexpr uint32_t MinShadowMapResolution = 128;
+
 struct AdaptiveShadowTelemetry
 {
     const char* fallback = "none";
     uint64_t dxgiBudget = 0, dxgiUsage = 0, retained = 0, newBytes = 0, peak = 0;
     uint32_t descriptorCapacity = 0, descriptors = 0;
+    uint64_t tracedLight = 0;
+    uint32_t tracedRequestedResolution = 0;
     std::array<uint32_t, 4> pagesByTier{};
     double lightPlanMs = 0, pagePlanMs = 0, pagePrepareMs = 0, descriptorStageMs = 0;
     bool observed = false;
@@ -214,6 +218,15 @@ public:
         if (telemetry)
         {
             telemetry->pagePrepareMs = elapsed(pagePrepareStart);
+            if (telemetry->tracedLight)
+            {
+                const auto found = std::find_if(logical.lights.begin(), logical.lights.end(), [&](const auto& light)
+                {
+                    return light.id == telemetry->tracedLight;
+                });
+                if (found != logical.lights.end())
+                    telemetry->tracedRequestedResolution = found->requestedTier;
+            }
             const auto& staged = *arena.PreparedPlan();
             for (const auto& page : staged.next.pages)
             {
@@ -264,7 +277,7 @@ private:
 
     std::array<ShadowContentCache, GameDx12NativeFrame12::kFrameCount> content_, staticContent_;
     std::array<ShadowPageResources, GameDx12NativeFrame12::kFrameCount> arenas_;
-    const std::array<ShadowPageShape, 4> shapes_{{{128, 6}, {256, 6}, {512, 6}, {1024, 6}}};
+    const std::array<ShadowPageShape, 4> shapes_{{{MinShadowMapResolution, 6}, {256, 6}, {512, 6}, {1024, 6}}};
     std::array<ShadowPageSpec, 4> specs_{};
     std::array<AdaptiveTier, 4> tiers_{};
     bool initialized_ = false;

@@ -43,7 +43,7 @@ inline bool FiniteVector(DirectX::FXMVECTOR value) noexcept
 
 inline bool MakeSunPlan(const DirectX::XMFLOAT4X4& cameraViewProjection, const float eye[3],
     const DirectX::XMFLOAT3& lightDirection, uint32_t count, uint32_t resolution,
-    float distance, SunPlan& result) noexcept
+    float distance, SunPlan& result, bool continuousFilter = false) noexcept
 {
     using namespace DirectX;
     result = {};
@@ -94,7 +94,8 @@ inline bool MakeSunPlan(const DirectX::XMFLOAT4X4& cameraViewProjection, const f
         {1.0f}, {0.25f, 1.0f}, {15.0f / 160, 40.0f / 160, 1.0f},
         {15.0f / 160, 40.0f / 160, 100.0f / 160, 1.0f}};
     constexpr float transitionFraction = 0.10f;
-    constexpr float guardTexels = 4.0f;
+    // Радиус 3 + билинейная опора 1 + максимум 0.5 текселя при привязке центра.
+    const float guardTexels = continuousFilter ? 4.5f : 4.0f;
     // Бюджет внекамерных кастеров в сторону источника. В плоскости карты
     // направление солнца сохраняет координаты X/Y у кастера и приёмника.
     constexpr float casterReach = 160.0f;

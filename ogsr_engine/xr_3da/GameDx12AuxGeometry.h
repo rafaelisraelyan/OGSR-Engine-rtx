@@ -56,10 +56,18 @@ struct ObjectDraw
     bool skinned = false;
 };
 
+// Снимок placement на потоке владельца; исходная матрица остаётся affine.
+struct DetailInstance
+{
+    DirectX::XMFLOAT4X4 world;
+    DirectX::XMFLOAT3 terrainNormal;
+    float hemi = 0.0f;
+};
+
 struct DetailDraw
 {
     uint32_t mesh = kInvalidMesh;
-    std::vector<DirectX::XMFLOAT4X4> transforms;
+    std::vector<DetailInstance> transforms;
 };
 
 struct Frame

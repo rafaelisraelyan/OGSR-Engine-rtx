@@ -25,13 +25,15 @@ public:
     FrameStructuredUpload& operator=(const FrameStructuredUpload&) = delete;
 
     template<class T>
-    HRESULT Write(ID3D12Device& device, std::span<const T> records) noexcept
+    HRESULT Write(ID3D12Device& device, std::span<const T> records, uint64_t capacityLimit = UINT64_MAX) noexcept
     {
         static_assert(std::is_trivially_copyable_v<T> && sizeof(T)%4==0);
         constexpr auto maxSize = (std::numeric_limits<size_t>::max)();
         if (records.size() > UINT32_MAX || records.size() > maxSize/sizeof(T))
             return E_INVALIDARG;
         const uint64_t bytes = records.empty() ? sizeof(T) : records.size_bytes();
+        if (bytes > capacityLimit || capacity_ > capacityLimit)
+            return E_OUTOFMEMORY;
         auto target = resource_;
         uint64_t capacity = capacity_;
         if (bytes > capacity)
@@ -40,7 +42,7 @@ public:
             // failure is returned to the owner, not silently truncated.
             capacity = bytes;
             if (capacity_ <= maxSize/2 && capacity_*2 > capacity)
-                capacity = capacity_*2;
+                capacity = capacity_*2 <= capacityLimit ? capacity_*2 : capacityLimit;
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_UPLOAD;
             heap.CreationNodeMask = heap.VisibleNodeMask = 1;

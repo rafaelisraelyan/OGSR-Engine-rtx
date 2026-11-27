@@ -39,6 +39,27 @@ struct DetailStats
     bool enabled = false;
 };
 
+// Консервативные world XZ границы всех нужных объёмов теневых карт.
+struct DetailShadowRegion { float minX, minZ, maxX, maxZ; };
+struct DetailShadowBudget
+{
+    size_t cacheBytes = 0, outputBytes = 0, workingBytes = 0;
+    size_t decodeSlots = 0;
+};
+struct DetailShadowPlacement
+{
+    uint32_t slot = 0, ordinal = 0, model = 0;
+    DirectX::XMFLOAT4X4 world{};
+    float radius = 0.f; // Сфера вокруг translation, включая смещение центра модели.
+};
+struct DetailShadowSnapshot
+{
+    std::vector<DetailShadowPlacement> placements;
+    uint64_t generation = 0;
+    size_t pendingSlots = 0, cachedBytes = 0, outputBytes = 0;
+    bool complete = false;
+};
+
 // Один набор level.details на игровую сессию. Заполняется только на потоке
 // игрового кадра. На отрисовку передаются модели и матрицы по значению.
 class LevelDetails
@@ -47,8 +68,12 @@ public:
     bool Load(std::string& reason);
     const std::vector<Mesh>& Models() const { return m_models; }
     void Collect(const float eye[3],
-                 std::vector<std::vector<DirectX::XMFLOAT4X4>>& instances,
+                 std::vector<std::vector<DetailInstance>>& instances,
                  DetailStats& stats);
+    // Только поток игрового кадра. Snapshot владеет данными; incomplete нельзя
+    // использовать как полное membership для теневого кэша.
+    void CollectShadow(std::span<const DetailShadowRegion> regions,
+                       const DetailShadowBudget& budget, DetailShadowSnapshot& out);
 
 private:
     struct ModelParameters
@@ -56,12 +81,14 @@ private:
         float minScale = 0.f;
         float maxScale = 0.f;
         float radius = 0.f;
+        float shadowRadius = 0.f;
     };
 
     struct Slot
     {
         uint16_t yBase = 0;
         uint8_t yHeight = 0;
+        uint8_t hemi = 0;
         bool occupied = false;
         std::array<uint8_t, 4> model{};
         std::array<uint16_t, 4> palette{};
@@ -74,6 +101,7 @@ private:
         float yaw;
         float scale;
         uint8_t model;
+        float hemi;
     };
 
     struct CachedSlot
@@ -100,7 +128,7 @@ private:
     };
 
     bool Parse(std::span<const uint8_t> bytes, std::string& reason);
-    CachedSlot Decompress(uint32_t index) const;
+    CachedSlot Decompress(uint32_t index, const PlacementSettings& settings) const;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -115,6 +143,10 @@ private:
     std::vector<PendingSlot> m_pending;
     std::vector<uint32_t> m_ready;
     size_t m_cachedPlacements = 0;
+    PlacementSettings m_shadowSettings;
+    std::unordered_map<uint32_t, CachedSlot> m_shadowCache;
+    size_t m_shadowCachedBytes = 0;
+    uint64_t m_shadowGeneration = 0;
 };
 } // namespace gameaux12
 

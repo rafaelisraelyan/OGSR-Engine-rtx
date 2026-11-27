@@ -15,7 +15,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <random>
+#include <stdexcept>
 #include <string_view>
 
 extern float dm_current_fade;
@@ -127,7 +130,7 @@ bool SetTexture(std::string_view source, std::string& texture)
         texture.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-.\\") == std::string::npos;
 }
 
-bool ParseModel(Bytes bytes, Mesh& mesh, float& minScale, float& maxScale, float& radius,
+bool ParseModel(Bytes bytes, Mesh& mesh, float& minScale, float& maxScale, float& radius, float& shadowRadius,
                 uint64_t& geometryBytes)
 {
     std::string_view shader, texture;
@@ -182,6 +185,8 @@ bool ParseModel(Bytes bytes, Mesh& mesh, float& minScale, float& maxScale, float
     bounds.getsphere(center, radius);
     if (!std::isfinite(radius) || radius <= 0.f)
         return false;
+    shadowRadius = radius + std::hypot(center.x, center.y, center.z);
+    if (!std::isfinite(shadowRadius)) return false;
     geometryBytes += outputBytes;
     mesh = std::move(model);
     return true;
@@ -297,7 +302,7 @@ bool LevelDetails::Parse(Bytes bytes, std::string& reason)
     for (uint32_t model = 0; model < header.object_count; ++model)
     {
         auto& p = m_modelParameters[model];
-        if (!ParseModel(models[model], m_models[model], p.minScale, p.maxScale, p.radius,
+        if (!ParseModel(models[model], m_models[model], p.minScale, p.maxScale, p.radius, p.shadowRadius,
                         m_loadStats.geometryBytes))
             ++m_loadStats.invalidModels;
     }
@@ -317,6 +322,7 @@ bool LevelDetails::Parse(Bytes bytes, std::string& reason)
         }
         slot.yBase = static_cast<uint16_t>(source.y_base);
         slot.yHeight = static_cast<uint8_t>(source.y_height);
+        slot.hemi = static_cast<uint8_t>(source.c_hemi);
         std::memcpy(slot.palette.data(), source.palette, sizeof(source.palette));
         for (uint32_t index = 0; index < slot.model.size(); ++index)
         {
@@ -336,7 +342,7 @@ bool LevelDetails::Parse(Bytes bytes, std::string& reason)
     return true;
 }
 
-LevelDetails::CachedSlot LevelDetails::Decompress(uint32_t index) const
+LevelDetails::CachedSlot LevelDetails::Decompress(uint32_t index, const PlacementSettings& settings) const
 {
     CachedSlot output;
     const Slot& slot = m_slots[index];
@@ -359,9 +365,9 @@ LevelDetails::CachedSlot LevelDetails::Decompress(uint32_t index) const
     std::mt19937 rng(seed);
     const auto random = [&] { return std::generate_canonical<float, 24>(rng); };
     const uint32_t grid = (std::min)(kPlacementGridLimit,
-        static_cast<uint32_t>(std::ceil(DETAIL_SLOT_SIZE / m_settings.density)));
+        static_cast<uint32_t>(std::ceil(DETAIL_SLOT_SIZE / settings.density)));
     const float step = DETAIL_SLOT_SIZE / static_cast<float>(grid);
-    const float jitter = m_settings.density / 1.7f;
+    const float jitter = settings.density / 1.7f;
     const Fvector down{0.f, -1.f, 0.f};
     const uint32_t materialCount = GMLib.CountMaterial();
     for (uint32_t z = 0; z <= grid; ++z)
@@ -395,8 +401,13 @@ LevelDetails::CachedSlot LevelDetails::Decompress(uint32_t index) const
                 if (CDB::TestRayTri(point, down, triangle.verts, u, v, distance, true) &&
                     std::isfinite(distance) && distance >= 0.f && distance <= nearest)
                 {
+                    Fvector candidate{};
+                    candidate.mknormal(triangle.verts[0], triangle.verts[1], triangle.verts[2]);
+                    if (!std::isfinite(candidate.x) || !std::isfinite(candidate.y) || !std::isfinite(candidate.z) ||
+                        (candidate.x * candidate.x + candidate.y * candidate.y + candidate.z * candidate.z) <= 1.e-8f)
+                        continue;
                     nearest = distance;
-                    up.mknormal(triangle.verts[0], triangle.verts[1], triangle.verts[2]);
+                    up = candidate;
                     hit = true;
                 }
             }
@@ -406,23 +417,149 @@ LevelDetails::CachedSlot LevelDetails::Decompress(uint32_t index) const
                 continue;
             }
 
-            const float slope = m_settings.slope * (0.8f + 0.2f * random());
+            const float slope = settings.slope * (0.8f + 0.2f * random());
             if (up.y < 1.f - slope)
             {
                 ++output.slopeRejected;
                 continue;
             }
             const auto& p = m_modelParameters[model];
-            const float scale = std::lerp(p.minScale * 0.5f, p.maxScale * 0.9f, random()) * m_settings.scale;
+            const float scale = std::lerp(p.minScale * 0.5f, p.maxScale * 0.9f, random()) * settings.scale;
             point.y -= nearest;
             output.placements.push_back({{point.x, point.y, point.z}, {up.x, up.y, up.z},
-                                         random() * PI_MUL_2, scale, model});
+                                         random() * PI_MUL_2, scale, model, std::clamp(slot.hemi / 15.f, 0.05f, 1.f)});
         }
     return output;
 }
 
+void LevelDetails::CollectShadow(std::span<const DetailShadowRegion> regions,
+                                 const DetailShadowBudget& budget, DetailShadowSnapshot& out)
+{
+    out = {};
+    try
+    {
+        if (m_slots.empty() || !psDeviceFlags.test(rsDetails)) { out.complete = true; return; }
+        if (!g_pGameLevel) return;
+        const PlacementSettings settings{
+            ReadSetting(ps_current_detail_density, 0.2f, 0.9f, 0.6f),
+            ReadSetting(ps_current_detail_scale, 0.7f, 1.5f, 1.f),
+            ReadSetting(ps_ssfx_terrain_grass_slope, 0.f, 1.f, 1.f),
+            ps_ssfx_terrain_grass_align != 0};
+        if (m_shadowGeneration == 0 || m_shadowSettings != settings)
+        {
+            m_shadowSettings = settings;
+            m_shadowCache.clear(); m_shadowCachedBytes = 0;
+            if (++m_shadowGeneration == 0) ++m_shadowGeneration;
+        }
+        out.generation = m_shadowGeneration;
+
+        // Placement может находиться за границей слота из-за jitter; сфера
+        // включает также ненулевой центр модели и полную базовую scale.
+        double margin = settings.density / 1.7 + EPS_L;
+        for (const auto& model : m_modelParameters)
+            margin = (std::max)(margin, double(settings.density / 1.7f + EPS_L) +
+                double(model.shadowRadius) * model.maxScale * 0.9 * settings.scale);
+        std::vector<uint32_t> requested;
+        for (const auto& r : regions)
+        {
+            if (!std::isfinite(r.minX) || !std::isfinite(r.maxX) || !std::isfinite(r.minZ) ||
+                !std::isfinite(r.maxZ) || r.minX > r.maxX || r.minZ > r.maxZ) return;
+            const auto lower = [](double value, int32_t offset, uint32_t count)
+            {
+                return static_cast<int32_t>(std::clamp(std::floor(value / DETAIL_SLOT_SIZE) + offset - 1.,
+                    0., double(count)));
+            };
+            const auto upper = [](double value, int32_t offset, uint32_t count)
+            {
+                return static_cast<int32_t>(std::clamp(std::floor(value / DETAIL_SLOT_SIZE) + offset + 1.,
+                    -1., double(count) - 1.));
+            };
+            const int32_t xmin = lower(double(r.minX) - margin, m_offsetX, m_width);
+            const int32_t xmax = upper(double(r.maxX) + margin, m_offsetX, m_width);
+            const int32_t zmin = lower(double(r.minZ) - margin, m_offsetZ, m_height);
+            const int32_t zmax = upper(double(r.maxZ) + margin, m_offsetZ, m_height);
+            for (int32_t z = zmin; z <= zmax; ++z)
+                for (int32_t x = xmin; x <= xmax; ++x)
+                {
+                    const uint32_t index = uint32_t(z) * m_width + uint32_t(x);
+                    if (!m_slots[index].occupied) continue;
+                    if (requested.size() >= budget.workingBytes / (2 * sizeof(uint32_t))) return;
+                    requested.push_back(index);
+                }
+        }
+        std::sort(requested.begin(), requested.end());
+        requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+        // Conservative accounting includes vector capacity and hash node overhead.
+        const auto cost = [](const CachedSlot& slot)
+        { return sizeof(CachedSlot) + 128u + slot.placements.capacity() * sizeof(Placement); };
+        std::erase_if(m_shadowCache, [&](const auto& entry)
+        {
+            if (std::binary_search(requested.begin(), requested.end(), entry.first)) return false;
+            m_shadowCachedBytes -= cost(entry.second); return true;
+        });
+        // При уменьшении бюджета не выдаём ранее накопленный сверх бюджета
+        // снимок как допустимый. Перезаполнение происходит постепенно.
+        if (m_shadowCachedBytes > budget.cacheBytes)
+        {
+            m_shadowCache.clear(); m_shadowCachedBytes = 0;
+        }
+        size_t decoded = 0;
+        constexpr size_t transient = sizeof(CachedSlot) + 128u + 2u * kMaxPlacementsPerSlot * sizeof(Placement);
+        for (const uint32_t index : requested)
+        {
+            if (m_shadowCache.contains(index)) continue;
+            if (decoded >= budget.decodeSlots || m_shadowCachedBytes > budget.cacheBytes ||
+                transient > budget.cacheBytes - m_shadowCachedBytes) { ++out.pendingSlots; continue; }
+            auto slot = Decompress(index, settings);
+            const size_t bytes = cost(slot);
+            if (bytes > budget.cacheBytes - m_shadowCachedBytes) { ++out.pendingSlots; continue; }
+            m_shadowCache.emplace(index, std::move(slot));
+            m_shadowCachedBytes += bytes; ++decoded;
+        }
+        out.cachedBytes = m_shadowCachedBytes;
+        if (out.pendingSlots) return;
+        size_t count = 0;
+        for (const auto index : requested)
+        {
+            const size_t n = m_shadowCache.at(index).placements.size();
+            if (n > (std::numeric_limits<size_t>::max)() - count) return;
+            count += n;
+        }
+        if (count > budget.outputBytes / sizeof(DetailShadowPlacement)) return;
+        out.placements.reserve(count);
+        for (const auto index : requested)
+        {
+            const auto& placements = m_shadowCache.at(index).placements;
+            for (size_t ordinal = 0; ordinal < placements.size(); ++ordinal)
+            {
+                const auto& item = placements[ordinal];
+                Fmatrix rotation; rotation.rotateY(item.yaw);
+                if (settings.align)
+                {
+                    const Fmatrix yaw = rotation;
+                    rotation.j.set(item.up[0], item.up[1], item.up[2]);
+                    Fvector::generate_orthonormal_basis(rotation.j, rotation.i, rotation.k);
+                    rotation.mulB_43(yaw);
+                }
+                rotation.i.mul(item.scale); rotation.j.mul(item.scale); rotation.k.mul(item.scale);
+                rotation.translate_over(item.position[0], item.position[1], item.position[2]);
+                DetailShadowPlacement placement;
+                placement.slot = index; placement.ordinal = static_cast<uint32_t>(ordinal);
+                placement.model = item.model;
+                std::memcpy(placement.world.m, rotation.m, sizeof(placement.world.m));
+                placement.radius = m_modelParameters[item.model].shadowRadius * item.scale;
+                out.placements.push_back(placement);
+            }
+        }
+        out.outputBytes = out.placements.size() * sizeof(DetailShadowPlacement);
+        out.complete = true;
+    }
+    catch (const std::bad_alloc&) { out.placements.clear(); out.complete = false; }
+    catch (const std::length_error&) { out.placements.clear(); out.complete = false; }
+}
+
 void LevelDetails::Collect(const float eye[3],
-                           std::vector<std::vector<DirectX::XMFLOAT4X4>>& instances,
+                           std::vector<std::vector<DetailInstance>>& instances,
                            DetailStats& stats)
 {
     instances.resize(m_models.size());
@@ -506,7 +643,7 @@ void LevelDetails::Collect(const float eye[3],
             break;
         }
         const uint32_t index = m_pending[loaded].index;
-        const auto& slot = m_cache.emplace(index, Decompress(index)).first->second;
+        const auto& slot = m_cache.emplace(index, Decompress(index, m_settings)).first->second;
         m_cachedPlacements += slot.placements.size();
         m_ready.push_back(index);
     }
@@ -574,9 +711,11 @@ void LevelDetails::Collect(const float eye[3],
             rotation.j.mul(scale);
             rotation.k.mul(scale);
             rotation.translate_over(item.position[0], item.position[1], item.position[2]);
-            auto& world = instances[item.model].emplace_back();
-            static_assert(sizeof(world.m) == sizeof(rotation.m));
-            std::memcpy(world.m, rotation.m, sizeof(world.m));
+            auto& instance = instances[item.model].emplace_back();
+            static_assert(sizeof(instance.world.m) == sizeof(rotation.m));
+            std::memcpy(instance.world.m, rotation.m, sizeof(instance.world.m));
+            instance.terrainNormal = {item.up[0], item.up[1], item.up[2]};
+            instance.hemi = item.hemi;
             ++emitted;
         }
     }
