@@ -85,12 +85,15 @@ void CALifeGraphRegistry::setup_current_level()
     }
     GameGraph::LEVEL_MAP::const_iterator I = ai().game_graph().header().levels().find(ai().game_graph().vertex(actor()->m_tGraphID)->level_id());
     R_ASSERT2(ai().game_graph().header().levels().end() != I, "Graph point level ID not found!");
-#ifdef DEBUG
-    int id = 
-#endif
-        pApp->Level_ID(*(*I).second.name(), "1.0", true);
-    VERIFY3(id >= 0, "Level is corrupted or doesn't exist", *(*I).second.name());
-    ai().load(*(*I).second.name());
+    const char* name = *I->second.name();
+    const int id = pApp->Level_ID(name, "1.0", true);
+    string_path game_levels, level_path;
+    FS.update_path(game_levels, "$game_levels$", "");
+    FS.update_path(level_path, "$level$", "");
+    Msg("* ALife level '%s': Level_ID=%d, $game_levels$='%s', $level$='%s'", name, id, game_levels, level_path);
+    CHECK_OR_EXIT(id >= 0, make_string("Required level '%s' is missing or incomplete under %s (Level_ID=%d)",
+        name, game_levels, id));
+    ai().load(name);
 }
 
 void CALifeGraphRegistry::attach(CSE_Abstract& object, CSE_ALifeInventoryItem* item, GameGraph::_GRAPH_ID game_vertex_id, bool alife_query, bool add_children)

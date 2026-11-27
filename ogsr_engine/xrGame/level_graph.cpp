@@ -18,6 +18,9 @@ CLevelGraph::CLevelGraph()
     string_path file_name;
     FS.update_path(file_name, "$level$", LEVEL_GRAPH_NAME);
     m_reader = FS.r_open(file_name);
+    CHECK_OR_EXIT(m_reader, make_string("Required level AI graph could not be opened: %s", file_name));
+    CHECK_OR_EXIT(m_reader->length() >= sizeof(CHeader), make_string("Level AI graph header is truncated: %s", file_name));
+    Msg("* Level AI graph opened: %s (%zu bytes)", file_name, m_reader->length());
 
     // m_header & data
     m_header = (CHeader*)m_reader->pointer();
