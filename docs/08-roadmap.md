@@ -1,8 +1,8 @@
 # 08 — План работ
 
 > **Актуальная рабочая ветка DX12:** `experiment/f43-csm-r2-c`.
-> **Дата сверки:** 2026-11-27. Проверенный HEAD перед docs-only обновлением: `52830d9ce0db9bae0fc105f5d789b89f825319f2`. Technical Windows/CPU/WARP and Hardware Preflight PASS WITH NOTES. Hardware DX12 initialization PASS; first adaptive+GBV Jupiter load FAIL (CPU access violation before scene present). Gameplay A/B BLOCKED; banked remains default.
-> **Область сверки:** экспериментальная ветка DX12, не текущий production `prypiat`. На момент сверки ветки имеют 122/72 уникальных коммита соответственно (merge-base `01bcc0b7ad4ec858b5f72987248e747309c9beda`). Не выполнять автоматический merge/rebase. Это не разрешение на интеграцию в prypiat.
+> **Дата сверки:** 2026-11-27. Проверенный HEAD перед docs-only обновлением: `58d921785e631c9676c3367f8cb717d19fceb224`. Jupiter loading recovered; adaptive hardware GBV observed-window PASS and non-validation Banked/Adaptive A/B PASS WITH NOTES. Banked remains default; performance optimization active.
+> **Область сверки:** экспериментальная ветка DX12, не текущий production `prypiat`. На момент сверки ветки имеют 126/72 уникальных коммита соответственно (merge-base `01bcc0b7ad4ec858b5f72987248e747309c9beda`). Не выполнять автоматический merge/rebase. Это не разрешение на интеграцию в prypiat.
 > **Приоритет источника:** текущая сводка ниже и актуальная матрица F имеют приоритет над датированными историческими статусами и гейтами в этом файле. История сохраняется, но не используется как задание на повторную реализацию. Source-only, CPU PASS, WARP, hardware runtime и независимая приёмка — разные статусы.
 > **Параллельные треки:** V (clouds), P (PhysX), DX11 и другие направления сохранены с их последними документированными статусами; их отдельные рабочие ветки в этой сверке не проверялись. Не считать их состояния актуальными на 2026-11-27 без отдельной сверки.
 
@@ -10,7 +10,7 @@
 
 **Цель:** полноценный игровой native DX12 renderer с сохранением оригинальной логики, ресурсов и модификаций, затем hybrid raster + DXR. Не отдельная техническая демонстрация.
 
-**Точка продолжения:** First Hardware / Gameplay Validation — FAIL at Jupiter level load before first scene present; hardware DX12/GBV initialization PASS. **NEXT — diagnose and repair runtime/VFS level loading, then compact revalidation.** [Failure review](dx12-f43-first-hardware-failure.md). Adaptive shadow technical results retained; actual mode and performance NOT RUN. Clustered Lighting blocked pending successful game validation.
+**Точка продолжения:** Jupiter Loading Recovery PASS; Hardware Performance Baseline PASS WITH NOTES. Adaptive shadows work on RTX 5070 Laptop; 28/29 lights shadowed vs 3/29, median frame 14.569 vs 11.390 ms, local GPU 1.677 vs 0.207 ms. **NEXT — F4.3 Shadow Caching, conservative per-slot content reuse**, then measured command batching/caster optimization, then Clustered Lighting according to profiling. [Hardware A/B review](dx12-f43-hardware-performance-review.md). No default switch or full visual parity claim.
 
 | Приоритет | Следующий результат | Зависимость |
 |---|---|---|
@@ -19,8 +19,10 @@
 | 3 | F4.3-P0-B3d — PASS WITH NOTES | [Evidence review](dx12-f43-b3d-review.md): CPU 48 local views, WARP 12/42, dynamic lists/timestamps, page-local depth, rollback and reuse |
 | 4 | F4.3 Adaptive Native Runtime — PASS WITH NOTES (technical) | [Review](dx12-f43-adaptive-runtime-review.md): unified CSM/local, 44 passes, 7 pages, 130 exact readback records per mode; production opt-in source integration |
 | 5 | Hardware Preflight — PASS WITH NOTES | [Review](dx12-f43-hardware-preflight-review.md): targeted CPU/WARP, Release, launcher A/B/GBV preflight; configurable shared page-byte cap/reserve and priority-aware placement |
-| 6 | Hardware / Gameplay Validation — FAIL / BLOCKED | [Failure review](dx12-f43-first-hardware-failure.md): CLevelGraph::CLevelGraph line 23, read AV 0x18, Win32 error 2; investigate level.ai VFS/path/archive and known-good runtime; no shadow changes without causal evidence. Resume A/B after load repaired. |
-| 7 | Clustered Lighting: conservative overlap, variable-length lists, no silent truncation | Correct adaptive runtime in game; research may start earlier |
+| 6 | Hardware / Gameplay Validation — PASS WITH NOTES, scoped | Recovery PASS; hardware GBV observed-window PASS, non-GBV A/B clean exit; [review](dx12-f43-hardware-performance-review.md). Prior missing-archive failure resolved; visual completeness, device loss and full lifecycle pending. |
+| 7 | Shadow Caching — NEXT | Conservative per-slot content reuse, exact invalidation and submission transaction; cached-vs-full parity, no quality reduction. |
+| 8 | Shadow command batching / caster preparation | Measure and optimize remaining CPU record/submit/culling work without loss of caster coverage. |
+| 9 | Clustered Lighting: conservative overlap, variable-length lists, no silent truncation | Profile actual pixel-light work; preserve existing lighting/visibility and no arbitrary quotas. Research may start earlier. |
 | Параллельно | F4.4-A2b.2 particles; F4.5-A IUIRender/fonts/menu/frame modes | Согласованные общие контракты ресурсов; без конкурирующих heap/queue/registry |
 | Далее | F4.5-B/C/D, остальные raster/material/HDR/temporal/DLSS, F6, hybrid DXR | Гейты готовности соответствующих подсистем; G0–G2 research может идти отдельно |
 
@@ -707,7 +709,7 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 
 ### Актуальная матрица DX12 — экспериментальная ветка 2026-11-27
 
-Основание: reviewed hardware attempt at `52830d9ce0db9bae0fc105f5d789b89f825319f2`, engine source preflight `3cdad61f5b94b546b29720bf19c15869c3966056`, [failure review](dx12-f43-first-hardware-failure.md) and [preflight review](dx12-f43-hardware-preflight-review.md). Technical CPU/WARP PASS WITH NOTES, hardware init PASS, game load FAIL; no successful scene frame or independent Windows replay.
+Основание: reviewed hardware A/B HEAD `58d921785e631c9676c3367f8cb717d19fceb224`, loading fix `97b5194397e375e0b61ccce9a306df69127c814c`, [hardware performance review](dx12-f43-hardware-performance-review.md), [initial failure review](dx12-f43-first-hardware-failure.md) and [preflight review](dx12-f43-hardware-preflight-review.md). Scoped technical/hardware PASS WITH NOTES. No independent Windows execution.
 
 | Этап | Состояние | Доказательства и оставшиеся гейты |
 |---|---|---|
@@ -740,8 +742,9 @@ NIS:   config/constants + коэффициенты фильтра (SRV) + sample
 | P0-B3c1 | `2b04d361`: 80-byte projection records; CPU address test and updated WARP baseline PASS | Current single bound physical page 0; multi-page descriptor sampling/runtime pending. |
 | P0-B3c2 | `ab701796`: source integrated + targeted Windows/WARP PASS WITH NOTES; two closure checks PASS at `ac987a8b` | t15, SM5.1 nonuniform index, 3/3 prior mutations, native Signal/cancel. Banked SM5.0/5.1 parity and real gated draws across disjoint ranges verified; production hardware acceptance and descriptor capacity/budget policy remain open. |
 | P0-B3d | `ac987a8b`: source integrated + CPU/WARP PASS WITH NOTES | 48 local views CPU; 12 legacy/multi/parallel and 42 serial multi/parallel WARP; dynamic per-slot list pool/timing IDs, actual depth, rollback/reuse. No mixed CSM+adaptive local frame or real game caster draw verified. |
-| Adaptive native runtime | `f0ff2894` + `3cdad61f`: source integrated + CPU/WARP PASS WITH NOTES | Combined 2 CSM + 42 local views / 7 pages, 130 exact depth/sampling values per mode; shrink to 6 then zero locals. Opt-in native caller. Preflight CPU priority/budget, targeted mixed WARP and launcher checks PASS; game/hardware and device loss NOT RUN. |
-| Hardware Preflight / Gameplay | Preflight PASS WITH NOTES; hardware init PASS; game load FAIL | [Failure review](dx12-f43-first-hardware-failure.md). A/B, visual quality, real adaptive pages/timings NOT RUN. Diagnose VFS/level loading, preserve evidence and saves. |
+| Adaptive native runtime | `f0ff2894` + `3cdad61f`: opt-in source/CPU/WARP and actual hardware path PASS WITH NOTES | Jupiter non-GBV 108 sampled adaptive presents, fallback none; initial 143 local views/26 pages, 28 shadowed lights. Scoped owner visual report, full visual/lifecycle/device loss pending. |
+| Hardware Preflight / Gameplay | Loading recovered; GBV and A/B PASS WITH NOTES | [Hardware review](dx12-f43-hardware-performance-review.md): 420 matched frame samples each, 418 GPU; median 11.390/14.569 ms; local GPU 0.207/1.677 ms. Keep banked default. |
+| Local shadow content cache | NEXT | Per-slot physical-resource generation, stable light/projection/face and exact caster input validity; dirty passes only, retain all valid sampling mappings; commit on Signal, cancel/quarantine and no extra waits. |
 | Clustered Lighting | PLANNED | Conservative overlap, variable-length lists, no silent per-cluster truncation; compare against brute-force reference and measure dense scenes. |
 | P1 / DXR shadows | PLANNED | Caster visibility/LOD/invalidation and safe caching; optional DXR visibility without double shadowing. |
 
@@ -793,7 +796,7 @@ MSVC UI command core CPU regression PASS in Windows baseline; native UI renderin
 5. If tests fail, fix minimal root cause, preserve assertions and independent oracle, rerun affected and regression tests. Publish logs and evidence; no new feature work on an unexplained build/GPU correctness failure. No game launch until separately agreed; hardware/game runtime remains a distinct gate.
 6. After baseline: B3c2 → B3d → adaptive runtime → hardware and game A/B (Jupiter, dense lights, resize/reload/shutdown, Debug/GBV separately from profiling). Capture actual GPU timings, CPU frametimes, memory budget/usage and visual parity; no claim of performance from CPU fixture or theoretical sample count.
 
-**Current verdict:** Technical baseline through Hardware Preflight PASS WITH NOTES. First game validation FAIL at level loading; hardware init PASS. [Failure review](dx12-f43-first-hardware-failure.md). Fix evidenced loading blocker before resuming A/B; no full baseline repeat, no production default switch.
+**Current verdict:** Technical baseline and hardware A/B PASS WITH NOTES; initial load failure resolved. [Hardware performance review](dx12-f43-hardware-performance-review.md). Next conservative shadow content caching and measured optimization. Full visual/lifecycle/device-loss acceptance and default switch remain separate.
 
 ### Исторические статусы F — снимок 2026-11-06 (prypiat)
 
