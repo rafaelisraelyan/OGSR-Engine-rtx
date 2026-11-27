@@ -1344,17 +1344,56 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     return all(coords > 0.0f) && all(coords < 1.0f) ? LOCAL_VALID : LOCAL_OUTSIDE;
 }
 
-float SampleLocalVisibility(float3 coords, uint layer)
+// Differentiate clip.xyz / clip.w along the geometric receiver plane.
+// The common 1/w cancels when solving depth as a function of shadow UV.
+float2 LocalReceiverGradient(float3 coords, float3 planeNormal, uint layer)
+{
+    const LocalShadowMatrix m = LocalShadowMatrices[layer];
+    const float3 w = m.column3.xyz;
+    const float2 ndc = (coords.xy - 0.5f) * float2(2.0f, -2.0f);
+    const float3 u = 0.5f * (m.column0.xyz - ndc.x * w);
+    const float3 v = -0.5f * (m.column1.xyz - ndc.y * w);
+    const float3 depth = m.column2.xyz - coords.z * w;
+    const float3 ray = cross(u, v);
+    const float determinant = dot(planeNormal, ray);
+    if (abs(determinant) <= max(1.0e-8f, 0.01f * length(ray)))
+        return 0.0f;
+    const float2 gradient = float2(dot(depth, cross(v, planeNormal)),
+                                   dot(depth, cross(planeNormal, u))) / determinant;
+    return all(isfinite(gradient)) ? gradient : 0.0f;
+}
+
+float CompareLocalShadow(float2 uv, float3 coords, float2 gradient, uint4 address)
+{
+    if (!any(gradient))
+        return LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(uv, address.y), coords.z);
+
+    const float texel = rcp((float)address.z);
+    const float2 pixel = uv * (float)address.z - 0.5f;
+    const float2 base = floor(pixel);
+    const float2 weight = frac(pixel);
+    // Gather the same bilinear footprint, with the depth of the receiver
+    // plane at each texel center. The clamp sampler repeats edge texels.
+    const float4 depths = LOCAL_SHADOW_PAGE(address.x).GatherRed(WallmarkSampler,
+        float3((base + 1.0f) * texel, address.y));
+    const float2 low = min((base + 0.5f) * texel, 1.0f - 0.5f * texel) - coords.xy;
+    const float2 high = min((base + 1.5f) * texel, 1.0f - 0.5f * texel) - coords.xy;
+    const float4 reference = coords.z + gradient.x * float4(low.x, high.x, high.x, low.x) +
+        gradient.y * float4(high.y, high.y, low.y, low.y);
+    const float4 visible = step(reference, depths);
+    return lerp(lerp(visible.w, visible.z, weight.x), lerp(visible.x, visible.y, weight.x), weight.y);
+}
+
+float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
 {
     if (layer >= LocalShadowConfig.x)
         return 1.0f;
     const uint4 address = LocalShadowMatrices[layer].address;
     if (!ValidLocalAddress(address))
         return 1.0f;
-    const uint physicalSlice = address.y;
     const float2 halfTexel = 0.5f / (float)address.z;
     const float2 center = clamp(coords.xy, halfTexel, 1.0f - halfTexel);
-    float visibility = LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(center, physicalSlice), coords.z);
+    float visibility = CompareLocalShadow(center, coords, gradient, address);
     [branch]
     if (visibility > 0.0f && visibility < 1.0f)
     {
@@ -1363,19 +1402,19 @@ float SampleLocalVisibility(float3 coords, uint layer)
         const float2 low = clamp(coords.xy - offset, halfTexel, 1.0f - halfTexel);
         const float2 high = clamp(coords.xy + offset, halfTexel, 1.0f - halfTexel);
         visibility = (visibility +
-            LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(low, physicalSlice), coords.z) +
-            LOCAL_SHADOW_PAGE(address.x).SampleCmpLevelZero(SunShadowSampler, float3(high, physicalSlice), coords.z)) / 3.0f;
+            CompareLocalShadow(low, coords, gradient, address) +
+            CompareLocalShadow(high, coords, gradient, address)) / 3.0f;
     }
     return visibility;
 }
 
-float LocalVisibility(LocalLightData source, float3 position, float3 normal, float3 lightDirection)
+float LocalVisibility(LocalLightData source, float3 position, float3 normal, float3 lightDirection, float3 planeNormal)
 {
     float3 coords;
     uint layer;
     if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
         return 1.0f;
-    return SampleLocalVisibility(coords, layer);
+    return SampleLocalVisibility(coords, layer, LocalReceiverGradient(coords, planeNormal, layer));
 }
 
 bool DebugLightMatches(uint index)
@@ -1383,7 +1422,7 @@ bool DebugLightMatches(uint index)
     return DiagnosticLight.y == 0 || DiagnosticLight.x == index + 1;
 }
 
-float3 DebugLocalShadow(float3 position, float3 normal)
+float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
 {
     [loop]
     for (uint index = 0; index < LightingFlags.z; ++index)
@@ -1410,7 +1449,7 @@ float3 DebugLocalShadow(float3 position, float3 normal)
             return saturate((linearDepth - nearDepth) / (farDepth - nearDepth)).xxx;
         }
         if (ViewMode == 5)
-            return SampleLocalVisibility(coords, layer).xxx;
+            return SampleLocalVisibility(coords, layer, LocalReceiverGradient(coords, planeNormal, layer)).xxx;
         return frac((layer + 1) * float3(0.618f, 0.381f, 0.173f));
     }
     return float3(0.12f, 0.0f, 0.12f);
@@ -1469,7 +1508,7 @@ bool LookupCluster(float3 world, float2 screen, out uint2 range)
     return true;
 }
 
-float3 LocalLighting(float3 normal, float3 position, float2 screen, bool diagnostic, bool withShadows)
+float3 LocalLighting(float3 normal, float3 position, float2 screen, float3 planeNormal, bool diagnostic, bool withShadows)
 {
     float3 light = 0.0f;
     uint2 range = 0;
@@ -1497,7 +1536,7 @@ float3 LocalLighting(float3 normal, float3 position, float2 screen, bool diagnos
         const float angular = LocalAngular(source, normal, lightDir);
         if (angular > 0.0f)
             light += source.colorInnerCos.rgb * (pow(falloff, 2.2f) * angular *
-                (withShadows ? LocalVisibility(source, position, normal, lightDir) : 1.0f));
+                (withShadows ? LocalVisibility(source, position, normal, lightDir, planeNormal) : 1.0f));
     }
     return light;
 }
@@ -1688,7 +1727,7 @@ float3 TerrainAlbedo(float3 baseLinear, float2 uv, float3 world)
 R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
 {
     // Считаем производные плоскости до clip и ветвления на режимы материалов.
-    const float3 correctedPlaneNormal = SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ?
+    const float3 correctedPlaneNormal = LocalShadowConfig.x != 0u || SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ?
         SunPlaneNormal(ddx_fine(input.world), ddy_fine(input.world)) : 0.0f;
     const bool flipNormal = !frontFace && (TextureMode & 32) != 0;
     const float3 n = SafeDirection(flipNormal ? -input.normal : input.normal);
@@ -1707,7 +1746,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         return textured ? float4(0.1f, 0.1f, 0.1f, 1.0f)
                         : float4(0.9f, 0.1f, 0.1f, 1.0f);
     if (ViewMode >= 4 && ViewMode <= 6)
-        return float4(DebugLocalShadow(input.world, n), 1.0f);
+        return float4(DebugLocalShadow(input.world, n, correctedPlaneNormal), 1.0f);
     if ((TextureMode & 2048u) != 0)
         baseColor.rgb = TerrainAlbedo(baseColor.rgb, input.uv, input.world);
     if (ViewMode == 7)
@@ -1722,7 +1761,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
     if (ViewMode == 14)
-        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, true, false)), 1.0f);
+        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, 0.0f, true, false)), 1.0f);
     if (ViewMode == 15 || ViewMode == 16)
     {
         const uint count = LightingFlags.z;
@@ -1738,7 +1777,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         const float angular = LocalAngular(source, n, lightDir);
         const float3 raw = source.colorInnerCos.rgb * (pow(falloff, 2.2f) * angular);
         const float visibility = falloff > 0.0f && angular > 0.0f ?
-            LocalVisibility(source, input.world, n, lightDir) : 1.0f;
+            LocalVisibility(source, input.world, n, lightDir, correctedPlaneNormal) : 1.0f;
         return float4(falloff, visibility, dot(raw * visibility, float3(0.2126f, 0.7152f, 0.0722f)), 1.0f);
     }
     if (ViewMode == 17)
@@ -1760,12 +1799,13 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         if (status == LOCAL_OUTSIDE) return float4(1, 1, 0, 1);
         if (status == LOCAL_BAD_LAYER) return float4(0, 1, 1, 1);
         if (status == LOCAL_BAD_PROJECTION) return float4(1, 0, 1, 1);
-        return float4(0, 0.25f + 0.75f * SampleLocalVisibility(coords, layer), 0, 1);
+        return float4(0, 0.25f + 0.75f * SampleLocalVisibility(coords, layer,
+            LocalReceiverGradient(coords, correctedPlaneNormal, layer)), 0, 1);
     }
     const float sunCosine = LightingFlags.y != 0 ? saturate(dot(n, -SunDirection.xyz)) : 0.0f;
     // Geometric receiver plane, computed before the light-dependent branch.
     const float3 planeNormal = SunFilter == 7 ? SafeDirection(cross(ddx(input.world), ddy(input.world))) :
-        correctedPlaneNormal;
+        (SunFilter == 4 || ViewMode == 24 || ViewMode == 30 ? correctedPlaneNormal : 0.0f);
     if (ViewMode == 19 || ViewMode == 20 || (ViewMode >= 26 && ViewMode <= 38))
         return float4(DebugSun(ViewMode, SelectSun(input.world, n, sunCosine), planeNormal, sunCosine), 1);
     if (ViewMode == 21)
@@ -1774,14 +1814,14 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         return float4(ToDisplay(SunColor.rgb * sunCosine *
             SunVisibility(input.world, n, sunCosine, planeNormal)), 1);
     if (ViewMode == 23)
-        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, false, true)), 1);
+        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, false, true)), 1);
     if (ViewMode == 24)
         return float4(planeNormal * (dot(planeNormal, n) < 0.0f ? -0.5f : 0.5f) + 0.5f, 1);
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
         const float direct = dot(SunColor.rgb * sunCosine, luminance);
-        const float local = dot(LocalLighting(n, input.world, input.position.xy, true, true), luminance);
+        const float local = dot(LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, true, true), luminance);
         const float3 display = ToDisplay(float3(direct, 0.0f, local));
         return float4(display.r, SunVisibility(input.world, n, sunCosine, planeNormal), display.b, 1.0f);
     }
@@ -1790,7 +1830,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     {
         if (LightingFlags.x != 0)
         {
-            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, input.position.xy, false, true);
+            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, false, true);
             if (sunCosine > 0.0f)
                 light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine, planeNormal));
         }

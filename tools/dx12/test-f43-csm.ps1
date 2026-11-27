@@ -4,7 +4,7 @@ param(
     [switch]$Sequential,
     [switch]$DescriptorTestsOnly,
     [switch]$CsmWarpOnly,
-    [ValidateSet('banked-parity','scalable','adaptive-runtime','shadow-cache','clustered-lighting')][string]$WarpCase,
+    [ValidateSet('banked-parity','scalable','adaptive-runtime','shadow-cache','clustered-lighting','page-table')][string]$WarpCase,
     [string]$JobLibrary
 )
 
