@@ -4,12 +4,22 @@
 #include "GameDx12Lighting.h"
 #include "GameDx12NativeFrame.h"
 
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 
 namespace game_shadow12
 {
+struct AdaptiveShadowTelemetry
+{
+    const char* fallback = "none";
+    uint64_t dxgiBudget = 0, dxgiUsage = 0, retained = 0, newBytes = 0, peak = 0;
+    uint32_t descriptorCapacity = 0, descriptors = 0;
+    std::array<uint32_t, 4> pagesByTier{};
+    bool observed = false;
+};
+
 // Живёт вместе со сценой. Арены публикуются только владельцем NativeFrame.
 class AdaptiveShadowRuntime
 {
@@ -18,6 +28,18 @@ public:
     {
         const char* value = std::getenv("OGSR_DX12_GAME_ADAPTIVE_SHADOWS");
         return value && std::strcmp(value, "1") == 0;
+    }
+
+    static uint64_t BudgetBytes() noexcept
+    {
+        static const auto value = ReadBytes("OGSR_DX12_GAME_ADAPTIVE_SHADOW_BUDGET_BYTES", UINT64_MAX);
+        return value;
+    }
+
+    static uint64_t ReserveBytes() noexcept
+    {
+        static const auto value = ReadBytes("OGSR_DX12_GAME_ADAPTIVE_SHADOW_RESERVE_BYTES", 0);
+        return value;
     }
 
     static AdaptiveCandidate Candidate(const gamelight12::LocalLight& light,
@@ -36,7 +58,7 @@ public:
         GameDx12NativeFrame12::Recording& recording, ShadowDescriptors& descriptors,
         std::span<const AdaptiveCandidate> candidates, uint64_t session, uint64_t epoch, uint64_t frame,
         uint32_t sunViews, ShadowAddressPlan& addresses, ShadowDescriptors::Binding& binding,
-        uint64_t slotAllowance = UINT64_MAX)
+        uint64_t slotAllowance = UINT64_MAX, AdaptiveShadowTelemetry* telemetry = nullptr)
     {
         if (!initialized_)
         {
@@ -66,6 +88,7 @@ public:
             return E_UNEXPECTED;
         const auto submit = owner.fenceValue + 1;
         const auto available = descriptors.Available(recording.slot, owner.fence.GetCompletedValue());
+        if (telemetry) telemetry->descriptorCapacity = available;
         const auto& current = arena.CurrentArena();
         const auto& last = other.CurrentArena().frame > current.frame ? other.CurrentArena() : current;
         AdaptivePlan prior{last.session, last.epoch, last.frame, last.policyRevision, 0, 0, {}};
@@ -75,9 +98,20 @@ public:
         {
             DXGI_QUERY_VIDEO_MEMORY_INFO info{};
             uint64_t headroom = 0;
-            if (FAILED(QueryShadowMemoryBudget(owner.device, adapter, 0, info, headroom)))
+            const auto status = QueryShadowMemoryBudget(owner.device, adapter, 0, info, headroom);
+            if (FAILED(status))
+            {
+                if (telemetry) telemetry->fallback = "dxgi_budget_unavailable";
                 return {};
-            auto budget = PlanAdaptiveSlotBudget(info.Budget, info.CurrentUsage, arena.CurrentBytes(), other.CurrentBytes(), 0);
+            }
+            if (telemetry)
+            {
+                telemetry->observed = true;
+                telemetry->dxgiBudget = info.Budget;
+                telemetry->dxgiUsage = info.CurrentUsage;
+            }
+            auto budget = PlanAdaptiveSlotBudget(info.Budget, info.CurrentUsage, arena.CurrentBytes(), other.CurrentBytes(),
+                ReserveBytes(), BudgetBytes());
             budget.finalBytes = (std::min)(budget.finalBytes, slotAllowance);
             budget.newBytes = (std::min)(budget.newBytes, budget.finalBytes);
             return budget;
@@ -165,7 +199,24 @@ public:
         }
         if (FAILED(hr))
             return hr;
+        if (telemetry)
+        {
+            const auto& staged = *arena.PreparedPlan();
+            for (const auto& page : staged.next.pages)
+            {
+                const auto tier = std::find_if(shapes_.begin(), shapes_.end(),
+                    [&](const auto& shape) { return shape.resolution == page.spec.resolution; });
+                if (tier != shapes_.end())
+                    ++telemetry->pagesByTier[static_cast<size_t>(tier - shapes_.begin())];
+                if (std::binary_search(staged.create.begin(), staged.create.end(), page.id))
+                    telemetry->newBytes += page.spec.bytes;
+            }
+            telemetry->retained = staged.bytes - telemetry->newBytes;
+            const auto sum = [](uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; };
+            telemetry->peak = sum(sum(arena.CurrentBytes(), other.CurrentBytes()), telemetry->newBytes);
+        }
         hr = recording.StageShadowPages(descriptors, arena, addresses, binding);
+        if (telemetry && SUCCEEDED(hr)) telemetry->descriptors = binding.pageCount;
         if (FAILED(hr))
             arena.CancelUnsubmitted();
         return hr;
@@ -179,6 +230,17 @@ public:
     }
 
 private:
+    static uint64_t ReadBytes(const char* key, uint64_t fallback) noexcept
+    {
+        const auto* text = std::getenv(key);
+        if (!text || !*text)
+            return fallback;
+        uint64_t value = 0;
+        const auto* end = text + std::strlen(text);
+        const auto parsed = std::from_chars(text, end, value);
+        return parsed.ec == std::errc{} && parsed.ptr == end ? value : 0;
+    }
+
     std::array<ShadowPageResources, GameDx12NativeFrame12::kFrameCount> arenas_;
     const std::array<ShadowPageShape, 4> shapes_{{{128, 6}, {256, 6}, {512, 6}, {1024, 6}}};
     std::array<ShadowPageSpec, 4> specs_{};

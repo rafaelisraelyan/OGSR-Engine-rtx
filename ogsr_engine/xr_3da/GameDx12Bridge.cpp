@@ -2461,6 +2461,41 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     const auto count = state.native.PresentCount();
     const auto& completedGpu = state.native.LastGpuTiming();
+    if (hr == S_OK && sceneRecorded && (count == 1 || count % 120 == 0))
+    {
+        auto t = sceneStats.adaptive;
+        if (!t.observed && state.nativeMemoryAdapter)
+        {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            t.observed = SUCCEEDED(state.nativeMemoryAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info));
+            t.dxgiBudget = info.Budget;
+            t.dxgiUsage = info.CurrentUsage;
+        }
+        const auto requested = lighting.localShadowCandidateCount;
+        const auto admitted = sceneStats.shadowedLights;
+        const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+        const bool banked = std::strcmp(sceneStats.shadowMode, "banked") == 0;
+        const auto pages = banked ? 1u : t.descriptors;
+        Msg("ph_dx12_shadow_preflight: present=%llu requested_mode=%s actual_mode=%s fallback=%s "
+            "dxgi_observed=%d dxgi_budget_bytes=%llu dxgi_usage_bytes=%llu shadow_budget_bytes=%llu reserve_bytes=%llu "
+            "retained_bytes=%llu new_bytes=%llu peak_bytes=%llu requested_lights=%u admitted_lights=%u denied_lights=%u "
+            "point_groups=%u spot_groups=%u pages=%u pages_128=%u pages_256=%u pages_512=%u pages_1024=%u "
+            "descriptors_used=%u descriptors_available=%u local_views=%u csm_views=%u lists=%u "
+            "shadow_cpu_ms=%.6f gpu_present=%llu gpu_frame_ms=%.6f gpu_shadow_ms=%.6f "
+            "gr_mode=%s gr_prep_jobs=%llu gr_prep_completed=%llu gr_prep_ms=%.6f "
+            "gr_record_jobs=%llu gr_record_completed=%llu gr_record_wait_ms=%.6f",
+            u(count), sceneStats.adaptiveRequested ? "adaptive" : "banked", sceneStats.shadowMode, t.fallback,
+            t.observed ? 1 : 0, u(t.dxgiBudget), u(t.dxgiUsage), u(game_shadow12::AdaptiveShadowRuntime::BudgetBytes()),
+            u(game_shadow12::AdaptiveShadowRuntime::ReserveBytes()), u(t.retained), u(t.newBytes), u(t.peak),
+            requested, admitted, requested - (std::min)(requested, admitted),
+            sceneStats.pointShadowFaces / 6, sceneStats.spotShadowMaps, pages, t.pagesByTier[0], t.pagesByTier[1],
+            t.pagesByTier[2], banked ? pages : t.pagesByTier[3], banked ? pages : t.descriptors,
+            banked ? 1u : t.descriptorCapacity, sceneStats.localShadowMaps,
+            sceneStats.sunShadowViews, sceneStats.commandLists, sceneStats.shadowCpuMs, u(completedGpu.present),
+            completedGpu.milliseconds, completedGpu.shadowMilliseconds, sceneStats.grMode,
+            u(sceneStats.grPrepJobs), u(sceneStats.grPrepCompleted), sceneStats.grParallelMs,
+            u(sceneStats.grRecordJobs), u(sceneStats.grRecordCompleted), sceneStats.grRecordWaitMs);
+    }
     if (completedGpu.present != 0 && completedGpu.present % 120 == 0 && !completedGpu.views.empty())
     {
         Msg("ph_dx12_csm: gpu_present=%llu gpu_ms=%.6f gpu_shadow_ms=%.6f gpu_scene_ms=%.6f shadow_views=%zu",

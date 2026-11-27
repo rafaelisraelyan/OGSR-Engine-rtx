@@ -123,6 +123,7 @@ public:
         uint32_t sunRigidDraws = 0;
         uint32_t sunSkinnedDraws = 0;
         uint32_t localShadowMaps = 0;
+        uint32_t sunShadowViews = 0;
         uint32_t localShadowDraws = 0;
         SurfaceStats surfaces;
         uint32_t waterDraws = 0;
@@ -144,6 +145,11 @@ public:
         const char* grMode = "static-serial";
         double grSerialMs = 0.0;
         double grParallelMs = 0.0;
+        game_shadow12::AdaptiveShadowTelemetry adaptive;
+        const char* shadowMode = "disabled";
+        uint64_t grPrepJobs = 0, grPrepCompleted = 0, grRecordJobs = 0, grRecordCompleted = 0;
+        double grRecordWaitMs = 0;
+        bool adaptiveRequested = false;
     };
 
     struct AuxStats

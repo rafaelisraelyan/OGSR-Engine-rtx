@@ -3875,6 +3875,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     game_shadow12::ShadowDescriptors::Binding adaptiveBinding;
     std::vector<std::array<FrustumPlane, 6>> adaptiveFrusta;
     bool adaptive = false;
+    stats.adaptiveRequested = game_shadow12::AdaptiveShadowRuntime::Enabled();
+    if (stats.adaptiveRequested)
+        stats.adaptive.fallback = !SceneLocalShadowsRequested() ? "local_shadows_disabled" :
+            !m_shadowDescriptors ? "descriptor_heap_unavailable" : !adapter ? "dxgi_adapter_unavailable" : "lighting_inactive";
     const uint32_t viewMode = SceneViewMode();
     static const bool legacyWaterSsr = gamewater12::Enabled("OGSR_DX12_GAME_LEGACY_WATER_SSR");
     constants.legacyWaterSsr = legacyWaterSsr ? 1u : 0u;
@@ -3993,11 +3997,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 }
                 candidates.push_back(game_shadow12::AdaptiveShadowRuntime::Candidate(light, cameraPosition, pixelsPerRadian));
             }
+            stats.adaptive.fallback = "none";
             const auto hr = m_adaptiveShadows->Prepare(owner, *adapter, recording, *m_shadowDescriptors,
-                candidates, LevelSession(), LevelEpoch(), lighting.frame, sunPlan.count, adaptiveAddresses, adaptiveBinding);
+                candidates, LevelSession(), LevelEpoch(), lighting.frame, sunPlan.count, adaptiveAddresses, adaptiveBinding,
+                UINT64_MAX, ((recording.frame->PresentCount() + 1) % 120 == 0 || recording.frame->PresentCount() == 0)
+                    ? &stats.adaptive : nullptr);
             if (FAILED(hr))
                 return Fail(reason, "adaptive local shadow preparation failed");
             adaptive = hr == S_OK;
+            if (adaptive) stats.shadowMode = "adaptive";
             if (adaptive)
             {
                 std::vector<uint32_t> mapping;
@@ -4045,6 +4053,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (!adaptive && m_localShadow != nullptr && (viewMode == 0 || viewMode >= 4))
             {
                 const auto selectionStart = Clock::now();
+                stats.shadowMode = "banked";
                 if (!SelectLocalShadowViews(lighting, m_localShadowSlices / game_shadow12::LayersPerBank,
                     m_localShadowAllocation, constants, localLights, localProjections, localShadowViews))
                     return Fail(reason, "invalid local shadow selection");
@@ -4215,6 +4224,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
     }
     const uint32_t passCount = static_cast<uint32_t>(passes.size());
+    stats.sunShadowViews = sunPlan.count;
     FrustumPlane planes[6] = {};
     const bool cull = !SceneCullDisabled() && BuildFrustum(logicalViewProjection, planes);
     stats.total = static_cast<uint32_t>(m_draws.size());
@@ -4429,6 +4439,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 snapshot.session == LevelSession() && snapshot.epoch == LevelEpoch() && snapshot.generation == Generation();
             if (!usePrepared)
                 throw std::runtime_error(prepReason.empty() ? "incomplete GR frame preparation" : prepReason);
+            stats.grPrepJobs = grStats.submitted;
+            stats.grPrepCompleted = grStats.completed;
             std::sort(workers.begin(), workers.end());
             participantsUsed = static_cast<uint32_t>(std::unique(workers.begin(), workers.end()) - workers.begin());
             if (grMode == renderprep12::Mode::Verify)
@@ -4984,9 +4996,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 work(0, count, 0);
                 return S_OK;
             }
-            GameDx12GRRangeStats12 stats;
+            GameDx12GRRangeStats12 recordStats;
             std::string taskReason;
-            return GameDx12GR_RunRanges(count, 1, work, stats, taskReason) ? S_OK : E_FAIL;
+            const bool succeeded = GameDx12GR_RunRanges(count, 1, work, recordStats, taskReason);
+            stats.grRecordJobs = recordStats.submitted;
+            stats.grRecordCompleted = recordStats.completed;
+            stats.grRecordWaitMs = recordStats.waitMs;
+            return succeeded ? S_OK : E_FAIL;
         };
         const auto hr = game_shadow12::RecordShadowPasses(recording, batch,
             [&](ID3D12GraphicsCommandList& target, uint32_t index)
@@ -5057,6 +5073,9 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 return Fail(reason, "failed to close native shadow list");
             accumulateShadows(passes[index], results[index].draws);
         }
+        stats.grRecordJobs = recordStats.submitted;
+        stats.grRecordCompleted = recordStats.completed;
+        stats.grRecordWaitMs = recordStats.waitMs;
         if (sample)
         {
             uint32_t mask = 0;
