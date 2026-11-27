@@ -1564,6 +1564,43 @@ void TestRealJupiter(TestContext& ctx, int argc, char** argv)
     ctx.Check(index_hash == "BE2A2F3B75643ABA50BF27608A358BA83E08D4CE8E027F5152CB3D48F4FF3AB7",
               "real Jupiter compact index SHA-256", index_hash);
 }
+void TestTreeHemi(TestContext& ctx)
+{
+    Fixture f = BuildFixture();
+    f.level[f.header + 1] = static_cast<uint8_t>(xraylevel12::kMtTreeSt);
+    Bytes data;
+    for (unsigned i = 0; i < 16; ++i)
+        AppendF32(data, i % 5 == 0 ? 1.0f : 0.0f);
+    for (float value : {0.1f, 0.2f, 0.3f, 0.4f, 0.5f,
+                        0.6f, 0.7f, 0.8f, 0.25f, 0.9f})
+        AppendF32(data, value);
+    AppendChunk(f.level, xraylevel12::kOgfTreeDef2, data);
+    WriteU32(f.level, f.level_visuals_header + 4,
+             ReadU32At(f.level, f.level_visuals_header + 4) + static_cast<uint32_t>(data.size()) + 8);
+    WriteU32(f.level, f.visual_chunk_header + 4,
+             ReadU32At(f.level, f.visual_chunk_header + 4) + static_cast<uint32_t>(data.size()) + 8);
+    xraylevel12::LevelPools pools;
+    std::string reason;
+    const auto result = xraylevel12::ReadLevelPools(f.level, f.geom, pools, reason);
+    constexpr float factor = 0.5f * 1.5f * 1.3333f;
+    ctx.Check(result == xraylevel12::ReadError::None && pools.visuals.size() == 1 &&
+              pools.visuals[0].drawable && pools.visuals[0].has_world &&
+              std::fabs(pools.visuals[0].tree_hemi_scale - 0.4f * factor) < 1.e-6f &&
+              std::fabs(pools.visuals[0].tree_hemi_bias - 0.25f * factor) < 1.e-6f,
+              "TREEDEF2 scale and bias follow R4");
+    for (unsigned element : {0u, 3u, 4u, 5u, 8u, 9u})
+    {
+        Bytes invalid = f.level;
+        WriteF32(invalid, invalid.size() - data.size() + (16 + element) * 4,
+                 std::numeric_limits<float>::quiet_NaN());
+        xraylevel12::LevelPools rejected;
+        reason.clear();
+        const auto invalidResult = xraylevel12::ReadLevelPools(invalid, f.geom, rejected, reason);
+        ctx.Check(invalidResult != xraylevel12::ReadError::None ||
+                  rejected.visuals.empty() || !rejected.visuals[0].drawable,
+                  "TREEDEF2 rejects nonfinite color data");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -1571,6 +1608,7 @@ int main(int argc, char** argv)
     TestContext ctx;
     std::printf("F4.0-B1 CPU geometry reader hardening tests\n");
     TestSyntheticContract(ctx);
+    TestTreeHemi(ctx);
     TestOffsetContract(ctx);
     TestBoundsAndHeaderSphere(ctx);
     TestSphereRegressions(ctx);

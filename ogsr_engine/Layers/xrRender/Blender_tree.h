@@ -11,6 +11,10 @@ private:
     xrP_BOOL oNotAnTree;
 
 public:
+#ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
+    bool RequiresAlphaTest() const noexcept { return oBlend.value != FALSE; }
+#endif
+
     virtual LPCSTR getComment() { return "LEVEL: trees/bushes"; }
     virtual BOOL canBeDetailed() { return TRUE; }
 

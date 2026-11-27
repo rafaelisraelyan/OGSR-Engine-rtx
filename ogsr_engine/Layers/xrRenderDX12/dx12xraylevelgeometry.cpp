@@ -974,6 +974,7 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
     uint32_t swi_container_id = 0;
     bool has_tree = false;
     float tree_world[16] = {};
+    float tree_color[10] = {};
     uint32_t swi_offset = 0;
     uint16_t swi_num_tris = 0;
     uint16_t swi_num_verts = 0;
@@ -1110,6 +1111,12 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
                 if (!std::isfinite(tree_world[element]))
                     return false;
             }
+            for (uint32_t element = 0; element < 10; ++element)
+            {
+                if (!ReadF32(level, data + (16 + element) * 4, tree_color[element]) ||
+                    !std::isfinite(tree_color[element]))
+                    return false;
+            }
             has_tree = true;
         }
         else
@@ -1160,6 +1167,12 @@ bool ReadPoolVisual(std::span<const uint8_t> level, const Chunk& chunk,
     if (isTree)
     {
         if (!has_tree)
+            return false;
+        // FTreeVisual::Load: hemi каждого блока умножается на 0.5 * 1.5 * 1.3333.
+        constexpr float r4HemiFactor = 0.5f * 1.5f * 1.3333f;
+        visual.tree_hemi_scale = tree_color[3] * r4HemiFactor;
+        visual.tree_hemi_bias = tree_color[8] * r4HemiFactor;
+        if (!std::isfinite(visual.tree_hemi_scale) || !std::isfinite(visual.tree_hemi_bias))
             return false;
         visual.has_world = true;
         for (uint32_t element = 0; element < 16; ++element)

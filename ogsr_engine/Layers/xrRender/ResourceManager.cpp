@@ -14,6 +14,7 @@
 #include "../xrRenderPC_R4/blender_deffer_aref.h"
 #include "Blender_BmmD.h"
 #include "Blender_Particle.h"
+#include "Blender_tree.h"
 #include <cmath>
 #endif
 
@@ -80,6 +81,24 @@ bool GameDx12ReadR4DeferredAlphaSource(LPCSTR name, bool& blended)
         return false;
     auto* resources = dxRenderDeviceRender::Instance().Resources;
     return resources && resources->ReadDeferredLevelAlphaSource(name, blended);
+}
+
+bool CResourceManager::ReadTreeAlphaSource(LPCSTR name, bool& cutout)
+{
+    const auto found = m_blenders.find(name);
+    if (found == m_blenders.end())
+        return false;
+    const auto* blender = dynamic_cast<const CBlender_Tree*>(found->second);
+    if (!blender || _lua_HasShader(name))
+        return false;
+    cutout = blender->RequiresAlphaTest();
+    return true;
+}
+
+bool GameDx12ReadR4TreeAlphaSource(LPCSTR name, bool& cutout)
+{
+    auto* resources = Device.m_pRender ? dxRenderDeviceRender::Instance().Resources : nullptr;
+    return resources && resources->ReadTreeAlphaSource(name, cutout);
 }
 
 bool CResourceManager::ReadTerrainSource(LPCSTR shader, LPCSTR baseTexture,

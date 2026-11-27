@@ -105,6 +105,7 @@ public:
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
     bool ReadClassicParticleSource(LPCSTR name, u32& blendId, u32& priority, bool& clampTexture, bool& strictSorting);
     bool ReadDeferredLevelAlphaSource(LPCSTR name, bool& blended);
+    bool ReadTreeAlphaSource(LPCSTR name, bool& cutout);
     bool ReadTerrainSource(LPCSTR shader, LPCSTR baseTexture, std::array<std::string, 4>& layerNames, float& detailScale);
 #endif
 

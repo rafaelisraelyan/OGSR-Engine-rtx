@@ -278,6 +278,9 @@ struct PoolVisual
                        0.0f, 1.0f, 0.0f, 0.0f,
                        0.0f, 0.0f, 1.0f, 0.0f,
                        0.0f, 0.0f, 0.0f, 1.0f};
+    // Коэффициенты hemi после однократного преобразования R4.
+    float tree_hemi_scale = 0.0f;
+    float tree_hemi_bias = 0.0f;
     // F4.1-E: id записи в таблице SWI уровня (для MT_TREE_PM).
     uint32_t swi_id = 0;
     bool has_swi = false;
