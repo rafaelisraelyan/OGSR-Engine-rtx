@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$GameRoot,
@@ -12,6 +12,10 @@ param(
     [switch]$NoDynamicSunShadows,
     [switch]$NoSunShadows,
     [switch]$NoLocalShadows,
+    [switch]$AdaptiveShadows,
+    [uint64]$AdaptiveShadowBudgetBytes = [uint64]::MaxValue,
+    [uint64]$AdaptiveShadowReserveBytes = 0,
+    [switch]$Preflight,
     [switch]$LegacyLocalPriority,
     [ValidateSet(1,2,3)][uint32]$LocalShadowBanks = 1,
     [switch]$SuppressUnmappedLocalLights,
@@ -60,6 +64,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($AdaptiveShadows -and ($R4 -or $NoShadows -or $NoLocalShadows -or $NoLocalLights)) {
+    throw 'AdaptiveShadows требует native DX12 с включёнными локальными тенями.'
+}
 if ($LegacySunPCF -and $SunShadowFilter -notin @('Auto','Legacy')) {
     throw 'Для -LegacySunPCF выберите Auto или Legacy.'
 }
@@ -111,7 +118,7 @@ $expectedAlias = '^\$app_data_root\$\s*=\s*true\s*\|\s*false\s*\|\s*' + [regex]:
 if (-not (Select-String -LiteralPath $config -Pattern $expectedAlias -Quiet)) {
     throw ('Проверьте путь $app_data_root$ в {0}. Ожидается {1}' -f $config, $appData)
 }
-if (Get-Process -Name xrEngine -ErrorAction SilentlyContinue) { throw 'Закройте текущий экземпляр xrEngine.' }
+if (!$Preflight -and (Get-Process -Name xrEngine -ErrorAction SilentlyContinue)) { throw 'Закройте текущий экземпляр xrEngine.' }
 
 $arguments = @('-fsltx', 'fsgame.ltx', '-nogameintro', '-log')
 if (-not $R4) {
@@ -149,7 +156,7 @@ $features = @{
     SUN_RESOLUTION = $SunShadowResolution
     SUN_DISTANCE = $SunShadowDistance
     SUN_FILTER = $SunShadowFilter.ToLowerInvariant()
-    SUN_BIAS_MASK = 15 - [int]$NoSunNormalBias - 2 * [int]$NoSunConstantBias - 4 * [int]$NoSunRasterBias - 8 * [int]$NoSunSlopeBias
+    SUN_BIAS_MASK = 15 - [int]$NoSunNormalBias.IsPresent - 2 * [int]$NoSunConstantBias.IsPresent - 4 * [int]$NoSunRasterBias.IsPresent - 8 * [int]$NoSunSlopeBias.IsPresent
     TRANSPARENCY = [int](-not $NoTransparency)
     LIT_DECALS = [int](-not $NoLitDecals)
     SOURCE_ALPHA_TEST = [int](-not $LegacyAlpha)
@@ -159,6 +166,9 @@ $features = @{
     LOCAL_SHADOWS = [int](-not $NoShadows -and -not $NoLocalShadows -and -not $NoLocalLights)
     STABLE_LOCAL_PRIORITY = [int](-not $LegacyLocalPriority)
     LOCAL_SHADOW_BANKS = $LocalShadowBanks
+    ADAPTIVE_SHADOWS = [int]$AdaptiveShadows.IsPresent
+    ADAPTIVE_SHADOW_BUDGET_BYTES = $AdaptiveShadowBudgetBytes.ToString([Globalization.CultureInfo]::InvariantCulture)
+    ADAPTIVE_SHADOW_RESERVE_BYTES = $AdaptiveShadowReserveBytes.ToString([Globalization.CultureInfo]::InvariantCulture)
     SUPPRESS_UNMAPPED_LOCAL_LIGHTS = [int]$SuppressUnmappedLocalLights.IsPresent
     RECEIVER_PLANE_SUN = [int](-not $LegacySunPCF)
     LEGACY_SKY_HEMI = [int]$LegacySkyHemi.IsPresent
@@ -205,6 +215,39 @@ if ($null -ne $GeometryObjectId) {
     $start.EnvironmentVariables['OGSR_DX12_GAME_R1_OBJECT_ID'] = [string]$GeometryObjectId
 }
 Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
+if ($Preflight) {
+    $profile = Join-Path $appData 'user_ogsr.ltx'
+    $archive = Join-Path $gameRoot 'resources/configs.db'
+    $resources = @(Get-ChildItem -LiteralPath (Join-Path $gameRoot 'resources') -Filter 'resources.db*' -File |
+        Where-Object Length -gt 0)
+    foreach ($path in @($profile, $archive, $save)) {
+        if (!(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -le 0) {
+            throw "Не найден непустой файл Jupiter: $path"
+        }
+    }
+    if (!$resources.Count) { throw 'Не найдены непустые архивы resources.db*.' }
+    $levelFiles = @(foreach ($relative in 'gamedata/levels/jupiter', 'levels/jupiter') {
+        $directory = Join-Path $gameRoot $relative
+        if (Test-Path -LiteralPath $directory -PathType Container) {
+            Get-ChildItem -LiteralPath $directory -Name -File | ForEach-Object { "$relative/$_" }
+        }
+    })
+    [pscustomobject]@{
+        GameRoot = $gameRoot
+        Exe = $start.FileName
+        Save = $save
+        SaveSha256 = (Get-FileHash -LiteralPath $save).Hash
+        Profile = $profile
+        ProfileSha256 = (Get-FileHash -LiteralPath $profile).Hash
+        JupiterOverlayFiles = $levelFiles
+        ResourceArchives = @($resources.Name)
+        AdaptiveShadows = $AdaptiveShadows.IsPresent
+        BudgetBytes = $features.ADAPTIVE_SHADOW_BUDGET_BYTES
+        ReserveBytes = $features.ADAPTIVE_SHADOW_RESERVE_BYTES
+        Validation = $Validation.IsPresent
+    } | ConvertTo-Json -Depth 2
+    return
+}
 $engine = [System.Diagnostics.Process]::Start($start)
 try {
     $engine.WaitForExit()
