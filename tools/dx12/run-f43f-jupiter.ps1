@@ -43,6 +43,16 @@ param(
     [Nullable[uint32]]$GeometryObjectId,
     [switch]$SceneLog,
     [switch]$Metrics,
+    [ValidateSet('A','B','C','D','E','F')][string]$PerformanceMode,
+    [switch]$ShadowCache,
+    [switch]$StaticShadowCache,
+    [switch]$ShadowBatching,
+    [switch]$ShadowCasterPreparation,
+    [switch]$ClusteredLighting,
+    [uint64]$MetricsStart = 1,
+    [uint64]$MetricsCount = 480,
+    [uint64]$MetricsStride = 1,
+    [string]$RunDirectory,
     [switch]$Validation,
     [ValidateSet('serial','parallel','verify')][string]$GR = 'serial',
     [ValidatePattern('^(auto|[0-9]|1[0-6])$')][string]$GRWorkers = 'auto',
@@ -64,6 +74,28 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($PerformanceMode) {
+    if ($R4) { throw 'Режимы A–F предназначены для native DX12.' }
+    $AdaptiveShadows = $PerformanceMode -ne 'A'
+    $ShadowCache = $PerformanceMode -in @('C','D','E','F')
+    $StaticShadowCache = $PerformanceMode -in @('D','E','F')
+    $ShadowBatching = $PerformanceMode -in @('E','F')
+    $ShadowCasterPreparation = $PerformanceMode -in @('E','F')
+    $ClusteredLighting = $PerformanceMode -eq 'F'
+    $Metrics = $true
+    $SunShadowProfile = 'Balanced'
+    $SunCascades = 3
+    $SunShadowResolution = 2048
+    $SunShadowDistance = 160
+    $LocalShadowBanks = 1
+    $GR = 'parallel'
+    $GRWorkers = '2'
+    $GRGrain = 256
+    $CommandLists = 'parallel'
+    $AdaptiveShadowBudgetBytes = 512MB
+    $AdaptiveShadowReserveBytes = 1GB
+}
+if ($StaticShadowCache -and !$ShadowCache) { throw 'Для StaticShadowCache нужен ShadowCache.' }
 if ($AdaptiveShadows -and ($R4 -or $NoShadows -or $NoLocalShadows -or $NoLocalLights)) {
     throw 'AdaptiveShadows требует native DX12 с включёнными локальными тенями.'
 }
@@ -181,6 +213,14 @@ $features = @{
     TRACE_LIGHTS = [int]$SceneLog.IsPresent
     VALIDATION = [int]$Validation.IsPresent
     METRICS = [int]$Metrics.IsPresent
+    METRICS_START = $MetricsStart
+    METRICS_COUNT = $MetricsCount
+    METRICS_STRIDE = $MetricsStride
+    SHADOW_CACHE = [int]$ShadowCache.IsPresent
+    SHADOW_STATIC_CACHE = [int]$StaticShadowCache.IsPresent
+    SHADOW_BATCHING = [int]$ShadowBatching.IsPresent
+    SHADOW_CASTER_PREPARATION = [int]$ShadowCasterPreparation.IsPresent
+    CLUSTERED_LIGHTING = [int]$ClusteredLighting.IsPresent
     FIXED_LIGHT_IDS = [string]$FixedLightIds
     FREEZE_LIGHT_RECORD = [int]$FreezeLightRecord.IsPresent
     LIGHT_PROBE_FRAMES = $ProbeFrames
@@ -214,8 +254,26 @@ $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_R1_OBJECT_ID')
 if ($null -ne $GeometryObjectId) {
     $start.EnvironmentVariables['OGSR_DX12_GAME_R1_OBJECT_ID'] = [string]$GeometryObjectId
 }
-Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
+$verifiedArchives = @()
+if ($PerformanceMode) {
+    $baselineArchives = [ordered]@{
+        'levels/levels.db0' = 'D4A24F79BC69AD666470CB067F7C0E14FAA814F4EC66AFD790CE23550F32C788'
+        'levels/levels.db1' = 'BF9EF7D57C790905B79EFCA6714FC37AE9DEBE524BC74E58421616634DB76DDB'
+        'localization/base_sounds.db' = 'B1B9728B0AAEB26B89ECA14AD6FC4185E89B85AA96CD42500A84A528D6299DE1'
+        'localization/xefis_movies.db' = 'CE2242AA1809944CB5918011DB776E09B5B72DE49E3999159A28FA7F36D514A0'
+        'localization/xenglish.db' = '1D5874C050B128A3464EF86A9EEF6112EF14AD829C6C582FAB9A4990AE6AF981'
+        'mp/mp_pool.db' = '83105212FDDE8EEE9EF0130288FBE0F17133A39C08D5F096F2ADEAD1B1C380BF'
+    }
+    $verifiedArchives = @(foreach ($entry in $baselineArchives.GetEnumerator()) {
+        $path = Join-Path $gameRoot $entry.Key
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Отсутствует архив $path." }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        if ($hash -ne $entry.Value) { throw "SHA-256 архива $path отличается от baseline Jupiter." }
+        [pscustomobject]@{ Path = $entry.Key; SHA256 = $hash }
+    })
+}
 if ($Preflight) {
+    Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
     $profile = Join-Path $appData 'user_ogsr.ltx'
     $archive = Join-Path $gameRoot 'resources/configs.db'
     $resources = @(Get-ChildItem -LiteralPath (Join-Path $gameRoot 'resources') -Filter 'resources.db*' -File |
@@ -245,14 +303,80 @@ if ($Preflight) {
         BudgetBytes = $features.ADAPTIVE_SHADOW_BUDGET_BYTES
         ReserveBytes = $features.ADAPTIVE_SHADOW_RESERVE_BYTES
         Validation = $Validation.IsPresent
-    } | ConvertTo-Json -Depth 2
+        PerformanceMode = $PerformanceMode
+        Cache = $ShadowCache.IsPresent
+        StaticCache = $StaticShadowCache.IsPresent
+        Batching = $ShadowBatching.IsPresent
+        CasterPreparation = $ShadowCasterPreparation.IsPresent
+        ClusteredLighting = $ClusteredLighting.IsPresent
+        VerifiedArchives = $verifiedArchives
+    } | ConvertTo-Json -Depth 3
     return
 }
-$engine = [System.Diagnostics.Process]::Start($start)
+$temporaryConfig = $null
+$engine = $null
+$isolatedAppData = $null
 try {
+    if ($PerformanceMode -or $RunDirectory) {
+        if (!$RunDirectory) { $RunDirectory = Join-Path $PSScriptRoot '../../artifacts/f43-performance-evolution/game-runs' }
+        $runId = '{0}-{1}-{2}' -f $PerformanceMode, (Get-Date -Format 'yyyyMMdd-HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0,8))
+        $run = New-Item -ItemType Directory -Path (Join-Path $RunDirectory $runId) -Force
+        $isolatedAppData = (New-Item -ItemType Directory -Path (Join-Path $run.FullName 'appdata')).FullName + '\'
+        $isolatedSaves = New-Item -ItemType Directory -Path (Join-Path $isolatedAppData 'savedgames')
+        Copy-Item -LiteralPath (Join-Path $appData 'user_ogsr.ltx') -Destination $isolatedAppData
+        Get-ChildItem -LiteralPath (Join-Path $appData 'savedgames') -Filter 'b23_jupiter.*' -File |
+            Copy-Item -Destination $isolatedSaves.FullName
+        $configName = "f43-performance-$runId.ltx"
+        $configPath = Join-Path $gameRoot $configName
+        $originalConfig = Get-Content -LiteralPath $config -Raw
+        $isolatedConfig = [regex]::Replace($originalConfig, "(?m)$expectedAlias",
+            [System.Text.RegularExpressions.MatchEvaluator]{ param($match) $match.Value.Replace($appData, $isolatedAppData) })
+        if ($isolatedConfig -eq $originalConfig) { throw 'Не удалось перенаправить appdata в отдельный каталог.' }
+        $file = [IO.File]::Open($configPath, [IO.FileMode]::CreateNew)
+        $temporaryConfig = $configPath
+        try {
+            $writer = [IO.StreamWriter]::new($file, [Text.UTF8Encoding]::new($false))
+            try { $writer.Write($isolatedConfig) } finally { $writer.Dispose() }
+        } finally { $file.Dispose() }
+        Copy-Item -LiteralPath $temporaryConfig -Destination $run.FullName
+        $start.Arguments = $start.Arguments.Replace('-fsltx fsgame.ltx', "-fsltx $configName")
+        [pscustomobject]@{
+            Mode = $PerformanceMode
+            Exe = $start.FileName
+            ExeSHA256 = (Get-FileHash -LiteralPath $start.FileName).Hash
+            SaveSHA256 = (Get-FileHash -LiteralPath $save).Hash
+            ProfileSHA256 = (Get-FileHash -LiteralPath (Join-Path $appData 'user_ogsr.ltx')).Hash
+            Args = $start.Arguments
+            Requested = $features
+            Archives = $verifiedArchives
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run.FullName 'launch.json') -Encoding UTF8
+    }
+
+    Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
+    $engine = [System.Diagnostics.Process]::Start($start)
     $engine.WaitForExit()
+    if ($isolatedAppData) {
+        $engine.ExitCode | Set-Content -LiteralPath (Join-Path $run.FullName 'engine.exit')
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $isolatedAppData 'logs') -Filter '*.log' -File -ErrorAction SilentlyContinue)
+        if ($logs.Count) {
+            Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight):' |
+                ForEach-Object Line | Set-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
+            $rows = @(Select-String -LiteralPath $logs.FullName -SimpleMatch 'ph_dx12_perf_detail:' | ForEach-Object {
+                $fields = [ordered]@{}
+                foreach ($match in [regex]::Matches($_.Line, '([a-z0-9_]+)=([^\s]+)')) {
+                    $fields[$match.Groups[1].Value] = $match.Groups[2].Value
+                }
+                [pscustomobject]$fields
+            })
+            if ($rows.Count) {
+                $rows | Export-Csv -LiteralPath (Join-Path $run.FullName 'performance.csv') -NoTypeInformation -Encoding UTF8
+            }
+        }
+        Write-Host $run.FullName
+    }
     if ($engine.ExitCode -ne 0) { throw "xrEngine завершился с кодом $($engine.ExitCode)." }
 }
 finally {
-    $engine.Dispose()
+    if ($engine) { $engine.Dispose() }
+    if ($temporaryConfig) { Remove-Item -LiteralPath $temporaryConfig }
 }
