@@ -87,14 +87,14 @@ inline bool BuildShadowPagePlan(const AdaptivePlan& logical, std::span<const Sha
     std::unordered_set<uint64_t> seen, assigned;
     for (const auto& a : logical.lights)
     {
-        if (!a.id || !seen.emplace(a.id).second || (a.faces != 1 && a.faces != 6) ||
+        if (!a.id || !std::isfinite(a.priority) || !seen.emplace(a.id).second || (a.faces != 1 && a.faces != 6) ||
             (!a.resolution && a.bytes) || (a.resolution && (!a.bytes || !byResolution.count(a.resolution)))) return false;
         if (a.resolution) requests.push_back(a);
     }
-    // Deterministic ordering independent of capture order. Retention first;
-    // for new groups, allocate point groups before individual spot slices.
+    // Физический план сохраняет приоритет с учётом hysteresis.
+    // ID решает только ничью между источниками с одинаковым приоритетом.
     std::sort(requests.begin(),requests.end(),[](const auto& a,const auto& b){
-        return a.faces != b.faces ? a.faces > b.faces : a.id < b.id;
+        return a.priority != b.priority ? a.priority > b.priority : a.id < b.id;
     });
     const auto activate = [&](ShadowPage p) -> bool {
         if (pages.size() >= pageCapacity || p.spec.bytes > pageBudget-plan.bytes) return false;
@@ -108,22 +108,29 @@ inline bool BuildShadowPagePlan(const AdaptivePlan& logical, std::span<const Sha
         next.placed.push_back({a.id,w.page.id,first,a.faces,a.resolution});
         assigned.emplace(a.id);
     };
-    if (compatible)
-        for (const auto& a : requests)
-        {
-            const auto it = prior.find(a.id);
-            if (it == prior.end() || it->second.resolution != a.resolution || it->second.faces != a.faces) continue;
-            const auto& p = it->second;
-            const auto& oldPage = old[oldIndex.at(p.page)].page;
-            if (!SamePageSpec(oldPage.spec,byResolution.at(a.resolution))) continue;
-            if (!active.count(p.page) && !activate(oldPage)) continue;
-            // Previous layout was validated; retained ranges cannot overlap.
-            place(pages[active.at(p.page)],a,p.first);
-        }
     for (const auto& a : requests)
     {
-        if (assigned.count(a.id)) continue;
         const auto& spec = byResolution.at(a.resolution);
+        if (compatible)
+        {
+            const auto it = prior.find(a.id);
+            if (it != prior.end())
+            {
+                const auto& p = it->second;
+                const auto& oldPage = old[oldIndex.at(p.page)].page;
+                if (p.faces == a.faces && SamePageSpec(oldPage.spec, spec) &&
+                    (active.count(p.page) || activate(oldPage)))
+                {
+                    auto& page = pages[active.at(p.page)];
+                    if (std::none_of(page.used.begin() + p.first, page.used.begin() + p.first + p.faces,
+                            [](uint8_t used) { return used != 0; }))
+                    {
+                        place(page, a, p.first);
+                        continue;
+                    }
+                }
+            }
+        }
         for (auto& w : pages)
         {
             if (w.page.spec.resolution != a.resolution) continue;

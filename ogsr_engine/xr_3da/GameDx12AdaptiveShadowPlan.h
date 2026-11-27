@@ -34,6 +34,7 @@ struct AdaptiveAssignment
     uint32_t requestedTier;
     uint32_t resolution; // 0: explicitly denied by budget
     uint64_t bytes;
+    double priority = 0.0;
 };
 struct AdaptivePlan
 {
@@ -112,7 +113,7 @@ inline bool BuildAdaptivePlan(std::span<const AdaptiveTier> tiers,
             }
         }
         work.push_back({plan.lights.size(), wanted, score});
-        plan.lights.push_back({c.id, c.faces, tiers[wanted].resolution, 0, 0});
+        plan.lights.push_back({c.id, c.faces, tiers[wanted].resolution, 0, 0, score});
     }
     std::sort(work.begin(), work.end(), [&](const Work& a, const Work& b) {
         if (a.score != b.score) return a.score > b.score;

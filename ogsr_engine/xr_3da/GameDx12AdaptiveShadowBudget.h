@@ -11,7 +11,7 @@ struct AdaptiveSlotBudget
 };
 
 constexpr AdaptiveSlotBudget PlanAdaptiveSlotBudget(uint64_t budget, uint64_t usage, uint64_t current,
-    uint64_t other, uint64_t incrementalReserve) noexcept
+    uint64_t other, uint64_t incrementalReserve, uint64_t shadowCap = UINT64_MAX) noexcept
 {
     // CurrentUsage уже включает резидентные страницы. Кредит относится только
     // к текущему слоту и доступен после успешной публикации замены.
@@ -19,8 +19,13 @@ constexpr AdaptiveSlotBudget PlanAdaptiveSlotBudget(uint64_t budget, uint64_t us
     const uint64_t nonReplaceableUsage = usage - credited;
     const uint64_t finalHeadroom = budget > nonReplaceableUsage ? budget - nonReplaceableUsage : 0;
     const uint64_t peakHeadroom = budget > usage ? budget - usage : 0;
-    return {finalHeadroom - (std::min)(finalHeadroom, incrementalReserve),
-        peakHeadroom - (std::min)(peakHeadroom, incrementalReserve)};
+    const uint64_t capAfterOther = shadowCap == UINT64_MAX ? UINT64_MAX :
+        shadowCap - (std::min)(shadowCap, other);
+    const uint64_t capForNew = shadowCap == UINT64_MAX ? UINT64_MAX :
+        capAfterOther - (std::min)(capAfterOther, current);
+    const auto slotCap = shadowCap == UINT64_MAX ? UINT64_MAX : (std::min)(capAfterOther, shadowCap / 2);
+    return {(std::min)(finalHeadroom - (std::min)(finalHeadroom, incrementalReserve), slotCap),
+        (std::min)(peakHeadroom - (std::min)(peakHeadroom, incrementalReserve), capForNew)};
 }
 
 // Возвращает только физически опубликованные группы, сохраняя ID и порядок
