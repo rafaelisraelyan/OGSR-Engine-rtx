@@ -1,7 +1,10 @@
 #include "stdafx.h"
 #include "GameDx12StaticScene.h"
+#include "GameDx12ClusteredLighting.h"
 #include "GameDx12ShadowRecording.h"
+#include "GameDx12StaticShadowCache.h"
 #include "GameDx12ShadowAddress.h"
+#include "GameDx12ShadowCullMask.h"
 #include "GameDx12J2APreparation.h"
 #include "GameDx12SunCascades.h"
 
@@ -20,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <xmmintrin.h>
 #include <new>
 #include <stdexcept>
 #include <unordered_set>
@@ -80,6 +84,9 @@ struct SceneFrameConstants
     std::array<float, game_shadow12::MaxSunCascades> sunDepthBias; // Нормализованный receiver bias по срезам.
     uint32_t sunCasterCounts[4];
     uint32_t localShadowConfig[4]; // x: проекции, y: страницы, z/w: слои и разрешение legacy-страницы.
+    uint32_t clusterTiles[4]; // viewport width/height и размер XY тайла.
+    uint32_t clusterGrid[4]; // количество тайлов X/Y, Z срезов, индексов.
+    float clusterDepth[4]; // near, far, масштаб log2, резерв.
 };
 static_assert(sizeof(LocalLightGpu) == 64);
 static_assert(offsetof(LocalLightGpu, positionInverseRangeSquared) == 0);
@@ -91,7 +98,8 @@ static_assert(offsetof(SceneFrameConstants, lightingFlags) == 384);
 static_assert(sizeof(DirectX::XMFLOAT4X4) == 64);
 static_assert(offsetof(SceneFrameConstants, hemiColor) == 400);
 static_assert(offsetof(SceneFrameConstants, diagnosticLight) == 512);
-static_assert(sizeof(SceneFrameConstants) == 688);
+static_assert(offsetof(SceneFrameConstants, clusterTiles) == 688);
+static_assert(sizeof(SceneFrameConstants) == 736);
 static_assert(offsetof(SceneFrameConstants, diagnosticOrigin) ==
     offsetof(SceneFrameConstants, diagnosticLight) + 16);
 static_assert(offsetof(SceneFrameConstants, legacyWaterSsr) ==
@@ -123,6 +131,8 @@ constexpr uint32_t kTerrainScaleRoot = 12;
 constexpr uint32_t kLocalLightBufferRoot = 13;
 constexpr uint32_t kLocalProjectionBufferRoot = 14;
 constexpr uint32_t kLocalPageShapesRoot = 15;
+constexpr uint32_t kClusterGridRoot = 16;
+constexpr uint32_t kClusterIndicesRoot = 17;
 constexpr uint32_t kTerrainDescriptor = kLocalShadowDescriptor + 1;
 constexpr uint32_t kTerrainTextureCount = 5;
 constexpr uint32_t kMaxTerrainSets = 128;
@@ -632,6 +642,9 @@ cbuffer FrameCB : register(b0)
     float4 SunDepthBias;
     uint4 SunCasterCounts;
     uint4 LocalShadowConfig;
+    uint4 ClusterTiles;
+    uint4 ClusterGrid;
+    float4 ClusterDepth;
 };
 
 // CPU uploads transposed matrices: each consecutive float4 is one
@@ -1428,12 +1441,51 @@ float LocalAngular(LocalLightData source, float3 normal, float3 lightDir)
     return cone * cosine;
 }
 
-float3 LocalLighting(float3 normal, float3 position, bool diagnostic, bool withShadows)
+StructuredBuffer<uint2> ClusterRanges : register(t16);
+StructuredBuffer<uint> ClusterLightIndices : register(t17);
+
+bool LookupCluster(float3 world, float2 screen, out uint2 range)
+{
+    range = 0;
+    [branch]
+    if (ClusterGrid.z == 0 || any(screen < 0) || any(screen >= float2(ClusterTiles.xy)))
+        return false;
+    const float4 clip = mul(float4(world, 1.0f), ViewProjection);
+    if (!(clip.w >= ClusterDepth.x && clip.w <= ClusterDepth.y))
+        return false;
+    const float2 projected = (clip.xy / clip.w * float2(0.5f, -0.5f) + 0.5f) * ClusterTiles.xy;
+    if (!all(projected >= 0.0f) || !all(projected < float2(ClusterTiles.xy)))
+        return false;
+    const uint2 tile = uint2(screen) / ClusterTiles.zw;
+    // Растровый экранный тайл может расходиться с повторной проекцией
+    // интерполированных world coordinates. В таком кадре сохраняем полный цикл.
+    if (any(tile != uint2(projected) / ClusterTiles.zw) || any(tile >= ClusterGrid.xy))
+        return false;
+    const uint z = min((uint)max(0.0f, log2(clip.w / ClusterDepth.x) * ClusterDepth.z), ClusterGrid.z - 1);
+    const uint2 candidate = ClusterRanges[(z * ClusterGrid.y + tile.y) * ClusterGrid.x + tile.x];
+    if (candidate.x > ClusterGrid.w || candidate.y > ClusterGrid.w - candidate.x || candidate.y > LightingFlags.z)
+        return false;
+    range = candidate;
+    return true;
+}
+
+float3 LocalLighting(float3 normal, float3 position, float2 screen, bool diagnostic, bool withShadows)
 {
     float3 light = 0.0f;
+    uint2 range = 0;
+    const bool clustered = (TextureMode & 64u) == 0 && LookupCluster(position, screen, range);
+    const uint count = clustered ? range.y : LightingFlags.z;
     [loop]
-    for (uint index = 0; index < LightingFlags.z; ++index)
+    for (uint item = 0; item < count; ++item)
     {
+        uint index = item;
+        [branch]
+        if (clustered)
+        {
+            // Безопасный адрес даже при спекулятивной оценке ветки FXC.
+            const uint last = max(ClusterGrid.w, 1u) - 1u;
+            index = ClusterLightIndices[min(range.x + item, last)];
+        }
         if (diagnostic && !DebugLightMatches(index))
             continue;
         const LocalLightData source = LocalLights[index];
@@ -1670,7 +1722,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
     if (ViewMode == 14)
-        return float4(ToDisplay(LocalLighting(n, input.world, true, false)), 1.0f);
+        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, true, false)), 1.0f);
     if (ViewMode == 15 || ViewMode == 16)
     {
         const uint count = LightingFlags.z;
@@ -1722,14 +1774,14 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         return float4(ToDisplay(SunColor.rgb * sunCosine *
             SunVisibility(input.world, n, sunCosine, planeNormal)), 1);
     if (ViewMode == 23)
-        return float4(ToDisplay(LocalLighting(n, input.world, false, true)), 1);
+        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, false, true)), 1);
     if (ViewMode == 24)
         return float4(planeNormal * (dot(planeNormal, n) < 0.0f ? -0.5f : 0.5f) + 0.5f, 1);
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
         const float direct = dot(SunColor.rgb * sunCosine, luminance);
-        const float local = dot(LocalLighting(n, input.world, true, true), luminance);
+        const float local = dot(LocalLighting(n, input.world, input.position.xy, true, true), luminance);
         const float3 display = ToDisplay(float3(direct, 0.0f, local));
         return float4(display.r, SunVisibility(input.world, n, sunCosine, planeNormal), display.b, 1.0f);
     }
@@ -1738,7 +1790,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     {
         if (LightingFlags.x != 0)
         {
-            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, false, true);
+            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, input.position.xy, false, true);
             if (sunCosine > 0.0f)
                 light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine, planeNormal));
         }
@@ -1774,13 +1826,7 @@ void shadowMain(ShadowInterpolants input)
 )";
 
 // Шесть плоскостей из row-vector ViewProjection (как в GameDx12Bridge.cpp).
-struct FrustumPlane
-{
-    float nx = 0.0f;
-    float ny = 0.0f;
-    float nz = 0.0f;
-    float d = 0.0f;
-};
+using FrustumPlane = game_shadow12::ShadowCullPlane;
 
 bool NormalizePlane(FrustumPlane& plane)
 {
@@ -2143,8 +2189,18 @@ void GameDx12StaticScene12::BuildShadowCasterTrees()
     // AABB узлов объединяет те же мировые сферы, что использует отсечение
     // отдельных draw. Локальные карты пропускают целые ветви уровня.
     for (auto& tree : m_shadowCasters)
+    {
+        tree.boundsVerified = std::all_of(tree.draws.begin(), tree.draws.end(), [&](uint32_t index)
+        {
+            const auto& draw = m_draws[index];
+            // Проверка битов сохраняет смысл и в конфигурации /fp:fast.
+            const auto finite = [](float value) { return (std::bit_cast<uint32_t>(value) & 0x7f800000u) != 0x7f800000u; };
+            return finite(draw.radius) && (std::bit_cast<uint32_t>(draw.radius) & 0x80000000u) == 0 &&
+                std::all_of(std::begin(draw.center), std::end(draw.center), finite);
+        });
         if (!tree.draws.empty())
             BuildShadowCasterNode(tree, 0, static_cast<uint32_t>(tree.draws.size()));
+    }
 }
 
 uint32_t GameDx12StaticScene12::BuildShadowCasterNode(ShadowCasterTree& tree, uint32_t first, uint32_t count)
@@ -2194,7 +2250,7 @@ uint32_t GameDx12StaticScene12::BuildShadowCasterNode(ShadowCasterTree& tree, ui
 bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                            std::string& reason)
 {
-    D3D12_ROOT_PARAMETER params[16] = {};
+    D3D12_ROOT_PARAMETER params[kClusterIndicesRoot + 1] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -2288,6 +2344,13 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     params[kLocalPageShapesRoot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[kLocalPageShapesRoot].Descriptor.ShaderRegister = 15;
     params[kLocalPageShapesRoot].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    for (const uint32_t slot : {kClusterGridRoot, kClusterIndicesRoot})
+    {
+        params[slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[slot].Descriptor.ShaderRegister = slot;
+        params[slot].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
 
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
@@ -3876,6 +3939,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     std::vector<std::array<FrustumPlane, 6>> adaptiveFrusta;
     bool adaptive = false;
     stats.adaptiveRequested = game_shadow12::AdaptiveShadowRuntime::Enabled();
+    stats.cacheRequested = gamewater12::Enabled("OGSR_DX12_GAME_SHADOW_CACHE");
+    stats.staticCacheRequested = gamewater12::Enabled("OGSR_DX12_GAME_SHADOW_STATIC_CACHE");
+    stats.batchingRequested = gamewater12::Enabled("OGSR_DX12_GAME_SHADOW_BATCHING");
+    stats.casterPreparationRequested = gamewater12::Enabled("OGSR_DX12_GAME_SHADOW_CASTER_PREPARATION");
     if (stats.adaptiveRequested)
         stats.adaptive.fallback = !SceneLocalShadowsRequested() ? "local_shadows_disabled" :
             !m_shadowDescriptors ? "descriptor_heap_unavailable" : !adapter ? "dxgi_adapter_unavailable" : "lighting_inactive";
@@ -4000,8 +4067,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             stats.adaptive.fallback = "none";
             const auto hr = m_adaptiveShadows->Prepare(owner, *adapter, recording, *m_shadowDescriptors,
                 candidates, LevelSession(), LevelEpoch(), lighting.frame, sunPlan.count, adaptiveAddresses, adaptiveBinding,
-                UINT64_MAX, ((recording.frame->PresentCount() + 1) % 120 == 0 || recording.frame->PresentCount() == 0)
-                    ? &stats.adaptive : nullptr);
+                UINT64_MAX, (recording.frame->Measuring() || (recording.frame->PresentCount() + 1) % 120 == 0 || recording.frame->PresentCount() == 0)
+                    ? &stats.adaptive : nullptr, stats.batchingRequested ? 0u : UINT32_MAX);
             if (FAILED(hr))
                 return Fail(reason, "adaptive local shadow preparation failed");
             adaptive = hr == S_OK;
@@ -4171,6 +4238,55 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         std::span<const LocalShadowGpuProjection>(localProjections));
     if (FAILED(projectionHr))
         return Fail(reason, "local projection structured upload failed");
+    stats.clusteredRequested = gamecluster12::Enabled();
+    auto& clusterGridUpload = m_clusterGridUploads[frameSlot];
+    auto& clusterIndexUpload = m_clusterIndexUploads[frameSlot];
+    if (stats.clusteredRequested && !localLights.empty())
+    {
+        const auto clusterStart = Clock::now();
+        try
+        {
+            float projection[16];
+            std::memcpy(projection, &logicalViewProjection, sizeof(projection));
+            const auto config = gamecluster12::PerspectiveConfig(recording.width, recording.height, projection);
+            std::vector<gamecluster12::Light> lights;
+            lights.reserve(localLights.size());
+            for (const auto& light : localLights)
+            {
+                const auto& p = light.positionInverseRangeSquared;
+                // Расширяем сферу относительно округления LocalFalloff в float.
+                const auto radius = static_cast<float>(std::sqrt(1.0 / p.w) *
+                    (1.0 + 32.0 * std::numeric_limits<float>::epsilon()));
+                lights.push_back({p.x, p.y, p.z, radius});
+            }
+            gamecluster12::Result clusters;
+            if (gamecluster12::Build(config, lights, clusters) &&
+                SUCCEEDED(clusterGridUpload.Write(*recording.device, std::span<const gamecluster12::Entry>(clusters.grid))) &&
+                SUCCEEDED(clusterIndexUpload.Write(*recording.device, std::span<const uint32_t>(clusters.indices))))
+            {
+                constants.clusterTiles[0] = config.width;
+                constants.clusterTiles[1] = config.height;
+                constants.clusterTiles[2] = config.tileWidth;
+                constants.clusterTiles[3] = config.tileHeight;
+                constants.clusterGrid[0] = clusters.tilesX;
+                constants.clusterGrid[1] = clusters.tilesY;
+                constants.clusterGrid[2] = config.slices;
+                constants.clusterGrid[3] = static_cast<uint32_t>(clusters.indices.size());
+                constants.clusterDepth[0] = config.nearDepth;
+                constants.clusterDepth[1] = config.farDepth;
+                constants.clusterDepth[2] = config.slices / std::log2(config.farDepth / config.nearDepth);
+                stats.clusteredActive = true;
+                stats.clusterCount = static_cast<uint32_t>(clusters.grid.size());
+                stats.clusterIndices = static_cast<uint32_t>(clusters.indices.size());
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            // Нулевой ClusterGrid.z оставляет полный цикл без частичных списков.
+        }
+        stats.clusterBuildMs = Ms(clusterStart);
+    }
+    stats.clusterBufferBytes = clusterGridUpload.Capacity() + clusterIndexUpload.Capacity();
     std::memcpy(frameDestination, &constants, sizeof(constants));
 
     struct ShadowPass
@@ -4183,6 +4299,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         bool spot;
         ID3D12Resource* resource;
         uint32_t slice;
+        uint64_t page = 0, light = 0;
+        uint32_t face = 0;
     };
     std::vector<ShadowPass> passes;
     passes.reserve(sunPlan.count + (adaptive ? adaptiveAddresses.views.size() : localShadowViews.count));
@@ -4220,7 +4338,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 return Fail(reason, "adaptive shadow view unavailable");
             const auto local = view.packets.first - game_shadow12::ReservedCsmProjections;
             passes.push_back({target.dsv, target.resolution, {view.projection}, adaptiveFrusta[local].data(),
-                true, (adaptiveAddresses.views[local].group & 255) == 1, target.resource, target.slice});
+                true, (adaptiveAddresses.views[local].group & 255) == 1, target.resource, target.slice,
+                view.page, view.light, view.face});
         }
     }
     const uint32_t passCount = static_cast<uint32_t>(passes.size());
@@ -4303,7 +4422,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         return renderprep12::Mode::Serial;
     }();
     const bool packForRecording = recording.UsesParallelShadowLists() && passCount > 1;
-    if (grMode != renderprep12::Mode::Serial || packForRecording)
+    uint32_t backgroundWorkers = 0;
+    if (grMode != renderprep12::Mode::Serial || packForRecording || stats.casterPreparationRequested)
     {
         static const uint32_t grain = []
         {
@@ -4332,6 +4452,22 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             workCount = staticBlocks + objectBlocks + passCount;
 
             const auto prepStart = Clock::now();
+            if (stats.casterPreparationRequested)
+            {
+                // Список пригодных mesh-частей зависит от снимка объекта, но не от света.
+                // Проверки bounds остаются в каждом проходе и используют frustum света.
+                m_shadowObjectRanges.resize(objectCount);
+                m_shadowObjectPackets.clear();
+                for (uint32_t i = 0; i < objectCount; ++i)
+                {
+                    const auto& object = snapshot.objects[i];
+                    const size_t first = m_shadowObjectPackets.size();
+                    for (const uint32_t handle : objectParts(object))
+                        if (const auto* mesh = objectMesh(handle, object); mesh && CastsSunShadow(mesh->surface))
+                            m_shadowObjectPackets.push_back({i, handle});
+                    m_shadowObjectRanges[i] = {first, m_shadowObjectPackets.size()};
+                }
+            }
             prepared.Clear();
             prepared.shadows.resize(projectionCount);
             prepared.statics.resize(snapshot.draws.size());
@@ -4340,6 +4476,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             workers.assign(workCount, UINT32_MAX);
             const auto process = [&](uint32_t begin, uint32_t end, uint32_t threadIndex)
             {
+                // Маска допустима при round-to-nearest и постепенном underflow.
+                const bool maskAllowed = stats.casterPreparationRequested && (_mm_getcsr() & 0xe040u) == 0;
                 for (uint32_t task = begin; task < end; ++task)
                 {
                     if (task < staticBlocks)
@@ -4374,17 +4512,19 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                             if (tree.nodes.empty())
                                 continue;
                             auto& indices = view.statics[layout];
-                            const auto visit = [&](const auto& self, uint32_t index, uint32_t depth) -> void
+                            const auto visit = [&](const auto& self, uint32_t index, uint32_t depth, uint32_t mask) -> void
                             {
                                 if (index >= tree.nodes.size() || depth > 32)
                                     throw std::runtime_error("invalid shadow BVH child");
                                 const auto& node = tree.nodes[index];
                                 if (!BoxInside(frustum, node.minimum, node.maximum))
                                     return;
+                                if (maskAllowed && tree.boundsVerified && mask)
+                                    mask = game_shadow12::ReduceShadowPlaneMask(frustum, node.minimum, node.maximum, mask, true);
                                 if (node.count == 0)
                                 {
-                                    self(self, node.left, depth + 1);
-                                    self(self, node.right, depth + 1);
+                                    self(self, node.left, depth + 1, mask);
+                                    self(self, node.right, depth + 1, mask);
                                     return;
                                 }
                                 if (node.first > tree.draws.size() || node.count > tree.draws.size() - node.first)
@@ -4395,11 +4535,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                                     if (drawIndex >= snapshot.draws.size())
                                         throw std::runtime_error("invalid static shadow handle");
                                     const auto& draw = snapshot.draws[drawIndex];
-                                    if (SphereInside(frustum, draw.center, draw.radius))
+                                    // При пересечении хотя бы одной плоскости остаётся исходный float-тест.
+                                    if (!mask || SphereInside(frustum, draw.center, draw.radius))
                                         indices.push_back(drawIndex);
                                 }
                             };
-                            visit(visit, 0, 0);
+                            visit(visit, 0, 0, 0x3f);
                         }
                         if (pass.dynamic)
                         {
@@ -4408,6 +4549,15 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                                 const auto& object = snapshot.objects[i];
                                 if (!SphereInside(frustum, object.center, object.radius))
                                     continue;
+                                if (stats.casterPreparationRequested)
+                                {
+                                    const auto [first, last] = m_shadowObjectRanges[i];
+                                    if (last - first > maxSources - view.objects.size())
+                                        throw std::runtime_error("GR native shadow packet cap exceeded");
+                                    view.objects.insert(view.objects.end(), m_shadowObjectPackets.begin() + first,
+                                        m_shadowObjectPackets.begin() + last);
+                                    continue;
+                                }
                                 for (const uint32_t handle : objectParts(object))
                                 {
                                     const auto* mesh = objectMesh(handle, object);
@@ -4439,6 +4589,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 snapshot.session == LevelSession() && snapshot.epoch == LevelEpoch() && snapshot.generation == Generation();
             if (!usePrepared)
                 throw std::runtime_error(prepReason.empty() ? "incomplete GR frame preparation" : prepReason);
+            backgroundWorkers = grStats.backgroundWorkers;
             stats.grPrepJobs = grStats.submitted;
             stats.grPrepCompleted = grStats.completed;
             std::sort(workers.begin(), workers.end());
@@ -4515,6 +4666,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 static_cast<unsigned long long>(grStats.failures), static_cast<unsigned long long>(grStats.unobservedFailures),
                 grain, grStats.submitMs, grStats.waitMs, stats.grParallelMs, stats.grSerialMs);
     }
+    stats.casterPreparationActive = stats.casterPreparationRequested && usePrepared;
     stats.cull_ms = Ms(cullStart);
 
     const auto textureHeap = m_textureHeap.Get();
@@ -4536,6 +4688,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         if (m_shadowPageSampling)
             target->SetGraphicsRootShaderResourceView(kLocalPageShapesRoot,
                 adaptiveBinding.shapes ? adaptiveBinding.shapes : frameCb);
+        target->SetGraphicsRootShaderResourceView(kClusterGridRoot,
+            stats.clusteredActive ? clusterGridUpload.Address() : frameCb);
+        target->SetGraphicsRootShaderResourceView(kClusterIndicesRoot,
+            stats.clusteredActive ? clusterIndexUpload.Address() : frameCb);
         if (validExtras)
             target->SetGraphicsRootShaderResourceView(4, transformSrv);
     };
@@ -4802,9 +4958,10 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             return Fail(reason, "shadow timing registration failed");
     }
     const FramePreparation& preparedPackets = prepared;
+    enum class ShadowDrawPart { All, Static, Dynamic };
     const auto recordShadowMap = [&](ID3D12GraphicsCommandList* shadowList,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, uint32_t projection,
-        const FrustumPlane* shadowPlanes, bool dynamic)
+        const FrustumPlane* shadowPlanes, bool dynamic, ShadowDrawPart part = ShadowDrawPart::All)
     {
         if (!adaptive)
             recording.StampShadow(*shadowList, projection, false);
@@ -4877,6 +5034,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             shadowList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         }
         shadowList->SetGraphicsRoot32BitConstant(kShadowLayerRoot, projection, 0);
+        if (part != ShadowDrawPart::Dynamic)
         for (uint32_t layout = 0; layout < static_cast<uint32_t>(m_sunShadowPipelines.size()); ++layout)
         {
             const auto& tree = m_shadowCasters[layout];
@@ -4898,7 +5056,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 ++draws.statics;
             });
         }
-        if (dynamic && validExtras && m_sunShadowAuxPipeline != nullptr)
+        if (part != ShadowDrawPart::Static && dynamic && validExtras && m_sunShadowAuxPipeline != nullptr)
         {
             shadowList->SetPipelineState(m_sunShadowAuxPipeline.Get());
             if (usePrepared)
@@ -4984,11 +5142,192 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     };
     if (adaptive)
     {
+        const auto drawCount = [&](const ShadowPass& pass) -> uint32_t
+        {
+            if (!usePrepared)
+                return 1;
+            const auto& prepared = preparedPackets.shadows[pass.view.projection];
+            size_t draws = prepared.objects.size();
+            for (const auto& layout : prepared.statics)
+                draws += layout.size();
+            if (pass.view.projection == 0)
+                draws += sunDetails.size();
+            return static_cast<uint32_t>((std::min)(draws, size_t(UINT32_MAX)));
+        };
+        std::vector<size_t> dirtyPasses;
+        dirtyPasses.reserve(passCount);
+        const auto buildContentKey = [&](const ShadowPass& pass, bool withDynamic)
+        {
+            game_shadow12::ShadowContentView key;
+            key.resource = reinterpret_cast<uintptr_t>(pass.resource);
+            // Page ID монотонен в пределах арены и сессии. Уничтожение
+            // арены также уничтожает её метаданные кеша.
+            key.resourceGeneration = pass.page;
+            key.session = LevelSession();
+            key.epoch = LevelEpoch();
+            key.slice = pass.slice;
+            key.resolution = pass.size;
+            key.light = key.lightGeneration = pass.light; // ID выдаётся один раз экземпляру света.
+            key.face = pass.face;
+            key.sceneGeneration = Generation();
+            const auto& matrix = localProjections[pass.view.projection - game_shadow12::ReservedCsmProjections].matrix;
+            std::memcpy(key.matrixBits.data(), &matrix, sizeof(matrix));
+            const auto light = std::lower_bound(lighting.localLights.begin(), lighting.localLights.end(),
+                pass.light, [](const auto& candidate, uint64_t id) { return candidate.id < id; });
+            key.known = usePrepared && light != lighting.localLights.end() && light->id == pass.light;
+            const auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+            if (key.known)
+            {
+                key.lightState = {bits(light->position.x), bits(light->position.y), bits(light->position.z),
+                    bits(light->direction.x), bits(light->direction.y), bits(light->direction.z),
+                    bits(light->range), bits(light->outerCos), bits(light->shadowNear), bits(light->shadowFar)};
+                key.raster = {bits(threshold), alphaTestDisabled};
+                const auto& prepared = preparedPackets.shadows[pass.view.projection];
+                for (const auto& layout : prepared.statics)
+                    key.staticCasters.insert(key.staticCasters.end(), layout.begin(), layout.end());
+                if (withDynamic)
+                {
+                    for (const auto& packet : prepared.objects)
+                    {
+                        const auto& object = snapshot.objects[packet.objectIndex];
+                        const auto& mesh = snapshot.meshes[packet.meshIndex];
+                        game_shadow12::ShadowContentCaster caster;
+                        caster.identity = uint64_t(object.id) + 1;
+                        caster.generation = object.generation;
+                        // Mesh handles/texture descriptors are append-only within a scene generation.
+                        caster.geometry = {packet.meshIndex, mesh.requiredBones, mesh.skinned};
+                        caster.material = {mesh.descriptor, static_cast<uint32_t>(mesh.surface)};
+                        caster.known = mesh.requiredBones <= object.boneCount;
+                        for (uint32_t bone = 0; bone < object.boneCount; ++bone)
+                        {
+                            const auto& pose = extras.poses[object.poseOffset + bone];
+                            for (const auto& row : pose.m)
+                                for (float component : row)
+                                {
+                                    caster.known = caster.known && std::isfinite(component);
+                                    caster.transform.push_back(bits(component));
+                                }
+                        }
+                        key.casters.push_back(std::move(caster));
+                    }
+                }
+            }
+            return key;
+        };
+        const std::vector<uint32_t>* cacheReasons = nullptr;
+        auto& cache = m_adaptiveShadows->Content(frameSlot);
+        if (stats.cacheRequested)
+        {
+            const auto cacheStart = Clock::now();
+            try
+            {
+                std::vector<game_shadow12::ShadowContentView> content;
+                content.reserve(adaptiveSchedule.size());
+                for (const auto& pass : passes)
+                {
+                    if (pass.view.IsSun())
+                        continue;
+                    content.push_back(buildContentKey(pass, true));
+                }
+                const auto fence = owner.fenceValue + 1;
+                if (cache.Prepare(std::move(content), fence))
+                {
+                    if (SUCCEEDED(recording.StageShadowContentCache(cache, fence)))
+                    {
+                        cacheReasons = &cache.Reasons();
+                        stats.cache = cache.Stats();
+                        stats.cacheActive = true;
+                    }
+                    else
+                        cache.CancelUnsubmitted();
+                }
+            }
+            catch (const std::bad_alloc&)
+            {
+                if (cache.Prepared())
+                    cache.CancelUnsubmitted();
+            }
+            stats.cacheValidationMs = Ms(cacheStart);
+        }
+        if (!cacheReasons)
+            cache.DiscardContents(); // Полный проход может перезаписать ранее кешированный слой.
         std::vector<game_shadow12::ShadowRecordingPass> batch;
         batch.reserve(passCount);
-        for (const auto& pass : passes)
-            batch.push_back({pass.view.projection, {pass.resource, pass.dsv, {}, pass.slice, pass.size}});
-        std::vector<ShadowDraws> results(passCount);
+        size_t local = 0;
+        for (size_t i = 0; i < passes.size(); ++i)
+        {
+            const auto& pass = passes[i];
+            if (!pass.view.IsSun() && cacheReasons && (*cacheReasons)[local++] == game_shadow12::ShadowContentHit)
+            {
+                stats.cacheSkippedDraws += drawCount(pass);
+                ++stats.localShadowMaps;
+                ++(pass.spot ? stats.spotShadowMaps : stats.pointShadowFaces);
+                continue;
+            }
+            dirtyPasses.push_back(i);
+            batch.push_back({pass.view.projection, {pass.resource, pass.dsv, {}, pass.slice, pass.size},
+                stats.batchingRequested ? drawCount(pass) : 1u});
+        }
+        struct StaticUpdate
+        {
+            game_shadow12::StaticShadowSlice scratch;
+            size_t keyIndex = 0;
+        };
+        std::vector<StaticUpdate> staticUpdates;
+        const std::vector<uint32_t>* staticReasons = nullptr;
+        auto& staticCache = m_adaptiveShadows->StaticContent(frameSlot);
+        if (stats.staticCacheRequested && stats.cacheActive && usePrepared)
+        {
+            const auto start = Clock::now();
+            try
+            {
+                game_shadow12::StaticShadowScratch scratch(m_adaptiveShadows->Pages(frameSlot));
+                std::vector<game_shadow12::ShadowContentView> keys;
+                staticUpdates.resize(dirtyPasses.size());
+                for (size_t index = 0; index < dirtyPasses.size(); ++index)
+                {
+                    const auto& pass = passes[dirtyPasses[index]];
+                    if (pass.view.IsSun())
+                        continue;
+                    auto key = buildContentKey(pass, false);
+                    if (!key.known || key.staticCasters.empty())
+                        continue;
+                    auto source = scratch.Take(pass.size);
+                    if (!source.page)
+                        continue;
+                    key.resource = reinterpret_cast<uintptr_t>(source.view.resource);
+                    key.resourceGeneration = source.page;
+                    key.slice = source.view.slice;
+                    staticUpdates[index] = {source, keys.size()};
+                    keys.push_back(std::move(key));
+                }
+                const auto fence = owner.fenceValue + 1;
+                if (!keys.empty() && staticCache.Prepare(std::move(keys), fence))
+                {
+                    if (SUCCEEDED(recording.StageShadowContentCache(staticCache, fence)))
+                    {
+                        staticReasons = &staticCache.Reasons();
+                        stats.staticCacheCopies = staticCache.Stats().dirty + staticCache.Stats().hits;
+                        stats.staticCacheHits = staticCache.Stats().hits;
+                        for (const auto& update : staticUpdates)
+                            if (update.scratch.page)
+                                stats.staticCacheCopyBytes += 4ull * update.scratch.view.resolution *
+                                    update.scratch.view.resolution;
+                    }
+                    else
+                        staticCache.CancelUnsubmitted();
+                }
+            }
+            catch (const std::bad_alloc&)
+            {
+                if (staticCache.Prepared())
+                    staticCache.CancelUnsubmitted();
+            }
+            stats.cacheValidationMs += Ms(start);
+        }
+        if (!staticReasons)
+            staticCache.DiscardContents();
+        std::vector<ShadowDraws> results(dirtyPasses.size());
         const auto dispatch = [&](uint32_t count, const auto& work) -> HRESULT
         {
             if (!usePrepared)
@@ -5007,17 +5346,34 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         const auto hr = game_shadow12::RecordShadowPasses(recording, batch,
             [&](ID3D12GraphicsCommandList& target, uint32_t index)
         {
-            const auto& pass = passes[index];
-            results[index] = recordShadowMap(&target, pass.dsv, pass.size, pass.view.projection, pass.planes, pass.dynamic);
+            const auto& pass = passes[dirtyPasses[index]];
+            if (staticReasons && staticUpdates[index].scratch.page)
+            {
+                const auto& update = staticUpdates[index];
+                ShadowDraws statics;
+                game_shadow12::CopyStaticShadow(target, update.scratch.view, batch[index].target,
+                    (*staticReasons)[update.keyIndex] != game_shadow12::ShadowContentHit, [&]
+                {
+                    statics = recordShadowMap(&target, update.scratch.view.dsv, pass.size,
+                        pass.view.projection, pass.planes, false, ShadowDrawPart::Static);
+                });
+                results[index] = recordShadowMap(&target, pass.dsv, pass.size,
+                    pass.view.projection, pass.planes, pass.dynamic, ShadowDrawPart::Dynamic);
+                results[index].statics = statics.statics;
+            }
+            else
+                results[index] = recordShadowMap(&target, pass.dsv, pass.size, pass.view.projection, pass.planes, pass.dynamic);
             return S_OK;
-        }, dispatch);
+        }, dispatch, {stats.batchingRequested, usePrepared ? backgroundWorkers + 1 : 1,
+            &stats.shadowBatches});
         if (FAILED(hr))
             return Fail(reason, "unified adaptive shadow recording failed");
+        stats.batchingActive = stats.batchingRequested && recording.UsesShadowLists();
         list = recording.list;
-        if (passCount && recording.UsesShadowLists())
-            stats.commandLists = passCount + 2;
-        for (uint32_t i = 0; i < passCount; ++i)
-            accumulateShadows(passes[i], results[i]);
+        if (!dirtyPasses.empty() && recording.UsesShadowLists())
+            stats.commandLists = stats.shadowBatches + 2;
+        for (size_t i = 0; i < dirtyPasses.size(); ++i)
+            accumulateShadows(passes[dirtyPasses[i]], results[i]);
     }
     else if (passCount != 0 && recording.UsesShadowLists())
     {
@@ -5304,6 +5660,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
     }
 
+    recording.StampOpaqueEnd();
     // R1 сортирует накладки как раньше. В B4 вода (R4 priority 2) идёт
     // перед стеклом (priority 3), внутри группы порядок от дальних к ближним.
     const bool sortTransparency = gameaux12::TransparencyEnabled();
@@ -5497,6 +5854,8 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_frameConstants.Reset();
     for (auto& upload : m_localLightUploads) upload.Reset();
     for (auto& upload : m_localProjectionUploads) upload.Reset();
+    for (auto& upload : m_clusterGridUploads) upload.Reset();
+    for (auto& upload : m_clusterIndexUploads) upload.Reset();
     m_sunShadow.Reset();
     m_sunShadowDsv.Reset();
     m_localShadow.Reset();
@@ -5586,6 +5945,8 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
     park(g_staticQuarantine.constants, m_frameConstants.Detach());
     for (auto& upload : m_localLightUploads) upload.Quarantine();
     for (auto& upload : m_localProjectionUploads) upload.Quarantine();
+    for (auto& upload : m_clusterGridUploads) upload.Quarantine();
+    for (auto& upload : m_clusterIndexUploads) upload.Quarantine();
     if (m_shadowDescriptors)
     {
         m_shadowDescriptors->Quarantine();

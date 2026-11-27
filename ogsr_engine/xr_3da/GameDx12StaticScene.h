@@ -150,6 +150,20 @@ public:
         uint64_t grPrepJobs = 0, grPrepCompleted = 0, grRecordJobs = 0, grRecordCompleted = 0;
         double grRecordWaitMs = 0;
         bool adaptiveRequested = false;
+        bool cacheRequested = false, cacheActive = false;
+        bool staticCacheRequested = false;
+        uint32_t staticCacheCopies = 0, staticCacheHits = 0;
+        uint64_t staticCacheCopyBytes = 0;
+        bool batchingRequested = false, batchingActive = false;
+        bool casterPreparationRequested = false, casterPreparationActive = false;
+        uint32_t shadowBatches = 0;
+        uint64_t cacheSkippedDraws = 0;
+        double cacheValidationMs = 0;
+        bool clusteredRequested = false, clusteredActive = false;
+        uint32_t clusterCount = 0, clusterIndices = 0;
+        uint64_t clusterBufferBytes = 0;
+        double clusterBuildMs = 0;
+        game_shadow12::ShadowContentStats cache;
     };
 
     struct AuxStats
@@ -283,6 +297,7 @@ private:
     {
         std::vector<uint32_t> draws;
         std::vector<ShadowCasterNode> nodes;
+        bool boundsVerified = false;
     };
 
     struct ShadowObjectPacket
@@ -312,6 +327,8 @@ private:
     FramePreparation m_preparedFrame;
     FramePreparation m_referenceFrame;
     std::vector<uint32_t> m_preparationParticipants;
+    std::vector<std::pair<size_t, size_t>> m_shadowObjectRanges;
+    std::vector<ShadowObjectPacket> m_shadowObjectPackets;
 
     struct Buffer12
     {
@@ -428,6 +445,7 @@ private:
     ComPtr<ID3D12Resource> m_frameConstants;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localLightUploads;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_localProjectionUploads;
+    std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_clusterGridUploads, m_clusterIndexUploads;
     ComPtr<ID3D12Resource> m_frameTransforms;
     // Держим staging даже при раннем выходе из загрузки с неизвестным fence.
     ComPtr<ID3D12Resource> m_copyStaging;

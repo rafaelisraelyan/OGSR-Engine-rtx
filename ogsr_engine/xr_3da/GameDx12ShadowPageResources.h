@@ -322,22 +322,49 @@ public:
             [](const Page& p, uint64_t id) { return p.description.id < id; });
         if (it == pending_->pages.end() || it->description.id != page || slice >= it->description.spec.slices)
             return false;
+        if (!IsPlaced(page, slice))
+            return false;
+        DescribeView(*it, slice, out);
+        return true;
+    }
+
+    // Слой зарезервированной физической страницы, свободный от активных
+    // проекций этого кадра. Дополнительные ресурсы и SRV не создаются.
+    bool GetSpareView(uint64_t page, uint32_t slice, View& out) const noexcept
+    {
+        out = {};
+        if (!pending_ || unknown_ || IsPlaced(page, slice)) return false;
+        const auto it = std::lower_bound(pending_->pages.begin(), pending_->pages.end(), page,
+            [](const Page& p, uint64_t id) { return p.description.id < id; });
+        if (it == pending_->pages.end() || it->description.id != page || slice >= it->description.spec.slices)
+            return false;
+        DescribeView(*it, slice, out);
+        return true;
+    }
+
+private:
+    bool IsPlaced(uint64_t page, uint32_t slice) const noexcept
+    {
         const auto& placements = pending_->byPhysicalSlice;
         const auto next = std::upper_bound(placements.begin(), placements.end(), std::pair{page, slice},
             [](const auto& key, const auto& p) { return key < std::pair{p.page, p.first}; });
         if (next == placements.begin())
             return false;
         const auto& placement = *(next - 1);
-        if (placement.page != page || slice - placement.first >= placement.faces)
-            return false;
-        out.resource = it->depth.Get();
-        out.dsv = it->dsv->GetCPUDescriptorHandleForHeapStart();
-        out.dsv.ptr += static_cast<SIZE_T>(slice)*dsvStride_;
-        out.srv = it->srv->GetCPUDescriptorHandleForHeapStart();
-        out.slice = slice; out.resolution = it->description.spec.resolution;
-        return true;
+        return placement.page == page && slice - placement.first < placement.faces;
     }
 
+    void DescribeView(const Page& page, uint32_t slice, View& out) const noexcept
+    {
+        out.resource = page.depth.Get();
+        out.dsv = page.dsv->GetCPUDescriptorHandleForHeapStart();
+        out.dsv.ptr += static_cast<SIZE_T>(slice) * dsvStride_;
+        out.srv = page.srv->GetCPUDescriptorHandleForHeapStart();
+        out.slice = slice;
+        out.resolution = page.description.spec.resolution;
+    }
+
+public:
     // Owner must have submitted the lists AND successfully signaled this
     // exact reserved fence on the same timeline. Cannot infer Signal success
     // from GetCompletedValue. Any mismatch after submission is terminal.

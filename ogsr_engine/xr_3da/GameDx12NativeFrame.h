@@ -3,6 +3,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include "GameDx12ShadowDescriptors.h"
+#include "GameDx12ShadowContentCache.h"
 #include "GameDx12ShadowViews.h"
 
 #include <array>
@@ -40,15 +41,17 @@ public:
         HRESULT StageShadowPages(game_shadow12::ShadowDescriptors& descriptors,
             game_shadow12::ShadowPageResources& pages, game_shadow12::ShadowAddressPlan& addresses,
             game_shadow12::ShadowDescriptors::Binding& binding) const;
+        HRESULT StageShadowContentCache(game_shadow12::ShadowContentCache& cache, uint64_t submitFence) const noexcept;
         bool UsesShadowLists() const noexcept;
         bool UsesParallelShadowLists() const noexcept;
         HRESULT OpenShadowList(uint32_t index, ID3D12GraphicsCommandList*& result) const noexcept;
         HRESULT CloseShadowList(uint32_t index) const noexcept;
         HRESULT BeginColorList() noexcept;
-        HRESULT ReserveShadowStorage(uint32_t views) const noexcept;
+        HRESULT ReserveShadowStorage(uint32_t views, uint32_t listLimit = UINT32_MAX) const noexcept;
         HRESULT SetShadowTimingViews(std::span<const uint32_t> projections) const noexcept;
         void StampShadow(ID3D12GraphicsCommandList& target, uint32_t projection, bool end) const noexcept;
         void StampSceneStart() const noexcept;
+        void StampOpaqueEnd() const noexcept;
 
         void BeginWater() const noexcept;
         void EndWater() const noexcept;
@@ -63,12 +66,19 @@ public:
         uint64_t& fenceValue;
     };
 
+    struct CpuTiming
+    {
+        double resetMs = 0, closeMs = 0, executeMs = 0, signalMs = 0, presentMs = 0;
+    };
+
     struct GpuTiming
     {
         uint64_t present = 0;
         double milliseconds = 0;
         double sceneMilliseconds = 0;
         double shadowMilliseconds = 0;
+        double csmMilliseconds = 0, localMilliseconds = 0, opaqueMilliseconds = 0, waterMilliseconds = 0;
+        bool waterMeasured = false;
         struct View { uint32_t projection; double milliseconds; };
         std::vector<View> views;
     };
@@ -92,12 +102,15 @@ public:
     bool IsInitialized() const noexcept { return m_swapchain != nullptr; }
     uint64_t PresentCount() const noexcept { return m_presentCount; }
     const GpuTiming& LastGpuTiming() const noexcept { return m_lastGpuTiming; }
+    const CpuTiming& LastCpuTiming() const noexcept { return m_cpuTiming; }
+    bool Measuring() const noexcept { return m_measureFrame; }
     void Release() noexcept;
     void Quarantine() noexcept;
 
 private:
     HRESULT CloseRecording() noexcept;
     game_shadow12::ShadowDescriptors* m_pendingShadowDescriptors = nullptr;
+    std::array<game_shadow12::ShadowContentCache*, 2> m_pendingShadowContent{};
     ID3D12Fence* m_recordingFence = nullptr;
 
     template <typename T> using Ptr = Microsoft::WRL::ComPtr<T>;
@@ -111,6 +124,7 @@ private:
         Ptr<ID3D12GraphicsCommandList> list;
         bool open = false;
         bool recorded = false;
+        double resetMs = 0, closeMs = 0;
     };
 
     struct Slot
@@ -127,7 +141,7 @@ private:
         AuxiliaryList colorPass;
         uint64_t fence = 0;
         uint64_t timingPresent = 0;
-        bool timingScene = false;
+        bool timingScene = false, timingOpaque = false, timingWater = false;
     };
 
     static HRESULT PrepareShadowTiming(ID3D12Device& device, Slot& slot, uint32_t views) noexcept;
@@ -152,6 +166,7 @@ private:
     uint32_t m_captureCount = 0;
     uint64_t m_timestampFrequency = 0;
     GpuTiming m_lastGpuTiming;
+    CpuTiming m_cpuTiming;
     uint32_t m_rtvStride = 0;
     uint32_t m_dsvStride = 0;
     uint32_t m_width = 0;
@@ -161,7 +176,8 @@ private:
     ID3D12GraphicsCommandList* m_activeList = nullptr;
     uint32_t m_shadowCount = 0;
     std::vector<ID3D12CommandList*> m_submitLists;
-    bool m_timingScene = false;
+    bool m_timingScene = false, m_timingOpaque = false;
+    uint32_t m_waterSections = 0;
     bool m_separateShadowLists = false;
     bool m_parallelShadowLists = false;
     bool m_recording = false;

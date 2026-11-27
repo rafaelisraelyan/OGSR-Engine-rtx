@@ -4,6 +4,9 @@
 #include <d3d12sdklayers.h>
 #include "GameDx12NativeFrame.h"
 #include "GameDx12ShadowRecording.h"
+#include "GameDx12ShadowContentCache.h"
+#include "GameDx12ClusteredLighting.h"
+#include "GameDx12StaticShadowCache.h"
 #include "GameDx12AdaptiveShadowRuntime.h"
 #include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12ShadowAddress.h"
@@ -23,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -152,6 +156,9 @@ void VerifyFrameAbi(ID3DBlob& bytecode)
     CHECK_FRAME_FIELD(SunDepthBias, sunDepthBias);
     CHECK_FRAME_FIELD(SunCasterCounts, sunCasterCounts);
     CHECK_FRAME_FIELD(LocalShadowConfig, localShadowConfig);
+    CHECK_FRAME_FIELD(ClusterTiles, clusterTiles);
+    CHECK_FRAME_FIELD(ClusterGrid, clusterGrid);
+    CHECK_FRAME_FIELD(ClusterDepth, clusterDepth);
 #undef CHECK_FRAME_FIELD
     D3D12_SHADER_INPUT_BIND_DESC binding{};
     Require(reflection->GetResourceBindingDescByName("LocalLights",&binding),"reflect local light SRV");
@@ -1124,7 +1131,7 @@ struct DepthPacketPipeline
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
 
-    explicit DepthPacketPipeline(ID3D12Device& device)
+    explicit DepthPacketPipeline(ID3D12Device& device, bool minimumDepth = false)
     {
         auto vertex = Compile(R"(
 cbuffer Packet : register(b0) { float Depth; }
@@ -1153,7 +1160,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
         desc.RasterizerState.DepthClipEnable = TRUE;
         desc.DepthStencilState.DepthEnable = TRUE;
         desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        desc.DepthStencilState.DepthFunc = minimumDepth ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
         desc.SampleDesc.Count = 1;
         desc.SampleMask = UINT_MAX;
         Require(device.CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "create depth packet PSO");
@@ -1445,6 +1452,8 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
             depths.push_back(static_cast<float>((view.light - 1) * 6 + view.face + 1) / 64);
         }
 
+        uint32_t batches = 0;
+        const bool batching = std::strcmp(mode, "parallel") == 0;
         const auto result = RecordShadowPasses(recording, passes, [&](ID3D12GraphicsCommandList& list, uint32_t index)
         {
             if (!iteration && index == sunCount)
@@ -1455,7 +1464,7 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             list.DrawInstanced(3, 1, 0, 0);
             return S_OK;
-        }, dispatch);
+        }, dispatch, {batching, 3, &batches});
         if (!iteration)
         {
             Check(result == E_ABORT && !arena.PreparedPlan() && arena.CurrentBytes() == oldBytes &&
@@ -1463,6 +1472,8 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
             continue;
         }
         Require(result, "record one mixed CSM/local batch");
+        Check(batches == (batching ? (std::min)(3u, static_cast<uint32_t>(passes.size())) : passes.size()),
+            "actual mixed batch count");
         used[recording.slot] = true;
         if (iteration >= 3)
             Check(frame.LastGpuTiming().views.size() == fullCount + sunCount, "combined timestamp ID count after slot reuse");
@@ -1541,6 +1552,315 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
     return readbacks;
 }
 
+// Cache-off и cache-on записывают собственные карты для каждого slot.
+std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
+    IDXGIAdapter3& adapter, const DepthPacketPipeline& depth, bool enabled, bool staticSplit = false)
+{
+    using namespace game_shadow12;
+    constexpr uint32_t count = 2;
+    auto& device = owner.device;
+    Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", "legacy") == 0, "cache recording mode");
+    D3D12_RESOURCE_DESC desc{};
+    Require(DescribeShadowPage({8,6}, desc), "cache page description");
+    desc.DepthOrArraySize = count * 2;
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    props.CreationNodeMask = props.VisibleNodeMask = 1;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT; clear.DepthStencil.Depth = 1;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors = Frame::kFrameCount * count * 2;
+    ComPtr<ID3D12DescriptorHeap> dsv;
+    Require(device.CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv)), "cache DSV heap");
+    const auto stride = device.GetDescriptorHandleIncrementSize(hd.Type);
+    std::array<ComPtr<ID3D12Resource>, Frame::kFrameCount> maps;
+    std::array<std::array<ShadowRecordingPass, count>, Frame::kFrameCount> targets{}, sources{};
+    std::array<std::unique_ptr<ShadowSamplingPass>, Frame::kFrameCount> sampling;
+    std::array<ShadowContentCache, Frame::kFrameCount> caches;
+    for (uint32_t slot = 0; slot < Frame::kFrameCount; ++slot)
+    {
+        Require(device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&maps[slot])), "cache depth array");
+        for (uint32_t i = 0; i < count * 2; ++i)
+        {
+            auto handle = dsv->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * count * 2 + i) * stride;
+            D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_D32_FLOAT; view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, i, 1};
+            device.CreateDepthStencilView(maps[slot].Get(), &view, handle);
+            auto& entry = i < count ? targets[slot][i] : sources[slot][i - count];
+            entry = {i, {maps[slot].Get(), handle, {}, i, 8}};
+        }
+        sampling[slot] = std::make_unique<ShadowSamplingPass>(device, maps[slot].Get(), count,
+            nullptr, 1, Mutation::None, true);
+    }
+    hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; hd.NumDescriptors = 24;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    Require(device.CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "cache descriptor heap");
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "cache descriptors");
+    AdaptiveShadowRuntime runtime;
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "cache frame");
+    std::array<bool, Frame::kFrameCount> used{};
+    std::vector<uint32_t> observed;
+    for (uint32_t iteration = 0; iteration < 12; ++iteration)
+    {
+        const uint32_t phase = iteration / 2;
+        Frame::Recording recording;
+        Require(frame.Begin(window, owner, recording), "cache begin");
+        const uint32_t slot = recording.slot; used[slot] = true;
+        auto& cache = caches[slot];
+        std::vector<ShadowContentView> views(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            auto& v = views[i]; v.resource = reinterpret_cast<uint64_t>(maps[slot].Get());
+            v.resourceGeneration = v.session = v.epoch = 1; v.slice = i; v.resolution = 8;
+            v.light = i + 1; v.lightGeneration = 1; v.matrixBits[0] = 0x3f800000; v.known = true;
+            ShadowContentCaster caster; caster.identity = 100 + i; caster.generation = 1; caster.known = true;
+            caster.geometry = {1}; caster.material = {1}; caster.transform = {1}; caster.raster = {1};
+            v.casters.push_back(std::move(caster));
+        }
+        if (phase >= 2) views[0].lightGeneration = 2;
+        if (phase >= 3) views[0].matrixBits[0] = 0x40000000;
+        if (phase >= 4) views[0].casters[0].transform[0] = 2;
+        if (phase >= 5) views[0].known = false;
+        const float depths[count] = {phase < 2 ? .25f : phase == 2 ? .75f :
+            phase == 3 ? .25f : phase == 4 ? .75f : .25f, .75f};
+        const auto stage = [&]()
+        {
+            ShadowAddressPlan addresses; ShadowDescriptors::Binding binding;
+            Require(runtime.Prepare(owner, adapter, recording, descriptors, {}, 1, 1, iteration + 1,
+                count, addresses, binding), "cache stage descriptor pages");
+            Check(cache.Prepare(views, owner.fenceValue + 1), "cache prepare");
+            Require(recording.StageShadowContentCache(cache, owner.fenceValue + 1), "cache stage");
+        };
+        if (enabled && iteration == 4)
+        {
+            stage();
+            Check(cache.Stats().dirty == 1 && cache.Stats().hits == 1, "cache cancellation candidate");
+            const uint64_t before = owner.fenceValue;
+            Require(frame.Cancel(), "cancel staged cache");
+            Check(!cache.Prepared() && owner.fenceValue == before, "cancel leaves cache unpublished");
+            Require(frame.Begin(window, owner, recording), "begin after cache cancel");
+            Check(recording.slot == slot, "cancel preserves slot");
+        }
+        std::vector<ShadowRecordingPass> dirty;
+        if (enabled)
+        {
+            stage();
+            const uint32_t expected = phase == 0 ? 2 : phase == 1 ? 0 : 1;
+            Check(cache.Stats().dirty == expected && cache.Stats().hits == count - expected, "cache hit decisions");
+            if (phase >= 2)
+            {
+                const uint32_t reason = phase == 2 ? ShadowContentLight : phase == 3 ? ShadowContentMatrix :
+                    phase == 4 ? ShadowContentCasters : ShadowContentUnknown;
+                Check((cache.Reasons()[0] & reason) != 0 && cache.Reasons()[1] == 0, "cache invalidation reason");
+            }
+            for (uint32_t i = 0; i < count; ++i) if (cache.Reasons()[i]) dirty.push_back(targets[slot][i]);
+        }
+        else dirty.assign(targets[slot].begin(), targets[slot].end());
+        const auto dispatch = [](uint32_t n, const auto& work) -> HRESULT { work(0, n, 0); return S_OK; };
+        Require(RecordShadowPasses(recording, dirty, [&](ID3D12GraphicsCommandList& list, uint32_t index)
+        {
+            const auto draw = [&](float z)
+            {
+                list.SetPipelineState(depth.pipeline.Get()); list.SetGraphicsRootSignature(depth.root.Get());
+                list.SetGraphicsRoot32BitConstant(0, std::bit_cast<uint32_t>(z), 0);
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list.DrawInstanced(3, 1, 0, 0);
+            };
+            const auto projection = dirty[index].projection;
+            if (staticSplit)
+                CopyStaticShadow(list, sources[slot][projection].target, dirty[index].target, phase == 0,
+                    [&] { draw(.75f); });
+            else
+                draw(.75f);
+            if (depths[projection] < .75f)
+                draw(depths[projection]);
+            return S_OK;
+        }, dispatch), "record cached maps");
+        Readback depthRead(device, desc, count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            Transition(*recording.list, *maps[slot].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, i);
+            depthRead.Copy(*recording.list, *maps[slot].Get(), i);
+            Transition(*recording.list, *maps[slot].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, i);
+        }
+        recording.StampSceneStart();
+        sampling[slot]->DrawPages(device, *recording.list, recording.rtv, {}, {}, count);
+        Readback colorRead(device, recording.color->GetDesc(), 1);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        colorRead.Copy(*recording.list, *recording.color, 0);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Require(frame.Present(owner, 1), "submit cache frame");
+        if (enabled) Check(!cache.Prepared(), "cache committed after Signal");
+        Require(frame.Drain(owner), "drain cache frame");
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t actual = depthRead.Pixel(i, 4, 4);
+            Check(actual == std::bit_cast<uint32_t>(depths[i]), "cache depth"); observed.push_back(actual);
+            const uint32_t sampled = colorRead.Pixel(0, i, 0);
+            Check(sampled == (depths[i] >= .5f ? 0xff00ffff : 0xff00ff00), "cache production sampling");
+            observed.push_back(sampled);
+        }
+    }
+    Check(used[0] && used[1], "cache exercised both slots");
+    return observed;
+}
+
+std::vector<uint32_t> RunClusters(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
+    int mode)
+{
+    auto& device = owner.device;
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "cluster frame");
+    Frame::Recording recording;
+    Require(frame.Begin(window, owner, recording), "cluster frame begin");
+
+    const auto vertex = Compile(R"(
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    const float2 p[3] = {float2(-1,-1), float2(-1,3), float2(3,-1)};
+    return float4(p[id], 0, 1);
+}
+)", "vs", "vs_5_0");
+    const std::string hlsl = "#define LEGACY_DIAGNOSTIC_LIGHT_SCALE 16\n" +
+        std::string(kFrameShaderConstants) + kScenePixelShader + R"(
+float4 clusterProbe(float4 pixel : SV_Position) : SV_Target
+{
+    float2 uv = pixel.xy / float2(ClusterTiles.xy);
+    float z = uv.x < 0.5f ? 4.0f : uv.y < 0.5f ? 8.0f : 15.0f;
+    float3 world = float3((2.0f * uv.x - 1.0f) * z, (1.0f - 2.0f * uv.y) * z, z);
+    return float4(LocalLighting(float3(0,0,1), world, pixel.xy, false, false), 1);
+}
+)";
+    const auto pixel = Compile(hlsl.c_str(), "clusterProbe", "ps_5_1");
+    ComPtr<ID3D12ShaderReflection> reflection;
+    Require(D3DReflect(pixel->GetBufferPointer(), pixel->GetBufferSize(), IID_ID3D12ShaderReflection,
+        reinterpret_cast<void**>(reflection.GetAddressOf())), "reflect clustered shader");
+    for (const auto [name, reg] : {std::pair{"LocalLights", 13u}, {"ClusterRanges", 16u}, {"ClusterLightIndices", 17u}})
+    {
+        D3D12_SHADER_INPUT_BIND_DESC binding{};
+        Require(reflection->GetResourceBindingDescByName(name, &binding), name);
+        Check(binding.Type == D3D_SIT_STRUCTURED && binding.BindPoint == reg && binding.BindCount == 1,
+            "clustered SRV register");
+    }
+    D3D12_ROOT_PARAMETER params[5]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {1, 0, 4};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    const uint32_t regs[] = {13, 16, 17};
+    for (size_t i = 0; i < std::size(regs); ++i)
+    {
+        params[i + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[i + 2].Descriptor.ShaderRegister = regs[i];
+        params[i + 2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = static_cast<UINT>(std::size(params));
+    signature.pParameters = params;
+    ComPtr<ID3DBlob> blob;
+    Require(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+        "cluster root serialization");
+    ComPtr<ID3D12RootSignature> root;
+    Require(device.CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+        "cluster root signature");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+    desc.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = recording.color->GetDesc().Format;
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.SampleDesc.Count = 1;
+    desc.SampleMask = UINT_MAX;
+    ComPtr<ID3D12PipelineState> pipeline;
+    Require(device.CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "cluster PSO");
+
+    gamecluster12::Config config{recording.width, recording.height, 6, 7, 12, 0.5f, 32.f};
+    config.viewProjection[0] = config.viewProjection[5] = config.viewProjection[11] = 1.f;
+    config.viewProjection[10] = config.farDepth / (config.farDepth - config.nearDepth);
+    config.viewProjection[14] = -config.nearDepth * config.viewProjection[10];
+    const std::array<gamecluster12::Light, 5> volumes = {{
+        {-2.f, 0.f, 5.f, 3.f}, {3.f, 0.f, 9.f, 4.f}, {0.f, 0.f, 0.f, 5.f},
+        {0.f, -5.f, 16.f, 4.f}, {100.f, 100.f, 5.f, 1.f}
+    }};
+    std::array<LocalLightGpu, volumes.size()> lights{};
+    for (uint32_t i = 0; i < lights.size(); ++i)
+    {
+        const auto& volume = volumes[i];
+        auto& light = lights[i];
+        light.positionInverseRangeSquared = {volume.x, volume.y, volume.z, 1.f / (volume.radius * volume.radius)};
+        light.colorInnerCos = {i == 0 ? .75f : 0.f, i == 1 ? .75f : 0.f, i == 3 ? .75f : 0.f, .75f};
+        light.directionOuterCos = {0, 0, -1, .1f};
+        light.type[0] = i == 1;
+    }
+    gamecluster12::Result clusters;
+    Check(gamecluster12::Build(config, volumes, clusters), "WARP cluster CPU lists");
+    if (mode == 2)
+        for (auto& entry : clusters.grid)
+            entry.count = 0; // Мутация, обнаруживаемая сравнением изображений.
+    if (mode == 3)
+        for (auto& entry : clusters.grid)
+            entry.offset = UINT32_MAX; // Некорректный диапазон включает полный цикл.
+    SceneFrameConstants cb{};
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned col = 0; col < 4; ++col)
+            cb.viewProjection.m[row][col] = config.viewProjection[col * 4 + row];
+    cb.lightingFlags[2] = static_cast<uint32_t>(lights.size());
+    cb.clusterTiles[0] = config.width;
+    cb.clusterTiles[1] = config.height;
+    cb.clusterTiles[2] = config.tileWidth;
+    cb.clusterTiles[3] = config.tileHeight;
+    cb.clusterGrid[0] = clusters.tilesX;
+    cb.clusterGrid[1] = clusters.tilesY;
+    cb.clusterGrid[2] = mode == 0 ? 0 : config.slices;
+    cb.clusterGrid[3] = static_cast<uint32_t>(clusters.indices.size());
+    cb.clusterDepth[0] = config.nearDepth;
+    cb.clusterDepth[1] = config.farDepth;
+    cb.clusterDepth[2] = config.slices / std::log2(config.farDepth / config.nearDepth);
+    game_shadow12::FrameStructuredUpload frameData, lightData, gridData, indexData;
+    Require(frameData.Write(device, std::span<const SceneFrameConstants>(&cb, 1)), "upload cluster FrameCB");
+    Require(lightData.Write(device, std::span<const LocalLightGpu>(lights)), "upload cluster lights");
+    Require(gridData.Write(device, std::span<const gamecluster12::Entry>(clusters.grid)), "upload cluster ranges");
+    Require(indexData.Write(device, std::span<const uint32_t>(clusters.indices)), "upload cluster indices");
+
+    auto& list = *recording.list;
+    list.SetGraphicsRootSignature(root.Get());
+    list.SetPipelineState(pipeline.Get());
+    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.OMSetRenderTargets(1, &recording.rtv, FALSE, nullptr);
+    list.SetGraphicsRootConstantBufferView(0, frameData.Address());
+    const uint32_t material[4]{};
+    list.SetGraphicsRoot32BitConstants(1, 4, material, 0);
+    list.SetGraphicsRootShaderResourceView(2, lightData.Address());
+    list.SetGraphicsRootShaderResourceView(3, gridData.Address());
+    list.SetGraphicsRootShaderResourceView(4, indexData.Address());
+    list.DrawInstanced(3, 1, 0, 0);
+    Readback pixels(device, recording.color->GetDesc(), 1);
+    Transition(list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pixels.Copy(list, *recording.color, 0);
+    Transition(list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Require(frame.Present(owner, 1), "clusters present");
+    Require(frame.Drain(owner), "clusters drain");
+    std::vector<uint32_t> result;
+    for (uint32_t y = 0; y < recording.height; ++y)
+        for (uint32_t x = 0; x < recording.width; ++x)
+            result.push_back(pixels.Pixel(0, x, y));
+    return result;
+}
+
 int main(int argc, char** argv)
 {
     ComPtr<ID3D12InfoQueue> messages;
@@ -1582,7 +1902,28 @@ int main(int argc, char** argv)
         const bool bankedOnly = argc > 1 && std::strcmp(argv[1], "--banked-parity") == 0;
         const bool scalableOnly = argc > 1 && std::strcmp(argv[1], "--scalable") == 0;
         const bool mixedOnly = argc > 1 && std::strcmp(argv[1], "--adaptive-runtime") == 0;
-        if (mixedOnly)
+        const bool cacheOnly = argc > 1 && std::strcmp(argv[1], "--shadow-cache") == 0;
+        const bool clusterOnly = argc > 1 && std::strcmp(argv[1], "--clustered-lighting") == 0;
+        if (cacheOnly)
+        {
+            DepthPacketPipeline depth(owner.device, true);
+            ComPtr<IDXGIAdapter3> memoryAdapter;
+            Require(adapter.As(&memoryAdapter), "cache DXGI budget interface");
+            const auto reference = RunShadowCache(window, *factory.Get(), owner, *memoryAdapter.Get(), depth, false);
+            Check(reference == RunShadowCache(window, *factory.Get(), owner, *memoryAdapter.Get(), depth, true),
+                "cache-off/cache-on depth and sampling parity");
+            Check(reference == RunShadowCache(window, *factory.Get(), owner, *memoryAdapter.Get(), depth, true, true),
+                "static-copy/dynamic overlay depth and sampling parity");
+        }
+        else if (clusterOnly)
+        {
+            const auto reference = RunClusters(window, *factory.Get(), owner, 0);
+            Check(reference == RunClusters(window, *factory.Get(), owner, 1), "clustered/full lighting parity");
+            Check(reference != RunClusters(window, *factory.Get(), owner, 2), "missing light mutation");
+            Check(reference == RunClusters(window, *factory.Get(), owner, 3), "invalid cluster metadata fallback");
+            std::puts("PASS: clustered/full lighting parity and mutation checks");
+        }
+        else if (mixedOnly)
         {
             DepthPacketPipeline depth(owner.device);
             ComPtr<IDXGIAdapter3> memoryAdapter;
@@ -1668,7 +2009,8 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts(mixedOnly ? "PASS: WARP Debug Layer + GBV, adaptive native shadow runtime" :
+        std::puts(cacheOnly ? "PASS: WARP Debug Layer + GBV, whole-map cache and static copy parity" :
+            clusterOnly ? "PASS: WARP Debug Layer + GBV, clustered lighting" : mixedOnly ? "PASS: WARP Debug Layer + GBV, adaptive native shadow runtime" :
             scalableOnly ? "PASS: WARP Debug Layer + GBV, scalable shadow recording" :
             bankedOnly ? "PASS: WARP Debug Layer + GBV, banked sampling parity" :
             pageTableOnly ? "PASS: WARP Debug Layer + GBV, physical page descriptor table" :

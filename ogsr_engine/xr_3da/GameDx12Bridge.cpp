@@ -2324,6 +2324,35 @@ gamewater12::Frame CaptureWater()
     return snapshot;
 }
 
+struct NativeMetricsWindow
+{
+    uint64_t start = 1, count = 480, stride = 1;
+
+    static NativeMetricsWindow Read() noexcept
+    {
+        NativeMetricsWindow window;
+        const auto read = [](const char* name, uint64_t fallback)
+        {
+            const auto* value = std::getenv(name);
+            if (!value)
+                return fallback;
+            const auto* end = value + std::strlen(value);
+            uint64_t parsed = 0;
+            const auto result = std::from_chars(value, end, parsed);
+            return result.ec == std::errc{} && result.ptr == end ? parsed : fallback;
+        };
+        window.start = (std::max)(uint64_t(1), read("OGSR_DX12_GAME_METRICS_START", window.start));
+        window.count = read("OGSR_DX12_GAME_METRICS_COUNT", window.count);
+        window.stride = (std::max)(uint64_t(1), read("OGSR_DX12_GAME_METRICS_STRIDE", window.stride));
+        return window;
+    }
+
+    bool Contains(uint64_t frame) const noexcept
+    {
+        return frame >= start && (count == 0 || frame - start < count) && (frame - start) % stride == 0;
+    }
+};
+
 void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
 {
     if (state.nativeFailed)
@@ -2350,7 +2379,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     GameDx12StaticScene12::FrameStats12 sceneStats;
     gamelight12::FrameSnapshot lighting;
     const bool sceneDetail = LightingDiagnosticOptions().sceneLog;
-    double prepareMs = 0.0;
+    double prepareMs = 0.0, lightCaptureMs = 0.0;
     if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
         state.staticScene.LevelSession() == state.levelSession &&
         state.staticScene.LevelEpoch() == state.captureEpoch)
@@ -2383,11 +2412,14 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             const GameDx12StaticSceneOwner12 upload{
                 state.device.Get(), state.queue.Get(), state.fence.Get(), state.fenceEvent,
                 state.allocator.Get(), state.list.Get(), &state.fenceValue};
+            const auto captureStart = state.native.Measuring() ? FrameClock::now() : FrameClock::time_point{};
             lighting = CaptureLighting(state, viewProjection, position);
+            if (state.native.Measuring())
+                lightCaptureMs = elapsed(captureStart, FrameClock::now());
             if (!flyCamera)
                 CaptureNativeParticleDiagnostics(state.levelSession, state.captureEpoch);
             const bool prepared = state.gameVisuals.Prepare(*g_pGameLevel, position, state.staticScene, upload, reason);
-            if (sceneDetail)
+            if (state.native.Measuring())
                 prepareMs = elapsed(begin, FrameClock::now());
             if (!prepared ||
                 !state.staticScene.RecordNativeFrame(
@@ -2512,7 +2544,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                         static_cast<unsigned long long>(completedGpu.present), timing.projection, timing.milliseconds);
             }
     }
-    if (hr == S_OK && sceneRecorded && sceneDetail)
+    if (hr == S_OK && sceneRecorded && (sceneDetail || state.native.Measuring()))
     {
         auto& perf = state.nativePerf;
         if (perf.frames == 0)
@@ -2559,6 +2591,20 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             perf = {};
         }
     }
+    if (hr == S_OK && sceneRecorded && (count == 1 || count % 120 == 0))
+        Msg("ph_dx12_perf_modes: present=%llu shadow=%s cache_requested=%d cache_actual=%d "
+            "cache_hits=%u cache_dirty=%u skipped_draws=%llu cache_unknown=%u "
+            "static_cache_requested=%d static_cache_actual=%d static_cache_hits=%u copies=%u copy_bytes=%llu "
+            "batching_requested=%d batching_actual=%d batches=%u lists=%u caster_requested=%d caster_actual=%d "
+            "cluster_requested=%d cluster_actual=%d clusters=%u indices=%u cluster_buffer_bytes=%llu",
+            static_cast<unsigned long long>(count), sceneStats.shadowMode, sceneStats.cacheRequested, sceneStats.cacheActive,
+            sceneStats.cache.hits, sceneStats.cache.dirty, static_cast<unsigned long long>(sceneStats.cacheSkippedDraws),
+            sceneStats.cache.reasons[0], sceneStats.staticCacheRequested, sceneStats.staticCacheCopies != 0,
+            sceneStats.staticCacheHits, sceneStats.staticCacheCopies, static_cast<unsigned long long>(sceneStats.staticCacheCopyBytes),
+            sceneStats.batchingRequested, sceneStats.batchingActive, sceneStats.shadowBatches, sceneStats.commandLists,
+            sceneStats.casterPreparationRequested, sceneStats.casterPreparationActive,
+            sceneStats.clusteredRequested, sceneStats.clusteredActive, sceneStats.clusterCount, sceneStats.clusterIndices,
+            static_cast<unsigned long long>(sceneStats.clusterBufferBytes));
     if (hr == S_OK && sceneRecorded)
         state.gameVisuals.LogPresent(count, state.fenceValue, auxDraws, state.staticScene.AuxResources());
     if (hr == S_OK && draws != 0)
@@ -2572,7 +2618,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
             const char* value = std::getenv("OGSR_DX12_GAME_METRICS");
             return value != nullptr && std::strcmp(value, "1") == 0;
         }();
-        if (detailed && frames <= 480)
+        static const auto window = NativeMetricsWindow::Read();
+        if (detailed && window.Contains(frames))
         {
             const auto& gpu = state.native.LastGpuTiming();
             Msg("ph_dx12_metrics: frame=%llu present=%llu fence=%llu slot=%u draws=%u camera_hash=%016llX "
@@ -2588,6 +2635,25 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 timings.snapshotMs, timings.serialMs, timings.parallelMs, timings.recordMs,
                 elapsed(presentStart, presentEnd), static_cast<unsigned long long>(gpu.present), gpu.milliseconds,
                 gpu.shadowMilliseconds, gpu.sceneMilliseconds);
+            const auto& cpu = state.native.LastCpuTiming();
+            Msg("ph_dx12_perf_detail: frame=%llu present=%llu gpu_present=%llu shadow_mode=%s "
+                "frame_ms=%.6f gpu_frame_ms=%.6f cache_hits=%u cache_dirty=%u skipped_draws=%llu "
+                "local_views=%u batches=%u command_lists=%u "
+                "capture_ms=%.6f prepare_ms=%.6f scene_prepare_ms=%.6f light_plan_ms=%.6f page_preview_ms=%.6f "
+                "page_prepare_ms=%.6f descriptor_stage_ms=%.6f cache_ms=%.6f reset_ms=%.6f close_work_ms=%.6f "
+                "shadow_record_ms=%.6f gr_wait_ms=%.6f execute_ms=%.6f signal_ms=%.6f swapchain_present_ms=%.6f "
+                "slot_wait_ms=%.6f cluster_build_ms=%.6f csm_gpu_ms=%.6f local_gpu_ms=%.6f opaque_gpu_ms=%.6f "
+                "water_gpu_ms=%.6f water_gpu_valid=%d",
+                static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(gpu.present), sceneStats.shadowMode,
+                frameMs, gpu.milliseconds, sceneStats.cache.hits, sceneStats.cache.dirty,
+                static_cast<unsigned long long>(sceneStats.cacheSkippedDraws), sceneStats.localShadowMaps,
+                sceneStats.shadowBatches, sceneStats.commandLists, lightCaptureMs, prepareMs, sceneStats.cull_ms, sceneStats.adaptive.lightPlanMs,
+                sceneStats.adaptive.pagePlanMs, sceneStats.adaptive.pagePrepareMs, sceneStats.adaptive.descriptorStageMs,
+                sceneStats.cacheValidationMs, cpu.resetMs, cpu.closeMs, sceneStats.shadowCpuMs, sceneStats.grRecordWaitMs,
+                cpu.executeMs, cpu.signalMs, cpu.presentMs, recording.slotFenceWaitMs,
+                sceneStats.clusterBuildMs, gpu.csmMilliseconds, gpu.localMilliseconds, gpu.opaqueMilliseconds,
+                gpu.waterMilliseconds, gpu.waterMeasured);
         }
         if (frames == 1 || frames == 30 || frames % 120 == 0)
         {

@@ -5,6 +5,7 @@
 #include "GameDx12NativeFrame.h"
 
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -17,6 +18,7 @@ struct AdaptiveShadowTelemetry
     uint64_t dxgiBudget = 0, dxgiUsage = 0, retained = 0, newBytes = 0, peak = 0;
     uint32_t descriptorCapacity = 0, descriptors = 0;
     std::array<uint32_t, 4> pagesByTier{};
+    double lightPlanMs = 0, pagePlanMs = 0, pagePrepareMs = 0, descriptorStageMs = 0;
     bool observed = false;
 };
 
@@ -58,8 +60,12 @@ public:
         GameDx12NativeFrame12::Recording& recording, ShadowDescriptors& descriptors,
         std::span<const AdaptiveCandidate> candidates, uint64_t session, uint64_t epoch, uint64_t frame,
         uint32_t sunViews, ShadowAddressPlan& addresses, ShadowDescriptors::Binding& binding,
-        uint64_t slotAllowance = UINT64_MAX, AdaptiveShadowTelemetry* telemetry = nullptr)
+        uint64_t slotAllowance = UINT64_MAX, AdaptiveShadowTelemetry* telemetry = nullptr,
+        uint32_t shadowListLimit = UINT32_MAX)
     {
+        using Clock = std::chrono::steady_clock;
+        const auto now = [&] { return telemetry ? Clock::now() : Clock::time_point{}; };
+        const auto elapsed = [&](auto start) { return std::chrono::duration<double, std::milli>(now() - start).count(); };
         if (!initialized_)
         {
             for (size_t i = 0; i < shapes_.size(); ++i)
@@ -125,21 +131,26 @@ public:
         AdaptivePlan logical;
         const auto plan = [&]()
         {
-            return BuildAdaptivePlan(tiers_, candidates, budget->finalBytes, session, epoch, frame, 1, &prior, logical);
+            const auto start = now();
+            const auto result = BuildAdaptivePlan(tiers_, candidates, budget->finalBytes, session, epoch, frame, 1, &prior, logical);
+            if (telemetry) telemetry->lightPlanMs += elapsed(start);
+            return result;
         };
         if (!plan())
             return E_INVALIDARG;
 
+        const auto pagePlanStart = now();
         ShadowPagePlan preview;
         if (!BuildShadowPagePlan(logical, specs_, budget->finalBytes, recording.slot,
                 owner.fence.GetCompletedValue(), submit, current.fence ? &current : nullptr, preview, available))
             return E_INVALIDARG;
+        if (telemetry) telemetry->pagePlanMs = elapsed(pagePlanStart);
         uint64_t views = sunViews;
         for (const auto& group : preview.next.placed)
             views += group.faces;
         if (views > (UINT32_MAX - 4) / 2)
             return E_OUTOFMEMORY;
-        const auto storage = recording.ReserveShadowStorage(static_cast<uint32_t>(views));
+        const auto storage = recording.ReserveShadowStorage(static_cast<uint32_t>(views), shadowListLimit);
         if (FAILED(storage))
             return storage;
         // Запрос после роста реальных списков и timestamp storage. Драйвер
@@ -152,6 +163,7 @@ public:
         }
         if (!plan())
             return E_INVALIDARG;
+        const auto pagePrepareStart = now();
         auto hr = arena.Prepare(logical, shapes_, budget->finalBytes, budget->newBytes, submit, available);
         if (hr == E_OUTOFMEMORY)
         {
@@ -201,6 +213,7 @@ public:
             return hr;
         if (telemetry)
         {
+            telemetry->pagePrepareMs = elapsed(pagePrepareStart);
             const auto& staged = *arena.PreparedPlan();
             for (const auto& page : staged.next.pages)
             {
@@ -215,7 +228,9 @@ public:
             const auto sum = [](uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; };
             telemetry->peak = sum(sum(arena.CurrentBytes(), other.CurrentBytes()), telemetry->newBytes);
         }
+        const auto descriptorStart = now();
         hr = recording.StageShadowPages(descriptors, arena, addresses, binding);
+        if (telemetry) telemetry->descriptorStageMs = elapsed(descriptorStart);
         if (telemetry && SUCCEEDED(hr)) telemetry->descriptors = binding.pageCount;
         if (FAILED(hr))
             arena.CancelUnsubmitted();
@@ -223,8 +238,14 @@ public:
     }
 
     const ShadowPageResources& Pages(uint32_t slot) const noexcept { return arenas_[slot]; }
+    ShadowContentCache& Content(uint32_t slot) noexcept { return content_[slot]; }
+    ShadowContentCache& StaticContent(uint32_t slot) noexcept { return staticContent_[slot]; }
     void Quarantine() noexcept
     {
+        for (auto& cache : content_)
+            cache.Quarantine();
+        for (auto& cache : staticContent_)
+            cache.Quarantine();
         for (auto& arena : arenas_)
             arena.Quarantine();
     }
@@ -241,6 +262,7 @@ private:
         return parsed.ec == std::errc{} && parsed.ptr == end ? value : 0;
     }
 
+    std::array<ShadowContentCache, GameDx12NativeFrame12::kFrameCount> content_, staticContent_;
     std::array<ShadowPageResources, GameDx12NativeFrame12::kFrameCount> arenas_;
     const std::array<ShadowPageShape, 4> shapes_{{{128, 6}, {256, 6}, {512, 6}, {1024, 6}}};
     std::array<ShadowPageSpec, 4> specs_{};

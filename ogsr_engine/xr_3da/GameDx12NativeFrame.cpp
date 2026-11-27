@@ -273,6 +273,20 @@ HRESULT GameDx12NativeFrame12::Recording::StageShadowPages(game_shadow12::Shadow
     return hr;
 }
 
+HRESULT GameDx12NativeFrame12::Recording::StageShadowContentCache(game_shadow12::ShadowContentCache& cache,
+    uint64_t submitFence) const noexcept
+{
+    if (!frame || !frame->m_recording || slot != frame->m_slot ||
+        !frame->m_pendingShadowDescriptors || !cache.Expects(submitFence))
+        return E_UNEXPECTED;
+    auto& staged = frame->m_pendingShadowContent;
+    const auto next = std::find(staged.begin(), staged.end(), nullptr);
+    if (next == staged.end() || std::find(staged.begin(), staged.end(), &cache) != staged.end())
+        return E_UNEXPECTED;
+    *next = &cache;
+    return S_OK;
+}
+
 HRESULT GameDx12NativeFrame12::CreateList(ID3D12Device& device, Ptr<ID3D12CommandAllocator>& allocator,
     Ptr<ID3D12GraphicsCommandList>& list) noexcept
 {
@@ -289,6 +303,10 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
     m_lastGpuTiming.present = 0;
     m_lastGpuTiming.milliseconds = m_lastGpuTiming.sceneMilliseconds = m_lastGpuTiming.shadowMilliseconds = 0;
     m_lastGpuTiming.views.clear();
+    m_lastGpuTiming.csmMilliseconds = m_lastGpuTiming.localMilliseconds = 0;
+    m_lastGpuTiming.opaqueMilliseconds = m_lastGpuTiming.waterMilliseconds = 0;
+    m_lastGpuTiming.waterMeasured = false;
+    m_cpuTiming = {};
     if (!m_swapchain || !m_depth || m_unknown || m_recording)
         return E_FAIL;
     RECT rect{};
@@ -317,7 +335,7 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count() : 0.0;
     if (slot.timingQueries && slot.timingPresent)
     {
-        const SIZE_T bytes = (4 + 2 * slot.timingViews.size()) * sizeof(uint64_t);
+        const SIZE_T bytes = (7 + 2 * slot.timingViews.size()) * sizeof(uint64_t);
         const D3D12_RANGE range{0, bytes};
         void* mapped = nullptr;
         try { m_lastGpuTiming.views.reserve(slot.timingViews.size()); }
@@ -332,15 +350,26 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
                 m_lastGpuTiming.milliseconds = tickMs * static_cast<double>(ticks[1] - ticks[0]);
                 if (slot.timingScene && ticks[3] >= ticks[2])
                     m_lastGpuTiming.sceneMilliseconds = tickMs * static_cast<double>(ticks[3] - ticks[2]);
+                if (slot.timingOpaque && ticks[4] >= ticks[2])
+                    m_lastGpuTiming.opaqueMilliseconds = tickMs * static_cast<double>(ticks[4] - ticks[2]);
+                if (slot.timingWater && ticks[6] >= ticks[5])
+                {
+                    m_lastGpuTiming.waterMilliseconds = tickMs * static_cast<double>(ticks[6] - ticks[5]);
+                    m_lastGpuTiming.waterMeasured = true;
+                }
                 uint64_t firstShadow = UINT64_MAX, lastShadow = 0;
                 for (size_t view = 0; view < slot.timingViews.size(); ++view)
                 {
-                    const auto first = ticks[4 + 2 * view], last = ticks[5 + 2 * view];
+                    const auto first = ticks[7 + 2 * view], last = ticks[8 + 2 * view];
                     if (last < first)
                         continue;
                     firstShadow = (std::min)(firstShadow, first);
                     lastShadow = (std::max)(lastShadow, last);
-                    m_lastGpuTiming.views.push_back({slot.timingViews[view], tickMs * static_cast<double>(last - first)});
+                    const auto projection = slot.timingViews[view];
+                    const double ms = tickMs * static_cast<double>(last - first);
+                    (game_shadow12::View{projection}.IsSun() ? m_lastGpuTiming.csmMilliseconds :
+                        m_lastGpuTiming.localMilliseconds) += ms;
+                    m_lastGpuTiming.views.push_back({projection, ms});
                 }
                 if (!m_lastGpuTiming.views.empty())
                     m_lastGpuTiming.shadowMilliseconds = tickMs * static_cast<double>(lastShadow - firstShadow);
@@ -357,7 +386,7 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
             return E_INVALIDARG;
         D3D12_QUERY_HEAP_DESC query{};
         query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query.Count = 4;
+        query.Count = 7;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC readback{};
@@ -391,18 +420,22 @@ HRESULT GameDx12NativeFrame12::Begin(HWND window, const Owner& owner, Recording&
         if (FAILED(hr))
             return hr;
     }
+    const auto resetStart = m_measureFrame ? Clock::now() : Clock::time_point{};
     hr = slot.allocator->Reset();
     if (FAILED(hr))
         return hr;
     hr = slot.list->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(hr))
         return hr;
+    if (m_measureFrame)
+        m_cpuTiming.resetMs = std::chrono::duration<double, std::milli>(Clock::now() - resetStart).count();
     m_recordingFence = &owner.fence;
     m_recording = true;
     m_activeList = slot.list.Get();
     m_shadowCount = 0;
 
-    m_timingScene = false;
+    m_timingScene = m_timingOpaque = false;
+    m_waterSections = 0;
     if (slot.timingQueries)
         slot.list->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
@@ -491,7 +524,11 @@ HRESULT GameDx12NativeFrame12::Recording::OpenShadowList(uint32_t index,
         catch (const std::exception&) { return E_OUTOFMEMORY; }
     }
     auto& pair = pool[index];
+    using Clock = std::chrono::steady_clock;
+    const auto start = frame->m_measureFrame ? Clock::now() : Clock::time_point{};
     const HRESULT hr = OpenList(pair);
+    pair.resetMs = frame->m_measureFrame ? std::chrono::duration<double, std::milli>(Clock::now() - start).count() : 0;
+    pair.closeMs = 0;
     if (SUCCEEDED(hr))
     {
         ++frame->m_shadowCount;
@@ -504,7 +541,12 @@ HRESULT GameDx12NativeFrame12::Recording::CloseShadowList(uint32_t index) const 
 {
     if (!UsesShadowLists() || !frame->m_recording || slot != frame->m_slot || index >= frame->m_shadowCount)
         return E_UNEXPECTED;
-    return CloseList(frame->m_slots[slot].shadows[index]);
+    using Clock = std::chrono::steady_clock;
+    const auto start = frame->m_measureFrame ? Clock::now() : Clock::time_point{};
+    auto& pair = frame->m_slots[slot].shadows[index];
+    const auto hr = CloseList(pair);
+    pair.closeMs = frame->m_measureFrame ? std::chrono::duration<double, std::milli>(Clock::now() - start).count() : 0;
+    return hr;
 }
 
 HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
@@ -518,9 +560,17 @@ HRESULT GameDx12NativeFrame12::Recording::BeginColorList() noexcept
         if (!current.shadows[index].recorded)
             return E_UNEXPECTED;
     frame->m_activeList = nullptr;
+    using Clock = std::chrono::steady_clock;
+    const auto start = frame->m_measureFrame ? Clock::now() : Clock::time_point{};
     HRESULT hr = current.list->Close();
+    const auto opened = frame->m_measureFrame ? Clock::now() : Clock::time_point{};
     if (SUCCEEDED(hr))
         hr = OpenList(current.colorPass);
+    if (frame->m_measureFrame)
+    {
+        frame->m_cpuTiming.closeMs += std::chrono::duration<double, std::milli>(opened - start).count();
+        frame->m_cpuTiming.resetMs += std::chrono::duration<double, std::milli>(Clock::now() - opened).count();
+    }
     if (SUCCEEDED(hr))
         list = frame->m_activeList = current.colorPass.list.Get();
     return hr;
@@ -538,7 +588,7 @@ HRESULT GameDx12NativeFrame12::PrepareShadowTiming(ID3D12Device& device, Slot& s
     if (FAILED(hr))
         return hr;
     auto desc = slot.timingReadback->GetDesc();
-    desc.Width = (4ull + query.Count) * sizeof(uint64_t);
+    desc.Width = (7ull + query.Count) * sizeof(uint64_t);
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     Ptr<ID3D12Resource> buffer;
@@ -552,7 +602,7 @@ HRESULT GameDx12NativeFrame12::PrepareShadowTiming(ID3D12Device& device, Slot& s
     return S_OK;
 }
 
-HRESULT GameDx12NativeFrame12::Recording::ReserveShadowStorage(uint32_t views) const noexcept
+HRESULT GameDx12NativeFrame12::Recording::ReserveShadowStorage(uint32_t views, uint32_t listLimit) const noexcept
 {
     if (!frame || !frame->m_recording || frame->m_slot != slot || !device || views > (UINT32_MAX - 4) / 2)
         return E_INVALIDARG;
@@ -561,8 +611,9 @@ HRESULT GameDx12NativeFrame12::Recording::ReserveShadowStorage(uint32_t views) c
     {
         try
         {
-            current.shadows.reserve(views);
-            while (current.shadows.size() < views)
+            const auto lists = (std::min)(views, listLimit);
+            current.shadows.reserve(lists);
+            while (current.shadows.size() < lists)
             {
                 AuxiliaryList candidate;
                 const auto create = CreateList(*device, candidate.allocator, candidate.list);
@@ -615,8 +666,19 @@ void GameDx12NativeFrame12::Recording::StampSceneStart() const noexcept
     }
 }
 
+void GameDx12NativeFrame12::Recording::StampOpaqueEnd() const noexcept
+{
+    if (frame && frame->m_timingScene && !frame->m_timingOpaque)
+    {
+        frame->m_timingOpaque = true;
+        list->EndQuery(frame->m_slots[slot].timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4);
+    }
+}
+
 void GameDx12NativeFrame12::Recording::BeginWater() const noexcept
 {
+    if (frame && frame->m_slots[slot].timingQueries && ++frame->m_waterSections == 1)
+        list->EndQuery(frame->m_slots[slot].timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5);
     constexpr auto shaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
     const D3D12_RESOURCE_BARRIER toCopy[] = {
@@ -643,11 +705,16 @@ void GameDx12NativeFrame12::Recording::EndWater() const noexcept
         D3D12_RESOURCE_STATE_DEPTH_WRITE);
     list->ResourceBarrier(1, &barrier);
     list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    if (frame && frame->m_waterSections == 1)
+        list->EndQuery(frame->m_slots[slot].timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6);
 }
 
 HRESULT GameDx12NativeFrame12::Cancel() noexcept
 {
     const auto close = CloseRecording();
+    for (auto& entry : m_pendingShadowContent)
+        if (auto* cache = std::exchange(entry, nullptr))
+            cache->CancelUnsubmitted();
     if (auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr))
     {
         const auto cancel = descriptors->CancelUnsubmitted();
@@ -822,10 +889,12 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         };
         if (m_timingScene)
             m_activeList->EndQuery(slot.timingQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 3);
-        resolve(query, m_timingScene ? 4u : 2u);
+        resolve(query, m_timingScene ? (m_timingOpaque ? 5u : 4u) : 2u);
+        if (m_waterSections == 1)
+            resolve(5, 2);
         if (!slot.timingViews.empty())
             m_activeList->ResolveQueryData(slot.shadowQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                0, 2 * static_cast<uint32_t>(slot.timingViews.size()), slot.timingReadback.Get(), 4 * sizeof(uint64_t));
+                0, 2 * static_cast<uint32_t>(slot.timingViews.size()), slot.timingReadback.Get(), 7 * sizeof(uint64_t));
     }
     bool captured = false;
     if (m_capturePath[0] && sceneFrame >= captureSceneStart)
@@ -861,12 +930,24 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         return E_OUTOFMEMORY;
     }
     const uint64_t value = owner.fenceValue + 1;
-    if (m_pendingShadowDescriptors && !m_pendingShadowDescriptors->Expects(owner.fence, value))
+    if ((m_pendingShadowDescriptors && !m_pendingShadowDescriptors->Expects(owner.fence, value)) ||
+        std::any_of(m_pendingShadowContent.begin(), m_pendingShadowContent.end(),
+            [value](const auto* cache) { return cache && !cache->Expects(value); }))
     {
         Cancel();
         return E_UNEXPECTED;
     }
+    using Clock = std::chrono::steady_clock;
+    const auto now = [&] { return m_measureFrame ? Clock::now() : Clock::time_point{}; };
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    for (uint32_t index = 0; index < m_shadowCount; ++index)
+    {
+        m_cpuTiming.resetMs += slot.shadows[index].resetMs;
+        m_cpuTiming.closeMs += slot.shadows[index].closeMs;
+    }
+    const auto closing = now();
     const HRESULT close = CloseRecording();
+    m_cpuTiming.closeMs += ms(closing, now());
     if (FAILED(close))
     {
         Cancel();
@@ -874,7 +955,9 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
     }
 
     m_submitted = true;
+    const auto executing = now();
     owner.queue.ExecuteCommandLists(static_cast<UINT>(lists.size()), lists.data());
+    m_cpuTiming.executeMs = ms(executing, now());
     if (m_presentCount == 79)
     {
         const char* probe = std::getenv("OGSR_DX12_GAME_NATIVE_REMOVE_DEVICE");
@@ -890,12 +973,17 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
                 Msg("ph_dx12_f42: fault device removal unavailable (ID3D12Device5)");
         }
     }
+    const auto signaling = now();
     const HRESULT signal = owner.queue.Signal(&owner.fence, value);
+    m_cpuTiming.signalMs = ms(signaling, now());
     auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr);
+    const auto caches = std::exchange(m_pendingShadowContent, {});
+    const auto quarantineCaches = [&] { for (auto* cache : caches) if (cache) cache->Quarantine(); };
     if (FAILED(signal))
     {
         if (descriptors)
             descriptors->Quarantine();
+        quarantineCaches();
         m_unknown = true;
         return signal;
     }
@@ -905,11 +993,21 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
         const auto commit = descriptors->CommitSubmitted(owner.fence, value);
         if (FAILED(commit))
         {
+            quarantineCaches();
             m_unknown = true;
             return commit;
         }
     }
+    for (auto* cache : caches)
+        if (cache && !cache->CommitSubmitted(value))
+        {
+            quarantineCaches();
+            m_unknown = true;
+            return E_UNEXPECTED;
+        }
+    const auto presenting = now();
     const HRESULT hr = m_swapchain->Present(1, 0);
+    m_cpuTiming.presentMs = ms(presenting, now());
     if (hr == S_OK)
     {
         ++m_presentCount;
@@ -918,6 +1016,8 @@ HRESULT GameDx12NativeFrame12::Present(const Owner& owner, uint64_t sceneFrame)
             slot.timingPresent = m_presentCount;
 
             slot.timingScene = m_timingScene;
+            slot.timingOpaque = m_timingOpaque;
+            slot.timingWater = m_waterSections == 1;
         }
         if (captured)
         {
@@ -954,6 +1054,9 @@ void GameDx12NativeFrame12::Quarantine() noexcept
 {
     if (auto* descriptors = std::exchange(m_pendingShadowDescriptors, nullptr))
         descriptors->Quarantine();
+    for (auto& entry : m_pendingShadowContent)
+        if (auto* cache = std::exchange(entry, nullptr))
+            cache->Quarantine();
     m_recordingFence = nullptr;
     // Fence без подтверждения: ссылки живут до завершения процесса.
     m_unknown = true;
