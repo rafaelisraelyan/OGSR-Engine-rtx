@@ -2537,10 +2537,10 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     const auto count = state.native.PresentCount();
     if (hr == S_OK && sceneRecorded && sceneStats.detailSunShadows &&
         (lighting.diagnosticBurst || count == 1 || count % 120 == 0))
-        Msg("ph_dx12_shadow_detail_submit: frame=%llu present=%llu slot=%u fence=%llu coverage_mask=0x%x instances=%u",
+        Msg("ph_dx12_shadow_detail_submit: frame=%llu present=%llu slot=%u fence=%llu coverage_mask=0x%x empty_mask=0x%x instances=%u",
             static_cast<unsigned long long>(lighting.frame), static_cast<unsigned long long>(count), recording.slot,
             static_cast<unsigned long long>(state.fenceValue), sceneStats.detailShadowCoverage,
-            sceneStats.detailShadowInstances);
+            sceneStats.detailShadowEmptyCoverage, sceneStats.detailShadowInstances);
     const auto& completedGpu = state.native.LastGpuTiming();
     BridgeStateData::NativeSample gpuSample;
     if (hr == S_OK && state.native.Measuring())

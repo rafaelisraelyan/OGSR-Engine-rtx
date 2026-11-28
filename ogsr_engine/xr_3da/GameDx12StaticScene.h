@@ -150,7 +150,7 @@ public:
         const char* shadowMode = "disabled";
         uint32_t sunFilter = 0, localFilterRadius = 0;
         bool detailSunShadows = false;
-        uint32_t detailShadowCoverage = 0, detailShadowInstances = 0;
+        uint32_t detailShadowCoverage = 0, detailShadowEmptyCoverage = 0, detailShadowInstances = 0;
         uint64_t grPrepJobs = 0, grPrepCompleted = 0, grRecordJobs = 0, grRecordCompleted = 0;
         double grRecordWaitMs = 0;
         bool adaptiveRequested = false;

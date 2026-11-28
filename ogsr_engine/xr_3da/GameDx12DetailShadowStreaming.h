@@ -195,10 +195,12 @@ DetailStreamingResult UpdateDetailShadowCache(std::span<const uint32_t> requeste
         ++result.attempts;
         auto slot = decode(id);
         const size_t bytes = cost(slot);
-        if (bytes <= budget.transientBytes && bytes <= decodeLimit)
+        if (bytes <= budget.transientBytes && bytes <= residentLimit)
         {
-            evictRetained(decodeLimit, bytes);
-            if (bytes <= decodeLimit - cachedBytes)
+            // После decode временный резерв освобождается. Сам placement
+            // переходит в resident storage без второй копии.
+            evictRetained(residentLimit, bytes);
+            if (bytes <= residentLimit - cachedBytes)
             {
                 cache.emplace(id, std::move(slot));
                 cachedBytes += bytes;

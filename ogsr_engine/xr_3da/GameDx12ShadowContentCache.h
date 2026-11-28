@@ -1,8 +1,11 @@
 #pragma once
 
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -17,6 +20,19 @@ struct ShadowContentCaster
     bool known = false;
     bool operator==(const ShadowContentCaster&) const = default;
 };
+
+template<class PoseMatrix>
+void AppendShadowCasterPose(ShadowContentCaster& caster, std::span<const PoseMatrix> poses)
+{
+    for (const auto& pose : poses)
+        for (const auto& row : pose.m)
+            for (const float component : row)
+            {
+                caster.known = caster.known && std::isfinite(component);
+                caster.transform.push_back(std::bit_cast<uint32_t>(component));
+            }
+}
+
 
 struct ShadowContentView
 {

@@ -5487,16 +5487,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                         caster.geometry = {packet.meshIndex, mesh.requiredBones, mesh.skinned};
                         caster.material = {mesh.descriptor, static_cast<uint32_t>(mesh.surface)};
                         caster.known = mesh.requiredBones <= object.boneCount;
-                        for (uint32_t bone = 0; bone < object.boneCount; ++bone)
-                        {
-                            const auto& pose = extras.poses[object.poseOffset + bone];
-                            for (const auto& row : pose.m)
-                                for (float component : row)
-                                {
-                                    caster.known = caster.known && std::isfinite(component);
-                                    caster.transform.push_back(bits(component));
-                                }
-                        }
+                        game_shadow12::AppendShadowCasterPose(caster,
+                            std::span(extras.poses).subspan(object.poseOffset, object.boneCount));
                         key.casters.push_back(std::move(caster));
                     }
                 }
@@ -5843,11 +5835,19 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         list->RSSetScissorRects(1, &mainRect);
     }
     for (uint32_t i = 0; i < sunPlan.count; ++i)
-        if ((preparedDetailCoverage & recordedSunMask & (1u << i)) && sunDraws[i].detail == preparedDetailCounts[i])
+    {
+        const uint32_t bit = 1u << i;
+        if ((preparedDetailCoverage & recordedSunMask & bit) && sunDraws[i].detail == preparedDetailCounts[i])
         {
-            stats.detailShadowCoverage |= 1u << i;
-            stats.detailShadowInstances += sunDraws[i].detail;
+            if (sunDraws[i].detail != 0)
+            {
+                stats.detailShadowCoverage |= bit;
+                stats.detailShadowInstances += sunDraws[i].detail;
+            }
+            else
+                stats.detailShadowEmptyCoverage |= bit;
         }
+    }
     const double shadowRecordMs = Ms(shadowRecordStart);
     stats.shadowCpuMs += shadowRecordMs;
     auto shadowSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();

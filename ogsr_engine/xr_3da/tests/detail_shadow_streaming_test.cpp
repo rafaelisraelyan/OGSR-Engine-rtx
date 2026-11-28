@@ -30,8 +30,11 @@ int main()
 
     cache.clear();
     bytes = observedPeak = 0;
-    const auto denied = UpdateDetailShadowCache(ids, {10, 4, 13, 256}, cache, bytes, cost, decode, discard);
-    assert(denied.denied == 1 && !denied.pending && denied.deniedFrom == 9 && bytes == 9 && observedPeak <= 13);
+    const auto nine = UpdateDetailShadowCache(std::span(ids).first(9), {10, 4, 12, 256},
+        cache, bytes, cost, decode, discard);
+    assert(!nine.pending && !nine.denied && bytes == 9 && observedPeak <= 12);
+    const auto denied = UpdateDetailShadowCache(ids, {10, 4, 12, 256}, cache, bytes, cost, decode, discard);
+    assert(denied.denied == 1 && !denied.pending && denied.deniedFrom == 9 && !denied.attempts && bytes == 9);
     const auto restored = UpdateDetailShadowCache(ids, {10, 4, 14, 256}, cache, bytes, cost, decode, discard);
     assert(!restored.pending && !restored.denied && restored.attempts == 1 && bytes == 10);
     const auto shrunk = UpdateDetailShadowCache(ids, {2, 4, 6, 256}, cache, bytes, cost, decode, discard);

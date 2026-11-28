@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -1987,10 +1988,6 @@ std::vector<uint32_t> RunAnimatedAdaptiveCache(HWND window, IDXGIFactory2& facto
         Check(addresses.views.size() == (budgetEmpty ? 0u : 1u), "animated cache budget admission");
 
         const float x = outside ? 4.f : 0.f;
-        const float center[3]{x + 1.f, 1.f, z};
-        // Сфера ограничивает весь треугольник poseProbe, включая обе кости.
-        const bool member = ShadowSphereInside(frustum, center, 2.84f);
-        Check(member == !outside, "animated bounds remove the old caster");
         std::array<DirectX::XMFLOAT4X4, 2> poses{};
         for (uint32_t bone = 0; bone < poses.size(); ++bone)
         {
@@ -1999,6 +1996,25 @@ std::vector<uint32_t> RunAnimatedAdaptiveCache(HWND window, IDXGIFactory2& facto
             pose._41 = x;
             pose._43 = z + (bone == 0 ? -.125f : .125f);
         }
+        const std::array<DirectX::XMFLOAT3, 3> mesh{{{-1,-1,0}, {-1,3,0}, {3,-1,0}}};
+        constexpr float maximumCoordinate = (std::numeric_limits<float>::max)();
+        DirectX::XMVECTOR minimum = DirectX::XMVectorReplicate(maximumCoordinate);
+        DirectX::XMVECTOR maximum = DirectX::XMVectorReplicate(-maximumCoordinate);
+        for (const auto& vertex : mesh)
+            for (const auto& pose : poses)
+            {
+                const auto world = DirectX::XMVector3TransformCoord(DirectX::XMLoadFloat3(&vertex),
+                    DirectX::XMLoadFloat4x4(&pose));
+                minimum = DirectX::XMVectorMin(minimum, world);
+                maximum = DirectX::XMVectorMax(maximum, world);
+            }
+        const auto midpoint = DirectX::XMVectorScale(DirectX::XMVectorAdd(minimum, maximum), .5f);
+        DirectX::XMFLOAT3 center{};
+        DirectX::XMStoreFloat3(&center, midpoint);
+        const float sphereCenter[]{center.x, center.y, center.z};
+        const float radius = .5f * DirectX::XMVectorGetX(DirectX::XMVector3Length(DirectX::XMVectorSubtract(maximum, minimum)));
+        const bool member = ShadowSphereInside(frustum, sphereCenter, radius);
+        Check(member == !outside, "animated bounds remove the old caster");
         if (member && !budgetEmpty)
             Require(uploads[slot].Write(device, std::span<const DirectX::XMFLOAT4X4>(poses)), "animated cache pose");
         auto& cache = runtime.Content(slot);
@@ -2049,10 +2065,7 @@ std::vector<uint32_t> RunAnimatedAdaptiveCache(HWND window, IDXGIFactory2& facto
                 caster.geometry = {1, 2, 1};
                 caster.material = {1};
                 caster.known = true;
-                for (const auto& pose : poses)
-                    for (const auto& row : pose.m)
-                        for (const float component : row)
-                            caster.transform.push_back(std::bit_cast<uint32_t>(component));
+                AppendShadowCasterPose(caster, std::span<const DirectX::XMFLOAT4X4>(poses));
                 key.casters.push_back(std::move(caster));
             }
             if (cacheMode)
