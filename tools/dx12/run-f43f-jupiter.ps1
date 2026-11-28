@@ -83,6 +83,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Test-NativeActualMode {
+    param([string[]]$Logs, [string]$Mode)
+    $failurePattern = 'ph_dx12_native: full_scene_state=failed|ph_dx12_f41: load failed stage='
+    if (!$Logs.Count -or (Select-String -LiteralPath $Logs -Pattern $failurePattern -Quiet)) {
+        return $false
+    }
+    if (!$Mode) {
+        return (Select-String -LiteralPath $Logs -Pattern 'ph_dx12_f41: ready level=' -Quiet)
+    }
+    $expected = if ($Mode -eq 'A') { 'banked' } else { 'adaptive' }
+    return (Select-String -LiteralPath $Logs -Pattern "\bph_dx12_shadow_preflight:.*\bactual_mode=$expected\b" -Quiet)
+}
 if ($PerformanceMode) {
     if ($R4) { throw 'Режимы A–F предназначены для native DX12.' }
     $AdaptiveShadows = $PerformanceMode -ne 'A'
@@ -197,6 +209,7 @@ $start.UseShellExecute = $false
 
 $features = @{
     STATIC_SCENE = '1'
+    M23 = 0
     PARTICLE_CAPTURE = [int]$ParticleCapture.IsPresent
     GR = $GR.ToLowerInvariant()
     GR_WORKERS = $GRWorkers.ToLowerInvariant()
@@ -347,7 +360,7 @@ $temporaryConfig = $null
 $engine = $null
 $isolatedAppData = $null
 try {
-    if ($PerformanceMode -or $RunDirectory) {
+    if (!$R4 -or $RunDirectory) {
         if (!$RunDirectory) { $RunDirectory = Join-Path $PSScriptRoot '../../artifacts/f43-performance-evolution/game-runs' }
         $runId = '{0}-{1}-{2}' -f $PerformanceMode, (Get-Date -Format 'yyyyMMdd-HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0,8))
         $run = New-Item -ItemType Directory -Path (Join-Path $RunDirectory $runId) -Force
@@ -385,12 +398,22 @@ try {
     Write-Host ('"{0}" {1}' -f $start.FileName, $start.Arguments)
     $engine = [System.Diagnostics.Process]::Start($start)
     $engine.WaitForExit()
+    $missingActualMode = $false
     if ($isolatedAppData) {
         $engine.ExitCode | Set-Content -LiteralPath (Join-Path $run.FullName 'engine.exit')
         $logs = @(Get-ChildItem -LiteralPath (Join-Path $isolatedAppData 'logs') -Filter '*.log' -File -ErrorAction SilentlyContinue)
+        if (!$R4) {
+            $missingActualMode = !(Test-NativeActualMode -Logs $logs.FullName -Mode $PerformanceMode)
+            $verdict = if ($missingActualMode -or $engine.ExitCode -ne 0) { 'FAIL' } else { 'PASS' }
+            $verdict | Set-Content -LiteralPath (Join-Path $run.FullName 'runtime.verdict')
+            if ($missingActualMode) {
+                'FAIL: full native scene or actual shadow mode was not confirmed' |
+                    Set-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
+            }
+        }
         if ($logs.Count) {
             Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight|shadow_assignment|shadow_membership|shadow_details|shadow_detail_cascade|shadow_detail_submit):' |
-                ForEach-Object Line | Set-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
+                ForEach-Object Line | Add-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
             $rows = @(Select-String -LiteralPath $logs.FullName -SimpleMatch 'ph_dx12_perf_detail:' | ForEach-Object {
                 $fields = [ordered]@{}
                 foreach ($match in [regex]::Matches($_.Line, '([a-z0-9_]+)=([^\s]+)')) {
@@ -421,6 +444,7 @@ try {
         Write-Host $run.FullName
     }
     if ($engine.ExitCode -ne 0) { throw "xrEngine завершился с кодом $($engine.ExitCode)." }
+    if ($missingActualMode) { throw 'Полноценная Native DX12 сцена или фактический режим теней не подтверждены.' }
 }
 finally {
     if ($engine) { $engine.Dispose() }

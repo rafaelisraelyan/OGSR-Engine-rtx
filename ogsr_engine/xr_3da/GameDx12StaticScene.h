@@ -254,6 +254,7 @@ public:
     }
 
 private:
+    friend struct GameDx12ProductionPsoProbe;
     struct DrawSource12
     {
         uint32_t visualId = 0;
@@ -422,6 +423,7 @@ private:
     xraylevel12::LevelPools m_poolRefs;
 
     ComPtr<ID3D12RootSignature> m_rootSignature;
+    uint64_t m_rootSignatureHash = 0;
     ComPtr<ID3D12PipelineState> m_pipelineState;
     // Вариант для раскладки, где TEXCOORD0 лежит по смещению 24.
     ComPtr<ID3D12PipelineState> m_pipelineUv24;

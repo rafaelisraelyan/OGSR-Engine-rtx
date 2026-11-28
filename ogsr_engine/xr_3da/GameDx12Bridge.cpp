@@ -309,7 +309,7 @@ bool M23Requested()
         state.m23Requested =
             value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
-    return state.m23Requested || state.nativeRequested;
+    return state.m23Requested;
 }
 
 bool B1WorldRequested()
@@ -2366,7 +2366,7 @@ struct NativeMetricsWindow
 
 void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
 {
-    if (state.nativeFailed)
+    if (state.nativeFailed || (state.staticSceneRequested && !state.staticSceneBound))
         return;
     const GameDx12NativeFrame12::Owner owner{
         *state.device.Get(), *state.queue.Get(), *state.fence.Get(),
@@ -2490,7 +2490,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
         if (FAILED(hr))
             state.native.Cancel();
     }
-    else if (SUCCEEDED(hr) && state.m23Bound && state.m23.IsLoaded() &&
+    else if (SUCCEEDED(hr) && !state.staticSceneRequested && state.m23Bound && state.m23.IsLoaded() &&
         state.m23.LevelSession() == state.levelSession &&
         state.m23.LevelEpoch() == state.captureEpoch)
     {
@@ -3569,7 +3569,7 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
 
     // F4.1: обычный native runtime загружает ВСЮ статическую сцену уровня.
     // Диагностические списки (M23/J1) остаются отдельными opt-in путями.
-    state.staticSceneRequested = state.nativeRequested && StaticSceneRequested();
+    state.staticSceneRequested = state.nativeRequested && StaticSceneRequested() && !M23Requested();
     state.staticSceneAttempted = false;
     state.staticSceneBound = false;
     state.staticSceneSession = 0;
@@ -3594,12 +3594,19 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
         if (!state.gpuUnknown && !state.quarantined &&
             state.staticScene.GpuCompletionUnknown())
             QuarantineForGeometryUnknown("f41_static_scene");
+        if (!state.staticSceneBound)
+        {
+            Msg("ph_dx12_native: full_scene_state=failed level='%s' session=%llu epoch=%llu",
+                state.levelName, static_cast<unsigned long long>(state.levelSession),
+                static_cast<unsigned long long>(state.captureEpoch));
+            return;
+        }
     }
     else if (state.nativeRequested && !state.staticSceneEnabledLogged)
     {
         state.staticSceneEnabledLogged = true;
-        Msg("ph_dx12_f41: full static scene disabled by "
-            "OGSR_DX12_GAME_STATIC_SCENE=0");
+        Msg("ph_dx12_f41: full static scene disabled by %s",
+            M23Requested() ? "OGSR_DX12_GAME_M23=1" : "OGSR_DX12_GAME_STATIC_SCENE=0");
     }
 
 #ifdef OGSR_J2B_M1_RUNTIME_PROBE

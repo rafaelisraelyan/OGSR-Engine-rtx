@@ -428,6 +428,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         uint32_t sunSlices = 0, bool receiverProbe = false)
     {
         SceneFrameConstants frame{};
+        frame.localFilterRadius = forcedRadius;
         frame.lightingFlags[3] = sunSlices;
         frame.sunFilter = 1;
         frame.sunShadowResolution = 8;

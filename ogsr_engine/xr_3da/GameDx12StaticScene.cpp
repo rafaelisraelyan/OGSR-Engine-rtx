@@ -13,6 +13,7 @@
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
+#include "GameDx12PsoDiagnostics.h"
 #include "../Layers/xrRender/xrRender_console.h"
 
 #include <d3dcompiler.h>
@@ -723,23 +724,31 @@ struct ShadowInterpolants
 };
 )";
 
+gamepso12::ShaderConfig SceneShaderConfig(bool pageTable)
+{
+    const auto sunMode = SceneSunFilter();
+    return {gamelight12::LegacyDiagnosticLightScale,
+        sunMode < game_shadow12::FirstContinuousSunMode ? 0u :
+            sunMode - game_shadow12::FirstContinuousSunMode + 1u,
+        SceneLocalFilterRadius(), pageTable};
+}
+
 bool CompileShader(std::string_view source, const char* entryPoint,
                    const char* target, ID3D10Blob** outBlob,
                    std::string& reason, bool pageTable = false)
 {
     ComPtr<ID3D10Blob> error;
-    const auto maxLocalLights = std::to_string(gamelight12::LegacyDiagnosticLightScale);
-    const auto sunMode = SceneSunFilter();
-    const auto sunRadius = std::to_string(sunMode < game_shadow12::FirstContinuousSunMode ? 0u :
-        sunMode - game_shadow12::FirstContinuousSunMode + 1u);
-    const auto localRadius = std::to_string(SceneLocalFilterRadius());
+    const auto config = SceneShaderConfig(pageTable);
+    const auto maxLocalLights = std::to_string(config.legacyLights);
+    const auto sunRadius = std::to_string(config.sunRadius);
+    const auto localRadius = std::to_string(config.localRadius);
     const D3D_SHADER_MACRO definitions[] = {{"LEGACY_DIAGNOSTIC_LIGHT_SCALE", maxLocalLights.c_str()},
         {"OGSR_DX12_CONTINUOUS_SUN", sunRadius.c_str()}, {"OGSR_DX12_CONTINUOUS_LOCAL", localRadius.c_str()},
         {pageTable ? "OGSR_DX12_SHADOW_PAGE_TABLE" : nullptr, pageTable ? "1" : nullptr}, {nullptr, nullptr}};
     std::string shader(kFrameShaderConstants);
     shader += source;
     const HRESULT hr = D3DCompile(shader.data(), shader.size(), nullptr, definitions,
-                                  nullptr, entryPoint, target, pageTable ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0, 0, outBlob,
+                                  nullptr, entryPoint, target, config.Flags(), 0, outBlob,
                                   &error);
     if (FAILED(hr))
     {
@@ -1462,7 +1471,9 @@ float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
     if (!ValidLocalAddress(address))
         return 1.0f;
 #if defined(OGSR_DX12_CONTINUOUS_LOCAL) && OGSR_DX12_CONTINUOUS_LOCAL > 0
-    return ContinuousLocalFilter(coords, gradient, address, OGSR_DX12_CONTINUOUS_LOCAL);
+    // Тот же радиус PCF3/5/7 приходит из frame CB. На RTX 5070 Laptop
+    // константный аргумент приводил к отказу создания SM5.1 PSO.
+    return ContinuousLocalFilter(coords, gradient, address, (int)clamp(LocalFilterRadius, 1u, 3u));
 #else
 #if !defined(OGSR_DX12_CONTINUOUS_LOCAL)
     if (LocalFilterRadius >= 1u && LocalFilterRadius <= 3u)
@@ -1906,8 +1917,6 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
         return float4(saturate(bakedHemi).xxx, 1.0f);
     if (ViewMode == 10)
         return float4(ToDisplay(IndirectHemi(n, bakedHemi)), 1.0f);
-    if (ViewMode == 14)
-        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, 0.0f, true, false)), 1.0f);
     if (ViewMode == 15 || ViewMode == 16)
     {
         const uint count = LightingFlags.z;
@@ -1961,15 +1970,25 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
             SunVisibility(input.world, n, sunCosine, planeNormal)), 1);
     if (ViewMode == 43)
         return float4(ToDisplay(SunColor.rgb * sunCosine), 1);
-    if (ViewMode == 23)
-        return float4(ToDisplay(LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, false, true)), 1);
     if (ViewMode == 24)
         return float4(planeNormal * (dot(planeNormal, n) < 0.0f ? -0.5f : 0.5f) + 0.5f, 1);
+
+    // FXC встраивает LocalLighting в каждый вызов. Один вызов сохраняет
+    // параметры диагностики и основной сцены и уменьшает полный DXBC.
+    const bool sceneLit = (TextureMode & 4) == 0 && LightingFlags.x != 0;
+    const bool diagnosticLocal = ViewMode == 13 || ViewMode == 14;
+    const bool displayLocal = ViewMode == 14 || ViewMode == 23;
+    float3 localLighting = 0.0f;
+    [branch] if (sceneLit || diagnosticLocal || displayLocal)
+        localLighting = LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal,
+            diagnosticLocal, ViewMode != 14);
+    if (displayLocal)
+        return float4(ToDisplay(localLighting), 1);
     if (ViewMode == 13)
     {
         const float3 luminance = float3(0.2126f, 0.7152f, 0.0722f);
         const float direct = dot(SunColor.rgb * sunCosine, luminance);
-        const float local = dot(LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, true, true), luminance);
+        const float local = dot(localLighting, luminance);
         const float3 display = ToDisplay(float3(direct, 0.0f, local));
         return float4(display.r, SunVisibility(input.world, n, sunCosine, planeNormal), display.b, 1.0f);
     }
@@ -1978,7 +1997,7 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     {
         if (LightingFlags.x != 0)
         {
-            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + LocalLighting(n, input.world, input.position.xy, correctedPlaneNormal, false, true);
+            light = Ambient.rgb + IndirectHemi(n, bakedHemi) + localLighting;
             if (sunCosine > 0.0f)
                 light += SunColor.rgb * (sunCosine * SunVisibility(input.world, n, sunCosine, planeNormal));
         }
@@ -2594,6 +2613,7 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                                      IID_PPV_ARGS(m_rootSignature.GetAddressOf()));
     if (FAILED(hr))
         return Fail(reason, "static scene root signature creation failed");
+    m_rootSignatureHash = gamepso12::BytecodeHash(signature->GetBufferPointer(), signature->GetBufferSize());
 
     ComPtr<ID3D10Blob> vertexShader;
     ComPtr<ID3D10Blob> pixelShader;
@@ -2652,7 +2672,16 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
     desc.NodeMask = 0;
     desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
-    const auto createDeferred = [&](DeferredPipelines& pipelines)
+    const auto create = [&](const char* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pso,
+                            ID3D12PipelineState** output, const char* vertexEntry = "main")
+    {
+        std::string diagnostic;
+        if (SUCCEEDED(gamepso12::Create(*device, pso, output, name, vertexEntry, "main",
+            SceneShaderConfig(m_shadowPageSampling), m_rootSignatureHash, diagnostic, Msg)))
+            return true;
+        return Fail(reason, diagnostic);
+    };
+    const auto createDeferred = [&](const char* layout, DeferredPipelines& pipelines)
     {
         for (uint32_t slot = 0; slot < DeferredPipelines::Count; ++slot)
         {
@@ -2682,26 +2711,23 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
                 target.DestBlendAlpha = D3D12_BLEND_ZERO;
                 target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
             }
-            if (FAILED(device->CreateGraphicsPipelineState(
-                    &deferred, IID_PPV_ARGS(pipelines.states[slot].GetAddressOf()))))
-                return Fail(reason, "deferred surface pipeline creation failed");
+            constexpr const char* variants[] = {"solid", "blend", "multiply", "translucent"};
+            static_assert(std::size(variants) == DeferredPipelines::Count);
+            char name[96]{};
+            std::snprintf(name, sizeof(name), "deferred_%s_%s", layout, variants[slot]);
+            if (!create(name, deferred, pipelines.states[slot].GetAddressOf()))
+                return false;
         }
         return true;
     };
 
-    hr = device->CreateGraphicsPipelineState(
-        &desc, IID_PPV_ARGS(m_pipelineState.GetAddressOf()));
-    if (FAILED(hr))
-        return Fail(reason, "static scene pipeline creation failed");
-    if (!createDeferred(m_deferredPipelines[0]))
+    if (!create("static_classic", desc, m_pipelineState.GetAddressOf()) ||
+        !createDeferred("classic", m_deferredPipelines[0]))
         return false;
 
     desc.InputLayout = kStaticInputLayouts[1];
-    hr = device->CreateGraphicsPipelineState(
-        &desc, IID_PPV_ARGS(m_pipelineUv24.GetAddressOf()));
-    if (FAILED(hr))
-        return Fail(reason, "static scene pipeline creation failed (uv24)");
-    if (!createDeferred(m_deferredPipelines[1]))
+    if (!create("static_uv24", desc, m_pipelineUv24.GetAddressOf()) ||
+        !createDeferred("uv24", m_deferredPipelines[1]))
         return false;
 
     if (gamewater12::PuddlesEnabled())
@@ -2717,8 +2743,9 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
             puddle.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
             puddle.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
             puddle.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-            const HRESULT puddleHr = device->CreateGraphicsPipelineState(
-                &puddle, IID_PPV_ARGS(m_pipelinePuddle.GetAddressOf()));
+            const HRESULT puddleHr = gamepso12::Create(*device, puddle, m_pipelinePuddle.GetAddressOf(),
+                "puddle", "puddleMain", "main", SceneShaderConfig(m_shadowPageSampling), m_rootSignatureHash,
+                puddleError, Msg);
             if (FAILED(puddleHr))
                 Msg("ph_dx12_f43e: puddle PSO unavailable hr=0x%08X", static_cast<unsigned>(puddleHr));
         }
@@ -2732,16 +2759,11 @@ bool GameDx12StaticScene12::CreatePipeline(ID3D12Device* device,
         return false;
     desc.VS = {auxVertex->GetBufferPointer(), auxVertex->GetBufferSize()};
     desc.InputLayout = kAuxInputLayout;
-    if (FAILED(device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(m_pipelineSkeletal.GetAddressOf()))))
-        return Fail(reason, "skeletal scene pipeline creation failed");
-    if (!createDeferred(m_deferredPipelines[2]))
+    if (!create("skeletal", desc, m_pipelineSkeletal.GetAddressOf()) ||
+        !createDeferred("skeletal", m_deferredPipelines[2]))
         return false;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    if (FAILED(device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(m_pipelineDetail.GetAddressOf()))))
-        return Fail(reason, "level detail pipeline creation failed");
-    return true;
+    return create("level_detail", desc, m_pipelineDetail.GetAddressOf());
 }
 
 bool GameDx12StaticScene12::CreateSunShadowPipeline(ID3D12Device* device, std::string& reason)
@@ -2777,26 +2799,13 @@ bool GameDx12StaticScene12::CreateSunShadowPipeline(ID3D12Device* device, std::s
     shadow.SampleDesc.Count = 1;
 
     static_assert(std::size(kStaticInputLayouts) == std::tuple_size_v<decltype(m_sunShadowPipelines)>);
-    constexpr const char* layoutNames[] = {"classic", "uv24"};
+    constexpr const char* layoutNames[] = {"sun_shadow_classic", "sun_shadow_uv24"};
     for (size_t i = 0; i < std::size(kStaticInputLayouts); ++i)
     {
         shadow.InputLayout = kStaticInputLayouts[i];
-        const HRESULT hr = device->CreateGraphicsPipelineState(&shadow,
-            IID_PPV_ARGS(m_sunShadowPipelines[i].GetAddressOf()));
-        if (FAILED(hr))
-        {
-            char diagnostic[256]{};
-            std::snprintf(diagnostic, sizeof(diagnostic),
-                "CreateGraphicsPipelineState PSO=sun_shadow layout=%s HRESULT=0x%08X "
-                "VS=%s/%s PS=%s/%s RTVCount=%u DSV=%u samples=%u depth_write=%u depth_func=%u cull=%u",
-                layoutNames[i], static_cast<unsigned>(hr), entry, vertexProfile, entry, pixelProfile,
-                shadow.NumRenderTargets, static_cast<unsigned>(shadow.DSVFormat), shadow.SampleDesc.Count,
-                static_cast<unsigned>(shadow.DepthStencilState.DepthWriteMask),
-                static_cast<unsigned>(shadow.DepthStencilState.DepthFunc),
-                static_cast<unsigned>(shadow.RasterizerState.CullMode));
-            reason = diagnostic;
+        if (FAILED(gamepso12::Create(*device, shadow, m_sunShadowPipelines[i].GetAddressOf(),
+            layoutNames[i], entry, entry, SceneShaderConfig(false), m_rootSignatureHash, reason, Msg)))
             return false;
-        }
     }
     if (SceneDynamicSunShadowsRequested() || SceneLocalShadowsRequested() || SceneDetailSunShadowsRequested())
     {
@@ -2806,15 +2815,8 @@ bool GameDx12StaticScene12::CreateSunShadowPipeline(ID3D12Device* device, std::s
         {
             shadow.VS = {auxVertex->GetBufferPointer(), auxVertex->GetBufferSize()};
             shadow.InputLayout = kAuxInputLayout;
-            const HRESULT hr = device->CreateGraphicsPipelineState(
-                &shadow, IID_PPV_ARGS(m_sunShadowAuxPipeline.GetAddressOf()));
-            if (FAILED(hr))
-            {
-                char message[96]{};
-                std::snprintf(message, sizeof(message), "skeletal sun shadow PSO HRESULT=0x%08X",
-                    static_cast<unsigned>(hr));
-                auxReason = message;
-            }
+            gamepso12::Create(*device, shadow, m_sunShadowAuxPipeline.GetAddressOf(), "sun_shadow_skeletal",
+                entry, entry, SceneShaderConfig(false), m_rootSignatureHash, auxReason, Msg);
         }
         if (!auxReason.empty())
         {
