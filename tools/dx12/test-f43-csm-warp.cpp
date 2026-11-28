@@ -5,6 +5,7 @@
 #include "GameDx12NativeFrame.h"
 #include "GameDx12ShadowRecording.h"
 #include "GameDx12ShadowContentCache.h"
+#include "GameDx12ShadowCullMask.h"
 #include "GameDx12ClusteredLighting.h"
 #include "GameDx12StaticShadowCache.h"
 #include "GameDx12AdaptiveShadowRuntime.h"
@@ -1940,6 +1941,219 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
     return observed;
 }
 
+std::vector<uint32_t> RunAnimatedAdaptiveCache(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
+    IDXGIAdapter3& adapter, uint32_t cacheMode)
+{
+    using namespace game_shadow12;
+    constexpr uint32_t resolution = 128, projection = ReservedCsmProjections;
+    auto& device = owner.device;
+    Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", "legacy") == 0, "animated cache recording mode");
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NumDescriptors = 24;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "animated cache descriptor heap");
+    ShadowSamplingPass sampling(device, nullptr, 1, nullptr, 1, Mutation::None, true, false, heap.Get());
+    ShadowDescriptors descriptors;
+    Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "animated cache descriptors");
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "animated cache frame");
+    AdaptiveShadowRuntime runtime;
+    DepthPacketPipeline staticDepth(device, true), animatedDepth(device, true, true);
+    std::array<FrameStructuredUpload, Frame::kFrameCount> uploads;
+    std::array<uint64_t, Frame::kFrameCount> previousPage{};
+    std::array<bool, Frame::kFrameCount> recovered{};
+    const AdaptiveCandidate light{17, 100, resolution, 1};
+    const ShadowCullPlane frustum[6]{{1,0,0,1}, {-1,0,0,1}, {0,1,0,1}, {0,-1,0,1},
+        {0,0,1,0}, {0,0,-1,1}};
+    std::vector<uint32_t> observed;
+    uint32_t mainHits = 0, staticHits = 0;
+    for (uint32_t iteration = 0; iteration < 14; ++iteration)
+    {
+        const uint32_t phase = iteration / 2;
+        const bool budgetEmpty = phase == 4;
+        const bool outside = phase == 3;
+        const float z = phase == 2 || phase == 6 ? .625f : .25f;
+        Frame::Recording recording;
+        Require(frame.Begin(window, owner, recording), "animated cache begin");
+        const uint32_t slot = recording.slot;
+        const auto& arena = runtime.Pages(slot);
+        ShadowAddressPlan addresses;
+        ShadowDescriptors::Binding binding;
+        Require(runtime.Prepare(owner, adapter, recording, descriptors, std::span(&light, 1),
+            1, 1, iteration + 1, 0, addresses, binding, budgetEmpty ? 0 : UINT64_MAX),
+            "animated cache adaptive stage");
+        Check(addresses.views.size() == (budgetEmpty ? 0u : 1u), "animated cache budget admission");
+
+        const float x = outside ? 4.f : 0.f;
+        const float center[3]{x + 1.f, 1.f, z};
+        // Сфера ограничивает весь треугольник poseProbe, включая обе кости.
+        const bool member = ShadowSphereInside(frustum, center, 2.84f);
+        Check(member == !outside, "animated bounds remove the old caster");
+        std::array<DirectX::XMFLOAT4X4, 2> poses{};
+        for (uint32_t bone = 0; bone < poses.size(); ++bone)
+        {
+            auto& pose = poses[bone];
+            pose._11 = pose._22 = pose._33 = pose._44 = 1.f;
+            pose._41 = x;
+            pose._43 = z + (bone == 0 ? -.125f : .125f);
+        }
+        if (member && !budgetEmpty)
+            Require(uploads[slot].Write(device, std::span<const DirectX::XMFLOAT4X4>(poses)), "animated cache pose");
+        auto& cache = runtime.Content(slot);
+        auto& staticCache = runtime.StaticContent(slot);
+        const auto stage = [&](ShadowContentCache& target, std::vector<ShadowContentView> keys)
+        {
+            const auto fence = owner.fenceValue + 1;
+            Check(target.Prepare(std::move(keys), fence), "animated cache content prepare");
+            Require(recording.StageShadowContentCache(target, fence), "animated cache content stage");
+        };
+
+        std::unique_ptr<Readback> depthRead;
+        ShadowPageResources::View target;
+        LocalShadowGpuProjection probe{};
+        if (!budgetEmpty)
+        {
+            const auto& address = addresses.views.front();
+            std::vector<ScheduledShadowView> schedule;
+            const ShadowPacketRange range{0, 1};
+            Check(PlanShadowViews(addresses, std::span(&range, 1), 1, schedule) && schedule.size() == 1,
+                "animated cache schedule");
+            const auto& view = schedule.front();
+            Check(view.projection == projection && view.resolution == resolution &&
+                arena.GetView(view.page, view.slice, target), "animated cache physical target");
+            if (phase == 0)
+                previousPage[slot] = view.page;
+            if (phase == 5)
+            {
+                Check(arena.CurrentBytes() == 0 && view.page != previousPage[slot],
+                    "animated cache recreates a physical page after budget recovery");
+                recovered[slot] = true;
+            }
+            probe.address = address;
+            ShadowContentView key;
+            key.resource = reinterpret_cast<uintptr_t>(target.resource);
+            key.resourceGeneration = view.page;
+            key.session = key.epoch = key.lightGeneration = key.sceneGeneration = 1;
+            key.slice = target.slice;
+            key.resolution = target.resolution;
+            key.light = light.id;
+            key.staticCasters = {1};
+            key.known = true;
+            const auto staticKey = key;
+            if (member)
+            {
+                ShadowContentCaster caster;
+                caster.identity = caster.generation = 1;
+                caster.geometry = {1, 2, 1};
+                caster.material = {1};
+                caster.known = true;
+                for (const auto& pose : poses)
+                    for (const auto& row : pose.m)
+                        for (const float component : row)
+                            caster.transform.push_back(std::bit_cast<uint32_t>(component));
+                key.casters.push_back(std::move(caster));
+            }
+            if (cacheMode)
+                stage(cache, {std::move(key)});
+            const bool hit = cacheMode && cache.Reasons().front() == ShadowContentHit;
+            Check(hit == (cacheMode != 0 && phase == 1), "animated cache hits only on unchanged pose/page");
+            mainHits += hit;
+            if (!hit)
+            {
+                StaticShadowSlice source;
+                bool refreshStatic = false;
+                if (cacheMode == 2)
+                {
+                    StaticShadowScratch scratch(arena);
+                    source = scratch.Take(resolution);
+                    Check(source.page != 0, "animated cache has adaptive static scratch");
+                    auto scratchKey = staticKey;
+                    scratchKey.resource = reinterpret_cast<uintptr_t>(source.view.resource);
+                    scratchKey.resourceGeneration = source.page;
+                    scratchKey.slice = source.view.slice;
+                    stage(staticCache, {std::move(scratchKey)});
+                    refreshStatic = staticCache.Reasons().front() != ShadowContentHit;
+                    Check(refreshStatic == (phase == 0 || phase == 2 || phase == 5),
+                        "static scratch survives pose and membership while SC2 stays active");
+                    staticHits += !refreshStatic;
+                }
+                const ShadowRecordingPass pass{projection, target};
+                const auto dispatch = [](uint32_t count, const auto& work) { work(0, count, 0); return S_OK; };
+                Require(RecordShadowPasses(recording, std::span(&pass, 1), [&](ID3D12GraphicsCommandList& list, uint32_t)
+                {
+                    const auto drawStatic = [&]
+                    {
+                        list.SetPipelineState(staticDepth.pipeline.Get());
+                        list.SetGraphicsRootSignature(staticDepth.root.Get());
+                        list.SetGraphicsRoot32BitConstant(0, std::bit_cast<uint32_t>(.875f), 0);
+                        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        list.DrawInstanced(3, 1, 0, 0);
+                    };
+                    if (source.page)
+                        CopyStaticShadow(list, source.view, target, refreshStatic, drawStatic);
+                    else
+                        drawStatic();
+                    if (member)
+                    {
+                        list.SetPipelineState(animatedDepth.pipeline.Get());
+                        list.SetGraphicsRootSignature(animatedDepth.root.Get());
+                        list.SetGraphicsRootShaderResourceView(0, uploads[slot].Address());
+                        list.SetGraphicsRoot32BitConstant(1, 0, 0);
+                        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        list.DrawInstanced(3, 1, 0, 0);
+                    }
+                    return S_OK;
+                }, dispatch), "animated cache draws");
+            }
+            else
+                staticCache.DiscardContents();
+            const auto description = target.resource->GetDesc();
+            depthRead = std::make_unique<Readback>(device, description, description.DepthOrArraySize);
+            Transition(*recording.list, *target.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, target.slice);
+            depthRead->Copy(*recording.list, *target.resource, target.slice);
+            Transition(*recording.list, *target.resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, target.slice);
+        }
+        else
+        {
+            if (cacheMode)
+                stage(cache, {});
+            staticCache.DiscardContents();
+        }
+
+        const auto probes = std::span<const LocalShadowGpuProjection>(&probe, budgetEmpty ? 0 : 1);
+        sampling.DrawPages(device, *recording.list, recording.rtv, binding, probes);
+        Readback colorRead(device, recording.color->GetDesc(), 1);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        colorRead.Copy(*recording.list, *recording.color, 0);
+        Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Require(frame.Present(owner, 1), "animated cache submit");
+        Require(frame.Drain(owner), "animated cache fence");
+        Check(!cache.Prepared() && !staticCache.Prepared(), "animated cache committed by signal");
+        Check((arena.CurrentBytes() == 0) == budgetEmpty, "animated cache budget committed");
+        const float expectedDepth = member ? z : .875f;
+        const uint32_t sampled = colorRead.Pixel(0, 0, 0);
+        Check(sampled == (budgetEmpty ? 0xff0000ffu : expectedDepth < .5f ? 0xff00ff00u : 0xff00ffffu),
+            "animated cache production sampling after pose and reassignment");
+        if (depthRead)
+        {
+            const auto stored = depthRead->Pixel(target.slice, resolution / 2, resolution / 2);
+            Check(stored == std::bit_cast<uint32_t>(expectedDepth), "animated cache depth readback");
+            observed.push_back(stored);
+        }
+        observed.push_back(sampled);
+    }
+    Check(recovered[0] && recovered[1], "animated cache exercised both native slots");
+    Check(mainHits == (cacheMode ? 2u : 0u) && staticHits == (cacheMode == 2 ? 4u : 0u),
+        "animated cache exercised SC1 hits and SC2 static copies");
+    std::printf("PASS: animated adaptive cache mode=%u SC1_hits=%u SC2_hits=%u samples=%zu\n",
+        cacheMode, mainHits, staticHits, observed.size());
+    return observed;
+}
+
 std::vector<uint32_t> RunClusters(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
     int mode, uint32_t pointResolution = 128)
 {
@@ -2532,7 +2746,18 @@ int main(int argc, char** argv)
             std::strcmp(argv[1], "--shadow-cache-continuous") == 0)) forcedRadius = 1;
         const bool clusterOnly = argc > 1 && (std::strcmp(argv[1], "--clustered-lighting") == 0 ||
             std::strcmp(argv[1], "--clustered-lighting-continuous") == 0);
-        if (detailsOnly)
+        const bool animatedCacheOnly = argc > 1 && std::strcmp(argv[1], "--animated-adaptive-cache") == 0;
+        if (animatedCacheOnly)
+        {
+            forcedRadius = 2;
+            ComPtr<IDXGIAdapter3> memoryAdapter;
+            Require(adapter.As(&memoryAdapter), "animated cache DXGI budget interface");
+            const auto baseline = RunAnimatedAdaptiveCache(window, *factory.Get(), owner, *memoryAdapter.Get(), 0);
+            for (uint32_t mode : {1u, 2u})
+                Check(baseline == RunAnimatedAdaptiveCache(window, *factory.Get(), owner, *memoryAdapter.Get(), mode),
+                    "animated cache-off/SC1/SC2 readback parity");
+        }
+        else if (detailsOnly)
             RunDetailCasters(window, *factory.Get(), owner);
         else if (pointOnly)
         {

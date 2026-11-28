@@ -10,6 +10,19 @@ namespace game_shadow12
 // Плоскость совместима с выражением nx*x + ny*y + nz*z + d в SphereInside.
 struct ShadowCullPlane { float nx = 0, ny = 0, nz = 0, d = 0; };
 
+inline bool ShadowSphereInside(const ShadowCullPlane planes[6], const float center[3], float radius) noexcept
+{
+    for (uint32_t index = 0; index < 6; ++index)
+    {
+        const auto& plane = planes[index];
+        const float distance = plane.nx * center[0] + plane.ny * center[1] +
+                               plane.nz * center[2] + plane.d;
+        if (distance < -radius)
+            return false;
+    }
+    return true;
+}
+
 // boundsVerified означает: все центры потомков конечны и лежат внутри bounds,
 // радиусы конечны и неотрицательны. Иначе вызывающий обязан передать false.
 // Каждый снятый бит гарантирует float distance >= 0, а значит sphere test

@@ -389,7 +389,7 @@ try {
         $engine.ExitCode | Set-Content -LiteralPath (Join-Path $run.FullName 'engine.exit')
         $logs = @(Get-ChildItem -LiteralPath (Join-Path $isolatedAppData 'logs') -Filter '*.log' -File -ErrorAction SilentlyContinue)
         if ($logs.Count) {
-            Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight|shadow_assignment|shadow_membership|shadow_details):' |
+            Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight|shadow_assignment|shadow_membership|shadow_details|shadow_detail_cascade|shadow_detail_submit):' |
                 ForEach-Object Line | Set-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
             $rows = @(Select-String -LiteralPath $logs.FullName -SimpleMatch 'ph_dx12_perf_detail:' | ForEach-Object {
                 $fields = [ordered]@{}

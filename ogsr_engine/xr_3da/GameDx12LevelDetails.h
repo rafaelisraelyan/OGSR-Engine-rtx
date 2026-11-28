@@ -3,6 +3,7 @@
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
 #include "GameDx12AuxGeometry.h"
+#include "GameDx12DetailShadowStreaming.h"
 
 #include <DirectXMath.h>
 
@@ -45,6 +46,8 @@ struct DetailShadowBudget
 {
     size_t cacheBytes = 0, outputBytes = 0, workingBytes = 0;
     size_t decodeSlots = 0;
+    // 0 означает проверяемый default: resident + полный transient bound.
+    size_t transientBytes = 0, peakBytes = 0;
 };
 struct DetailShadowPlacement
 {
@@ -56,7 +59,9 @@ struct DetailShadowSnapshot
 {
     std::vector<DetailShadowPlacement> placements;
     uint64_t generation = 0;
-    size_t pendingSlots = 0, cachedBytes = 0, outputBytes = 0;
+    size_t pendingSlots = 0, deniedSlots = 0, retainedSlots = 0, cachedBytes = 0, outputBytes = 0;
+    uint32_t cascadeCompleteMask = 0;
+    std::array<DetailShadowCascadeEvidence, 4> cascadeEvidence{};
     bool complete = false;
 };
 
@@ -73,7 +78,7 @@ public:
     // Только поток игрового кадра. Snapshot владеет данными; incomplete нельзя
     // использовать как полное membership для теневого кэша.
     void CollectShadow(std::span<const DetailShadowRegion> regions,
-                       const DetailShadowBudget& budget, DetailShadowSnapshot& out);
+                       const DetailShadowBudget& budget, const float eye[3], DetailShadowSnapshot& out);
 
 private:
     struct ModelParameters

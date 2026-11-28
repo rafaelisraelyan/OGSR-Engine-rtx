@@ -2076,15 +2076,7 @@ bool BuildFrustum(const DirectX::XMFLOAT4X4& full, FrustumPlane planes[6])
 bool SphereInside(const FrustumPlane planes[6], const float center[3],
                   float radius)
 {
-    for (uint32_t index = 0; index < 6; ++index)
-    {
-        const FrustumPlane& plane = planes[index];
-        const float distance = plane.nx * center[0] + plane.ny * center[1] +
-                               plane.nz * center[2] + plane.d;
-        if (distance < -radius)
-            return false;
-    }
-    return true;
+    return game_shadow12::ShadowSphereInside(planes, center, radius);
 }
 
 bool BoxInside(const FrustumPlane* planes, const float minimum[3], const float maximum[3])
@@ -5107,6 +5099,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     // Слоты декодируются на потоке владельца. Работники записи получают
     // неизменяемые пакеты и адрес загрузки уже защищённого fence слота.
     std::array<std::vector<gameaux12::DetailShadowDraw>, game_shadow12::MaxSunCascades> sunDetails;
+    std::array<uint32_t, game_shadow12::MaxSunCascades> preparedDetailCounts{};
+    uint32_t preparedDetailCoverage = 0;
     D3D12_GPU_VIRTUAL_ADDRESS detailShadowSrv = 0;
     const bool logDetails = lighting.diagnosticBurst || lighting.frame == 1 || lighting.frame % 120 == 0;
     if (stats.detailSunShadows && logDetails &&
@@ -5122,7 +5116,6 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     {
         const char* detailStatus = "invalid_region";
         gameaux12::DetailShadowSnapshot candidate;
-        bool complete = false;
         std::vector<DirectX::XMFLOAT4X4> transforms;
         auto& upload = m_detailShadowUploads[frameSlot];
         try
@@ -5133,57 +5126,94 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                 valid &= gameaux12::DetailCasterRegion(sunPlan.cascades[i].viewProjection, regions[i]);
             if (valid)
             {
-                detailSource->CollectShadow(std::span(regions).first(sunPlan.count), kDetailShadowBudget, candidate);
-                complete = candidate.complete;
-                detailStatus = complete ? "complete" : candidate.pendingSlots ? "pending" : "incomplete_source";
+                detailSource->CollectShadow(std::span(regions).first(sunPlan.count),
+                    kDetailShadowBudget, cameraPosition, candidate);
+                detailStatus = candidate.complete ? "complete" : candidate.deniedSlots ? "budget_denied" :
+                    candidate.pendingSlots ? "pending" : "incomplete_source";
 
                 std::vector<uint32_t> meshes;
                 meshes.reserve(extras.details.size());
                 for (const auto& group : extras.details)
                 {
                     const auto* mesh = group.mesh < snapshot.meshes.size() ? &snapshot.meshes[group.mesh] : nullptr;
-                    meshes.push_back(mesh && !mesh->skinned && mesh->requiredBones == 1 ?
-                        group.mesh : gameaux12::kInvalidMesh);
+                    if (!mesh || !mesh->indices || !mesh->vb.BufferLocation || !mesh->vb.SizeInBytes ||
+                        !mesh->ib.BufferLocation || !mesh->ib.SizeInBytes || mesh->descriptor == kNullDescriptor)
+                        meshes.push_back(gameaux12::kInvalidMesh);
+                    else if (mesh->skinned || mesh->requiredBones != 1 ||
+                        (mesh->surface != SurfaceMode::Cutout && mesh->surface != SurfaceMode::Opaque))
+                        meshes.push_back(gameaux12::kUnsupportedDetailShadowMesh);
+                    else
+                        meshes.push_back(group.mesh);
                 }
-                const auto placements = complete ? std::span<const gameaux12::DetailShadowPlacement>(candidate.placements) :
-                    std::span<const gameaux12::DetailShadowPlacement>();
+                const auto placements = std::span<const gameaux12::DetailShadowPlacement>(candidate.placements);
                 const auto bounds = gameaux12::DetailShadowBounds(placements);
-                for (uint32_t i = 0; i < sunPlan.count && valid; ++i)
+                for (uint32_t i = 0; i < sunPlan.count; ++i)
                 {
-                    std::array<gameaux12::DetailShadowPlane, 6> frustum;
-                    for (uint32_t plane = 0; plane < frustum.size(); ++plane)
+                    const auto bit = 1u << i;
+                    const auto& spatial = candidate.cascadeEvidence[i];
+                    gameaux12::DetailShadowDrawReport packets;
+                    const char* cascadeReason = "spatial_incomplete";
+                    if ((candidate.cascadeCompleteMask & bit) != 0)
                     {
-                        const auto& p = sunPlanes[i][plane];
-                        frustum[plane] = {{p.nx, p.ny, p.nz}, p.d};
+                        std::array<gameaux12::DetailShadowPlane, 6> frustum;
+                        for (uint32_t plane = 0; plane < frustum.size(); ++plane)
+                        {
+                            const auto& p = sunPlanes[i][plane];
+                            frustum[plane] = {{p.nx, p.ny, p.nz}, p.d};
+                        }
+                        if (gameaux12::AppendDetailShadowDraws(placements, bounds, frustum, meshes,
+                            kDetailShadowUploadBytes, transforms, sunDetails[i], &packets))
+                        {
+                            preparedDetailCoverage |= bit;
+                            preparedDetailCounts[i] = static_cast<uint32_t>(packets.prepared);
+                            cascadeReason = packets.prepared ? "packets_ready" : "no_casters";
+                        }
+                        else
+                            cascadeReason = packets.missingMesh || packets.unsupportedMaterial ? "gpu_resources" :
+                                packets.status == gameaux12::DetailShadowDrawStatus::UploadBudget ? "upload_budget" :
+                                "invalid_packets";
                     }
-                    valid = gameaux12::AppendDetailShadowDraws(placements, bounds, frustum, meshes,
-                        kDetailShadowUploadBytes, transforms, sunDetails[i]);
+                    if (logDetails)
+                        Msg("ph_dx12_shadow_detail_cascade: frame=%llu slot=%u cascade=%u spatial_complete=%d "
+                            "requested_slots=%zu pending_slots=%zu denied_slots=%zu spatial_reason=%s "
+                            "selected=%zu prepared=%zu skipped_casters=%zu missing_mesh=%zu unsupported_material=%zu reason=%s",
+                            static_cast<unsigned long long>(lighting.frame), frameSlot, i,
+                            (candidate.cascadeCompleteMask & bit) != 0, spatial.requestedSlots, spatial.pendingSlots,
+                            spatial.deniedSlots, gameaux12::DetailShadowCoverageLabel(spatial.reason), packets.selected, packets.prepared,
+                            packets.selected - packets.prepared, packets.missingMesh, packets.unsupportedMaterial, cascadeReason);
                 }
-                if (!valid)
-                    detailStatus = "upload_budget";
-                else if (!transforms.empty())
+                if (!transforms.empty())
                 {
                     if (SUCCEEDED(upload.Write(*recording.device,
                         std::span<const DirectX::XMFLOAT4X4>(transforms), kDetailShadowUploadBytes)))
                         detailShadowSrv = upload.Address();
                     else
+                    {
                         detailStatus = "upload_failed";
+                        for (uint32_t i = 0; i < sunPlan.count; ++i)
+                            if (preparedDetailCounts[i] != 0)
+                                preparedDetailCoverage &= ~(1u << i);
+                    }
                 }
             }
         }
         catch (const std::bad_alloc&)
         {
             detailStatus = "host_memory";
+            preparedDetailCoverage = 0;
         }
         if (!detailShadowSrv)
             sunDetails = {};
         if (logDetails)
-            Msg("ph_dx12_shadow_details: frame=%llu slot=%u requested=1 actual=%s complete=%d retained=%d reason=%s placements=%zu instances=%zu pending_slots=%zu "
-                "snapshot_generation=%llu upload_capacity_bytes=%llu",
+            Msg("ph_dx12_shadow_details: frame=%llu slot=%u requested=1 actual=%s complete=%d retained=%zu reason=%s "
+                "placements=%zu instances=%zu pending_slots=%zu denied_slots=%zu spatial_mask=0x%x ready_mask=0x%x "
+                "snapshot_generation=%llu resident_bytes=%zu upload_capacity_bytes=%llu",
                 static_cast<unsigned long long>(lighting.frame), frameSlot,
-                detailShadowSrv ? "complete" : "off", complete, 0, detailStatus,
-                candidate.placements.size(), detailShadowSrv ? transforms.size() : 0,
-                candidate.pendingSlots, static_cast<unsigned long long>(candidate.generation),
+                detailShadowSrv ? "uploaded" : preparedDetailCoverage ? "empty" : "off",
+                candidate.complete, candidate.retainedSlots, detailStatus, candidate.placements.size(),
+                detailShadowSrv ? transforms.size() : 0, candidate.pendingSlots, candidate.deniedSlots,
+                candidate.cascadeCompleteMask, preparedDetailCoverage,
+                static_cast<unsigned long long>(candidate.generation), candidate.cachedBytes,
                 static_cast<unsigned long long>(upload.Capacity()));
     }
 
@@ -5379,6 +5409,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     };
     const auto activePasses = std::span(passes.data(), passCount);
     std::array<ShadowDraws, game_shadow12::MaxSunCascades> sunDraws{};
+    uint32_t recordedSunMask = 0;
     const auto accumulateShadows = [&](const ShadowPass& pass, const ShadowDraws& draws)
     {
         stats.staticShadowDraws += draws.statics;
@@ -5388,6 +5419,7 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             stats.sunRigidDraws += draws.rigid;
             stats.sunSkinnedDraws += draws.skinned;
             sunDraws[pass.view.Slice()] = draws;
+            recordedSunMask |= 1u << pass.view.Slice();
             constants.sunCasterCounts[pass.view.Slice()] = draws.statics + draws.rigid + draws.skinned;
         }
         else
@@ -5810,6 +5842,12 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         list->RSSetViewports(1, &mainViewport);
         list->RSSetScissorRects(1, &mainRect);
     }
+    for (uint32_t i = 0; i < sunPlan.count; ++i)
+        if ((preparedDetailCoverage & recordedSunMask & (1u << i)) && sunDraws[i].detail == preparedDetailCounts[i])
+        {
+            stats.detailShadowCoverage |= 1u << i;
+            stats.detailShadowInstances += sunDraws[i].detail;
+        }
     const double shadowRecordMs = Ms(shadowRecordStart);
     stats.shadowCpuMs += shadowRecordMs;
     auto shadowSrv = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
