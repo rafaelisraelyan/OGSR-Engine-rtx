@@ -184,6 +184,8 @@ struct BridgeStateData
         gamelight12::Vec3 camera{}, forward{}, sunDirection{}, sunColor{}, ambient{}, hemi{};
         uint32_t sunFilter = 0, localRadius = 0, localCount = 0;
         const char* shadowMode = "unavailable";
+        std::array<char, 96> weather{};
+        float timeOfDay = -1.0f;
         bool sun = false, hemisphere = false, cache = false, clustered = false;
     };
     std::array<NativeSample, GameDx12NativeFrame12::kFrameCount> nativeSamples{};
@@ -2447,6 +2449,16 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                         viewProjection._34, sample.forward);
                     sample.sunDirection = lighting.sunDirection;
                     sample.sunColor = lighting.sunColor;
+                    if (g_pGamePersistent)
+                    {
+                        const auto& environment = g_pGamePersistent->Environment();
+                        sample.timeOfDay = environment.GetRenderTimeOfDay();
+                        if (const char* weather = environment.GetWeather().c_str())
+                        {
+                            for (size_t i = 0; i + 1 < sample.weather.size() && weather[i]; ++i)
+                                sample.weather[i] = static_cast<unsigned char>(weather[i]) > ' ' ? weather[i] : '_';
+                        }
+                    }
                     sample.ambient = lighting.ambient;
                     sample.hemi = lighting.hemi;
                     sample.sunFilter = sceneStats.sunFilter;
@@ -2699,6 +2711,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 "camera=(%.5f,%.5f,%.5f) forward=(%.6f,%.6f,%.6f) sun_dir=(%.6f,%.6f,%.6f) "
                 "sun_rgb=(%.6f,%.6f,%.6f) ambient=(%.6f,%.6f,%.6f) hemi=(%.6f,%.6f,%.6f) "
                 "sun_active=%d hemi_active=%d local_count=%u "
+                "weather=%s time_of_day_s=%.3f gpu_weather=%s gpu_time_of_day_s=%.3f "
                 "gpu_context_valid=%d gpu_camera=(%.5f,%.5f,%.5f) gpu_forward=(%.6f,%.6f,%.6f) "
                 "gpu_sun_dir=(%.6f,%.6f,%.6f) gpu_sun_rgb=(%.6f,%.6f,%.6f) "
                 "gpu_ambient=(%.6f,%.6f,%.6f) gpu_hemi=(%.6f,%.6f,%.6f) "
@@ -2723,6 +2736,8 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 lighting.ambient.x, lighting.ambient.y, lighting.ambient.z,
                 lighting.hemi.x, lighting.hemi.y, lighting.hemi.z,
                 lighting.sunEnabled, lighting.hemiEnabled, lighting.localCount,
+                sample.weather[0] ? sample.weather.data() : "unknown", sample.timeOfDay,
+                gpuSample.weather[0] ? gpuSample.weather.data() : "unknown", gpuSample.timeOfDay,
                 gpuSample.present != 0, gpuSample.camera.x, gpuSample.camera.y, gpuSample.camera.z,
                 gpuSample.forward.x, gpuSample.forward.y, gpuSample.forward.z,
                 gpuSample.sunDirection.x, gpuSample.sunDirection.y, gpuSample.sunDirection.z,

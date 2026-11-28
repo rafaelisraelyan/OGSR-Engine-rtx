@@ -347,6 +347,7 @@ public:
 
     void SetWeather(const shared_str& name, const bool forced = false);
     const shared_str& GetWeather() const { return CurrentWeatherName; }
+    float GetRenderTimeOfDay() const noexcept { return fGameTime; }
     const shared_str& GetPrevWeather() const { return PrevWeatherName; }
     void SetWeatherNext(const shared_str& name);
     void ChangeGameTime(float game_time);

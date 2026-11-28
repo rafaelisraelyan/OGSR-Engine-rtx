@@ -1532,7 +1532,10 @@ bool DebugLightMatches(uint index)
     return DiagnosticLight.y == 0 || DiagnosticLight.x == index + 1;
 }
 
-float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
+float LocalFalloff(LocalLightData source, float3 toLight);
+float LocalAngular(LocalLightData source, float3 normal, float3 lightDir);
+
+float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal, uint mode)
 {
     [loop]
     for (uint index = 0; index < LightingFlags.z; ++index)
@@ -1540,6 +1543,13 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
         const LocalLightData source = LocalLights[index];
         const float3 delta = source.positionInverseRangeSquared.xyz - position;
         const float3 lightDirection = SafeDirection(delta);
+        if (mode == 5)
+        {
+            if (DebugLightMatches(index) && LocalFalloff(source, delta) > 0.0f &&
+                LocalAngular(source, normal, lightDirection) > 0.0f)
+                return LocalVisibility(source, position, normal, lightDirection, planeNormal).xxx;
+            continue;
+        }
         if (!DebugLightMatches(index) || source.type.y == 0 ||
             dot(delta, delta) * source.positionInverseRangeSquared.w >= 1.0f ||
             (source.type.x != 0 && dot(-lightDirection, source.directionOuterCos.xyz) < source.directionOuterCos.w))
@@ -1548,15 +1558,15 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
         uint layer;
         if (ProjectLocalShadow(source, position, normal, lightDirection, coords, layer) != LOCAL_VALID)
             continue;
-        if (ViewMode == 40 || ViewMode == 41)
+        if (mode == 40 || mode == 41)
         {
             const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
-            if (ViewMode == 40)
+            if (mode == 40)
                 return 0.15f + 0.85f * frac(float3(address.x + 1u, address.y + 1u, (address.w >> 8) + 1u) *
                     float3(0.618f, 0.381f, 0.173f));
             return (address.z / 1024.0f).xxx;
         }
-        if (ViewMode == 4)
+        if (mode == 4)
         {
             const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
             const float3 sampleCoords = float3(coords.xy, address.y);
@@ -1566,7 +1576,7 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
             const float linearDepth = nearDepth * farDepth / lerp(farDepth, nearDepth, depth);
             return saturate((linearDepth - nearDepth) / (farDepth - nearDepth)).xxx;
         }
-        if (ViewMode == 5)
+        if (mode == 44)
             return SampleLocalVisibility(coords, layer, LocalReceiverGradient(coords, planeNormal, layer)).xxx;
         return frac((layer + 1) * float3(0.618f, 0.381f, 0.173f));
     }
@@ -1867,10 +1877,10 @@ R"(float4 main(PSInput input, bool frontFace : SV_IsFrontFace) : SV_Target
     if (ViewMode == 3)
         return textured ? float4(0.1f, 0.1f, 0.1f, 1.0f)
                         : float4(0.9f, 0.1f, 0.1f, 1.0f);
-    if ((ViewMode >= 4 && ViewMode <= 6) || ViewMode == 40)
-        return float4(DebugLocalShadow(input.world, n, correctedPlaneNormal), 1.0f);
+    if ((ViewMode >= 4 && ViewMode <= 6) || ViewMode == 40 || ViewMode == 44)
+        return float4(DebugLocalShadow(input.world, n, correctedPlaneNormal, ViewMode), 1.0f);
     if (ViewMode == 41)
-        return DiagnosticLight.y != 0 ? float4(DebugLocalShadow(input.world, n, correctedPlaneNormal), 1.0f) :
+        return DiagnosticLight.y != 0 ? float4(DebugLocalShadow(input.world, n, correctedPlaneNormal, ViewMode), 1.0f) :
             float4((LightingFlags.w != 0u ? SunShadowResolution / 4096.0f : 0.0f).xxx, 1.0f);
     if (ViewMode == 42)
     {
@@ -2232,7 +2242,7 @@ uint32_t SceneViewMode()
         if (value == nullptr || value[0] == '\0')
             return 0u;
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return parsed <= 43ul ? static_cast<uint32_t>(parsed) : 0u;
+        return parsed <= 44ul ? static_cast<uint32_t>(parsed) : 0u;
     }();
     return mode;
 }
@@ -5098,10 +5108,21 @@ bool GameDx12StaticScene12::RecordNativeFrame(
     // неизменяемые пакеты и адрес загрузки уже защищённого fence слота.
     std::array<std::vector<gameaux12::DetailShadowDraw>, game_shadow12::MaxSunCascades> sunDetails;
     D3D12_GPU_VIRTUAL_ADDRESS detailShadowSrv = 0;
+    const bool logDetails = lighting.diagnosticBurst || lighting.frame == 1 || lighting.frame % 120 == 0;
+    if (stats.detailSunShadows && logDetails &&
+        (sunPlan.count == 0 || !validExtras || !detailSource || !m_sunShadowAuxPipeline))
+        Msg("ph_dx12_shadow_details: frame=%llu slot=%u requested=1 actual=off complete=0 retained=0 placements=0 instances=0 pending_slots=0 reason=%s",
+            static_cast<unsigned long long>(lighting.frame), frameSlot,
+            !sunPlan.count ? "no_cascade" : !validExtras ? "invalid_snapshot" :
+            !detailSource ? "no_detail_source" : "no_pipeline");
+    if (!stats.detailSunShadows && logDetails)
+        Msg("ph_dx12_shadow_details: frame=%llu slot=%u requested=0 actual=off complete=0 retained=0 placements=0 instances=0 pending_slots=0 reason=disabled",
+            static_cast<unsigned long long>(lighting.frame), frameSlot);
     if (sunPlan.count != 0 && validExtras && detailSource && stats.detailSunShadows && m_sunShadowAuxPipeline)
     {
         const char* detailStatus = "invalid_region";
         gameaux12::DetailShadowSnapshot candidate;
+        bool complete = false;
         std::vector<DirectX::XMFLOAT4X4> transforms;
         auto& upload = m_detailShadowUploads[frameSlot];
         try
@@ -5113,18 +5134,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
             if (valid)
             {
                 detailSource->CollectShadow(std::span(regions).first(sunPlan.count), kDetailShadowBudget, candidate);
-                if (candidate.complete)
-                {
-                    m_detailShadowSnapshot = std::move(candidate);
-                    detailStatus = "complete";
-                }
-                else if (candidate.generation != m_detailShadowSnapshot.generation)
-                {
-                    m_detailShadowSnapshot = {};
-                    detailStatus = "pending";
-                }
-                else
-                    detailStatus = m_detailShadowSnapshot.complete ? "retained" : "pending";
+                complete = candidate.complete;
+                detailStatus = complete ? "complete" : candidate.pendingSlots ? "pending" : "incomplete_source";
 
                 std::vector<uint32_t> meshes;
                 meshes.reserve(extras.details.size());
@@ -5134,7 +5145,8 @@ bool GameDx12StaticScene12::RecordNativeFrame(
                     meshes.push_back(mesh && !mesh->skinned && mesh->requiredBones == 1 ?
                         group.mesh : gameaux12::kInvalidMesh);
                 }
-                const auto& placements = m_detailShadowSnapshot.placements;
+                const auto placements = complete ? std::span<const gameaux12::DetailShadowPlacement>(candidate.placements) :
+                    std::span<const gameaux12::DetailShadowPlacement>();
                 const auto bounds = gameaux12::DetailShadowBounds(placements);
                 for (uint32_t i = 0; i < sunPlan.count && valid; ++i)
                 {
@@ -5165,12 +5177,13 @@ bool GameDx12StaticScene12::RecordNativeFrame(
         }
         if (!detailShadowSrv)
             sunDetails = {};
-        if (lighting.diagnosticBurst || lighting.frame % 120 == 0)
-            Msg("ph_dx12_shadow_details: frame=%llu slot=%u state=%s placements=%zu instances=%zu pending_slots=%zu "
+        if (logDetails)
+            Msg("ph_dx12_shadow_details: frame=%llu slot=%u requested=1 actual=%s complete=%d retained=%d reason=%s placements=%zu instances=%zu pending_slots=%zu "
                 "snapshot_generation=%llu upload_capacity_bytes=%llu",
-                static_cast<unsigned long long>(lighting.frame), frameSlot, detailStatus,
-                m_detailShadowSnapshot.placements.size(), detailShadowSrv ? transforms.size() : 0,
-                candidate.pendingSlots, static_cast<unsigned long long>(m_detailShadowSnapshot.generation),
+                static_cast<unsigned long long>(lighting.frame), frameSlot,
+                detailShadowSrv ? "complete" : "off", complete, 0, detailStatus,
+                candidate.placements.size(), detailShadowSrv ? transforms.size() : 0,
+                candidate.pendingSlots, static_cast<unsigned long long>(candidate.generation),
                 static_cast<unsigned long long>(upload.Capacity()));
     }
 
@@ -6148,7 +6161,6 @@ void GameDx12StaticScene12::ReleaseGpu()
     m_frameConstants.Reset();
     for (auto& upload : m_localLightUploads) upload.Reset();
     for (auto& upload : m_detailShadowUploads) upload.Reset();
-    m_detailShadowSnapshot = {};
     for (auto& upload : m_localProjectionUploads) upload.Reset();
     for (auto& upload : m_clusterGridUploads) upload.Reset();
     for (auto& upload : m_clusterIndexUploads) upload.Reset();
@@ -6218,7 +6230,6 @@ void GameDx12StaticScene12::QuarantineGpu() noexcept
     m_copyStaging.Detach();
     m_frameTransforms.Detach();
     for (auto& upload : m_detailShadowUploads) upload.Quarantine();
-    m_detailShadowSnapshot = {};
     m_frameTransformsMapped = nullptr;
     m_pipelineSkeletal.Detach();
     m_pipelineDetail.Detach();

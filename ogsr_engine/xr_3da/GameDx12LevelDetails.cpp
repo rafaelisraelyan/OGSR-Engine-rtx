@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "GameDx12LevelDetails.h"
+#include "GameDx12DetailShadowStreaming.h"
 
 #ifdef OGSR_ENABLE_EXPERIMENTAL_DX12_GAME_BRIDGE
 
@@ -492,30 +493,10 @@ void LevelDetails::CollectShadow(std::span<const DetailShadowRegion> regions,
         // Conservative accounting includes vector capacity and hash node overhead.
         const auto cost = [](const CachedSlot& slot)
         { return sizeof(CachedSlot) + 128u + slot.placements.capacity() * sizeof(Placement); };
-        std::erase_if(m_shadowCache, [&](const auto& entry)
-        {
-            if (std::binary_search(requested.begin(), requested.end(), entry.first)) return false;
-            m_shadowCachedBytes -= cost(entry.second); return true;
-        });
-        // При уменьшении бюджета не выдаём ранее накопленный сверх бюджета
-        // снимок как допустимый. Перезаполнение происходит постепенно.
-        if (m_shadowCachedBytes > budget.cacheBytes)
-        {
-            m_shadowCache.clear(); m_shadowCachedBytes = 0;
-        }
-        size_t decoded = 0;
         constexpr size_t transient = sizeof(CachedSlot) + 128u + 2u * kMaxPlacementsPerSlot * sizeof(Placement);
-        for (const uint32_t index : requested)
-        {
-            if (m_shadowCache.contains(index)) continue;
-            if (decoded >= budget.decodeSlots || m_shadowCachedBytes > budget.cacheBytes ||
-                transient > budget.cacheBytes - m_shadowCachedBytes) { ++out.pendingSlots; continue; }
-            auto slot = Decompress(index, settings);
-            const size_t bytes = cost(slot);
-            if (bytes > budget.cacheBytes - m_shadowCachedBytes) { ++out.pendingSlots; continue; }
-            m_shadowCache.emplace(index, std::move(slot));
-            m_shadowCachedBytes += bytes; ++decoded;
-        }
+        out.pendingSlots = UpdateDetailShadowCache(requested, budget.cacheBytes, budget.decodeSlots,
+            transient, m_shadowCache, m_shadowCachedBytes, cost,
+            [&](uint32_t index) { return Decompress(index, settings); });
         out.cachedBytes = m_shadowCachedBytes;
         if (out.pendingSlots) return;
         size_t count = 0;

@@ -454,7 +454,6 @@ private:
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_clusterGridUploads, m_clusterIndexUploads;
     ComPtr<ID3D12Resource> m_frameTransforms;
     std::array<game_shadow12::FrameStructuredUpload, GameDx12NativeFrame12::kFrameCount> m_detailShadowUploads;
-    gameaux12::DetailShadowSnapshot m_detailShadowSnapshot;
     // Держим staging даже при раннем выходе из загрузки с неизвестным fence.
     ComPtr<ID3D12Resource> m_copyStaging;
     void* m_frameConstantsMapped = nullptr;

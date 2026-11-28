@@ -1231,7 +1231,7 @@ struct DepthPacketPipeline
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
 
-    explicit DepthPacketPipeline(ID3D12Device& device, bool minimumDepth = false)
+    explicit DepthPacketPipeline(ID3D12Device& device, bool minimumDepth = false, bool animated = false)
     {
         auto vertex = Compile(R"(
 cbuffer Packet : register(b0) { float Depth; }
@@ -1239,12 +1239,30 @@ float4 main(uint id : SV_VertexID) : SV_Position {
     float2 vertices[3] = {float2(-1,-1), float2(-1,3), float2(3,-1)};
     return float4(vertices[id], Depth, 1);
 })", "main", "vs_5_0");
+        if (animated)
+        {
+            const std::string source = std::string(kFrameShaderConstants) + kAuxVertexShader + R"(
+float4 poseProbe(uint id : SV_VertexID) : SV_Position
+{
+    const float2 corner = id == 0 ? float2(-1,-1) : id == 1 ? float2(-1,3) : float2(3,-1);
+    float3 p, n;
+    SkinVertex(float3(corner,0), float3(0,1,0), uint4(0,1,0,0), float4(.5,.5,0,0), 0, p, n);
+    return float4(p, 1);
+}
+)";
+            vertex = Compile(source.c_str(), "poseProbe", "vs_5_0");
+        }
         D3D12_ROOT_PARAMETER parameter{};
-        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        parameter.Constants.Num32BitValues = 1;
+        parameter.ParameterType = animated ? D3D12_ROOT_PARAMETER_TYPE_SRV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        if (animated) parameter.Descriptor.ShaderRegister = 1;
+        else parameter.Constants.Num32BitValues = 1;
+        D3D12_ROOT_PARAMETER matrixBase{};
+        matrixBase.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        matrixBase.Constants = {3, 0, 1};
+        const D3D12_ROOT_PARAMETER parameters[] = {parameter, matrixBase};
         D3D12_ROOT_SIGNATURE_DESC signature{};
-        signature.NumParameters = 1;
-        signature.pParameters = &parameter;
+        signature.NumParameters = animated ? 2 : 1;
+        signature.pParameters = parameters;
         ComPtr<ID3DBlob> blob;
         Require(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
             "serialize depth packet signature");
@@ -1705,6 +1723,8 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
     Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "cache descriptors");
     AdaptiveShadowRuntime runtime;
     Frame frame;
+    DepthPacketPipeline animatedDepth(device, true, true);
+    std::array<FrameStructuredUpload, Frame::kFrameCount> poseUploads;
     Require(frame.Initialize(window, factory, owner), "cache frame");
     std::array<bool, Frame::kFrameCount> used{};
     std::array<bool, Frame::kFrameCount> written{};
@@ -1751,6 +1771,19 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
         if (phase >= 5) views[0].known = false;
         const float depths[count] = {phase < 2 ? .25f : phase == 2 ? .75f :
             phase == 3 ? .25f : phase == 4 ? .75f : .25f, .75f};
+        std::array<DirectX::XMFLOAT4X4, count * 2> poses{};
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            for (uint32_t bone = 0; bone < 2; ++bone)
+            {
+                auto& matrix = poses[i * 2 + bone];
+                matrix._11 = matrix._22 = matrix._33 = matrix._44 = 1.0f;
+                matrix._43 = depths[i] + (bone == 0 ? -.125f : .125f);
+            }
+            views[i].casters[0].transform = {std::bit_cast<uint32_t>(poses[i * 2]._43),
+                std::bit_cast<uint32_t>(poses[i * 2 + 1]._43)};
+        }
+        Require(poseUploads[slot].Write(device, std::span<const DirectX::XMFLOAT4X4>(poses)), "animated shadow pose upload");
         const auto stage = [&]()
         {
             ShadowAddressPlan addresses; ShadowDescriptors::Binding binding;
@@ -1830,7 +1863,11 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
             if (depths[local] < .75f)
             {
                 stamp(Frame::ShadowPhase::Dynamic, false);
-                draw(depths[local]);
+                list.SetPipelineState(animatedDepth.pipeline.Get());
+                list.SetGraphicsRootSignature(animatedDepth.root.Get());
+                list.SetGraphicsRootShaderResourceView(0, poseUploads[slot].Address());
+                list.SetGraphicsRoot32BitConstant(1, local * 2, 0);
+                list.DrawInstanced(3, 1, 0, 0);
                 stamp(Frame::ShadowPhase::Dynamic, true);
             }
             return S_OK;
@@ -1921,7 +1958,10 @@ float4 edgeProbe(float4 pixel : SV_Position) : SV_Target
 {
 #if defined(OGSR_F43_POINT_PROBE)
     const float2 edge = (pixel.xy - 24.0f) * 0.003f + 1.0f;
-    return float4(LocalVisibility(LocalLights[0], float3(edge * 4.0f, 4.0f), 0, 0, 0).xxx, 1);
+    const float3 position = float3(edge * 4.0f, 4.0f);
+    const float3 normal = SafeDirection(-position);
+    const float visibility = LocalVisibility(LocalLights[0], position, normal, normal, 0);
+    return float4(visibility, DebugLocalShadow(position, normal, 0, 5).x, 0, 1);
 #else
     const float x = 0.75f + (pixel.x - 27.0f) * 0.003f;
     const float3 position = float3(x * 4.0f, 0, 4.0f);
@@ -2490,7 +2530,9 @@ int main(int argc, char** argv)
                         };
                         const float wx = weight(ax), wy = weight(ay), wz = weight(1.f);
                         const float expected = 255.f * wx / (wx + wy + wz);
-                        const unsigned actual = result[y * 48 + x] & 255u;
+                        const auto pixel = result[y * 48 + x];
+                        const unsigned actual = pixel & 255u;
+                        Check(actual == ((pixel >> 8) & 255u), "final diagnostic visibility equals production");
                         if (std::abs(static_cast<float>(actual) - expected) > 1.1f && ++mismatch <= 8)
                             std::printf("point mismatch size=%u x=%u y=%u actual=%u expected=%.3f\n",
                                 size, x, y, actual, expected);

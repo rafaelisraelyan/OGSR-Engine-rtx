@@ -38,6 +38,7 @@ param(
     [switch]$LegacyWaterSSR,
     [switch]$LegacyFloraBounds,
     [switch]$DetailSunShadows,
+    [switch]$DetailShadowValidation,
     [switch]$NoHemi,
     [switch]$NoTerrainDetail,
     [switch]$NoShadows,
@@ -77,7 +78,7 @@ param(
         'Ambient','SunDirect','LocalTotal','GeometricNormals','HDRClip',
         'SunShadowUV','SunReceiverDepth','SunStoredDepth','SunBias','SunSlope','SunPCFWeights','SunShadowTexelGrid',
         'CascadeIndex','CascadeCoverage','CascadeBlend','CascadeTexelSize','CascadeDepth','ShadowCasterCount','SunShadowVisibility',
-        'BakedHemi','PhysicalShadowAddress','ActualShadowResolution','MaterialClass','SunDiffuse')]
+        'BakedHemi','PhysicalShadowAddress','ActualShadowResolution','MaterialClass','SunDiffuse','PrimaryFaceVisibility')]
     [string]$View = 'Default'
 )
 
@@ -102,6 +103,11 @@ if ($PerformanceMode) {
     $CommandLists = 'parallel'
     $AdaptiveShadowBudgetBytes = 512MB
     $AdaptiveShadowReserveBytes = 1GB
+}
+if ($DetailShadowValidation) {
+    if ($R4 -or $NoShadows -or $NoSunShadows) { throw 'DetailShadowValidation требует native DX12 и солнечные тени.' }
+    $DetailSunShadows = $true
+    $Metrics = $true
 }
 if ($NoShadowCache) { $ShadowCache = $false; $StaticShadowCache = $false }
 if ($NoClusteredLighting) { $ClusteredLighting = $false }
@@ -262,7 +268,7 @@ $views = @{
     SunShadowUV = 26; SunReceiverDepth = 27; SunStoredDepth = 28; SunBias = 29; SunSlope = 30
     SunPCFWeights = 31; SunShadowTexelGrid = 32; CascadeIndex = 33; CascadeCoverage = 34
     CascadeBlend = 35; CascadeTexelSize = 36; CascadeDepth = 37; ShadowCasterCount = 38; SunShadowVisibility = 19
-    BakedHemi = 39; PhysicalShadowAddress = 40; ActualShadowResolution = 41; MaterialClass = 42; SunDiffuse = 43
+    BakedHemi = 39; PhysicalShadowAddress = 40; ActualShadowResolution = 41; MaterialClass = 42; SunDiffuse = 43; PrimaryFaceVisibility = 44
 }
 $start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
