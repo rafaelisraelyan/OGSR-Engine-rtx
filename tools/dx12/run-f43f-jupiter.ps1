@@ -24,8 +24,12 @@ param(
     [ValidateRange(1,4)][uint32]$SunCascades,
     [ValidateSet(1024,2048,4096)][uint32]$SunShadowResolution,
     [ValidateRange(10,1000)][uint32]$SunShadowDistance,
-    [ValidateSet('Auto','Point','Bilinear','Legacy','ReceiverPlane','PCF3','PCF5','FR3','PCF7')]
+    [ValidateSet('Auto','LegacyAuto','Point','Bilinear','Legacy','ReceiverPlane','PCF3','PCF5','FR3','PCF7',
+        'Subtexel3','Subtexel5','Subtexel7')]
     [string]$SunShadowFilter = 'Auto',
+    [ValidateSet('Performance','Balanced','Quality')][string]$SunFilterQuality,
+    [ValidateSet('Auto','Legacy','Subtexel3','Subtexel5','Subtexel7')][string]$LocalShadowFilter = 'Auto',
+    [ValidateSet('Performance','Balanced','Quality')][string]$LocalFilterQuality,
     [switch]$NoSunNormalBias,
     [switch]$NoSunConstantBias,
     [switch]$NoSunRasterBias,
@@ -46,9 +50,12 @@ param(
     [ValidateSet('A','B','C','D','E','F')][string]$PerformanceMode,
     [switch]$ShadowCache,
     [switch]$StaticShadowCache,
+    [switch]$NoShadowCache,
     [switch]$ShadowBatching,
     [switch]$ShadowCasterPreparation,
     [switch]$ClusteredLighting,
+    [switch]$NoClusteredLighting,
+    [switch]$ShadowPhaseTiming,
     [uint64]$MetricsStart = 1,
     [uint64]$MetricsCount = 480,
     [uint64]$MetricsStride = 1,
@@ -69,7 +76,8 @@ param(
         'LocalRaw','LocalProbe','LightIndex','WorldPosition','ShadowFailureReason','SunVisibility','SunDepthDelta',
         'Ambient','SunDirect','LocalTotal','GeometricNormals','HDRClip',
         'SunShadowUV','SunReceiverDepth','SunStoredDepth','SunBias','SunSlope','SunPCFWeights','SunShadowTexelGrid',
-        'CascadeIndex','CascadeCoverage','CascadeBlend','CascadeTexelSize','CascadeDepth','ShadowCasterCount','SunShadowVisibility')]
+        'CascadeIndex','CascadeCoverage','CascadeBlend','CascadeTexelSize','CascadeDepth','ShadowCasterCount','SunShadowVisibility',
+        'BakedHemi','PhysicalShadowAddress','ActualShadowResolution','MaterialClass','SunDiffuse')]
     [string]$View = 'Default'
 )
 
@@ -95,6 +103,18 @@ if ($PerformanceMode) {
     $AdaptiveShadowBudgetBytes = 512MB
     $AdaptiveShadowReserveBytes = 1GB
 }
+if ($NoShadowCache) { $ShadowCache = $false; $StaticShadowCache = $false }
+if ($NoClusteredLighting) { $ClusteredLighting = $false }
+if ($ShadowPhaseTiming) { $Metrics = $true }
+$filterTiers = @{ Performance = 'Subtexel3'; Balanced = 'Subtexel5'; Quality = 'Subtexel7' }
+if ($SunFilterQuality) {
+    if ($SunShadowFilter -ne 'Auto') { throw 'Выберите один способ задать солнечный фильтр.' }
+    $SunShadowFilter = $filterTiers[$SunFilterQuality]
+}
+if ($LocalFilterQuality) {
+    if ($LocalShadowFilter -ne 'Auto') { throw 'Выберите один способ задать локальный фильтр.' }
+    $LocalShadowFilter = $filterTiers[$LocalFilterQuality]
+}
 if ($StaticShadowCache -and !$ShadowCache) { throw 'Для StaticShadowCache нужен ShadowCache.' }
 if ($AdaptiveShadows -and ($R4 -or $NoShadows -or $NoLocalShadows -or $NoLocalLights)) {
     throw 'AdaptiveShadows требует native DX12 с включёнными локальными тенями.'
@@ -102,6 +122,7 @@ if ($AdaptiveShadows -and ($R4 -or $NoShadows -or $NoLocalShadows -or $NoLocalLi
 if ($LegacySunPCF -and $SunShadowFilter -notin @('Auto','Legacy')) {
     throw 'Для -LegacySunPCF выберите Auto или Legacy.'
 }
+if ($LegacySunPCF) { $SunShadowFilter = 'Legacy' }
 if ($FixedLightIds -and $FreezeLightRecord) { throw 'Выберите один режим фиксации света.' }
 if (($FixedLightIds -or $FreezeLightRecord) -and $NoLocalLights) { throw 'Для фиксации света требуется включённый local lighting.' }
 if (($FreezeLightRecord -or $View -in @('LocalProbe','LightIndex','ShadowFailureReason')) -and $LightId -eq 0) {
@@ -188,6 +209,8 @@ $features = @{
     SUN_RESOLUTION = $SunShadowResolution
     SUN_DISTANCE = $SunShadowDistance
     SUN_FILTER = $SunShadowFilter.ToLowerInvariant()
+    LOCAL_FILTER = $LocalShadowFilter.ToLowerInvariant()
+    SHADOW_PHASE_TIMING = [int]$ShadowPhaseTiming.IsPresent
     SUN_BIAS_MASK = 15 - [int]$NoSunNormalBias.IsPresent - 2 * [int]$NoSunConstantBias.IsPresent - 4 * [int]$NoSunRasterBias.IsPresent - 8 * [int]$NoSunSlopeBias.IsPresent
     TRANSPARENCY = [int](-not $NoTransparency)
     LIT_DECALS = [int](-not $NoLitDecals)
@@ -239,6 +262,7 @@ $views = @{
     SunShadowUV = 26; SunReceiverDepth = 27; SunStoredDepth = 28; SunBias = 29; SunSlope = 30
     SunPCFWeights = 31; SunShadowTexelGrid = 32; CascadeIndex = 33; CascadeCoverage = 34
     CascadeBlend = 35; CascadeTexelSize = 36; CascadeDepth = 37; ShadowCasterCount = 38; SunShadowVisibility = 19
+    BakedHemi = 39; PhysicalShadowAddress = 40; ActualShadowResolution = 41; MaterialClass = 42; SunDiffuse = 43
 }
 $start.EnvironmentVariables['OGSR_DX12_GAME_SCENE_VIEW'] = [string]$views[$View]
 $start.EnvironmentVariables.Remove('OGSR_DX12_GAME_TRACE_LIGHT_ID')
@@ -359,7 +383,7 @@ try {
         $engine.ExitCode | Set-Content -LiteralPath (Join-Path $run.FullName 'engine.exit')
         $logs = @(Get-ChildItem -LiteralPath (Join-Path $isolatedAppData 'logs') -Filter '*.log' -File -ErrorAction SilentlyContinue)
         if ($logs.Count) {
-            Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight):' |
+            Select-String -LiteralPath $logs.FullName -Pattern 'ph_dx12_(perf_modes|shadow_preflight|shadow_assignment|shadow_membership|shadow_details):' |
                 ForEach-Object Line | Set-Content -LiteralPath (Join-Path $run.FullName 'actual-modes.log')
             $rows = @(Select-String -LiteralPath $logs.FullName -SimpleMatch 'ph_dx12_perf_detail:' | ForEach-Object {
                 $fields = [ordered]@{}
@@ -370,6 +394,22 @@ try {
             })
             if ($rows.Count) {
                 $rows | Export-Csv -LiteralPath (Join-Path $run.FullName 'performance.csv') -NoTypeInformation -Encoding UTF8
+                $culture = [Globalization.CultureInfo]::InvariantCulture
+                $frameTimes = @($rows | ForEach-Object {
+                    $value = [double]::Parse($_.frame_ms, $culture)
+                    if ($value -gt 0 -and ![double]::IsInfinity($value)) { $value }
+                } | Sort-Object)
+                if ($frameTimes.Count) {
+                    $p50 = [int][Math]::Ceiling(0.50 * $frameTimes.Count) - 1
+                    $p95 = [int][Math]::Ceiling(0.95 * $frameTimes.Count) - 1
+                    [ordered]@{
+                        Samples = $frameTimes.Count
+                        FrameP50Ms = $frameTimes[$p50]
+                        FrameP95Ms = $frameTimes[$p95]
+                        PercentileMethod = 'nearest rank'
+                        Scope = 'Эта сессия. Межсессионное сравнение требует совпадающих интервалов.'
+                    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run.FullName 'performance-summary.json') -Encoding UTF8
+                }
             }
         }
         Write-Host $run.FullName
