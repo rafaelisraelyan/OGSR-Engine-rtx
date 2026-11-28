@@ -116,3 +116,54 @@ $common = @{
 - Q7. При metrics записываются имя цикла погоды, время среды в секундах и параметры солнца. Для GPU используются теги завершившегося present, включая `gpu_weather` и `gpu_time_of_day_s`. Имя цикла не описывает весь переход погоды. PERF-01/02/03 ждут аппаратного профилирования.
 
 Reference F использует прежний подтверждённый EXE. Артефакты closure находятся рядом с checkout в `runs/closure-release`, проверка пакета и точные SHA приведены в манифесте closure. Публикация подготовлена локально. Игра не запускалась.
+
+## F4.3-Q-R1 · исправления независимого ревью
+
+Исходный срез сборки — `1d63f7246d00c5b064d960b6d7009c721e3b7352`. База сравнения — `965b323e71d87883a4f49c5689c29232365ffcfd`. Общая визуальная приёмка остаётся **PARTIAL**.
+
+### Q-Balanced и режим detail shadows
+
+- **CR-Q01 / #46.** Бюджет resident, резерв декодирования и пик placement storage учитываются раздельно. До декодирования освобождается место под transient. После переноса нового объекта в кеш проверяется resident. Запрос 10×1 при resident 10, transient 4, peak 14 и decode 256 дал ровно 10 декодирований за четыре вызова, без pending. При peak 12 девять слотов готовы, десятый имеет явный отказ. Повышение peak возвращает полное покрытие.
+- **CR-Q02 / CR-Q05 / #46.** Уникальные slot IDs и маска каскадов формируются до проверки рабочего бюджета. Покрытие каждого каскада проверяется по обязательным слотам текущего поколения. Два слота запаса используются для prefetch и удержания. Очерёдность отдаёт приоритет обязательным слотам. При сравнении двух областей CPU подтвердил сохранение готового каскада, 4 pending в соседнем после перемещения и полное покрытие на следующем шаге. Каскад с недостающими слотами исключается из detail pass до готовности.
+- **CR-Q03 / CR-Q04 / #46.** Color и shadow используют одну геометрию placement, масштаб, fade и SSA при одинаковой позиции камеры. Участие в тенях определяется по frustum каскада, в том числе за пределами видимой области камеры. Отдельные стадии подтверждают покрытие, готовность mesh и материала, подготовку пакетов, загрузку, запись и отправку. Отсутствующий выбранный mesh отклоняет каскад. Лог `ph_dx12_shadow_detail_submit` после успешного Present показывает маску фактически отправленных caster packets и отдельную маску доказанно пустых каскадов.
+- **CR-Q06 / #46.** При совпадении настроек оба прохода переиспользуют данные уже декодированного слота. Кеши пока хранят отдельные копии, а CForm queries остаются на потоке владельца. Пик CDB и выделения контейнеров не измерены. Ограничение бюджета относится к оценке placement storage. Исчезновение части теней всё ещё возможно при неполном каскаде, отказе бюджета или неполных GPU-пакетах. **Q-Details остаётся PARTIAL и экспериментальным opt-in.**
+- **#47.** Один сценарий WARP сравнил cache-off, SC1 и SC2 в двух слотах при смене позы, выходе кастера из light frustum, сокращении бюджета до нуля и восстановлении с новыми page IDs. Сценарий использует production `SkinVertex`, упаковку битов позы, culling по сфере, D32 readback и production `SampleLocalVisibility`. Получено по 26 сопоставленных значений, по два SC1 hit, четыре SC2 hit при активном SC2. Сфера вычисляется из синтетической геометрии и двух матриц позы. Игровой producer animated bounds реальных NPC и визуальные скачки требуют игровой проверки.
+- **#48.** Timestamp и политики Adaptive, SC1/SC2, Clustered Lighting сохранены. PERF-01/02/03 остаются открыты до аппаратного профилирования. В ручном A/B сопоставляйте реальное положение камеры, погоду, освещение и время суток. Выводы о времени кадра на RTX по WARP не делаются.
+
+CPU PASS — streaming, unique coverage, независимый переход областей, ошибка GPU mesh, geometry policy, membership и SC1. WARP PASS с Debug Layer + GBV — `animated-adaptive-cache` и `detail-casters`, без validation warnings в этих запусках. Последний сценарий проверил 624 кастера, оба слота, production VS и D32, инвариантность перестановки и мутацию пропущенного кастера. Изменения не затронули общие интерфейсы feature-off, поэтому отдельная DX11-сборка в R1 не требовалась.
+
+Terra A работала над streaming и placement cache, Terra B над геометрией и GPU coverage, Terra C независимо проверила два зафиксированных source SHA. Для R1 повторно использованы агентские роли этапа F4.3-Q, настроенные на Terra 6.1 High. Повторное обращение не раскрывает новый идентификатор исполнения модели. Замечания ревью о девятом слоте и раздельном учёте пустых каскадов исправлены в `1d63f7246`.
+
+### Ручная проверка R1
+
+Два основных запуска используют сохранение Jupiter и один маршрут. Выполнять команды из checkout F4.3-Q. `-Preflight` проверяет входы без запуска. Для игрового прогона владелец повторяет соответствующую команду без `-Preflight` и завершает сессию штатным выходом.
+
+```powershell
+$reference = Join-Path $env:USERPROFILE '.codex\worktrees\f43-performance-evolution\OGSR ENGINE fork from rtx\bin_x64\xrEngine.exe'
+$candidate = (Resolve-Path '..\runs\r1-20261128\release-reviewed\bin\xrEngine.exe').Path
+$runRoot = (Resolve-Path '..\runs').Path
+# При необходимости создайте свободный SUBST S: для сокращения пути сеанса.
+subst S: $runRoot
+$common = @{
+    GameRoot = 'D:\OGSR_F4B1B5_Round2_Runtime'
+    RunDirectory = 'S:\jupiter-quality-r1'
+    PerformanceMode = 'F'
+    MetricsStart = 1
+    MetricsCount = 0
+    MetricsStride = 8
+}
+.\tools\dx12\run-f43f-jupiter.ps1 @common -Exe $reference -Preflight
+.\tools\dx12\run-f43f-jupiter.ps1 @common -Exe $candidate -SunFilterQuality Balanced -LocalFilterQuality Balanced -Preflight
+```
+
+Reference F использует исходный EXE Performance Evolution `0e62b8f73e0306e22e5dc01e02f999ad57804a75`, SHA-256 `AD37789E9C32BD9BE3C334196805C562291D7E585A64801F515485D7410ECA1C`. Q-Balanced включает PCF5 для солнца и локальных теней при всех оптимизациях F. У Q-Balanced detail shadows выключены. Q-Details использует тот же набор с `-DetailShadowValidation`; запуск остаётся диагностическим до подтверждения бюджета памяти и стабильности покрытия. `actual-modes.log` сохраняет requested/actual и раздельные сообщения о покрытии, pending/denied, GPU readiness и submit. Игра при подготовке кандидата не запускалась.
+
+
+### Сборка и доказательства R1
+
+**Q-Balanced — READY FOR MANUAL HARDWARE VALIDATION.** Native Release x64 и оба Jupiter preflight прошли. Adaptive включён. В обычном ручном A/B Debug Layer и GBV выключены. Профиль, сохранение и `fsgame.ltx` сохранили исходные SHA-256.
+
+- `xrEngine.exe` SHA-256 `366A4FE2A1BCFFC66445DD58A14A1B223D81F24F60E65881CD2948E1D74CEE0B`
+- `xrEngine.pdb` SHA-256 `D00FB0E536A57116D5CBE4D3DC53D1F94F26D71D2B258802E8F06733D6E2D6C1`
+- Локальный пакет `f43-quality-r1-evidence.zip` содержит source diff, независимое ревью, CPU/WARP и build logs, preflight, checksum manifest и точные Git SHA. EXE/PDB хранятся рядом в `release-reviewed/bin`.
+- Визуальные статусы #41 и #46–48 остаются открыты.
