@@ -167,3 +167,30 @@ Reference F использует исходный EXE Performance Evolution `0e6
 - `xrEngine.pdb` SHA-256 `D00FB0E536A57116D5CBE4D3DC53D1F94F26D71D2B258802E8F06733D6E2D6C1`
 - Локальный пакет `f43-quality-r1-evidence.zip` содержит source diff, независимое ревью, CPU/WARP и build logs, preflight, checksum manifest и точные Git SHA. EXE/PDB хранятся рядом в `release-reviewed/bin`.
 - Визуальные статусы #41 и #46–48 остаются открыты.
+
+## F4.3-Q-R2 · восстановление инициализации production PSO
+
+Ручной прогон Q-Balanced R1 — **Runtime FAIL**. Полноценная статика Jupiter остановилась в первом CreateGraphicsPipelineState. Следом рендерился демонстрационный M2.3. В журнале все 391 выборки имели `shadow_mode=disabled`. Эти данные исключены из сравнения производительности.
+
+Standalone стенд воспроизвёл отказ на RTX 5070 Laptop с драйвером 621.24 на точных VS/PS main, Root Signature, input layouts и PSO исходного среза. HRESULT — `0x8007000E` (E_OUTOFMEMORY). GetDeviceRemovedReason вернул `S_OK`, InfoQueue была пуста. Матрица изолировала отказ до полного PS с непрерывной локальной фильтрацией. В исходной сборке он воспроизводился и при Legacy sun. Исходный игровой лог потерял HRESULT, поэтому код получен из аппаратного воспроизведения той же конфигурации.
+
+Production PS читает радиус из frame CB, сохраняя выбранные PCF3/5/7 и receiver-plane correction. В полном pixel main сведены повторявшиеся вызовы LocalLighting в один, с прежними аргументами режимов диагностики и основного освещения. Контроль с одним изменением радиуса прошёл PCF5/PCF5, а Legacy sun с непрерывным локальным фильтром всё ещё возвращал тот же HRESULT. После объединения вызовов прошла вся матрица. Это локализует отказ до формы полного DXBC блока локального освещения с FXC inlining и специализацией. В PCF5/PCF5 DXBC уменьшился со 187 920 до 147 940 байт, а счётчик инструкций FXC — с 7309 до 5656. Контроль с общим вызовом и восстановленной константой также прошёл PCF5/PCF5 и Legacy/PCF5. Внутренний механизм отказа драйвера по имеющимся данным неизвестен.
+
+Ошибки production PSO сохраняют HRESULT, идентификатор PSO, хэши сериализованной Root Signature и DXBC, профили, макросы, reflection ресурсов и сигнатур, LUID, Vendor/Device, версию драйвера, capabilities и InfoQueue при доступности. При отказе полной native сцены владелец сохраняет прежний путь освобождения ресурсов и останавливает запись кадров. M2.3 доступен через явный `OGSR_DX12_GAME_M23=1`. Jupiter launcher выставляет отдельный FAIL при ошибке полной сцены или отсутствии подтверждения фактического shadow mode прогона A–F.
+
+- **Hardware PSO и draw/readback PASS.** Двадцать production PSO на каждый из семи наборов sun/local — Legacy/Legacy, PCF3/Legacy, Legacy/PCF3, PCF5/Legacy, Legacy/PCF5, PCF5/PCF5, PCF7/PCF7. На RTX с Debug Layer при полном SM5.1 page-table path прочитан пиксель RGBA 221/221/226/255 для каждого набора. Сообщений InfoQueue не было в итоговом прогоне.
+- **WARP sampling PASS.** `continuous-2` подтвердил численные значения солнечного и локального PCF5. `clustered-lighting-continuous` подтвердил receiver-plane correction и Clustered Lighting parity. Обе проверки Debug Layer + GBV.
+- **Launcher regression PASS.** Функция вердикта приняла журнал Reference F и отклонила журнал сбоя R1 и пустой ввод.
+- Независимый анализ Terra 6.1 High проверил подозреваемые несовместимости Root Signature и HLSL, а после аппаратного воспроизведения подтвердил эквивалентность радиуса из frame CB.
+
+При изменениях production HLSL или Root Signature аппаратный PSO и draw/readback — обязательный гейт до передачи релизного кандидата владельцу. Из checkout запустить `tools/dx12/test-f43-production-pso.ps1 -OutputDirectory <новый-каталог>` на RTX 5070 Laptop с установленным Debug Layer. Гейт требует семь PASS и сохраняет логи по конфигурациям. Численный WARP-гейт проходит отдельно.
+
+Игровая проверка R2 остаётся за владельцем. Для следующего сеанса использовать R2 EXE с прежним Jupiter launcher профилем Q-Balanced, обоими фильтрами Balanced и DetailShadowValidation выключенным. Reference F уже измерен.
+
+[Трекер #41](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/41) · [P0 #49](https://github.com/rafaelisraelyan/OGSR-Engine-rtx/issues/49)
+
+
+Native Release x64 и Q-Balanced Jupiter preflight **PASS**. Исходный SHA сборки — `c1dbb4782fc96f0ae9b24adfbe4e18aa1dc769f1`.
+
+- SHA-256 `xrEngine.exe` — `E2F4BEFB665563EEFA9A9C896B0486229AD5952DD56FE65078A334977270A4DC`
+- SHA-256 `xrEngine.pdb` — `3FC38E98A34C87EBB43D19F5E2265B91FA031C0314587DF7CB6B3AA1C862C629`
