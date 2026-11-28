@@ -10,6 +10,8 @@
 #include "GameDx12AdaptiveShadowRuntime.h"
 #include "GameDx12FrameStructuredUpload.h"
 #include "GameDx12ShadowAddress.h"
+#include "GameDx12ShadowFilter.h"
+#include "GameDx12DetailShadowDraws.h"
 #include "gr/jobs/JobGroup.h"
 #include "gr/jobs/JobSystem.h"
 
@@ -49,6 +51,10 @@ void Check(bool ok, const char* operation)
         throw std::runtime_error(operation);
 }
 
+static bool continuousOnly = false;
+static uint32_t forcedRadius = 0;
+static bool continuousBanked = false;
+static bool legacyDiagnostic = false;
 enum class Mutation { None, ForceSunZero, SwapSun, ReverseCompare, WrongNext, DisableBlend, WrongLocal };
 const char* MutationName(Mutation m)
 {
@@ -159,6 +165,7 @@ void VerifyFrameAbi(ID3DBlob& bytecode)
     CHECK_FRAME_FIELD(ClusterTiles, clusterTiles);
     CHECK_FRAME_FIELD(ClusterGrid, clusterGrid);
     CHECK_FRAME_FIELD(ClusterDepth, clusterDepth);
+    CHECK_FRAME_FIELD(LocalFilterRadius, localFilterRadius);
 #undef CHECK_FRAME_FIELD
     D3D12_SHADER_INPUT_BIND_DESC binding{};
     Require(reflection->GetResourceBindingDescByName("LocalLights",&binding),"reflect local light SRV");
@@ -223,18 +230,23 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
     }
     if (y == 4)
     {
-        const float3 points[8] = {
-            float3(.46875,.0625,.5), float3(.53125,.0625,.640625),
-            float3(.46875,.265625,.5), float3(.53125,.3125,.5),
-            float3(.03125,.1875,.5), float3(.96875,.1875,.5),
-            float3(.4375,.4375,.5), float3(.5625,.6875,.5)
-        };
         if (x >= 8) return float4(0,0,0,1);
-        // Explicit fixture-only probes beyond the legacy CB array limits.
+        // Не используем динамический индекс локального HLSL-массива:
+        // FXC/WARP при двух ветвях фильтра менял значения этих probes.
+        float3 probeCoords = float3(.5625,.6875,.5);
+        if (x == 0) probeCoords = float3(.46875,.0625,.5);
+        if (x == 1) probeCoords = float3(.53125,.0625,.640625);
+        if (x == 2) probeCoords = float3(.46875,.265625,.5);
+        if (x == 3) probeCoords = float3(.53125,.3125,.5);
+        if (x == 4) probeCoords = float3(.03125,.1875,.5);
+        if (x == 5) probeCoords = float3(.96875,.1875,.5);
+        if (x == 6) probeCoords = float3(.4375,.4375,.5);
+        // Фикстура дополнительно разместила запись 31 за пределами числа
+        // активных карт. Читаем её напрямую для проверки stride t14.
         const float structured = x == 0 ? LocalLights[32].colorInnerCos.w :
-            x == 1 ? ProjectLocalMatrix(float4(1,2,3,1),31).x : 0.0f;
-        return float4(SunFilterVisibility(points[x],float3(0,0,1),0),
-                      SunFilterVisibility(points[x],float3(.25,0,1),0),structured,1);
+            x == 1 ? dot(float4(1,2,3,1), LocalShadowMatrices[31].column0) : 0.0f;
+        return float4(SunFilterVisibility(probeCoords,float3(0,0,1),0),
+                      SunFilterVisibility(probeCoords,float3(.25,0,1),0),structured,1);
     }
     if (x >= count && x < count + LightingFlags.z)
     {
@@ -245,6 +257,15 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         float threshold = .03125 * (physical + 1);
         if (y == 6)
             return float4(SampleLocalVisibility(float3(.25,.25,threshold), layer, float2(-.125,.0625)),0,0,1);
+        if (y == 7 || y == 8)
+        {
+            if (LocalFilterRadius == 0) return float4(0,0,0,1);
+            const float2 uv = y == 7 ? float2(.37,.29) : float2(.015,.985);
+            const float2 gradient = float2(-.125,.0625);
+            return float4(SampleLocalVisibility(float3(uv,threshold),layer,gradient),
+                SampleLocalVisibility(float3(uv,threshold+.04),layer,gradient),
+                SampleLocalVisibility(float3(uv,threshold),layer,0.0f),1);
+        }
         return float4(stored,SampleLocalVisibility(float3(.25,.25,threshold),layer,0.0f),
             SampleLocalVisibility(float3(.25,.25,threshold+.015625),layer,0.0f),1);
     }
@@ -296,6 +317,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
             Mutate(pixel,mutation);
         if (banked)
             pixel.insert(0, "#define OGSR_DX12_SHADOW_PAGE_TABLE 1\n");
+        pixel.insert(0, "#define OGSR_DX12_CONTINUOUS_SUN " + std::to_string(forcedRadius) +
+                "\n#define OGSR_DX12_CONTINUOUS_LOCAL " + std::to_string(forcedRadius) + "\n");
         const auto vs = Compile(vertex, "vs", "vs_5_0");
         const auto ps = Compile(pixel.c_str(), "probe", sm51 ? "ps_5_1" : "ps_5_0",
             sm51 ? D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES : 0);
@@ -470,6 +493,7 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         frame.sunCameraForward = {1, 0, 0, 1};
         frame.sunShadowResolution = 8;
         frame.sunFilter = filter;
+        frame.localFilterRadius = filter >= 9 && filter <= 11 ? filter - 8 : 0;
         for (uint32_t i = 0; i < sunSlices; ++i)
         {
             auto& matrix = frame.sunShadowViewProjection[i];
@@ -504,8 +528,8 @@ float4 probe(float4 pixel : SV_Position) : SV_Target
         if (banked51)
             list.SetGraphicsRootShaderResourceView(5, projections.Address());
         const uint32_t width = (std::max)(sunSlices + localSlices + 1, ref::ProbeCount);
-        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 6, 0, 1};
-        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 7};
+        D3D12_VIEWPORT viewport{0, 1, static_cast<float>(width), 8, 0, 1};
+        D3D12_RECT rect{0, 1, static_cast<LONG>(width), 9};
         list.RSSetViewports(1, &viewport);
         list.RSSetScissorRects(1, &rect);
         list.OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -677,8 +701,8 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
     std::vector<uint32_t> result;
     uint32_t mismatches = 0;
     bool observedTiming = false;
-    const uint32_t frameCount = mutation == Mutation::None ? 8u : 1u;
-    for (uint32_t index = 0; index < frameCount; ++index)
+    const uint32_t frameCount = forcedRadius ? 8u + forcedRadius + (continuousBanked ? 2u : 0u) : mutation == Mutation::None && !legacyDiagnostic ? 8u : 1u;
+    for (uint32_t index = forcedRadius && mutation == Mutation::None ? 7u + forcedRadius : continuousOnly && mutation == Mutation::None ? 8u : 0u; index < frameCount; ++index)
     {
         const int windowSize = index < 3 ? 48 : 64;
         Check(SetWindowPos(window, nullptr, 0, 0, windowSize, windowSize,
@@ -762,7 +786,7 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
         constexpr auto renderState = D3D12_RESOURCE_STATE_RENDER_TARGET;
         // Sample every production array slice through t2/t6 before the color pass
         // overwrites the control pixels. The readback proves SRV array indexing.
-        const uint32_t filter = mutation == Mutation::None ? index + 1 : 4;
+        const uint32_t filter = mutation == Mutation::None ? (forcedRadius ? 8u + forcedRadius : index + 1) : 4;
         recording.StampSceneStart();
         sampling.Draw(*recording.list, recording.rtv, sunCount, localCount, filter);
         Readback sampledColor(device, recording.color->GetDesc(), 1);
@@ -818,6 +842,27 @@ std::vector<uint32_t> Run(HWND window, IDXGIFactory2& factory, const Frame::Owne
                 const auto pixel = sampledColor.Pixel(0, sunCount + layer, 6);
                 Check((pixel & 255u) > 0 && (pixel & 255u) < 255, "banked corrected PCF footprint");
                 result.push_back(pixel);
+                if (filter >= 9 && filter <= 11)
+                    for (uint32_t row : {7u,8u})
+                    {
+                        const auto sample = sampledColor.Pixel(0, sunCount + layer, row);
+                        const double u = row == 7 ? .37 : .015, v = row == 7 ? .29 : .985;
+                        const double d = ref::LocalDepth(ref::PhysicalLocalLayer(layer));
+                        const std::array<double,3> expected{
+                            ref::LocalContinuous(u,v,d,d,filter-8,-.125,.0625),
+                            ref::LocalContinuous(u,v,d+.04,d,filter-8,-.125,.0625),
+                            ref::LocalContinuous(u,v,d,d,filter-8,0,0)};
+                        for (unsigned channel=0; channel<3; ++channel)
+                        {
+                            const int actual=(sample>>(8*channel))&255;
+                            const int wanted=(int)std::lround(expected[channel]*255);
+                            if (std::abs(actual-wanted)>1)
+                                std::printf("local PCF mismatch filter=%u layer=%u row=%u channel=%u actual=%d expected=%d\n",
+                                    filter,layer,row,channel,actual,wanted);
+                            Check(std::abs(actual-wanted)<=1, "local continuous numerical oracle");
+                        }
+                        result.push_back(sample);
+                    }
             }
         result.insert(result.end(), {background,foreground});
         for (uint32_t pass = 0; pass < passCount; ++pass)
@@ -1615,6 +1660,8 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
     constexpr uint32_t count = 2, resolution = 16;
     auto& device = owner.device;
     Check(_putenv_s("OGSR_DX12_GAME_COMMAND_LISTS", "legacy") == 0, "cache recording mode");
+    Check(_putenv_s("OGSR_DX12_GAME_METRICS", "1") == 0, "cache timing mode");
+    Check(_putenv_s("OGSR_DX12_GAME_SHADOW_PHASE_TIMING", "1") == 0, "cache phase timing mode");
     D3D12_RESOURCE_DESC desc{};
     Require(DescribeShadowPage({resolution,6}, desc), "cache page description");
     desc.DepthOrArraySize = count * 2;
@@ -1645,7 +1692,7 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
             view.Texture2DArray = {0, i, 1};
             device.CreateDepthStencilView(maps[slot].Get(), &view, handle);
             auto& entry = i < count ? targets[slot][i] : sources[slot][i - count];
-            entry = {i, {maps[slot].Get(), handle, {}, i, resolution}};
+            entry = {ReservedCsmProjections + i, {maps[slot].Get(), handle, {}, i, resolution}};
         }
         sampling[slot] = std::make_unique<ShadowSamplingPass>(device, nullptr, 1,
             maps[slot].Get(), count, Mutation::None, true);
@@ -1660,6 +1707,8 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
     Frame frame;
     Require(frame.Initialize(window, factory, owner), "cache frame");
     std::array<bool, Frame::kFrameCount> used{};
+    std::array<bool, Frame::kFrameCount> written{};
+    std::array<double, static_cast<size_t>(Frame::ShadowPhase::Count)> phaseTimes{};
     std::vector<uint32_t> observed;
     const std::array<uint32_t, 4> shape{resolution, resolution, count, 0};
     FrameStructuredUpload shapeData;
@@ -1678,6 +1727,13 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
         Frame::Recording recording;
         Require(frame.Begin(window, owner, recording), "cache begin");
         const uint32_t slot = recording.slot; used[slot] = true;
+        const auto& timing = frame.LastGpuTiming();
+        if (timing.present != 0)
+        {
+            Check(timing.localPhasesMeasured == written[slot], "timing tracks slot-local recorded views");
+            for (size_t i = 0; i < phaseTimes.size(); ++i)
+                phaseTimes[i] += timing.localPhaseMilliseconds[i];
+        }
         auto& cache = caches[slot];
         std::vector<ShadowContentView> views(count);
         for (uint32_t i = 0; i < count; ++i)
@@ -1751,13 +1807,32 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
                     }
             };
             const auto projection = dirty[index].projection;
+            const auto local = projection - ReservedCsmProjections;
+            const auto stamp = [&](Frame::ShadowPhase tag, bool end) { recording.StampShadowPhase(list, projection, tag, end); };
+            const auto recordStatics = [&](D3D12_CPU_DESCRIPTOR_HANDLE target)
+            {
+                stamp(Frame::ShadowPhase::Static, false);
+                drawStatic(target);
+                stamp(Frame::ShadowPhase::Static, true);
+            };
             if (staticSplit)
-                CopyStaticShadow(list, sources[slot][projection].target, dirty[index].target, phase == 0,
-                    [&] { drawStatic(sources[slot][projection].target.dsv); });
+            {
+                if (phase != 0) stamp(Frame::ShadowPhase::Copy, false);
+                CopyStaticShadow(list, sources[slot][local].target, dirty[index].target, phase == 0, [&]
+                {
+                    recordStatics(sources[slot][local].target.dsv);
+                    stamp(Frame::ShadowPhase::Copy, false);
+                });
+                stamp(Frame::ShadowPhase::Copy, true);
+            }
             else
-                drawStatic(dirty[index].target.dsv);
-            if (depths[projection] < .75f)
-                draw(depths[projection]);
+                recordStatics(dirty[index].target.dsv);
+            if (depths[local] < .75f)
+            {
+                stamp(Frame::ShadowPhase::Dynamic, false);
+                draw(depths[local]);
+                stamp(Frame::ShadowPhase::Dynamic, true);
+            }
             return S_OK;
         }, dispatch), "record cached maps");
         Readback depthRead(device, desc, count);
@@ -1778,6 +1853,7 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
         colorRead.Copy(*recording.list, *recording.color, 0);
         Transition(*recording.list, *recording.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         Require(frame.Present(owner, 1), "submit cache frame");
+        written[slot] = !dirty.empty();
         if (enabled) Check(!cache.Prepared(), "cache committed after Signal");
         Require(frame.Drain(owner), "drain cache frame");
         for (uint32_t i = 0; i < count; ++i)
@@ -1793,12 +1869,21 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
         }
     }
     Check(used[0] && used[1], "cache exercised both slots");
+    Check(phaseTimes[static_cast<size_t>(Frame::ShadowPhase::Static)] > 0.0 &&
+        phaseTimes[static_cast<size_t>(Frame::ShadowPhase::Dynamic)] > 0.0 &&
+        (phaseTimes[static_cast<size_t>(Frame::ShadowPhase::Copy)] > 0.0) == staticSplit,
+        "static, dynamic and copy timestamp pairs resolved");
+    std::puts("PASS: slot-fenced shadow phase timestamps");
     return observed;
 }
 
 std::vector<uint32_t> RunClusters(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner,
-    int mode)
+    int mode, uint32_t pointResolution = 128)
 {
+    const bool pointFaces = mode == 6;
+    const bool spotEdge = mode == 7;
+    const bool localEdge = pointFaces || spotEdge;
+    std::printf("cluster mode=%d radius=%u\n", mode, forcedRadius);
     auto& device = owner.device;
     Frame frame;
     Require(frame.Initialize(window, factory, owner), "cluster frame");
@@ -1817,7 +1902,12 @@ Receiver vs(uint id : SV_VertexID)
     return receiver;
 }
 )", "vs", "vs_5_0");
-    const std::string hlsl = "#define LEGACY_DIAGNOSTIC_LIGHT_SCALE 16\n#define OGSR_DX12_SHADOW_PAGE_TABLE 1\n" +
+    const char* probeDefine = pointFaces ? "#define OGSR_F43_POINT_PROBE 1\n" :
+        spotEdge ? "#define OGSR_F43_SPOT_PROBE 1\n" : "";
+    const std::string hlsl = std::string(probeDefine) +
+        "#define LEGACY_DIAGNOSTIC_LIGHT_SCALE 16\n#define OGSR_DX12_SHADOW_PAGE_TABLE 1\n" +
+        std::string("#define OGSR_DX12_CONTINUOUS_SUN ") + std::to_string(forcedRadius) +
+        "\n#define OGSR_DX12_CONTINUOUS_LOCAL " + std::to_string(forcedRadius) + "\n" +
         std::string(kFrameShaderConstants) + kScenePixelShader + R"(
 float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_Target
 {
@@ -1826,14 +1916,34 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     const float3 receiver = DiagnosticLight.w == 4 ? 0.0f : plane;
     return float4(LocalLighting(normal, world, pixel.xy, receiver, false, DiagnosticLight.w != 5), 1);
 }
+#if defined(OGSR_F43_POINT_PROBE) || defined(OGSR_F43_SPOT_PROBE)
+float4 edgeProbe(float4 pixel : SV_Position) : SV_Target
+{
+#if defined(OGSR_F43_POINT_PROBE)
+    const float2 edge = (pixel.xy - 24.0f) * 0.003f + 1.0f;
+    return float4(LocalVisibility(LocalLights[0], float3(edge * 4.0f, 4.0f), 0, 0, 0).xxx, 1);
+#else
+    const float x = 0.75f + (pixel.x - 27.0f) * 0.003f;
+    const float3 position = float3(x * 4.0f, 0, 4.0f);
+    const LocalLightData light = LocalLights[0];
+    float3 coords;
+    uint layer;
+    const uint status = ProjectLocalShadow(light, position, 0, 0, coords, layer);
+    return float4(LocalVisibility(light, position, 0, 0, 0), status == LOCAL_VALID ? 1 : 0, 0, 1);
+#endif
+}
+#endif
 )";
-    const auto pixel = Compile(hlsl.c_str(), "clusterProbe", "ps_5_1", D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES);
+    const auto pixel = Compile(hlsl.c_str(), localEdge ? "edgeProbe" : "clusterProbe", "ps_5_1",
+        D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES);
     ComPtr<ID3D12ShaderReflection> reflection;
     Require(D3DReflect(pixel->GetBufferPointer(), pixel->GetBufferSize(), IID_ID3D12ShaderReflection,
         reinterpret_cast<void**>(reflection.GetAddressOf())), "reflect clustered shader");
     for (const auto [name, reg] : {std::pair{"LocalLights", 13u}, {"ClusterRanges", 16u}, {"ClusterLightIndices", 17u},
             {"LocalShadowMatrices", 14u}, {"LocalShadowPageShapes", 15u}})
     {
+        if (localEdge && reg >= 16u)
+            continue;
         D3D12_SHADER_INPUT_BIND_DESC binding{};
         Require(reflection->GetResourceBindingDescByName(name, &binding), name);
         Check(binding.Type == D3D_SIT_STRUCTURED && binding.BindPoint == reg && binding.BindCount == 1,
@@ -1915,6 +2025,12 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
         light.type[0] = i == 0;
         light.type[1] = i == 0 ? 1u : 0u;
     }
+    if (localEdge)
+    {
+        lights[0].positionInverseRangeSquared = {0, 0, 0, 1.f / 64.f};
+        lights[0].directionOuterCos = {0, 0, 1, .8f};
+        lights[0].type[0] = pointFaces ? 0u : 1u;
+    }
     gamecluster12::Result clusters;
     Check(gamecluster12::Build(config, volumes, clusters), "WARP cluster CPU lists");
     if (mode == 2)
@@ -1927,8 +2043,11 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     for (unsigned row = 0; row < 4; ++row)
         for (unsigned col = 0; col < 4; ++col)
             cb.viewProjection.m[row][col] = config.viewProjection[col * 4 + row];
+    cb.localFilterRadius = forcedRadius;
+    cb.pointFaceBlendStart = pointFaces ? game_shadow12::PointFaceBlendStart(128) : 0.0f;
     cb.lightingFlags[2] = static_cast<uint32_t>(lights.size());
     cb.localShadowConfig[0] = cb.localShadowConfig[1] = 1;
+    if (pointFaces) cb.localShadowConfig[0] = 6;
     cb.diagnosticLight[3] = static_cast<uint32_t>(mode);
     cb.clusterTiles[0] = config.width;
     cb.clusterTiles[1] = config.height;
@@ -1949,10 +2068,10 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
 
     // Карта повторяет перспективную глубину наклонной плоскости.
     // В правой части отдельный occluder даёт контроль настоящей тени.
-    constexpr uint32_t resolution = 16;
+    const uint32_t resolution = localEdge ? pointResolution : 16;
     D3D12_RESOURCE_DESC shadowDesc{};
     Require(game_shadow12::DescribeShadowPage({resolution, 6}, shadowDesc), "cluster shadow description");
-    shadowDesc.DepthOrArraySize = 1;
+    shadowDesc.DepthOrArraySize = pointFaces ? 6 : 1;
     D3D12_HEAP_PROPERTIES shadowHeap{};
     shadowHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
     shadowHeap.CreationNodeMask = shadowHeap.VisibleNodeMask = 1;
@@ -1964,7 +2083,7 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
         D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&shadow)), "cluster shadow depth");
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    heapDesc.NumDescriptors = 1;
+    heapDesc.NumDescriptors = shadowDesc.DepthOrArraySize;
     ComPtr<ID3D12DescriptorHeap> dsv;
     Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&dsv)), "cluster shadow DSV heap");
     D3D12_DEPTH_STENCIL_VIEW_DESC depthView{};
@@ -1974,7 +2093,19 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     const auto dsvHandle = dsv->GetCPUDescriptorHandleForHeapStart();
     device.CreateDepthStencilView(shadow.Get(), &depthView, dsvHandle);
     auto& list = *recording.list;
-    for (LONG y = 0; y < static_cast<LONG>(resolution); ++y)
+    if (pointFaces)
+        for (uint32_t face = 0; face < 6; ++face)
+        {
+            depthView.Texture2DArray.FirstArraySlice = face;
+            D3D12_CPU_DESCRIPTOR_HANDLE target = dsvHandle;
+            target.ptr += static_cast<SIZE_T>(face) * device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            device.CreateDepthStencilView(shadow.Get(), &depthView, target);
+            // +X освещён, +Y и +Z закрыты. Стык смешивает независимые результаты.
+            list.ClearDepthStencilView(target, D3D12_CLEAR_FLAG_DEPTH, face == 0 ? 1.0f : 0.0f, 0, 0, nullptr);
+        }
+    else if (spotEdge)
+        list.ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, .5f, 0, 0, nullptr);
+    else for (LONG y = 0; y < static_cast<LONG>(resolution); ++y)
         for (LONG x = 0; x < static_cast<LONG>(resolution); ++x)
         {
             const float px = 2.0f * (x + .5f) / resolution - 1.0f;
@@ -1984,8 +2115,10 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
             list.ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH,
                 planeDepth + .001f - (x >= 10 ? .05f : 0.0f), 0, 1, &texel);
         }
-    Transition(list, *shadow.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 0);
+    Transition(list, *shadow.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 1;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ComPtr<ID3D12DescriptorHeap> srv;
     Require(device.CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srv)), "cluster shadow SRV heap");
@@ -1993,16 +2126,46 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     shadowView.Format = DXGI_FORMAT_R32_FLOAT;
     shadowView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     shadowView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    shadowView.Texture2DArray.MipLevels = shadowView.Texture2DArray.ArraySize = 1;
+    shadowView.Texture2DArray.MipLevels = 1;
+    shadowView.Texture2DArray.ArraySize = shadowDesc.DepthOrArraySize;
     device.CreateShaderResourceView(shadow.Get(), &shadowView, srv->GetCPUDescriptorHandleForHeapStart());
-    LocalShadowGpuProjection shadowProjection{};
-    auto& matrix = shadowProjection.matrix;
-    matrix._11 = matrix._22 = matrix._33 = matrix._43 = 1.0f;
-    matrix._34 = -1.0f;
-    shadowProjection.address = {0, 0, resolution, 1};
-    const std::array<uint32_t, 4> shape{resolution, resolution, 1, 0};
+    std::array<LocalShadowGpuProjection, 6> shadowProjections{};
+    if (pointFaces)
+    {
+        using namespace DirectX;
+        const XMFLOAT3 directions[] = {{1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}};
+        const XMFLOAT3 ups[] = {{0,1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {0,1,0}, {0,1,0}};
+        float fov = 0;
+        Check(game_shadow12::GuardedLocalFov(XM_PIDIV2, game_shadow12::MinShadowMapResolution,
+            fov, true), "point guard");
+        const auto projection = XMMatrixPerspectiveFovLH(fov, 1.0f, 0.5f, 32.0f);
+        for (uint32_t face = 0; face < 6; ++face)
+        {
+            const auto view = XMMatrixLookToLH(XMVectorZero(), XMLoadFloat3(&directions[face]), XMLoadFloat3(&ups[face]));
+            XMStoreFloat4x4(&shadowProjections[face].matrix, XMMatrixTranspose(view * projection));
+            shadowProjections[face].address = {0, face, resolution, 6u | (face << 8)};
+        }
+    }
+    else if (spotEdge)
+    {
+        using namespace DirectX;
+        float fov = 0;
+        Check(game_shadow12::GuardedLocalFov(2.0f * std::atan(.75f), game_shadow12::MinShadowMapResolution,
+            fov), "spot guard");
+        XMStoreFloat4x4(&shadowProjections[0].matrix,
+            XMMatrixTranspose(XMMatrixPerspectiveFovLH(fov, 1.0f, .5f, 32.0f)));
+        shadowProjections[0].address = {0, 0, resolution, 1};
+    }
+    else
+    {
+        auto& matrix = shadowProjections[0].matrix;
+        matrix._11 = matrix._22 = matrix._33 = matrix._43 = 1.0f;
+        matrix._34 = -1.0f;
+        shadowProjections[0].address = {0, 0, resolution, 1};
+    }
+    const std::array<uint32_t, 4> shape{resolution, resolution, shadowDesc.DepthOrArraySize, 0};
     game_shadow12::FrameStructuredUpload projectionData, shapeData;
-    Require(projectionData.Write(device, std::span<const LocalShadowGpuProjection>(&shadowProjection, 1)),
+    Require(projectionData.Write(device, std::span<const LocalShadowGpuProjection>(shadowProjections).first(shadowDesc.DepthOrArraySize)),
         "upload cluster shadow projection");
     Require(shapeData.Write(device, std::span<const std::array<uint32_t, 4>>(&shape, 1)),
         "upload cluster shadow shape");
@@ -2022,6 +2185,9 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     list.SetGraphicsRootShaderResourceView(5, projectionData.Address());
     list.SetGraphicsRootShaderResourceView(6, shapeData.Address());
     list.SetGraphicsRootDescriptorTable(7, srv->GetGPUDescriptorHandleForHeapStart());
+    constexpr D3D12_RECT pointRect{21, 10, 27, 27};
+    if (localEdge)
+        list.RSSetScissorRects(1, &pointRect);
     list.DrawInstanced(3, 1, 0, 0);
     Readback pixels(device, recording.color->GetDesc(), 1);
     Transition(list, *recording.color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2036,8 +2202,214 @@ float4 clusterProbe(float4 pixel : SV_Position, float3 world : TEXCOORD0) : SV_T
     return result;
 }
 
+void RunDetailCasters(HWND window, IDXGIFactory2& factory, const Frame::Owner& owner)
+{
+    using gameaux12::AppendDetailShadowDraws;
+    using gameaux12::DetailCasterRegion;
+    using gameaux12::DetailShadowBounds;
+    using gameaux12::DetailShadowDraw;
+    using gameaux12::DetailShadowPlacement;
+    using gameaux12::DetailShadowPlane;
+    using gameaux12::DetailShadowRegion;
+    using namespace game_shadow12;
+    constexpr uint32_t resolution = 32, width = 26, height = 24;
+    auto& device = owner.device;
+    Frame frame;
+    Require(frame.Initialize(window, factory, owner), "detail shadow frame");
+
+    const std::string hlsl = std::string(kFrameShaderConstants) + kAuxVertexShader + R"(
+ShadowInterpolants detailShadowProbe(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
+{
+    const float2 corner = vertex == 0 ? float2(-0.8,-0.8) :
+        vertex == 1 ? float2(0,0.8) : float2(0.8,-0.8);
+    const uint4 bones = uint4(0,1,0,0);
+    const float4 weights = ReservedGeometry != 0 ? float4(.5,.5,0,0) : float4(1,0,0,0);
+    return shadowMain(float3(corner, 0), float3(0,1,0), float2(0,0), bones, weights, instance);
+}
+)";
+    const auto vertex = Compile(hlsl.c_str(), "detailShadowProbe", "vs_5_0");
+    D3D12_ROOT_PARAMETER params[6]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].ParameterType = params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {3, 0, 1};
+    params[2].Constants = {6, 0, 1};
+    params[3].ParameterType = params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 1;
+    params[4].Descriptor.ShaderRegister = 14;
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[5].Constants = {4, 0, 4};
+    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+    rootDesc.NumParameters = static_cast<UINT>(std::size(params));
+    rootDesc.pParameters = params;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ComPtr<ID3DBlob> signature;
+    Require(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr), "detail root blob");
+    ComPtr<ID3D12RootSignature> root;
+    Require(device.CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+        IID_PPV_ARGS(&root)), "detail root signature");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDesc{};
+    pipelineDesc.pRootSignature = root.Get();
+    pipelineDesc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+    pipelineDesc.SampleMask = UINT_MAX;
+    pipelineDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipelineDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipelineDesc.RasterizerState.DepthClipEnable = TRUE;
+    pipelineDesc.DepthStencilState.DepthEnable = TRUE;
+    pipelineDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pipelineDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pipelineDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipelineDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pipelineDesc.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pipeline;
+    Require(device.CreateGraphicsPipelineState(&pipelineDesc, IID_PPV_ARGS(&pipeline)), "detail shadow PSO");
+
+    D3D12_RESOURCE_DESC desc{};
+    Require(DescribeShadowPage({resolution, 6}, desc), "detail depth description");
+    desc.DepthOrArraySize = 1;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hp.CreationNodeMask = hp.VisibleNodeMask = 1;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1.0f;
+    ComPtr<ID3D12Resource> shadow;
+    Require(device.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &clear, IID_PPV_ARGS(&shadow)), "detail depth resource");
+    D3D12_DESCRIPTOR_HEAP_DESC dsvDesc{};
+    dsvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvDesc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> dsv;
+    Require(device.CreateDescriptorHeap(&dsvDesc, IID_PPV_ARGS(&dsv)), "detail depth heap");
+    const auto depthView = dsv->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_D32_FLOAT;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.ArraySize = 1;
+    device.CreateDepthStencilView(shadow.Get(), &view, depthView);
+
+    SceneFrameConstants cb{};
+    auto& projection = cb.sunShadowViewProjection[0];
+    projection._11 = projection._22 = 1.0f / resolution;
+    projection._33 = 1.0f / 16.0f;
+    projection._44 = 1.0f;
+    DetailShadowRegion region{};
+    Check(DetailCasterRegion(projection, region) && region.minX == -32.0f && region.maxX == 32.0f,
+        "detail light caster region");
+    FrameStructuredUpload frameData, indices;
+    const uint32_t indexData[] = {0, 1, 2};
+    Require(frameData.Write(device, std::span<const SceneFrameConstants>(&cb, 1)), "detail FrameCB");
+    Require(indices.Write(device, std::span<const uint32_t>(indexData)), "detail index buffer");
+    const D3D12_INDEX_BUFFER_VIEW indexView{indices.Address(), sizeof(indexData), DXGI_FORMAT_R32_UINT};
+    std::array<FrameStructuredUpload, Frame::kFrameCount> instanceSlots;
+    std::array<bool, Frame::kFrameCount> slotUsed{};
+    const std::array<DetailShadowPlane, 6> planes{{
+        {{1,0,0},32}, {{-1,0,0},32}, {{0,1,0},32}, {{0,-1,0},32}, {{0,0,1},0}, {{0,0,-1},16}}};
+    constexpr uint32_t meshes[] = {11, 22};
+    std::vector<DetailShadowPlacement> placements;
+    for (uint32_t y = 1; y <= height; ++y)
+        for (uint32_t x = 1; x <= width; ++x)
+        {
+            DetailShadowPlacement instance{};
+            instance.slot = (y * 3) + x / 13;
+            instance.ordinal = x % 13;
+            instance.model = x & 1u;
+            instance.world._11 = instance.world._22 = instance.world._33 = instance.world._44 = 1.0f;
+            instance.world._41 = static_cast<float>(2 * x + 1) - resolution;
+            instance.world._42 = static_cast<float>(resolution) - (2 * y + 1);
+            instance.world._43 = 4.0f;
+            instance.radius = 1.2f;
+            placements.push_back(instance);
+        }
+    auto outside = placements.front();
+    outside.slot = 999;
+    outside.world._41 = 40;
+    placements.push_back(outside);
+
+    Readback readback(device, desc, 1);
+    for (unsigned iteration = 0; iteration < 4; ++iteration)
+    {
+        Frame::Recording recording;
+        Require(frame.Begin(window, owner, recording), "detail shadow Begin");
+        slotUsed[recording.slot] = true;
+        auto input = placements;
+        const bool missing = iteration == 3;
+        if (missing)
+            input.erase(input.begin()); // Мутация вне прежней границы 12 м.
+        if (iteration != 0)
+            std::reverse(input.begin(), input.end());
+        const auto bounds = DetailShadowBounds(input);
+        std::vector<DirectX::XMFLOAT4X4> transforms;
+        std::vector<DetailShadowDraw> draws;
+        Check(AppendDetailShadowDraws(input, bounds, planes, meshes, 2u * 1024 * 1024, transforms, draws),
+            "packed production detail casters");
+        Check(draws.size() == 2 && transforms.size() == width * height - static_cast<unsigned>(missing),
+            "detail caster count and outside-frustum rejection");
+        const auto animatedBase = static_cast<uint32_t>(transforms.size());
+        // Два настоящих влияния через тот же SkinVertex. Меняем только
+        // pose второй кости, когда первый кадр уже записан в каждом слоте.
+        auto bone = placements.front().world;
+        bone._41 = 29.0f; // x=30
+        bone._42 = -27.0f; // y=29
+        transforms.push_back(bone);
+        bone._43 = iteration >= 2 ? 12.0f : 4.0f;
+        transforms.push_back(bone);
+        auto& upload = instanceSlots[recording.slot];
+        Require(upload.Write(device, std::span<const DirectX::XMFLOAT4X4>(transforms)), "detail slot upload");
+        auto& list = *recording.list;
+        list.SetGraphicsRootSignature(root.Get());
+        list.SetGraphicsRootConstantBufferView(0, frameData.Address());
+        list.SetGraphicsRoot32BitConstant(2, 0, 0);
+        list.SetGraphicsRootShaderResourceView(3, upload.Address());
+        list.SetGraphicsRootShaderResourceView(4, frameData.Address());
+        list.SetPipelineState(pipeline.Get());
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.IASetIndexBuffer(&indexView);
+        const D3D12_VIEWPORT viewport{0, 0, resolution, resolution, 0, 1};
+        const D3D12_RECT rect{0, 0, resolution, resolution};
+        list.RSSetViewports(1, &viewport);
+        list.RSSetScissorRects(1, &rect);
+        list.OMSetRenderTargets(0, nullptr, FALSE, &depthView);
+        list.ClearDepthStencilView(depthView, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        const uint32_t detailGeometry[] = {0, 0, 0, 0};
+        list.SetGraphicsRoot32BitConstants(5, 4, detailGeometry, 0);
+        for (const auto& draw : draws)
+        {
+            list.SetGraphicsRoot32BitConstant(1, draw.first, 0);
+            list.DrawIndexedInstanced(3, draw.count, 0, 0, 0);
+        }
+        const uint32_t animatedGeometry[] = {1, 0, 0, 0};
+        list.SetGraphicsRoot32BitConstants(5, 4, animatedGeometry, 0);
+        list.SetGraphicsRoot32BitConstant(1, animatedBase, 0);
+        list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+        Transition(list, *shadow.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        readback.Copy(list, *shadow.Get(), 0);
+        Transition(list, *shadow.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        Require(frame.Present(owner, 1), "detail shadow Present");
+        Require(frame.Drain(owner), "detail shadow Drain");
+        uint32_t mismatch = 0;
+        for (uint32_t y = 0; y < resolution; ++y)
+            for (uint32_t x = 0; x < resolution; ++x)
+            {
+                const bool animated = x == 30 && y == 29;
+                const auto expected = animated ? (iteration >= 2 ? .5f : .25f) :
+                    (x >= 1 && x <= width && y >= 1 && y <= height ? .25f : 1.0f);
+                const bool different = readback.Pixel(0, x, y) != std::bit_cast<uint32_t>(expected);
+                if (animated)
+                    Check(!different, "actual two-bone pose changed depth in both slots");
+                else
+                    mismatch += different;
+            }
+        Check(mismatch == static_cast<unsigned>(missing), "detail GPU depth grid and missed caster mutation");
+    }
+    Check(slotUsed[0] && slotUsed[1], "detail casters used both slots");
+    std::printf("PASS: %u detail casters in two slots, production VS and D32, permutation and missing mutation\n",
+        width * height);
+    std::puts("PASS: production two-bone shadow pose changes D32 from .25 to .5 in both slots");
+}
+
 int main(int argc, char** argv)
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     ComPtr<ID3D12InfoQueue> messages;
     try
     {
@@ -2076,10 +2448,67 @@ int main(int argc, char** argv)
         const bool pageTableOnly = argc > 1 && std::strcmp(argv[1], "--page-table") == 0;
         const bool bankedOnly = argc > 1 && std::strcmp(argv[1], "--banked-parity") == 0;
         const bool scalableOnly = argc > 1 && std::strcmp(argv[1], "--scalable") == 0;
-        const bool mixedOnly = argc > 1 && std::strcmp(argv[1], "--adaptive-runtime") == 0;
-        const bool cacheOnly = argc > 1 && std::strcmp(argv[1], "--shadow-cache") == 0;
-        const bool clusterOnly = argc > 1 && std::strcmp(argv[1], "--clustered-lighting") == 0;
-        if (cacheOnly)
+        const bool mixedOnly = argc > 1 && (std::strcmp(argv[1], "--adaptive-runtime") == 0 ||
+            std::strcmp(argv[1], "--adaptive-runtime-continuous") == 0);
+        const bool cacheOnly = argc > 1 && (std::strcmp(argv[1], "--shadow-cache") == 0 ||
+            std::strcmp(argv[1], "--shadow-cache-continuous") == 0);
+        const bool pointOnly = argc > 1 && std::strcmp(argv[1], "--point-face-continuous") == 0;
+        const bool detailsOnly = argc > 1 && std::strcmp(argv[1], "--detail-casters") == 0;
+        continuousOnly = argc > 1 && std::strncmp(argv[1], "--continuous", 12) == 0;
+        if (continuousOnly && std::strlen(argv[1]) == 14 && argv[1][12] == '-' &&
+            argv[1][13] >= '1' && argv[1][13] <= '3')
+            forcedRadius = static_cast<uint32_t>(argv[1][13] - '0');
+        continuousBanked = argc > 1 && std::strcmp(argv[1], "--continuous-banked-1") == 0;
+        if (continuousBanked) forcedRadius = 1;
+        legacyDiagnostic = argc > 1 && std::strcmp(argv[1], "--legacy-diagnostic") == 0;
+        if (argc > 1 && (std::strcmp(argv[1], "--clustered-lighting-continuous") == 0 ||
+            std::strcmp(argv[1], "--adaptive-runtime-continuous") == 0 ||
+            std::strcmp(argv[1], "--shadow-cache-continuous") == 0)) forcedRadius = 1;
+        const bool clusterOnly = argc > 1 && (std::strcmp(argv[1], "--clustered-lighting") == 0 ||
+            std::strcmp(argv[1], "--clustered-lighting-continuous") == 0);
+        if (detailsOnly)
+            RunDetailCasters(window, *factory.Get(), owner);
+        else if (pointOnly)
+        {
+            forcedRadius = 3;
+            for (const uint32_t size : {128u, 256u, 512u, 1024u})
+            {
+                const auto result = RunClusters(window, *factory.Get(), owner, 6, size);
+                Check(result.size() == 48 * 48, "point viewport");
+                uint32_t edge = 0, corner = 0, mismatch = 0;
+                constexpr float start = 116.f / 120.f;
+                for (uint32_t y = 10; y < 27; ++y)
+                    for (uint32_t x = 21; x < 27; ++x)
+                    {
+                        const float ax = 1.f + (x + .5f - 24.f) * .003f;
+                        const float ay = 1.f + (y + .5f - 24.f) * .003f;
+                        const float largest = (std::max)({ax, ay, 1.f});
+                        const auto weight = [&](float axis)
+                        {
+                            const float t = std::clamp((axis / largest - start) / (1.f - start), 0.f, 1.f);
+                            return t * t * (3.f - 2.f * t);
+                        };
+                        const float wx = weight(ax), wy = weight(ay), wz = weight(1.f);
+                        const float expected = 255.f * wx / (wx + wy + wz);
+                        const unsigned actual = result[y * 48 + x] & 255u;
+                        if (std::abs(static_cast<float>(actual) - expected) > 1.1f && ++mismatch <= 8)
+                            std::printf("point mismatch size=%u x=%u y=%u actual=%u expected=%.3f\n",
+                                size, x, y, actual, expected);
+                        corner += wx > 0 && wy > 0 && wz > 0;
+                        edge += wx > 0 && wy == 0 && wz > 0;
+                    }
+                Check(edge > 0 && corner > 0, "two- and three-face samples");
+                Check(mismatch == 0, "point edge/corner visibility oracle");
+                std::printf("PASS: point seams at %upx, two-face=%u three-face=%u\n", size, edge, corner);
+                const auto spot = RunClusters(window, *factory.Get(), owner, 7, size);
+                Check(spot.size() == 48 * 48, "spot viewport");
+                for (uint32_t y = 10; y < 27; ++y)
+                    for (uint32_t x = 21; x < 27; ++x)
+                        Check(spot[y * 48 + x] == 0xff00ff00u, "spot cone edge remains covered and shadowed");
+                std::printf("PASS: spot cone edge at %upx\n", size);
+            }
+        }
+        else if (cacheOnly)
         {
             DepthPacketPipeline depth(owner.device, true);
             ComPtr<IDXGIAdapter3> memoryAdapter;
@@ -2129,6 +2558,15 @@ int main(int argc, char** argv)
             Check(legacy == RunScalable(window, *factory.Get(), owner, pass, "parallel", 2), "legacy/parallel depth parity");
             const auto serial = RunScalable(window, *factory.Get(), owner, pass, "multi", 7);
             Check(serial == RunScalable(window, *factory.Get(), owner, pass, "parallel", 7), "expanded serial/parallel depth parity");
+        }
+        else if (legacyDiagnostic)
+        {
+            Run(window, *factory.Get(), owner, "legacy", 2, 8);
+        }
+        else if (continuousOnly)
+        {
+            Run(window, *factory.Get(), owner, "legacy", 2, 8, 0, Mutation::None, continuousBanked);
+            std::puts("PASS: continuous CSM and local numerical readback");
         }
         else if (bankedOnly)
         {
@@ -2196,7 +2634,11 @@ int main(int argc, char** argv)
         }
         Check(problems == 0, "D3D12 warning/error/corruption");
         std::printf("D3D12 expected clear-value warnings=%u\n", expectedClearWarnings);
-        std::puts(cacheOnly ? "PASS: WARP Debug Layer + GBV, whole-map cache and static copy parity" :
+        std::puts(detailsOnly ? "PASS: WARP Debug Layer + GBV, detail caster preparation" :
+            pointOnly ? "PASS: WARP Debug Layer + GBV, point edge/corner and spot cone" :
+            continuousOnly ? "PASS: WARP Debug Layer + GBV, one specialized radius" :
+            legacyDiagnostic ? "PASS: WARP Debug Layer + GBV, one legacy sampling frame" :
+            cacheOnly ? "PASS: WARP Debug Layer + GBV, whole-map cache and static copy parity" :
             clusterOnly ? "PASS: WARP Debug Layer + GBV, clustered lighting" : mixedOnly ? "PASS: WARP Debug Layer + GBV, adaptive native shadow runtime" :
             scalableOnly ? "PASS: WARP Debug Layer + GBV, scalable shadow recording" :
             bankedOnly ? "PASS: WARP Debug Layer + GBV, banked sampling parity" :

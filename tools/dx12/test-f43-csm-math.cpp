@@ -70,8 +70,9 @@ int main()
         {
             for (const uint32_t resolution : {1024u, 2048u, 4096u})
             {
-                SunPlan plan;
+                SunPlan plan, continuousPlan;
                 Require(MakeSunPlan(camera, origin, sunlight, count, resolution, 160, plan), "build cascade projections");
+                Require(MakeSunPlan(camera, origin, sunlight, count, resolution, 160, continuousPlan, true), "build continuous cascade projections");
                 Require(plan.count == count && std::abs(plan.cascades[0].splitNear - 0.3f) < 0.001f, "camera near/depth");
                 Require(std::abs(plan.cascades[count - 1].splitFar - 160.0f) < 0.001f, "camera far cap");
                 float previousBlend = plan.cascades[0].splitNear;
@@ -92,6 +93,10 @@ int main()
                                 const auto point = XMVectorSet(eye.x + x * halfHeight * (16.0f / 9.0f),
                                     eye.y + y * halfHeight, eye.z + depth, 1);
                                 Require(Covers(cascade, point), "receiver corner coverage");
+                                const auto projected = XMVector3TransformCoord(point, XMLoadFloat4x4(&continuousPlan.cascades[slice].viewProjection));
+                                const float margin = 8.0f / resolution;
+                                Require(std::abs(XMVectorGetX(projected)) <= 1.0f - margin + 1e-5f &&
+                                    std::abs(XMVectorGetY(projected)) <= 1.0f - margin + 1e-5f, "continuous filter guard");
                                 Require(Covers(cascade, XMVectorSubtract(point, XMVectorScale(light, 120))), "off-camera caster coverage");
                             }
                         }

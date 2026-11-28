@@ -4,7 +4,7 @@ param(
     [switch]$Sequential,
     [switch]$DescriptorTestsOnly,
     [switch]$CsmWarpOnly,
-    [ValidateSet('banked-parity','scalable','adaptive-runtime','shadow-cache','clustered-lighting','page-table')][string]$WarpCase,
+    [ValidateSet('banked-parity','scalable','adaptive-runtime','shadow-cache','clustered-lighting','page-table','continuous-1','continuous-2','continuous-3','continuous-banked-1','legacy-diagnostic','adaptive-runtime-continuous','shadow-cache-continuous','clustered-lighting-continuous','point-face-continuous','detail-casters')][string]$WarpCase,
     [string]$JobLibrary
 )
 
@@ -31,14 +31,15 @@ $scene = Get-Content -LiteralPath "$engine/GameDx12StaticScene.cpp" -Raw
 $patterns = @(
     '(?s)constexpr uint32_t kLocalShadowLayers = .*?static_assert\(kFrameConstantsSize == \d+\);',
     '(?s)constexpr const char\* kFrameShaderConstants = R"\(.*?\)";',
-    '(?s)constexpr const char\* kScenePixelShader = R"\(.*?\)";'
+    '(?s)constexpr const char\* kAuxVertexShader = R"\(.*?\)";',
+    '(?s)const std::string kScenePixelShader = std::string\(R"\(.*?\)";'
 )
 $declarations = foreach ($pattern in $patterns) {
     $match = [regex]::Match($scene, $pattern)
     if (!$match.Success) { throw "Не найдено объявление для проверки GPU: $pattern" }
     $match.Value
 }
-$declarations | Set-Content -LiteralPath "$($output.FullName)/production-shadow.inc" -Encoding utf8
+("#include `"GameDx12ShadowFilterHlsl.h`"" + [Environment]::NewLine + ($declarations -join [Environment]::NewLine)) | Set-Content -LiteralPath "$($output.FullName)/production-shadow.inc" -Encoding utf8
 if (!$JobLibrary) { $JobLibrary = "$gr/x64/ReleaseDX12/gr_job_system.lib" }
 $common += "/I$($output.FullName)"
 $warpArgs = @()

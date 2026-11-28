@@ -61,12 +61,54 @@ inline double Box(uint32_t slice, double u, double v, double z, int radius)
     const int width = radius*2+1;
     return sum / (width*width);
 }
+// Независимый эталон: сумма N*N билинейных сравнений, а не свёрнутые веса GPU.
+inline double Continuous(uint32_t slice, double u, double v, double z, int radius, double gx = 0, double gy = 0)
+{
+    double sum = 0;
+    for (int oy = -radius; oy <= radius; ++oy)
+        for (int ox = -radius; ox <= radius; ++ox)
+        {
+            const double sampleU = u + double(ox) / Size, sampleV = v + double(oy) / Size;
+            const double px = sampleU * Size - .5, py = sampleV * Size - .5;
+            const int bx = static_cast<int>(std::floor(px)), by = static_cast<int>(std::floor(py));
+            const double fx = px - bx, fy = py - by;
+            for (int y = 0; y != 2; ++y) for (int x = 0; x != 2; ++x)
+            {
+                const double cx = (bx + x + .5) / Size, cy = (by + y + .5) / Size;
+                sum += (x ? fx : 1-fx) * (y ? fy : 1-fy) *
+                    (z + gx*(cx-u) + gy*(cy-v) <= Texel(slice,bx+x,by+y) ? 1.0 : 0.0);
+            }
+        }
+    const int width = radius*2+1;
+    return sum / (width*width);
+}
+// Эталон локальной карты: повтор краевого текселя и корректировка его
+// реального центра. Суммируем отдельные билинейные выборки.
+inline double LocalContinuous(double u, double v, double receiver, double stored, int radius, double gx, double gy)
+{
+    double sum = 0;
+    for (int oy=-radius; oy<=radius; ++oy) for (int ox=-radius; ox<=radius; ++ox)
+    {
+        const double px=u*Size+ox-.5, py=v*Size+oy-.5;
+        const int bx=(int)std::floor(px), by=(int)std::floor(py);
+        const double fx=px-bx, fy=py-by;
+        for (int y=0;y<2;++y) for (int x=0;x<2;++x)
+        {
+            const int tx=(std::clamp)(bx+x,0,Size-1), ty=(std::clamp)(by+y,0,Size-1);
+            const double z=receiver+gx*((tx+.5)/Size-u)+gy*((ty+.5)/Size-v);
+            sum+=(x?fx:1-fx)*(y?fy:1-fy)*(z<=stored ? 1.0 : 0.0);
+        }
+    }
+    const int width=radius*2+1;
+    return sum/(width*width);
+}
 inline double Filter(uint32_t mode, Probe p, bool slope)
 {
     const double z = p.z - Bias;
     const int x0 = static_cast<int>(std::floor(p.u * Size));
     const int y0 = static_cast<int>(std::floor(p.v * Size));
     if (mode == 1) return Compare(x0,y0,z);
+    if (mode >= 9 && mode <= 11) return Continuous(0,p.u,p.v,z,mode-8,slope ? -4.0 : 0.0);
     if (mode == 5 || mode == 6 || mode == 8)
         return Box(0,p.u,p.v,z,mode == 5 ? 1 : mode == 6 ? 2 : 3);
     const double base = Linear(p.u,p.v,z,slope && (mode == 4 || mode == 7) ? -4.0 : 0.0);
@@ -101,7 +143,8 @@ inline Expected Pixel(uint32_t x,uint32_t y,uint32_t sun,uint32_t local,uint32_t
     // primary/overlap probes. Compute the original fixture projection.
     const double u = .25 + .0625 * (x + (y == 2 ? .875 : .5));
     const auto visibility = [&](uint32_t slice) {
-        return filter == 8 ? Box(slice,u,.6875,.5-Bias,3) :
+        return filter >= 9 && filter <= 11 ? Continuous(slice,u,.6875,.5-Bias,filter-8) :
+            filter == 8 ? Box(slice,u,.6875,.5-Bias,3) :
             (SunDepth(slice) >= .5-Bias ? 1.0 : 0.0);
     };
     const double visible = visibility(x);
