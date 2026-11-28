@@ -1518,6 +1518,8 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
     Require(descriptors.Initialize(device, owner.fence, *heap.Get(), 2), "mixed descriptors");
     Frame frame;
     Require(frame.Initialize(window, factory, owner), "mixed frame");
+    DepthPacketPipeline animatedDepth(device, true, true);
+    std::array<FrameStructuredUpload, Frame::kFrameCount> mixedPoses;
 
     ShadowPageSpec low{};
     Require(QueryShadowPageSpec(device, {128,6}, low), "cost of lower tier");
@@ -1532,13 +1534,13 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
 
     std::array<bool, Frame::kFrameCount> used{};
     std::vector<uint32_t> readbacks;
-    for (uint32_t iteration = 0; iteration < 5; ++iteration)
+    for (uint32_t iteration = 0; iteration < 7; ++iteration)
     {
         Frame::Recording recording;
         Check(frame.Begin(window, owner, recording) == S_OK, "mixed begin without prior timing hint");
         const auto& arena = runtime.Pages(recording.slot);
-        const auto planned = iteration < 3 ? UINT64_MAX : iteration == 3 ? low.bytes + 5 : 0;
-        const uint32_t expectedCount = iteration < 3 ? fullCount : iteration == 3 ? 6 : 0;
+        const auto planned = iteration == 3 ? low.bytes + 5 : iteration == 4 ? uint64_t{0} : UINT64_MAX;
+        const uint32_t expectedCount = iteration == 3 ? 6 : iteration == 4 ? 0 : fullCount;
         const auto previous = owner.fenceValue;
         const auto oldBytes = arena.CurrentBytes();
         ShadowAddressPlan addresses;
@@ -1567,8 +1569,21 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
             ShadowPageResources::View target;
             Check(arena.GetView(view.page, view.slice, target), "mixed local page slice");
             passes.push_back({view.projection, target});
-            depths.push_back(static_cast<float>((view.light - 1) * 6 + view.face + 1) / 64);
+            depths.push_back(static_cast<float>((view.light - 1) * 6 + view.face + 1 + (iteration >= 5 ? 8 : 0)) / 64);
         }
+
+        std::vector<DirectX::XMFLOAT4X4> poses(expectedCount * 2);
+        for (uint32_t i = 0; i < expectedCount; ++i)
+            for (uint32_t bone = 0; bone < 2; ++bone)
+            {
+                auto& m = poses[i * 2 + bone];
+                m._11 = m._22 = m._33 = m._44 = 1.0f;
+                m._43 = depths[sunCount + i] + (bone ? .0078125f : -.0078125f);
+            }
+        if (expectedCount)
+            Require(mixedPoses[recording.slot].Write(device, std::span<const DirectX::XMFLOAT4X4>(poses)), "adaptive pose upload");
+        if (iteration == 6)
+            Check(oldBytes == 0 && arena.PreparedPlan()->create.size() != 0, "restored budget allocates fresh physical pages");
 
         uint32_t batches = 0;
         const bool batching = std::strcmp(mode, "parallel") == 0;
@@ -1576,6 +1591,16 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
         {
             if (!iteration && index == sunCount)
                 return E_ABORT;
+            if (index >= sunCount)
+            {
+                list.SetPipelineState(animatedDepth.pipeline.Get());
+                list.SetGraphicsRootSignature(animatedDepth.root.Get());
+                list.SetGraphicsRootShaderResourceView(0, mixedPoses[recording.slot].Address());
+                list.SetGraphicsRoot32BitConstant(1, (index - sunCount) * 2, 0);
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list.DrawInstanced(3, 1, 0, 0);
+                return S_OK;
+            }
             list.SetPipelineState(depth.pipeline.Get());
             list.SetGraphicsRootSignature(depth.root.Get());
             list.SetGraphicsRoot32BitConstant(0, std::bit_cast<uint32_t>(depths[index]), 0);
@@ -1593,7 +1618,7 @@ std::vector<uint32_t> RunMixedRuntime(HWND window, IDXGIFactory2& factory, const
         Check(batches == (batching ? (std::min)(3u, static_cast<uint32_t>(passes.size())) : passes.size()),
             "actual mixed batch count");
         used[recording.slot] = true;
-        if (iteration >= 3)
+        if (iteration == 3 || iteration == 4)
             Check(frame.LastGpuTiming().views.size() == fullCount + sunCount, "combined timestamp ID count after slot reuse");
 
         Readback sunRead(device, sunDesc, sunCount);
@@ -1864,6 +1889,7 @@ std::vector<uint32_t> RunShadowCache(HWND window, IDXGIFactory2& factory, const 
             {
                 stamp(Frame::ShadowPhase::Dynamic, false);
                 list.SetPipelineState(animatedDepth.pipeline.Get());
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 list.SetGraphicsRootSignature(animatedDepth.root.Get());
                 list.SetGraphicsRootShaderResourceView(0, poseUploads[slot].Address());
                 list.SetGraphicsRoot32BitConstant(1, local * 2, 0);
