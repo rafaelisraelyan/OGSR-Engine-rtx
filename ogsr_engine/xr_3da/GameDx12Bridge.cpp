@@ -178,6 +178,15 @@ struct BridgeStateData
     uint64_t capturedFrames = 0;
     uint64_t rejectedFrames = 0;
     uint64_t nativeScenePresents = 0;
+    struct NativeSample
+    {
+        uint64_t present = 0;
+        gamelight12::Vec3 camera{}, forward{}, sunDirection{}, sunColor{}, ambient{}, hemi{};
+        uint32_t sunFilter = 0, localRadius = 0, localCount = 0;
+        const char* shadowMode = "unavailable";
+        bool sun = false, hemisphere = false, cache = false, clustered = false;
+    };
+    std::array<NativeSample, GameDx12NativeFrame12::kFrameCount> nativeSamples{};
     std::chrono::steady_clock::time_point previousNativePresent{};
     struct
     {
@@ -2378,6 +2387,7 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     GameDx12StaticScene12::AuxStats auxDraws;
     GameDx12StaticScene12::FrameStats12 sceneStats;
     gamelight12::FrameSnapshot lighting;
+    BridgeStateData::NativeSample sample;
     const bool sceneDetail = LightingDiagnosticOptions().sceneLog;
     double prepareMs = 0.0, lightCaptureMs = 0.0;
     if (SUCCEEDED(hr) && state.staticSceneBound && state.staticScene.IsLoaded() &&
@@ -2428,7 +2438,27 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                     lighting, CaptureWater(), sceneStats, auxDraws, reason))
                 hr = E_FAIL;
             else
+            {
                 sceneRecorded = true;
+                if (state.native.Measuring())
+                {
+                    sample.camera = {position[0], position[1], position[2]};
+                    gamelight12::NormalizeDirection(viewProjection._14, viewProjection._24,
+                        viewProjection._34, sample.forward);
+                    sample.sunDirection = lighting.sunDirection;
+                    sample.sunColor = lighting.sunColor;
+                    sample.ambient = lighting.ambient;
+                    sample.hemi = lighting.hemi;
+                    sample.sunFilter = sceneStats.sunFilter;
+                    sample.localRadius = sceneStats.localFilterRadius;
+                    sample.localCount = lighting.localCount;
+                    sample.shadowMode = sceneStats.shadowMode;
+                    sample.sun = lighting.sunEnabled;
+                    sample.hemisphere = lighting.hemiEnabled;
+                    sample.cache = sceneStats.cacheActive;
+                    sample.clustered = sceneStats.clusteredActive;
+                }
+            }
         }
         catch (...)
         {
@@ -2494,6 +2524,16 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
     }
     const auto count = state.native.PresentCount();
     const auto& completedGpu = state.native.LastGpuTiming();
+    BridgeStateData::NativeSample gpuSample;
+    if (hr == S_OK && state.native.Measuring())
+    {
+        auto& slot = state.nativeSamples[recording.slot];
+        if (completedGpu.present != 0 && slot.present == completedGpu.present)
+            gpuSample = slot;
+        if (sceneRecorded && draws != 0)
+            sample.present = count;
+        slot = sample;
+    }
     if (hr == S_OK && sceneRecorded && (count == 1 || count % 120 == 0))
     {
         auto t = sceneStats.adaptive;
@@ -2658,7 +2698,12 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 "sun_filter=%u local_filter_radius=%u detail_sun_shadows=%d "
                 "camera=(%.5f,%.5f,%.5f) forward=(%.6f,%.6f,%.6f) sun_dir=(%.6f,%.6f,%.6f) "
                 "sun_rgb=(%.6f,%.6f,%.6f) ambient=(%.6f,%.6f,%.6f) hemi=(%.6f,%.6f,%.6f) "
-                "sun_active=%d hemi_active=%d local_count=%u",
+                "sun_active=%d hemi_active=%d local_count=%u "
+                "gpu_context_valid=%d gpu_camera=(%.5f,%.5f,%.5f) gpu_forward=(%.6f,%.6f,%.6f) "
+                "gpu_sun_dir=(%.6f,%.6f,%.6f) gpu_sun_rgb=(%.6f,%.6f,%.6f) "
+                "gpu_ambient=(%.6f,%.6f,%.6f) gpu_hemi=(%.6f,%.6f,%.6f) "
+                "gpu_sun_active=%d gpu_hemi_active=%d gpu_local_count=%u gpu_shadow_mode=%s "
+                "gpu_sun_filter=%u gpu_local_filter_radius=%u gpu_cache_active=%d gpu_clustered_active=%d",
                 static_cast<unsigned long long>(frames), static_cast<unsigned long long>(count),
                 static_cast<unsigned long long>(gpu.present), sceneStats.shadowMode,
                 frameMs, gpu.milliseconds, sceneStats.cache.hits, sceneStats.cache.dirty,
@@ -2671,13 +2716,21 @@ void RenderNativeFrame(BridgeStateData& state, const Matrix4& fullTransform)
                 gpu.waterMilliseconds, gpu.waterMeasured, sceneStats.grParallelMs,
                 gpu.localPhaseMilliseconds[0], gpu.localPhaseMilliseconds[1], gpu.localPhaseMilliseconds[2],
                 gpu.localPhasesMeasured, sceneStats.sunFilter, sceneStats.localFilterRadius, sceneStats.detailSunShadows,
-                Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z,
-                Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z,
+                sample.camera.x, sample.camera.y, sample.camera.z,
+                sample.forward.x, sample.forward.y, sample.forward.z,
                 lighting.sunDirection.x, lighting.sunDirection.y, lighting.sunDirection.z,
                 lighting.sunColor.x, lighting.sunColor.y, lighting.sunColor.z,
                 lighting.ambient.x, lighting.ambient.y, lighting.ambient.z,
                 lighting.hemi.x, lighting.hemi.y, lighting.hemi.z,
-                lighting.sunEnabled, lighting.hemiEnabled, lighting.localCount);
+                lighting.sunEnabled, lighting.hemiEnabled, lighting.localCount,
+                gpuSample.present != 0, gpuSample.camera.x, gpuSample.camera.y, gpuSample.camera.z,
+                gpuSample.forward.x, gpuSample.forward.y, gpuSample.forward.z,
+                gpuSample.sunDirection.x, gpuSample.sunDirection.y, gpuSample.sunDirection.z,
+                gpuSample.sunColor.x, gpuSample.sunColor.y, gpuSample.sunColor.z,
+                gpuSample.ambient.x, gpuSample.ambient.y, gpuSample.ambient.z,
+                gpuSample.hemi.x, gpuSample.hemi.y, gpuSample.hemi.z,
+                gpuSample.sun, gpuSample.hemisphere, gpuSample.localCount, gpuSample.shadowMode,
+                gpuSample.sunFilter, gpuSample.localRadius, gpuSample.cache, gpuSample.clustered);
         }
         if (frames == 1 || frames == 30 || frames % 120 == 0)
         {
@@ -3482,6 +3535,7 @@ void GameDx12Bridge_OnLevelReady(const char* levelName)
     state.cameraLogged = false;
     state.nativeGameplayStarted = false;
     state.nativeScenePresents = 0;
+    state.nativeSamples = {};
     state.previousNativePresent = {};
     state.nativePerf = {};
     state.levelActive = true;

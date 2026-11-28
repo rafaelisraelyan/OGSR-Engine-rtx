@@ -680,9 +680,15 @@ struct LocalShadowMatrix
 };
 StructuredBuffer<LocalLightData> LocalLights : register(t13);
 StructuredBuffer<LocalShadowMatrix> LocalShadowMatrices : register(t14);
+uint LocalShadowMatrixIndex(uint projection)
+{
+    // Root SRV не задаёт границу. Ограничиваем адрес и в ветвях,
+    // где FXC может вынести загрузку из-под проверки проекции.
+    return min(projection, max(LocalShadowConfig.x, 1u) - 1u);
+}
 float4 ProjectLocalMatrix(float4 world, uint slice)
 {
-    const LocalShadowMatrix m = LocalShadowMatrices[slice];
+    const LocalShadowMatrix m = LocalShadowMatrices[LocalShadowMatrixIndex(slice)];
     return float4(dot(world,m.column0),dot(world,m.column1),dot(world,m.column2),dot(world,m.column3));
 }
 
@@ -1345,7 +1351,7 @@ uint ProjectLocalFace(uint first, uint layer, uint faces, uint4 baseAddress, flo
     coords = 0.0f;
     if (layer >= LocalShadowConfig.x)
         return LOCAL_BAD_LAYER;
-    const uint4 address = LocalShadowMatrices[layer].address;
+    const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
     const uint face = layer - first;
     if (!ValidLocalAddress(address) || address.x != baseAddress.x ||
         address.z != baseAddress.z || address.y < baseAddress.y ||
@@ -1376,7 +1382,7 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
     const uint first = layer;
     if (faces > LocalShadowConfig.x - first)
         return LOCAL_BAD_LAYER;
-    const uint4 baseAddress = LocalShadowMatrices[first].address;
+    const uint4 baseAddress = LocalShadowMatrices[LocalShadowMatrixIndex(first)].address;
     if (!ValidLocalAddress(baseAddress) || baseAddress.w != faces)
         return LOCAL_BAD_LAYER;
     // Смещение задаётся в метрах. Грань point-карты выбирается уже
@@ -1410,7 +1416,7 @@ uint ProjectLocalShadow(LocalLightData source, float3 position, float3 normal, f
 // The common 1/w cancels when solving depth as a function of shadow UV.
 float2 LocalReceiverGradient(float3 coords, float3 planeNormal, uint layer)
 {
-    const LocalShadowMatrix m = LocalShadowMatrices[layer];
+    const LocalShadowMatrix m = LocalShadowMatrices[LocalShadowMatrixIndex(layer)];
     const float3 w = m.column3.xyz;
     const float2 ndc = (coords.xy - 0.5f) * float2(2.0f, -2.0f);
     const float3 u = 0.5f * (m.column0.xyz - ndc.x * w);
@@ -1452,7 +1458,7 @@ float SampleLocalVisibility(float3 coords, uint layer, float2 gradient)
 {
     if (layer >= LocalShadowConfig.x)
         return 1.0f;
-    const uint4 address = LocalShadowMatrices[layer].address;
+    const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
     if (!ValidLocalAddress(address))
         return 1.0f;
 #if defined(OGSR_DX12_CONTINUOUS_LOCAL) && OGSR_DX12_CONTINUOUS_LOCAL > 0
@@ -1497,7 +1503,7 @@ float LocalVisibility(LocalLightData source, float3 position, float3 normal, flo
         if (largest > 0.0f)
         {
             const uint first = source.type.y - 1u;
-            const uint4 baseAddress = LocalShadowMatrices[first].address;
+            const uint4 baseAddress = LocalShadowMatrices[LocalShadowMatrixIndex(first)].address;
             float visibility = primary, total = 1.0f;
             [loop]
             for (uint i = 0; i < 3; ++i)
@@ -1544,7 +1550,7 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
             continue;
         if (ViewMode == 40 || ViewMode == 41)
         {
-            const uint4 address = LocalShadowMatrices[layer].address;
+            const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
             if (ViewMode == 40)
                 return 0.15f + 0.85f * frac(float3(address.x + 1u, address.y + 1u, (address.w >> 8) + 1u) *
                     float3(0.618f, 0.381f, 0.173f));
@@ -1552,7 +1558,7 @@ float3 DebugLocalShadow(float3 position, float3 normal, float3 planeNormal)
         }
         if (ViewMode == 4)
         {
-            const uint4 address = LocalShadowMatrices[layer].address;
+            const uint4 address = LocalShadowMatrices[LocalShadowMatrixIndex(layer)].address;
             const float3 sampleCoords = float3(coords.xy, address.y);
             const float depth = LOCAL_SHADOW_PAGE(address.x).SampleLevel(WallmarkSampler, sampleCoords, 0);
             const float nearDepth = asfloat(source.type.z);
